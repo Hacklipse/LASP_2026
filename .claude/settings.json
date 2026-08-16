@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la ~/.ssh/ 2>/dev/null || echo \"no ~/.ssh\")",
+      "Read(//Users/shinjonghyeop/.ssh/**)",
+      "Read(//Users/shinjonghyeop/**)",
+      "Bash(ssh -o StrictHostKeyChecking=accept-new -T git@github.com)",
+      "Bash(git ls-remote *)",
+      "Bash(git ls-tree *)",
+      "Bash(git branch *)",
+      "Bash(git reset *)"
+    ]
+  }
+}

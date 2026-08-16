@@ -1,0 +1,182 @@
+{
+  ".claude/.headroom_wrap_marker.json": {
+    "mtime": 1786509336.1918182,
+    "ast_hash": "688a009d730b7c42f65195be312864f1",
+    "semantic_hash": "688a009d730b7c42f65195be312864f1"
+  },
+  ".claude/settings.local.json": {
+    "mtime": 1786509336.1916933,
+    "ast_hash": "76d00497f910e42b18c928a8566d41d4",
+    "semantic_hash": "76d00497f910e42b18c928a8566d41d4"
+  },
+  "pyproject.toml": {
+    "mtime": 1786368760.0,
+    "ast_hash": "ecb83ed8a369440be7cb56a39afe4fc7",
+    "semantic_hash": "ecb83ed8a369440be7cb56a39afe4fc7"
+  },
+  "src/hacklipse/__init__.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "9676bcbacf2a53cbd7907934db54a2a8",
+    "semantic_hash": "9676bcbacf2a53cbd7907934db54a2a8"
+  },
+  "src/hacklipse/adapters/__init__.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "5a853cd7f3baaa9f8350ea31058e3db0",
+    "semantic_hash": "5a853cd7f3baaa9f8350ea31058e3db0"
+  },
+  "src/hacklipse/adapters/budget.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "580f8d2e4c258044c8c036abbd849f54",
+    "semantic_hash": "580f8d2e4c258044c8c036abbd849f54"
+  },
+  "src/hacklipse/adapters/dispatcher.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "23351c5c207344d86fc9395bdc41cbe6",
+    "semantic_hash": "23351c5c207344d86fc9395bdc41cbe6"
+  },
+  "src/hacklipse/adapters/memory.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "2237819fae6e4c956a1828778b38ceff",
+    "semantic_hash": "2237819fae6e4c956a1828778b38ceff"
+  },
+  "src/hacklipse/adapters/policy.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "53ad6f297f42588ff0aed70a2ba705c6",
+    "semantic_hash": "53ad6f297f42588ff0aed70a2ba705c6"
+  },
+  "src/hacklipse/adapters/reporting.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "bad021a271c4676d366e59eca1339cd2",
+    "semantic_hash": "bad021a271c4676d366e59eca1339cd2"
+  },
+  "src/hacklipse/adapters/retry.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "d2959f5bdbb99e7eefc60ed85f7613d4",
+    "semantic_hash": "d2959f5bdbb99e7eefc60ed85f7613d4"
+  },
+  "src/hacklipse/adapters/routing.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "579dba3124d665bac6d18b0c6cbf4f70",
+    "semantic_hash": "579dba3124d665bac6d18b0c6cbf4f70"
+  },
+  "src/hacklipse/adapters/runtime.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "3ec5e9ee215ea15ed80aefd365f4ab60",
+    "semantic_hash": "3ec5e9ee215ea15ed80aefd365f4ab60"
+  },
+  "src/hacklipse/application/__init__.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "cd0f56751cb6cb6ca0a822cc430e455c",
+    "semantic_hash": "cd0f56751cb6cb6ca0a822cc430e455c"
+  },
+  "src/hacklipse/application/errors.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "862bbe810a9c1c965a29c2b995265f98",
+    "semantic_hash": "862bbe810a9c1c965a29c2b995265f98"
+  },
+  "src/hacklipse/application/execution.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "d9d55eac2e7a07032b7ca93682aea41f",
+    "semantic_hash": "d9d55eac2e7a07032b7ca93682aea41f"
+  },
+  "src/hacklipse/application/orchestrator.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "f06e7ffb2d39914f982088757351555b",
+    "semantic_hash": "f06e7ffb2d39914f982088757351555b"
+  },
+  "src/hacklipse/application/state_machine.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "e85872f67e6755150a805d6918a7f512",
+    "semantic_hash": "e85872f67e6755150a805d6918a7f512"
+  },
+  "src/hacklipse/application/task_executor.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "24ce062810fc57a0dd52fd07172126af",
+    "semantic_hash": "24ce062810fc57a0dd52fd07172126af"
+  },
+  "src/hacklipse/application/task_factory.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "7d29d7ca0d1c45678f0db0c26b1ae37e",
+    "semantic_hash": "7d29d7ca0d1c45678f0db0c26b1ae37e"
+  },
+  "src/hacklipse/bootstrap.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "403a7ca7027af4a551cd83c504cff062",
+    "semantic_hash": "403a7ca7027af4a551cd83c504cff062"
+  },
+  "src/hacklipse/domain/__init__.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "a5ea6511547da42ea68ce7b982cd0817",
+    "semantic_hash": "a5ea6511547da42ea68ce7b982cd0817"
+  },
+  "src/hacklipse/domain/errors.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "f4af43b91825781760c20661e3e8464c",
+    "semantic_hash": "f4af43b91825781760c20661e3e8464c"
+  },
+  "src/hacklipse/domain/models.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "0b09f7e88cc0bae1994fa9c2121c0fdf",
+    "semantic_hash": "0b09f7e88cc0bae1994fa9c2121c0fdf"
+  },
+  "src/hacklipse/ports/__init__.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "279faa4bee0a08a3f3e3350bc3b40638",
+    "semantic_hash": "279faa4bee0a08a3f3e3350bc3b40638"
+  },
+  "src/hacklipse/ports/agents.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "3837b78ebf14df64d0d519dac951028f",
+    "semantic_hash": "3837b78ebf14df64d0d519dac951028f"
+  },
+  "src/hacklipse/ports/control.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "3e34d01626696ab819eff36085e106a7",
+    "semantic_hash": "3e34d01626696ab819eff36085e106a7"
+  },
+  "src/hacklipse/ports/errors.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "6c5830f5751c1f981a2c53b9611c842b",
+    "semantic_hash": "6c5830f5751c1f981a2c53b9611c842b"
+  },
+  "src/hacklipse/ports/knowledge.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "877688f2d0b7bfd6e9494b9d8fe0dca6",
+    "semantic_hash": "877688f2d0b7bfd6e9494b9d8fe0dca6"
+  },
+  "src/hacklipse/ports/repositories.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "0c7f0fc8807d269831e9367c504fc2a8",
+    "semantic_hash": "0c7f0fc8807d269831e9367c504fc2a8"
+  },
+  "src/hacklipse/ports/runtime.py": {
+    "mtime": 1786368761.0,
+    "ast_hash": "d2533163d908444d07182ebaae30d4bf",
+    "semantic_hash": "d2533163d908444d07182ebaae30d4bf"
+  },
+  "tests/test_dependency_direction.py": {
+    "mtime": 1786368760.0,
+    "ast_hash": "d065a653b1c52872d9409cfbd66dbeb8",
+    "semantic_hash": "d065a653b1c52872d9409cfbd66dbeb8"
+  },
+  "tests/test_end_to_end.py": {
+    "mtime": 1786368760.0,
+    "ast_hash": "78039bd105dbbf15788c0661fce00e09",
+    "semantic_hash": "78039bd105dbbf15788c0661fce00e09"
+  },
+  "tests/test_invariants.py": {
+    "mtime": 1786368760.0,
+    "ast_hash": "f723ac9bcfc637953c651b39cf994395",
+    "semantic_hash": "f723ac9bcfc637953c651b39cf994395"
+  },
+  ".serena/project.yml": {
+    "mtime": 1786509334.6157444,
+    "ast_hash": "a535aeba96c2d7d9dc9d4fc96ffc11fe",
+    "semantic_hash": "a535aeba96c2d7d9dc9d4fc96ffc11fe"
+  },
+  "README.md": {
+    "mtime": 1786368760.0,
+    "ast_hash": "72d8bf86a4e3bb1d63b0c7ea2e8f671f",
+    "semantic_hash": "72d8bf86a4e3bb1d63b0c7ea2e8f671f"
+  }
+}
