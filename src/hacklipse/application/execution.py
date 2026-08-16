@@ -83,6 +83,7 @@ class RuntimeEvidenceCollector:
         )
         return evidence_id
 
+    # TO DO collect 호출
     def handle(self, task: TaskEnvelope) -> AgentResult:
         """증적 요청 계약을 검증하고 공통 수집 경계에 실행을 위임한다."""
 
