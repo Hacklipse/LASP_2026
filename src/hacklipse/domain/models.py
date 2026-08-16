@@ -186,6 +186,18 @@ class Evidence:
 
 
 @dataclass(frozen=True, slots=True)
+class Surface:
+    """Recon이 발견한 공격 표면 하나(URL·메서드·파라미터·인증 요건)."""
+
+    surface_id: str
+    run_id: str
+    url: str
+    method: str
+    parameters: tuple[str, ...] = ()
+    requires_auth: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class Candidate:
     """아직 독립 검증을 통과하지 않은 취약점 가설."""
 
