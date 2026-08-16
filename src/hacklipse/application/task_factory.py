@@ -23,6 +23,8 @@ class TaskFactory:
             agent_type=agent_type,
             request_budget=request_budget,
             target_url=run.target_url,
+            # HttpExecutionRuntime의 GET 실행 도구 이름과 맞춰야 collect()가 통과한다.
+            allowed_tools=("http_get",),
         )
 
     def analysis(
