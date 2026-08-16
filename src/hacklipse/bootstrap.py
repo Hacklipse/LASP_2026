@@ -36,6 +36,7 @@ class LocalApplication:
     budget_manager: InMemoryBudgetManager
     policy_gate: AllowlistPolicyGate
     runtime: ExecutionRuntime
+    collector: RuntimeEvidenceCollector
 
 
 def build_local_application(
@@ -56,6 +57,16 @@ def build_local_application(
     # 명시적인 Runtime 주입이 없으면 외부 실행을 전부 거부하는 구현을 선택한다.
     selected_runtime = runtime or DisabledExecutionRuntime()
     selected_config = config or OrchestratorConfig()
+    # 항상 만들어 노출한다 — Recon처럼 이 collector를 직접 주입받아야 하는 Agent는
+    # agents 인자로 들어가기 전에 이미 collector가 필요해서 순환이 생기기 때문에,
+    # 호출자가 build 후 app.collector로 받아 별도로 등록한다.
+    collector = RuntimeEvidenceCollector(
+        run_store=stores.runs,
+        evidence_store=stores.evidence,
+        policy_gate=policy,
+        budget_manager=budget,
+        runtime=selected_runtime,
+    )
 
     for agent_type, agent in agents.items():
         # 실제 Recon/Analysis/Validation Agent는 호출자가 명시적으로 제공해야 한다.
@@ -72,16 +83,7 @@ def build_local_application(
         )
     if selected_config.evidence_collector_agent_type not in agents:
         # 추가 증적 수집은 공통 정책·예산·Runtime 경계를 거치는 Worker로 연결한다.
-        dispatcher.register(
-            selected_config.evidence_collector_agent_type,
-            RuntimeEvidenceCollector(
-                run_store=stores.runs,
-                evidence_store=stores.evidence,
-                policy_gate=policy,
-                budget_manager=budget,
-                runtime=selected_runtime,
-            ),
-        )
+        dispatcher.register(selected_config.evidence_collector_agent_type, collector)
 
     # Task 실행기와 Orchestrator는 Port만 바라보며 구체 Adapter를 직접 생성하지 않는다.
     task_executor = TaskExecutor(
@@ -111,4 +113,5 @@ def build_local_application(
         budget_manager=budget,
         policy_gate=policy,
         runtime=selected_runtime,
+        collector=collector,
     )

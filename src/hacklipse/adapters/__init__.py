@@ -5,6 +5,7 @@ from .dispatcher import LocalTaskDispatcher
 from .http_runtime import HttpExecutionRuntime
 from .memory import MemoryStoreBundle
 from .policy import AllowlistPolicyGate
+from .recon import ReconAgent
 from .reporting import MarkdownReportAgent
 from .retry import BoundedRetryPolicy
 from .routing import RoutingRule, RuleBasedVulnerabilityRouter
@@ -19,6 +20,7 @@ __all__ = [
     "LocalTaskDispatcher",
     "MarkdownReportAgent",
     "MemoryStoreBundle",
+    "ReconAgent",
     "RoutingRule",
     "RuleBasedVulnerabilityRouter",
 ]
