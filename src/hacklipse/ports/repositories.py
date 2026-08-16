@@ -10,6 +10,7 @@ from hacklipse.domain import (
     Finding,
     ReportArtifact,
     Run,
+    Surface,
     TaskRecord,
 )
 
@@ -46,6 +47,16 @@ class EvidenceStore(Protocol):
     def get_many(self, run_id: str, evidence_ids: Sequence[str]) -> Sequence[Evidence]: ...
 
     def list_by_run(self, run_id: str) -> Sequence[Evidence]: ...
+
+
+class SurfaceStore(Protocol):
+    """Recon이 발견한 공격 표면을 저장하고 Run 범위로 조회하는 계약."""
+
+    def add(self, surface: Surface) -> None: ...
+
+    def get(self, run_id: str, surface_id: str) -> Surface: ...
+
+    def list_by_run(self, run_id: str) -> Sequence[Surface]: ...
 
 
 class CandidateStore(Protocol):

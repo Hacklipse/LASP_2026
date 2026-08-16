@@ -9,6 +9,7 @@ from .repositories import (
     FindingStore,
     ReportStore,
     RunStore,
+    SurfaceStore,
     TaskStore,
 )
 from .runtime import ExecutionRuntime
@@ -25,6 +26,7 @@ __all__ = [
     "ReportStore",
     "RetryPolicy",
     "RunStore",
+    "SurfaceStore",
     "TaskDispatcher",
     "TaskStore",
     "VulnerabilityRouter",

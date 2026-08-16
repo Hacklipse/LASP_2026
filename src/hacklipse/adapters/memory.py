@@ -6,7 +6,15 @@ from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 
-from hacklipse.domain import Candidate, Evidence, Finding, ReportArtifact, Run, TaskRecord
+from hacklipse.domain import (
+    Candidate,
+    Evidence,
+    Finding,
+    ReportArtifact,
+    Run,
+    Surface,
+    TaskRecord,
+)
 from hacklipse.ports.errors import DuplicateRecord, RecordNotFound
 
 
@@ -72,6 +80,27 @@ class InMemoryEvidenceStore:
         return tuple(self.get(run_id, evidence_id) for evidence_id in evidence_ids)
 
     def list_by_run(self, run_id: str) -> tuple[Evidence, ...]:
+        return tuple(deepcopy(item) for item in self._items.values() if item.run_id == run_id)
+
+
+class InMemorySurfaceStore:
+    """Recon이 발견한 Surface를 Run 범위로만 조회 가능하게 보관한다."""
+
+    def __init__(self) -> None:
+        self._items: dict[str, Surface] = {}
+
+    def add(self, surface: Surface) -> None:
+        _add(self._items, surface.surface_id, surface)
+
+    def get(self, run_id: str, surface_id: str) -> Surface:
+        """Surface가 요청한 Run에 속할 때만 반환한다."""
+
+        surface = _get(self._items, surface_id)
+        if surface.run_id != run_id:
+            raise RecordNotFound(f"surface not found in run {run_id}: {surface_id}")
+        return surface
+
+    def list_by_run(self, run_id: str) -> tuple[Surface, ...]:
         return tuple(deepcopy(item) for item in self._items.values() if item.run_id == run_id)
 
 
@@ -142,6 +171,7 @@ class MemoryStoreBundle:
     runs: InMemoryRunStore = field(default_factory=InMemoryRunStore)
     tasks: InMemoryTaskStore = field(default_factory=InMemoryTaskStore)
     evidence: InMemoryEvidenceStore = field(default_factory=InMemoryEvidenceStore)
+    surfaces: InMemorySurfaceStore = field(default_factory=InMemorySurfaceStore)
     candidates: InMemoryCandidateStore = field(default_factory=InMemoryCandidateStore)
     findings: InMemoryFindingStore = field(default_factory=InMemoryFindingStore)
     reports: InMemoryReportStore = field(default_factory=InMemoryReportStore)
