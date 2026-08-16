@@ -9,6 +9,7 @@ from hacklipse.domain import (
     AgentResult,
     AgentResultStatus,
     Evidence,
+    EvidenceRequest,
     ExecutionRequest,
     TaskEnvelope,
 )
@@ -37,26 +38,27 @@ class RuntimeEvidenceCollector:
         self._runtime = runtime
         self._id_factory = id_factory or (lambda: str(uuid4()))
 
-    def handle(self, task: TaskEnvelope) -> AgentResult:
-        """증적 요청을 검증하고 Runtime 결과를 append-only Evidence로 저장한다."""
-
-        request_spec = task.evidence_request
-        if request_spec is None or task.target_url is None:
-            raise AgentContractError("evidence collection task is missing its request")
-        if request_spec.suggested_tool not in task.allowed_tools:
-            raise AgentContractError("requested execution tool is not allowed by the task")
+    def collect(
+        self,
+        run_id: str,
+        target_url: str,
+        spec: EvidenceRequest,
+        *,
+        task_id: str,
+    ) -> str:
+        """정책·예산·Runtime 경계를 거쳐 Evidence를 저장하고 ID를 반환한다."""
 
         # 저장된 Run을 신뢰 기준으로 사용해 Task가 임의 정책을 주입하지 못하게 한다.
-        run = self._runs.get(task.run_id)
+        run = self._runs.get(run_id)
         execution_id = f"exec-{self._id_factory()}"
         request = ExecutionRequest(
             execution_id=execution_id,
-            run_id=task.run_id,
-            task_id=task.task_id,
-            tool=request_spec.suggested_tool,
-            target_url=task.target_url,
-            surface_id=request_spec.surface_id,
-            purpose=request_spec.reason,
+            run_id=run_id,
+            task_id=task_id,
+            tool=spec.suggested_tool,
+            target_url=target_url,
+            surface_id=spec.surface_id,
+            purpose=spec.reason,
         )
         # 실제 호출 직전에 Scope와 예산을 검사해 우회 실행을 막는다.
         self._policy.validate_execution(run, request)
@@ -78,6 +80,24 @@ class RuntimeEvidenceCollector:
                 artifact_refs=result.artifact_refs,
                 content_hash=result.content_hash,
             )
+        )
+        return evidence_id
+
+    # TO DO collect 호출
+    def handle(self, task: TaskEnvelope) -> AgentResult:
+        """증적 요청 계약을 검증하고 공통 수집 경계에 실행을 위임한다."""
+
+        request_spec = task.evidence_request
+        if request_spec is None or task.target_url is None:
+            raise AgentContractError("evidence collection task is missing its request")
+        if request_spec.suggested_tool not in task.allowed_tools:
+            raise AgentContractError("requested execution tool is not allowed by the task")
+
+        evidence_id = self.collect(
+            task.run_id,
+            task.target_url,
+            request_spec,
+            task_id=task.task_id,
         )
         return AgentResult(
             task_id=task.task_id,
