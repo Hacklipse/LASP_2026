@@ -8,3 +8,8 @@ __pycache__/
 build/
 dist/
 
+.claude/
+.serena/
+graphify-out/
+.DS_Store
+
