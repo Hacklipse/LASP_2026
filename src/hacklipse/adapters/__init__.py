@@ -2,6 +2,7 @@
 
 from .budget import InMemoryBudgetManager
 from .dispatcher import LocalTaskDispatcher
+from .http_runtime import HttpExecutionRuntime
 from .memory import MemoryStoreBundle
 from .policy import AllowlistPolicyGate
 from .reporting import MarkdownReportAgent
@@ -13,6 +14,7 @@ __all__ = [
     "AllowlistPolicyGate",
     "BoundedRetryPolicy",
     "DisabledExecutionRuntime",
+    "HttpExecutionRuntime",
     "InMemoryBudgetManager",
     "LocalTaskDispatcher",
     "MarkdownReportAgent",
