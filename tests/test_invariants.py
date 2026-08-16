@@ -17,6 +17,7 @@ from hacklipse.domain import (
     RunPhase,
     RunRequest,
     RunScope,
+    Surface,
     ValidationResult,
     ValidationVerdict,
 )
@@ -100,6 +101,22 @@ class ArchitectureInvariantTests(unittest.TestCase):
             stores.evidence.append(evidence)
         with self.assertRaises(RecordNotFound):
             stores.evidence.get("run-2", "evi-1")
+
+    def test_surface_is_run_scoped(self) -> None:
+        """Surface 조회는 발견된 Run 범위를 넘어갈 수 없어야 한다."""
+
+        stores = MemoryStoreBundle()
+        surface = Surface(
+            surface_id="surface-1",
+            run_id="run-1",
+            url="https://local.test/login",
+            method="GET",
+        )
+        stores.surfaces.add(surface)
+
+        self.assertEqual(stores.surfaces.get("run-1", "surface-1"), surface)
+        with self.assertRaises(RecordNotFound):
+            stores.surfaces.get("run-2", "surface-1")
 
     def test_policy_rejects_target_outside_allowlist_before_run_creation(self) -> None:
         """허용되지 않은 호스트는 Run이나 Task 생성 전에 거부한다."""
