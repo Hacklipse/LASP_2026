@@ -11,6 +11,8 @@ from .retry import BoundedRetryPolicy
 from .routing import RoutingRule, RuleBasedVulnerabilityRouter
 from .runtime import DisabledExecutionRuntime
 from .validation import ValidationAgent
+from .sqlite_budget import SQLiteBudgetManager
+from .sqlite_store import SQLiteStoreBundle
 
 __all__ = [
     "AllowlistPolicyGate",
@@ -25,4 +27,6 @@ __all__ = [
     "RoutingRule",
     "RuleBasedVulnerabilityRouter",
     "ValidationAgent",
+    "SQLiteBudgetManager",
+    "SQLiteStoreBundle",
 ]
