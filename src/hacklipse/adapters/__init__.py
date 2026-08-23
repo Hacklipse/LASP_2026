@@ -10,6 +10,7 @@ from .reporting import MarkdownReportAgent
 from .retry import BoundedRetryPolicy
 from .routing import RoutingRule, RuleBasedVulnerabilityRouter
 from .runtime import DisabledExecutionRuntime
+from .validation import ValidationAgent
 
 __all__ = [
     "AllowlistPolicyGate",
@@ -23,4 +24,5 @@ __all__ = [
     "ReconAgent",
     "RoutingRule",
     "RuleBasedVulnerabilityRouter",
+    "ValidationAgent",
 ]
