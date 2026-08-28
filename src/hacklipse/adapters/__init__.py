@@ -8,7 +8,7 @@ from .policy import AllowlistPolicyGate
 from .recon import ReconAgent
 from .reporting import MarkdownReportAgent
 from .retry import BoundedRetryPolicy
-from .routing import RoutingRule, RuleBasedVulnerabilityRouter
+from .routing import RoutingRule, RuleBasedVulnerabilityRouter, SurfaceRoutingRule
 from .runtime import DisabledExecutionRuntime
 from .validation import ValidationAgent
 from .sqlite_budget import SQLiteBudgetManager
@@ -26,6 +26,7 @@ __all__ = [
     "ReconAgent",
     "RoutingRule",
     "RuleBasedVulnerabilityRouter",
+    "SurfaceRoutingRule",
     "ValidationAgent",
     "SQLiteBudgetManager",
     "SQLiteStoreBundle",

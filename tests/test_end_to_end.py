@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 
+from hacklipse.adapters import RuleBasedVulnerabilityRouter
 from hacklipse.bootstrap import build_local_application
 from hacklipse.domain import (
     AgentResult,
@@ -166,7 +167,13 @@ class EndToEndWorkflowTests(unittest.TestCase):
     def _application(self, *, validation_agent=None, runtime=None):
         """테스트마다 격리된 메모리 Application과 fixture Agent를 조립한다."""
 
-        app = build_local_application({}, runtime=runtime)
+        # 이 테스트는 기존 Reflection Evidence 경로 하나의 E2E만 검증한다.
+        # Surface 기반 다중 Candidate 규칙은 tests/test_routing.py에서 별도로 고정한다.
+        app = build_local_application(
+            {},
+            runtime=runtime,
+            router=RuleBasedVulnerabilityRouter(surface_rules=()),
+        )
         app.dispatcher.register(
             "recon", ReconFixtureAgent(app.stores.evidence, app.stores.surfaces)
         )

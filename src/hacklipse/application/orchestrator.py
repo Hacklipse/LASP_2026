@@ -153,10 +153,11 @@ class Orchestrator:
         return self._merge_agent_result(run, result)
 
     def _route(self, run: Run) -> Run:
-        """저장된 Evidence를 Router에 전달하고 생성된 Candidate를 저장한다."""
+        """저장된 Surface·Evidence를 Router에 전달하고 Candidate를 저장한다."""
 
+        surfaces = self._surfaces.list_by_run(run.run_id)
         evidence = self._evidence.get_many(run.run_id, run.evidence_ids)
-        decisions = self._router.route(run, evidence)
+        decisions = self._router.route(run, surfaces, evidence)
         candidate_ids = list(run.candidate_ids)
         for decision in decisions:
             candidate = decision.candidate

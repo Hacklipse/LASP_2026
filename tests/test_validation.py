@@ -6,6 +6,7 @@ import unittest
 
 from hacklipse.adapters.memory import InMemoryCandidateStore, InMemoryEvidenceStore
 from hacklipse.adapters.recon import ReconAgent
+from hacklipse.adapters.routing import RuleBasedVulnerabilityRouter
 from hacklipse.adapters.validation import ValidationAgent
 from hacklipse.application.errors import AgentContractError
 from hacklipse.bootstrap import build_local_application
@@ -176,7 +177,12 @@ class ValidationDrivesEvidenceLoopTests(unittest.TestCase):
     """완료 기준: evidence_requests 루프가 실제 ValidationAgent로 Finding까지 완주한다."""
 
     def test_independent_reproduction_confirms_and_reaches_report(self) -> None:
-        app = build_local_application(agents={}, runtime=_RouteThenReproduceRuntime())
+        # 이 테스트는 Path Traversal Validation 루프 하나만 검증한다.
+        app = build_local_application(
+            agents={},
+            runtime=_RouteThenReproduceRuntime(),
+            router=RuleBasedVulnerabilityRouter(surface_rules=()),
+        )
         app.dispatcher.register(
             "recon",
             ReconAgent(
