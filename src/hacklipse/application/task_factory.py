@@ -28,17 +28,24 @@ class TaskFactory:
         )
 
     def analysis(
-        self, run: Run, candidate: Candidate, *, request_budget: int
+        self,
+        run: Run,
+        candidate: Candidate,
+        *,
+        target_url: str,
+        request_budget: int,
     ) -> TaskEnvelope:
-        """Candidate와 연결된 Evidence ID만 포함한 Analysis Task를 생성한다."""
+        """Candidate의 실제 Surface URL과 Evidence 참조를 Analysis Task에 담는다."""
 
         return self._base(
             run,
             agent_type=candidate.assigned_agent,
             request_budget=request_budget,
+            target_url=target_url,
             surface_id=candidate.surface_id,
             candidate_id=candidate.candidate_id,
             evidence_ids=candidate.evidence_ids,
+            allowed_tools=("http_get",),
         )
 
     def validation(

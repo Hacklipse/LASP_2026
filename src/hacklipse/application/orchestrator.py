@@ -177,9 +177,12 @@ class Orchestrator:
             # 이미 처리된 Candidate는 재개 시 중복 분석하지 않는다.
             if candidate.status != "routed":
                 continue
+            # Candidate가 참조하는 Run-scoped Surface를 실제 Analysis 대상으로 해석한다.
+            surface = self._surfaces.get(run.run_id, candidate.surface_id)
             task = self._task_factory.analysis(
                 current,
                 candidate,
+                target_url=surface.url,
                 request_budget=self._budget.remaining(run.run_id),
             )
             result = self._tasks.execute(task)

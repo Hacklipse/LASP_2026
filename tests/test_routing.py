@@ -130,6 +130,12 @@ class SurfaceRoutingWorkflowTests(unittest.TestCase):
             [candidate.vulnerability_type for candidate in candidates],
             ["XSS", "SQLi", "SSTI"],
         )
+        tasks = app.stores.tasks.list_by_run(run.run_id)
+        analysis_task = tasks[-1].envelope
+        self.assertEqual(analysis_task.agent_type, "xss_analyzer")
+        self.assertEqual(analysis_task.surface_id, "surface-search")
+        self.assertEqual(analysis_task.target_url, "http://localhost/search")
+        self.assertEqual(analysis_task.allowed_tools, ("http_get",))
 
 
 if __name__ == "__main__":
