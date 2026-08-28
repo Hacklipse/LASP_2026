@@ -14,6 +14,7 @@ from hacklipse.domain import (
     RunPhase,
     RunRequest,
     RunScope,
+    Surface,
     TaskEnvelope,
     TaskStatus,
     ValidationResult,
@@ -24,12 +25,22 @@ from hacklipse.domain import (
 class ReconFixtureAgent:
     """Reflection Observation 하나를 생성하는 로컬 Recon 대역."""
 
-    def __init__(self, evidence_store) -> None:
+    def __init__(self, evidence_store, surface_store) -> None:
         self._evidence = evidence_store
+        self._surfaces = surface_store
 
     def handle(self, task: TaskEnvelope) -> AgentResult:
         # 실제 HTTP 요청 대신 고정된 Surface와 Observation을 Evidence Store에 기록한다.
         evidence_id = f"evi-recon-{task.run_id}"
+        self._surfaces.add(
+            Surface(
+                surface_id="surface-search",
+                run_id=task.run_id,
+                url="http://local.test/discovered-search",
+                method="GET",
+                parameters=("q",),
+            )
+        )
         self._evidence.append(
             Evidence(
                 evidence_id=evidence_id,
@@ -136,7 +147,11 @@ class EvidenceSeekingValidationFixtureAgent:
 class LocalFixtureRuntime:
     """네트워크 호출 없이 브라우저 실행 결과 형태만 반환하는 Runtime 대역."""
 
+    def __init__(self) -> None:
+        self.requests = []
+
     def execute(self, request):
+        self.requests.append(request)
         return ExecutionResult(
             execution_id=request.execution_id,
             evidence_type="browser_execution",
@@ -152,7 +167,9 @@ class EndToEndWorkflowTests(unittest.TestCase):
         """테스트마다 격리된 메모리 Application과 fixture Agent를 조립한다."""
 
         app = build_local_application({}, runtime=runtime)
-        app.dispatcher.register("recon", ReconFixtureAgent(app.stores.evidence))
+        app.dispatcher.register(
+            "recon", ReconFixtureAgent(app.stores.evidence, app.stores.surfaces)
+        )
         app.dispatcher.register(
             "xss_analyzer", XssAnalysisFixtureAgent(app.stores.evidence)
         )
@@ -201,7 +218,8 @@ class EndToEndWorkflowTests(unittest.TestCase):
         """추가 증적이 Orchestrator와 공통 Runtime 경계를 왕복하는지 확인한다."""
 
         validator = EvidenceSeekingValidationFixtureAgent()
-        app = self._application(validation_agent=validator, runtime=LocalFixtureRuntime())
+        runtime = LocalFixtureRuntime()
+        app = self._application(validation_agent=validator, runtime=runtime)
 
         run = app.orchestrator.start(self._request())
 
@@ -222,6 +240,10 @@ class EndToEndWorkflowTests(unittest.TestCase):
             ],
         )
         self.assertEqual(app.budget_manager.remaining(run.run_id), 9)
+        self.assertEqual(
+            [request.target_url for request in runtime.requests],
+            ["http://local.test/discovered-search"],
+        )
 
 
 if __name__ == "__main__":

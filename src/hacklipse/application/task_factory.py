@@ -66,6 +66,7 @@ class TaskFactory:
         candidate: Candidate,
         request: EvidenceRequest,
         *,
+        target_url: str,
         agent_type: str,
         request_budget: int,
     ) -> TaskEnvelope:
@@ -75,7 +76,7 @@ class TaskFactory:
             run,
             agent_type=agent_type,
             request_budget=request_budget,
-            target_url=run.target_url,
+            target_url=target_url,
             surface_id=candidate.surface_id,
             candidate_id=candidate.candidate_id,
             evidence_ids=candidate.evidence_ids,

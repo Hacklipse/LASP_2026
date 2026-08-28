@@ -24,6 +24,7 @@ from hacklipse.ports import (
     PolicyGate,
     ReportStore,
     RunStore,
+    SurfaceStore,
     VulnerabilityRouter,
 )
 
@@ -59,6 +60,7 @@ class Orchestrator:
         candidate_store: CandidateStore,
         finding_store: FindingStore,
         report_store: ReportStore,
+        surface_store: SurfaceStore,
         policy_gate: PolicyGate,
         budget_manager: BudgetManager,
         router: VulnerabilityRouter,
@@ -73,6 +75,7 @@ class Orchestrator:
         self._candidates = candidate_store
         self._findings = finding_store
         self._reports = report_store
+        self._surfaces = surface_store
         self._policy = policy_gate
         self._budget = budget_manager
         self._router = router
@@ -215,10 +218,16 @@ class Orchestrator:
                 if requests and evidence_round < self._config.max_evidence_rounds:
                     # Validator가 Worker를 직접 호출하지 않고 Orchestrator가 수집 Task를 만든다.
                     for request in requests:
+                        if request.surface_id != candidate.surface_id:
+                            raise AgentContractError(
+                                "validation evidence request references a different surface"
+                            )
+                        surface = self._surfaces.get(run.run_id, request.surface_id)
                         collection_task = self._task_factory.evidence_collection(
                             current,
                             candidate,
                             request,
+                            target_url=surface.url,
                             agent_type=self._config.evidence_collector_agent_type,
                             request_budget=self._budget.remaining(run.run_id),
                         )

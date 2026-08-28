@@ -127,6 +127,7 @@ def build_local_application(
         candidate_store=selected_stores.candidates,
         finding_store=selected_stores.findings,
         report_store=selected_stores.reports,
+        surface_store=selected_stores.surfaces,
         policy_gate=policy,
         budget_manager=selected_budget,
         router=router or RuleBasedVulnerabilityRouter(),
