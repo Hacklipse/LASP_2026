@@ -239,7 +239,7 @@ class _RejectingValidator:
             task_id=task.task_id,
             status=AgentResultStatus.COMPLETED,
             validation=ValidationResult(
-                validation_id="validation-baseline",
+                validation_id=task.validation_id or "",
                 run_id=task.run_id,
                 candidate_id=task.candidate_id or "",
                 verdict=ValidationVerdict.REJECTED,

@@ -57,6 +57,16 @@ class ValidationVerdict(str, Enum):
     BLOCKED = "blocked"
 
 
+class ValidationProofType(str, Enum):
+    """취약점 유형별 CONFIRMED 판정이 요구하는 구조화된 증명 종류."""
+
+    XSS_EXECUTION = "xss_execution"
+    SQLI_EFFECT = "sqli_effect"
+    UNAUTHORIZED_OBJECT_ACCESS = "unauthorized_object_access"
+    PATH_TRAVERSAL_FILE_READ = "path_traversal_file_read"
+    SSTI_EXECUTION = "ssti_execution"
+
+
 class HttpRequestKind(str, Enum):
     """비교 기준 요청과 취약점 탐색 요청을 기계적으로 구분한다."""
 
@@ -198,6 +208,7 @@ class TaskEnvelope:
     policy_profile: str = "safe"
     timeout_seconds: int = 120
     credential_ref: str | None = None
+    validation_id: str | None = None
     evidence_request: EvidenceRequest | None = None
 
     def __post_init__(self) -> None:
@@ -239,6 +250,8 @@ class Evidence:
     surface_id: str | None
     created_by: str
     evidence_type: str
+    source_task_id: str | None = None
+    validation_id: str | None = None
     observation: Mapping[str, object] = field(default_factory=dict)
     artifact_refs: Mapping[str, str] = field(default_factory=dict)
     content_hash: str | None = None
@@ -291,6 +304,23 @@ class RouteDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class ValidationProof:
+    """CONFIRMED 판정을 뒷받침하는 취약점별 증명과 직접 Evidence 참조."""
+
+    proof_type: ValidationProofType
+    evidence_ids: tuple[str, ...]
+    summary: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.proof_type, ValidationProofType):
+            raise DomainInvariantError("validation proof type must be structured")
+        if not self.evidence_ids:
+            raise DomainInvariantError("validation proof must reference evidence")
+        if not self.summary.strip():
+            raise DomainInvariantError("validation proof must explain the reproduced effect")
+
+
+@dataclass(frozen=True, slots=True)
 class ValidationResult:
     """Candidate에 대한 독립 검증 결과와 근거 Evidence."""
 
@@ -301,7 +331,26 @@ class ValidationResult:
     evidence_ids: tuple[str, ...]
     reason: str
     reproduction_count: int = 0
-    evidence_requests: tuple[EvidenceRequest, ...] = ()
+    proof: ValidationProof | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.verdict, ValidationVerdict):
+            raise DomainInvariantError("validation verdict must be structured")
+        if not self.validation_id:
+            raise DomainInvariantError("validation result must identify its session")
+        if not self.reason.strip():
+            raise DomainInvariantError("validation result must explain its verdict")
+        if self.reproduction_count < 0:
+            raise DomainInvariantError("validation reproduction count cannot be negative")
+        if self.verdict is ValidationVerdict.CONFIRMED:
+            if self.proof is None:
+                raise DomainInvariantError(
+                    "confirmed validation requires vulnerability-specific proof"
+                )
+            if not set(self.proof.evidence_ids).issubset(self.evidence_ids):
+                raise DomainInvariantError(
+                    "validation proof evidence must be included in validation evidence"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,6 +448,7 @@ class ExecutionRequest:
     headers: tuple[tuple[str, str], ...] = ()
     body: str | None = None
     request_kind: HttpRequestKind = HttpRequestKind.CONTROL
+    validation_id: str | None = None
 
     def __post_init__(self) -> None:
         # Runtime 직전 객체도 동일한 명세 검증을 통과시켜 직접 생성 경로의 우회를 막는다.

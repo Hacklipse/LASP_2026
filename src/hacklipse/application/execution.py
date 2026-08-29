@@ -46,6 +46,7 @@ class RuntimeEvidenceCollector:
         spec: EvidenceRequest,
         *,
         task_id: str,
+        validation_id: str | None = None,
     ) -> str:
         """정책·예산·Runtime 경계를 거쳐 Evidence를 저장하고 ID를 반환한다."""
 
@@ -66,6 +67,7 @@ class RuntimeEvidenceCollector:
             headers=http_request.headers,
             body=http_request.body,
             request_kind=http_request.request_kind,
+            validation_id=validation_id,
         )
         # 실제 호출 직전에 Scope와 예산을 검사해 우회 실행을 막는다.
         self._policy.validate_execution(run, request)
@@ -88,6 +90,8 @@ class RuntimeEvidenceCollector:
                 surface_id=request.surface_id,
                 created_by=f"execution_runtime:{request.tool}",
                 evidence_type=result.evidence_type,
+                source_task_id=task_id,
+                validation_id=validation_id,
                 observation=observation,
                 artifact_refs=result.artifact_refs,
                 content_hash=result.content_hash,
@@ -110,6 +114,7 @@ class RuntimeEvidenceCollector:
             task.target_url,
             request_spec,
             task_id=task.task_id,
+            validation_id=task.validation_id,
         )
         return AgentResult(
             task_id=task.task_id,

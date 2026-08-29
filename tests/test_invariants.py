@@ -20,6 +20,8 @@ from hacklipse.domain import (
     RunRequest,
     RunScope,
     Surface,
+    ValidationProof,
+    ValidationProofType,
     ValidationResult,
     ValidationVerdict,
 )
@@ -60,30 +62,37 @@ class ArchitectureInvariantTests(unittest.TestCase):
                 finding_id="finding-1", candidate=candidate, validation=validation
             )
 
-    def test_confirmed_finding_requires_supporting_evidence(self) -> None:
-        """confirmed라도 근거 Evidence가 없으면 Finding 생성이 실패해야 한다."""
-
-        candidate = Candidate(
-            candidate_id="candidate-1",
-            run_id="run-1",
-            surface_id="surface-1",
-            vulnerability_type="XSS",
-            hypothesis="reflection",
-            assigned_agent="xss_analyzer",
-            evidence_ids=("evi-1",),
-        )
-        validation = ValidationResult(
-            validation_id="validation-1",
-            run_id="run-1",
-            candidate_id="candidate-1",
-            verdict=ValidationVerdict.CONFIRMED,
-            evidence_ids=(),
-            reason="invalid fixture",
-        )
+    def test_confirmed_validation_requires_vulnerability_specific_proof(self) -> None:
+        """confirmed 판정 자체가 구조화 proof 없이는 생성되지 않아야 한다."""
 
         with self.assertRaises(DomainInvariantError):
-            Finding.from_confirmed(
-                finding_id="finding-1", candidate=candidate, validation=validation
+            ValidationResult(
+                validation_id="validation-1",
+                run_id="run-1",
+                candidate_id="candidate-1",
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence_ids=("evi-1",),
+                reason="invalid fixture",
+                reproduction_count=1,
+            )
+
+    def test_validation_proof_evidence_must_be_part_of_result(self) -> None:
+        """LLM이 판정 근거 목록 밖의 Evidence를 proof로 주장할 수 없어야 한다."""
+
+        with self.assertRaises(DomainInvariantError):
+            ValidationResult(
+                validation_id="validation-1",
+                run_id="run-1",
+                candidate_id="candidate-1",
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence_ids=("evi-validation",),
+                reason="invalid proof reference",
+                reproduction_count=1,
+                proof=ValidationProof(
+                    proof_type=ValidationProofType.XSS_EXECUTION,
+                    evidence_ids=("evi-analysis",),
+                    summary="claimed script execution",
+                ),
             )
 
     def test_evidence_is_append_only_and_run_scoped(self) -> None:

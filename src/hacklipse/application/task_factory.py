@@ -53,6 +53,7 @@ class TaskFactory:
         run: Run,
         candidate: Candidate,
         *,
+        validation_id: str,
         agent_type: str,
         request_budget: int,
     ) -> TaskEnvelope:
@@ -65,6 +66,8 @@ class TaskFactory:
             surface_id=candidate.surface_id,
             candidate_id=candidate.candidate_id,
             evidence_ids=candidate.evidence_ids,
+            allowed_tools=("http_get",),
+            validation_id=validation_id,
         )
 
     def evidence_collection(
@@ -76,6 +79,7 @@ class TaskFactory:
         target_url: str,
         agent_type: str,
         request_budget: int,
+        validation_id: str | None = None,
     ) -> TaskEnvelope:
         """추가 증적 요청을 공통 Runtime Worker용 Task로 변환한다."""
 
@@ -88,6 +92,7 @@ class TaskFactory:
             candidate_id=candidate.candidate_id,
             evidence_ids=candidate.evidence_ids,
             allowed_tools=(request.suggested_tool,),
+            validation_id=validation_id,
             evidence_request=request,
         )
 
@@ -113,6 +118,7 @@ class TaskFactory:
         evidence_ids: tuple[str, ...] = (),
         finding_ids: tuple[str, ...] = (),
         allowed_tools: tuple[str, ...] = (),
+        validation_id: str | None = None,
         evidence_request: EvidenceRequest | None = None,
     ) -> TaskEnvelope:
         """모든 Task에 공통인 Run·정책·예산 정보를 조립한다."""
@@ -129,5 +135,6 @@ class TaskFactory:
             allowed_tools=allowed_tools,
             request_budget=request_budget,
             policy_profile=run.policy_profile,
+            validation_id=validation_id,
             evidence_request=evidence_request,
         )

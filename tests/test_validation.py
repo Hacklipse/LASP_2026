@@ -27,6 +27,7 @@ from hacklipse.domain import (
 _RUN_ID = "run-1"
 _SURFACE_ID = "surface-1"
 _CANDIDATE_ID = "candidate-1"
+_VALIDATION_ID = "validation-1"
 
 
 def _make_candidate(
@@ -54,14 +55,25 @@ def _seed_evidence(evidence_id: str = "evi-seed") -> Evidence:
     )
 
 
-def _reproduction_evidence(evidence_id: str, *, status: int) -> Evidence:
+def _reproduction_evidence(
+    evidence_id: str,
+    *,
+    status: int | None = 200,
+    validation_id: str | None = _VALIDATION_ID,
+    observation_type: str = "http_response",
+) -> Evidence:
+    observation: dict[str, object] = {"type": observation_type}
+    if status is not None:
+        observation["status"] = status
     return Evidence(
         evidence_id=evidence_id,
         run_id=_RUN_ID,
         surface_id=_SURFACE_ID,
-        created_by="http_execution_runtime:http_get",
-        evidence_type="http_response",
-        observation={"type": "http_response", "status": status},
+        created_by="execution_runtime:http_get",
+        evidence_type=observation_type,
+        source_task_id="task-collect",
+        validation_id=validation_id,
+        observation=observation,
     )
 
 
@@ -73,7 +85,9 @@ def _task(evidence_ids: tuple[str, ...], *, candidate_id: str | None = _CANDIDAT
         surface_id=_SURFACE_ID,
         candidate_id=candidate_id,
         evidence_ids=evidence_ids,
+        allowed_tools=("http_get",),
         request_budget=5,
+        validation_id=_VALIDATION_ID,
     )
 
 
@@ -90,10 +104,16 @@ def _make_agent() -> tuple[ValidationAgent, InMemoryCandidateStore, InMemoryEvid
 class ValidationAgentTests(unittest.TestCase):
     def test_requests_independent_reproduction_when_none_collected_yet(self) -> None:
         agent, candidates, evidence = _make_agent()
-        candidates.add(_make_candidate())
+        candidates.add(_make_candidate(evidence_ids=("evi-seed", "evi-analysis-http")))
         evidence.append(_seed_evidence())
+        # Analysis가 만든 일반 HTTP 응답은 Validation 재현 증적으로 인정하면 안 된다.
+        evidence.append(
+            _reproduction_evidence(
+                "evi-analysis-http", status=200, validation_id=None
+            )
+        )
 
-        result = agent.handle(_task(("evi-seed",)))
+        result = agent.handle(_task(("evi-seed", "evi-analysis-http")))
 
         self.assertEqual(result.status, AgentResultStatus.NEEDS_EVIDENCE)
         self.assertIsNone(result.validation)
@@ -102,7 +122,7 @@ class ValidationAgentTests(unittest.TestCase):
         self.assertEqual(request.surface_id, _SURFACE_ID)
         self.assertEqual(request.suggested_tool, "http_get")
 
-    def test_confirms_when_independent_reproduction_succeeds(self) -> None:
+    def test_successful_generic_reproduction_remains_suspected(self) -> None:
         agent, candidates, evidence = _make_agent()
         candidates.add(_make_candidate(evidence_ids=("evi-seed", "evi-repro")))
         evidence.append(_seed_evidence())
@@ -112,11 +132,12 @@ class ValidationAgentTests(unittest.TestCase):
 
         self.assertEqual(result.status, AgentResultStatus.COMPLETED)
         assert result.validation is not None
-        self.assertEqual(result.validation.verdict, ValidationVerdict.CONFIRMED)
+        self.assertEqual(result.validation.verdict, ValidationVerdict.SUSPECTED)
         self.assertEqual(result.validation.reproduction_count, 1)
         self.assertEqual(result.validation.evidence_ids, ("evi-repro",))
+        self.assertIsNone(result.validation.proof)
 
-    def test_rejects_when_independent_reproduction_fails(self) -> None:
+    def test_http_status_alone_never_confirms_or_rejects(self) -> None:
         agent, candidates, evidence = _make_agent()
         candidates.add(_make_candidate(evidence_ids=("evi-seed", "evi-repro")))
         evidence.append(_seed_evidence())
@@ -126,7 +147,36 @@ class ValidationAgentTests(unittest.TestCase):
 
         self.assertEqual(result.status, AgentResultStatus.COMPLETED)
         assert result.validation is not None
-        self.assertEqual(result.validation.verdict, ValidationVerdict.REJECTED)
+        self.assertEqual(result.validation.verdict, ValidationVerdict.SUSPECTED)
+
+    def test_network_error_marks_validation_blocked(self) -> None:
+        agent, candidates, evidence = _make_agent()
+        candidates.add(_make_candidate(evidence_ids=("evi-seed", "evi-error")))
+        evidence.append(_seed_evidence())
+        evidence.append(
+            _reproduction_evidence(
+                "evi-error", status=None, observation_type="http_error"
+            )
+        )
+
+        result = agent.handle(_task(("evi-seed", "evi-error")))
+
+        assert result.validation is not None
+        self.assertEqual(result.validation.verdict, ValidationVerdict.BLOCKED)
+
+    def test_evidence_from_another_validation_session_is_ignored(self) -> None:
+        agent, candidates, evidence = _make_agent()
+        candidates.add(_make_candidate(evidence_ids=("evi-seed", "evi-old")))
+        evidence.append(_seed_evidence())
+        evidence.append(
+            _reproduction_evidence(
+                "evi-old", status=200, validation_id="validation-old"
+            )
+        )
+
+        result = agent.handle(_task(("evi-seed", "evi-old")))
+
+        self.assertIs(result.status, AgentResultStatus.NEEDS_EVIDENCE)
 
     def test_missing_candidate_id_is_a_contract_error(self) -> None:
         agent, *_ = _make_agent()
@@ -174,10 +224,10 @@ class _PassthroughAnalysisAgent:
 
 
 class ValidationDrivesEvidenceLoopTests(unittest.TestCase):
-    """완료 기준: evidence_requests 루프가 실제 ValidationAgent로 Finding까지 완주한다."""
+    """중앙 수집 Evidence가 현재 Validation 세션 provenance를 갖는지 검증한다."""
 
-    def test_independent_reproduction_confirms_and_reaches_report(self) -> None:
-        # 이 테스트는 Path Traversal Validation 루프 하나만 검증한다.
+    def test_generic_reproduction_stays_suspected_and_reaches_report(self) -> None:
+        # 취약점별 proof가 없는 Path Traversal baseline은 Finding을 만들지 않는다.
         app = build_local_application(
             agents={},
             runtime=_RouteThenReproduceRuntime(),
@@ -208,8 +258,16 @@ class ValidationDrivesEvidenceLoopTests(unittest.TestCase):
 
         self.assertIs(run.phase, RunPhase.DONE)
         findings = app.stores.findings.list_by_run(run.run_id)
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].vulnerability_type, "Path Traversal")
+        self.assertEqual(findings, ())
+        candidate = app.stores.candidates.list_by_run(run.run_id)[0]
+        self.assertEqual(candidate.status, "suspected")
+        validation_evidence = [
+            item
+            for item in app.stores.evidence.list_by_run(run.run_id)
+            if item.validation_id is not None
+        ]
+        self.assertEqual(len(validation_evidence), 1)
+        self.assertIsNotNone(validation_evidence[0].source_task_id)
         tasks = app.stores.tasks.list_by_run(run.run_id)
         self.assertEqual(
             [item.envelope.agent_type for item in tasks],
@@ -223,7 +281,7 @@ class ValidationDrivesEvidenceLoopTests(unittest.TestCase):
             ],
         )
         reports = app.stores.reports.list_by_run(run.run_id)
-        self.assertIn(findings[0].finding_id, reports[0].content)
+        self.assertEqual(len(reports), 1)
 
 
 if __name__ == "__main__":

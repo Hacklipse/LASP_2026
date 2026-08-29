@@ -71,6 +71,7 @@ class SQLiteStoreTests(unittest.TestCase):
                 allowed_tools=("http_get",),
                 request_budget=9,
                 credential_ref="credential-local",
+                validation_id="validation-1",
                 evidence_request=EvidenceRequest(
                     evidence_type="page_fetch",
                     surface_id="surface-1",
@@ -98,6 +99,8 @@ class SQLiteStoreTests(unittest.TestCase):
             surface_id="surface-1",
             created_by="execution_runtime:http_get",
             evidence_type="http_response",
+            source_task_id="task-1",
+            validation_id="validation-1",
             observation={
                 "status": 200,
                 "headers": [

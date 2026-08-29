@@ -25,6 +25,8 @@ from .models import (
     TaskRecord,
     TaskStatus,
     ValidationResult,
+    ValidationProof,
+    ValidationProofType,
     ValidationVerdict,
 )
 
@@ -53,5 +55,7 @@ __all__ = [
     "TaskRecord",
     "TaskStatus",
     "ValidationResult",
+    "ValidationProof",
+    "ValidationProofType",
     "ValidationVerdict",
 ]
