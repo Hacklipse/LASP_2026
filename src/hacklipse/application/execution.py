@@ -79,6 +79,8 @@ class RuntimeEvidenceCollector:
         observation = dict(result.observation)
         # Runtime 구현이 바뀌어도 control/probe 출처가 Evidence에서 사라지지 않게 한다.
         observation.setdefault("request_kind", request.request_kind.value)
+        observation.setdefault("requested_url", request.resolved_url)
+        observation.setdefault("method", request.method.upper())
         self._evidence.append(
             Evidence(
                 evidence_id=evidence_id,

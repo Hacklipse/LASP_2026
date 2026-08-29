@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 from hacklipse.adapters import (
     HeuristicXssAnalyzer,
@@ -87,7 +88,6 @@ def _task(*, parameters: tuple[str, ...], request_budget: int = 10) -> tuple:
     app.stores.candidates.add(candidate)
     app.budget_manager.open_run(run.run_id, run.request_budget)
     agent = HeuristicXssAnalyzer(
-        collector=app.collector,
         candidate_store=app.stores.candidates,
         surface_store=app.stores.surfaces,
         evidence_store=app.stores.evidence,
@@ -106,11 +106,33 @@ def _task(*, parameters: tuple[str, ...], request_budget: int = 10) -> tuple:
     return agent, app, runtime, envelope
 
 
+def _collect_requested(agent_result, app, task: TaskEnvelope) -> TaskEnvelope:
+    evidence_ids = []
+    for request in agent_result.evidence_requests:
+        evidence_ids.append(
+            app.collector.collect(
+                task.run_id,
+                task.target_url or "",
+                request,
+                task_id=task.task_id,
+            )
+        )
+    return replace(
+        task,
+        evidence_ids=tuple(evidence_ids),
+        request_budget=app.budget_manager.remaining(task.run_id),
+    )
+
+
 class HeuristicXssAnalyzerTests(unittest.TestCase):
     def test_reflected_marker_creates_observation(self) -> None:
         agent, app, runtime, task = _task(parameters=("name",))
 
-        result = agent.handle(task)
+        requested = agent.handle(task)
+        self.assertIs(requested.status, AgentResultStatus.NEEDS_EVIDENCE)
+        self.assertEqual(runtime.requests, [])
+
+        result = agent.handle(_collect_requested(requested, app, task))
 
         self.assertIs(result.status, AgentResultStatus.COMPLETED)
         self.assertEqual(
@@ -135,9 +157,10 @@ class HeuristicXssAnalyzerTests(unittest.TestCase):
         agent, app, runtime, task = _task(parameters=("name",))
         runtime.reflect = False
 
-        result = agent.handle(task)
+        requested = agent.handle(task)
+        result = agent.handle(_collect_requested(requested, app, task))
 
-        self.assertEqual(len(result.new_evidence_ids), 2)
+        self.assertEqual(result.new_evidence_ids, ())
         self.assertFalse(
             any(
                 item.created_by == "heuristic_xss_analyzer"
@@ -148,10 +171,11 @@ class HeuristicXssAnalyzerTests(unittest.TestCase):
     def test_each_parameter_gets_one_probe_after_shared_control(self) -> None:
         agent, app, runtime, task = _task(parameters=("first", "second"))
 
-        result = agent.handle(task)
+        requested = agent.handle(task)
+        result = agent.handle(_collect_requested(requested, app, task))
 
         self.assertEqual(len(runtime.requests), 3)
-        self.assertEqual(len(result.new_evidence_ids), 5)
+        self.assertEqual(len(result.new_evidence_ids), 2)
         probes = runtime.requests[1:]
         self.assertEqual(
             probes[0].query_parameters,
@@ -237,7 +261,6 @@ class HeuristicXssWorkflowTests(unittest.TestCase):
         app.dispatcher.register(
             "xss_analyzer",
             HeuristicXssAnalyzer(
-                collector=app.collector,
                 candidate_store=app.stores.candidates,
                 surface_store=app.stores.surfaces,
                 evidence_store=app.stores.evidence,
@@ -264,7 +287,15 @@ class HeuristicXssWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(
             [item.envelope.agent_type for item in app.stores.tasks.list_by_run(run.run_id)],
-            ["recon", "xss_analyzer", "validation", "report"],
+            [
+                "recon",
+                "xss_analyzer",
+                "evidence_collector",
+                "evidence_collector",
+                "xss_analyzer",
+                "validation",
+                "report",
+            ],
         )
 
 

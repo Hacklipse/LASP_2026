@@ -169,7 +169,7 @@ class Orchestrator:
         return run.with_updates(candidate_ids=tuple(dict.fromkeys(candidate_ids)))
 
     def _analyze(self, run: Run) -> Run:
-        """라우팅된 각 Candidate를 담당 Analysis Agent에 전달한다."""
+        """Analysis 요청·중앙 Evidence 수집·재호출을 반복해 Candidate를 분석한다."""
 
         current = run
         for candidate_id in run.candidate_ids:
@@ -179,17 +179,56 @@ class Orchestrator:
                 continue
             # Candidate가 참조하는 Run-scoped Surface를 실제 Analysis 대상으로 해석한다.
             surface = self._surfaces.get(run.run_id, candidate.surface_id)
-            task = self._task_factory.analysis(
-                current,
-                candidate,
-                target_url=surface.url,
-                request_budget=self._budget.remaining(run.run_id),
-            )
-            result = self._tasks.execute(task)
-            self._require_completed(result, "analysis")
-            current = self._merge_agent_result(current, result)
-            candidate = candidate.add_evidence(result.new_evidence_ids).set_status("analyzed")
-            self._candidates.save(candidate)
+            for evidence_round in range(self._config.max_evidence_rounds + 1):
+                task = self._task_factory.analysis(
+                    current,
+                    candidate,
+                    target_url=surface.url,
+                    request_budget=self._budget.remaining(run.run_id),
+                )
+                result = self._tasks.execute(task)
+
+                # Agent가 요청 계획과 함께 만든 Observation이 있다면 먼저 병합한다.
+                current = self._merge_agent_result(current, result)
+                candidate = candidate.add_evidence(result.new_evidence_ids)
+                self._candidates.save(candidate)
+
+                if result.status is AgentResultStatus.COMPLETED:
+                    candidate = candidate.set_status("analyzed")
+                    self._candidates.save(candidate)
+                    break
+                if result.status is not AgentResultStatus.NEEDS_EVIDENCE:
+                    raise AgentContractError("analysis did not complete")
+                if not result.evidence_requests:
+                    raise AgentContractError(
+                        "analysis requested evidence without an EvidenceRequest"
+                    )
+                if evidence_round >= self._config.max_evidence_rounds:
+                    raise AgentContractError("analysis evidence rounds exhausted")
+
+                # Agent는 실행하지 않고 요청만 반환한다. 실제 실행은 중앙 수집 Task가 맡는다.
+                for request in result.evidence_requests:
+                    if request.surface_id != candidate.surface_id:
+                        raise AgentContractError(
+                            "analysis evidence request references a different surface"
+                        )
+                    if request.suggested_tool not in task.allowed_tools:
+                        raise AgentContractError(
+                            "analysis requested a tool that is not allowed by its task"
+                        )
+                    collection_task = self._task_factory.evidence_collection(
+                        current,
+                        candidate,
+                        request,
+                        target_url=surface.url,
+                        agent_type=self._config.evidence_collector_agent_type,
+                        request_budget=self._budget.remaining(run.run_id),
+                    )
+                    collection = self._tasks.execute(collection_task)
+                    self._require_completed(collection, "evidence collection")
+                    current = self._merge_agent_result(current, collection)
+                    candidate = candidate.add_evidence(collection.new_evidence_ids)
+                    self._candidates.save(candidate)
         return current
 
     def _validate(self, run: Run) -> Run:
