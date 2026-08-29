@@ -12,6 +12,8 @@ from hacklipse.domain import (
     Evidence,
     EvidenceRequest,
     ExecutionResult,
+    HttpRequestKind,
+    HttpRequestSpec,
     RunPhase,
     RunRequest,
     RunScope,
@@ -120,10 +122,16 @@ class EvidenceSeekingValidationFixtureAgent:
         if self.calls == 1:
             # Validator가 Runtime을 직접 호출하지 않고 EvidenceRequest만 반환하는지 검증한다.
             request = EvidenceRequest(
-                evidence_type="browser_execution",
+                evidence_type="http_response",
                 surface_id=task.surface_id or "surface-search",
-                reason="browser confirmation is required",
-                suggested_tool="browser_render",
+                reason="structured reflection probe is required",
+                suggested_tool="http_get",
+                http_request=HttpRequestSpec(
+                    method="GET",
+                    query_parameters=(("name", "hacklipse7331"),),
+                    headers=(("Accept", "text/html"),),
+                    request_kind=HttpRequestKind.PROBE,
+                ),
             )
             return AgentResult(
                 task_id=task.task_id,
@@ -146,7 +154,7 @@ class EvidenceSeekingValidationFixtureAgent:
 
 
 class LocalFixtureRuntime:
-    """네트워크 호출 없이 브라우저 실행 결과 형태만 반환하는 Runtime 대역."""
+    """네트워크 호출 없이 구조화 HTTP 요청을 기록하는 Runtime 대역."""
 
     def __init__(self) -> None:
         self.requests = []
@@ -155,9 +163,8 @@ class LocalFixtureRuntime:
         self.requests.append(request)
         return ExecutionResult(
             execution_id=request.execution_id,
-            evidence_type="browser_execution",
-            observation={"type": "browser_marker_observed"},
-            artifact_refs={"render": "fixture://render/result"},
+            evidence_type="http_response",
+            observation={"type": "http_response", "status": 200},
         )
 
 
@@ -234,7 +241,11 @@ class EndToEndWorkflowTests(unittest.TestCase):
         tasks = app.stores.tasks.list_by_run(run.run_id)
         self.assertIs(run.phase, RunPhase.DONE)
         self.assertEqual(validator.calls, 2)
-        self.assertIn("browser_execution", {item.evidence_type for item in evidence})
+        self.assertIn("http_response", {item.evidence_type for item in evidence})
+        collected = next(
+            item for item in evidence if item.created_by == "execution_runtime:http_get"
+        )
+        self.assertEqual(collected.observation["request_kind"], "probe")
         self.assertEqual(
             [item.envelope.agent_type for item in tasks],
             [
@@ -250,6 +261,15 @@ class EndToEndWorkflowTests(unittest.TestCase):
         self.assertEqual(
             [request.target_url for request in runtime.requests],
             ["http://local.test/discovered-search"],
+        )
+        request = runtime.requests[0]
+        self.assertEqual(request.method, "GET")
+        self.assertEqual(request.query_parameters, (("name", "hacklipse7331"),))
+        self.assertEqual(request.headers, (("Accept", "text/html"),))
+        self.assertIs(request.request_kind, HttpRequestKind.PROBE)
+        self.assertEqual(
+            request.resolved_url,
+            "http://local.test/discovered-search?name=hacklipse7331",
         )
 
 

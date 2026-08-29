@@ -7,9 +7,10 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qsl, urlsplit
 
 from hacklipse.adapters import HttpExecutionRuntime
-from hacklipse.domain import ExecutionRequest
+from hacklipse.domain import ExecutionRequest, HttpRequestKind
 from hacklipse.ports.errors import ExternalExecutionDisabled
 
 # 리다이렉트 대상 서버가 실제로 요청을 받았는지 세는 카운터.
@@ -26,7 +27,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
-        path = self.path
+        parsed = urlsplit(self.path)
+        path = parsed.path
         if path == "/ok":
             self._text(200, b"hello REFLECTED_MARKER")
         elif path == "/redirect":
@@ -58,6 +60,12 @@ class _Handler(BaseHTTPRequestHandler):
             # 클라이언트가 보낸 Accept-Encoding을 본문에 되돌려준다.
             ae = self.headers.get("Accept-Encoding", "(none)")
             self._text(200, f"AE={ae}".encode())
+        elif path == "/echo-query":
+            query = parse_qsl(parsed.query, keep_blank_values=True)
+            self._text(200, repr(query).encode())
+        elif path == "/echo-header":
+            marker = self.headers.get("X-Test-Marker", "(none)")
+            self._text(200, f"MARKER={marker}".encode())
         elif path == "/delay":
             time.sleep(0.2)
             self._text(200, b"delayed")
@@ -66,6 +74,15 @@ class _Handler(BaseHTTPRequestHandler):
             self._text(200, b"late")
         else:
             self._text(404, b"?")
+
+    def do_POST(self) -> None:  # noqa: N802
+        if urlsplit(self.path).path != "/echo-body":
+            self._text(404, b"?")
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+        content_type = self.headers.get("Content-Type", "(none)")
+        self._text(200, b"TYPE=" + content_type.encode() + b";BODY=" + body)
 
     def _text(self, code: int, body: bytes) -> None:
         self.send_response(code)
@@ -110,7 +127,17 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
         cls.server.shutdown()
         cls.target.shutdown()
 
-    def _req(self, path: str, *, method: str = "GET", host: str | None = None) -> ExecutionRequest:
+    def _req(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        host: str | None = None,
+        query_parameters: tuple[tuple[str, str], ...] = (),
+        headers: tuple[tuple[str, str], ...] = (),
+        body: str | None = None,
+        request_kind: HttpRequestKind = HttpRequestKind.CONTROL,
+    ) -> ExecutionRequest:
         base = host or f"http://127.0.0.1:{self.port}"
         return ExecutionRequest(
             execution_id="exec-1",
@@ -121,6 +148,10 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
             surface_id=None,
             purpose="test",
             method=method,
+            query_parameters=query_parameters,
+            headers=headers,
+            body=body,
+            request_kind=request_kind,
         )
 
     # 1
@@ -217,6 +248,52 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
     def test_accept_encoding_identity(self) -> None:
         r = self.runtime.execute(self._req("/echo-accept-encoding"))
         self.assertEqual(r.observation["body"], "AE=identity")
+
+    def test_structured_query_parameters_are_encoded_and_repeated(self) -> None:
+        r = self.runtime.execute(
+            self._req(
+                "/echo-query?existing=1#ignored",
+                query_parameters=(
+                    ("name", "hacklipse 7331"),
+                    ("id", "1"),
+                    ("id", "2"),
+                ),
+                request_kind=HttpRequestKind.PROBE,
+            )
+        )
+
+        self.assertEqual(
+            r.observation["body"],
+            "[('existing', '1'), ('name', 'hacklipse 7331'), ('id', '1'), ('id', '2')]",
+        )
+        self.assertNotIn("#ignored", r.observation["requested_url"])
+        self.assertEqual(r.observation["request_kind"], "probe")
+
+    def test_custom_header_is_sent_without_overriding_runtime_headers(self) -> None:
+        r = self.runtime.execute(
+            self._req("/echo-header", headers=(("X-Test-Marker", "reflection"),))
+        )
+
+        self.assertEqual(r.observation["body"], "MARKER=reflection")
+
+    def test_post_body_is_sent_as_utf8_text(self) -> None:
+        r = self.runtime.execute(
+            self._req(
+                "/echo-body",
+                method="POST",
+                headers=(("Content-Type", "application/x-www-form-urlencoded"),),
+                body="name=hacklipse7331&submit=확인",
+                request_kind=HttpRequestKind.PROBE,
+            )
+        )
+
+        self.assertEqual(r.observation["status"], 200)
+        self.assertEqual(
+            r.observation["body"],
+            "TYPE=application/x-www-form-urlencoded;BODY=name=hacklipse7331&submit=확인",
+        )
+        self.assertEqual(r.observation["method"], "POST")
+        self.assertEqual(r.observation["request_kind"], "probe")
 
     # 추가: 환경변수 프록시를 무시하는지
     def test_env_proxy_ignored(self) -> None:

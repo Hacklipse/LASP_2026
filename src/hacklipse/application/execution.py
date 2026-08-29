@@ -11,6 +11,7 @@ from hacklipse.domain import (
     Evidence,
     EvidenceRequest,
     ExecutionRequest,
+    HttpRequestSpec,
     TaskEnvelope,
 )
 from hacklipse.ports import BudgetManager, EvidenceStore, ExecutionRuntime, PolicyGate, RunStore
@@ -51,6 +52,7 @@ class RuntimeEvidenceCollector:
         # 저장된 Run을 신뢰 기준으로 사용해 Task가 임의 정책을 주입하지 못하게 한다.
         run = self._runs.get(run_id)
         execution_id = f"exec-{self._id_factory()}"
+        http_request = spec.http_request or HttpRequestSpec()
         request = ExecutionRequest(
             execution_id=execution_id,
             run_id=run_id,
@@ -59,6 +61,11 @@ class RuntimeEvidenceCollector:
             target_url=target_url,
             surface_id=spec.surface_id,
             purpose=spec.reason,
+            method=http_request.method,
+            query_parameters=http_request.query_parameters,
+            headers=http_request.headers,
+            body=http_request.body,
+            request_kind=http_request.request_kind,
         )
         # 실제 호출 직전에 Scope와 예산을 검사해 우회 실행을 막는다.
         self._policy.validate_execution(run, request)
@@ -69,6 +76,9 @@ class RuntimeEvidenceCollector:
 
         # Runtime 결과는 메시지로 중계하지 않고 Evidence Store에 먼저 기록한다.
         evidence_id = f"evi-{self._id_factory()}"
+        observation = dict(result.observation)
+        # Runtime 구현이 바뀌어도 control/probe 출처가 Evidence에서 사라지지 않게 한다.
+        observation.setdefault("request_kind", request.request_kind.value)
         self._evidence.append(
             Evidence(
                 evidence_id=evidence_id,
@@ -76,7 +86,7 @@ class RuntimeEvidenceCollector:
                 surface_id=request.surface_id,
                 created_by=f"execution_runtime:{request.tool}",
                 evidence_type=result.evidence_type,
-                observation=result.observation,
+                observation=observation,
                 artifact_refs=result.artifact_refs,
                 content_hash=result.content_hash,
             )

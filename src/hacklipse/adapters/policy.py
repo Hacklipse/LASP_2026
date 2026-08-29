@@ -24,7 +24,8 @@ class AllowlistPolicyGate:
 
         if request.run_id != run.run_id:
             raise PolicyViolation("execution request belongs to another run")
-        self._validate_url(request.target_url, run.scope)
+        # 구조화 query까지 결합된 실제 전송 URL을 기준으로 Scope를 검사한다.
+        self._validate_url(request.resolved_url, run.scope)
         if run.policy_profile == "safe" and request.method.upper() not in self._safe_methods:
             raise PolicyViolation("state-changing method requires a different policy profile")
 

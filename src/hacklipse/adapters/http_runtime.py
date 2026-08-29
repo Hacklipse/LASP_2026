@@ -77,7 +77,8 @@ class HttpExecutionRuntime:
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
         """정책 검사를 통과한 요청을 실제로 전송하고 응답을 Evidence로 변환한다."""
 
-        scheme = urllib.parse.urlsplit(request.target_url).scheme.lower()
+        requested_url = request.resolved_url
+        scheme = urllib.parse.urlsplit(requested_url).scheme.lower()
         method = request.method.upper()
         if scheme not in _ALLOWED_SCHEMES:
             # 마지막 방어선: 정책 게이트를 통과했더라도 위험 스킴은 여기서 거부한다.
@@ -85,36 +86,54 @@ class HttpExecutionRuntime:
                 f"unsupported url scheme for http runtime: {scheme or '(none)'}"
             )
 
-        http_request = urllib.request.Request(
-            request.target_url,
-            method=method,
-            headers={
+        headers = dict(request.headers)
+        # 이 두 헤더는 Runtime의 안전·식별 경계이므로 Agent 명세로 덮어쓸 수 없다.
+        headers.update(
+            {
                 "User-Agent": self._user_agent,
                 # 서버 압축을 끈다. urllib은 gzip을 자동 해제하지 않으므로, 압축 응답을
                 # 그대로 받으면 텍스트 분석(reflection·secret 탐지)이 깨진다.
                 "Accept-Encoding": "identity",
-            },
+            }
+        )
+        body = request.body.encode("utf-8") if request.body is not None else None
+        http_request = urllib.request.Request(
+            requested_url,
+            data=body,
+            method=method,
+            headers=headers,
         )
 
         # 응답 지연 측정 시작. time-based blind 탐지(예: SQLi SLEEP)의 유일한 신호원이다.
         started = time.perf_counter()
         try:
             with self._opener.open(http_request, timeout=self._timeout) as response:
-                return self._response_result(request, method, response, started, redirect=False)
+                return self._response_result(
+                    request, requested_url, method, response, started, redirect=False
+                )
         except urllib.error.HTTPError as error:
             # HTTPError도 응답 유사 객체다 — 실제 리다이렉트(301/302/303/307/308)만
             # http_redirect로, 나머지(304·4xx·5xx)는 정상 응답으로 기록한다.
             try:
                 redirect = error.code in _REDIRECT_STATUSES
-                return self._response_result(request, method, error, started, redirect=redirect)
+                return self._response_result(
+                    request, requested_url, method, error, started, redirect=redirect
+                )
             finally:
                 error.close()
         except (urllib.error.URLError, TimeoutError) as error:
             # DNS 실패·연결 거부·타임아웃 등 — 예상한 네트워크 예외만 관측 사실로 남긴다.
-            return self._error_result(request, method, error, started)
+            return self._error_result(request, requested_url, method, error, started)
 
     def _response_result(
-        self, request: ExecutionRequest, method: str, response, started: float, *, redirect: bool
+        self,
+        request: ExecutionRequest,
+        requested_url: str,
+        method: str,
+        response,
+        started: float,
+        *,
+        redirect: bool,
     ) -> ExecutionResult:
         """응답 유사 객체(정상 응답 또는 HTTPError)를 ExecutionResult로 변환한다."""
 
@@ -135,7 +154,8 @@ class HttpExecutionRuntime:
             "type": "http_redirect" if redirect else "http_response",
             "status": status,
             "method": method,
-            "requested_url": request.target_url,
+            "requested_url": requested_url,
+            "request_kind": request.request_kind.value,
             "content_type": content_type,
             "headers": headers,
             "body_bytes": len(raw),
@@ -163,7 +183,12 @@ class HttpExecutionRuntime:
         )
 
     def _error_result(
-        self, request: ExecutionRequest, method: str, error: BaseException, started: float
+        self,
+        request: ExecutionRequest,
+        requested_url: str,
+        method: str,
+        error: BaseException,
+        started: float,
     ) -> ExecutionResult:
         """네트워크 오류를 예외 대신 http_error 증적으로 변환한다."""
 
@@ -173,7 +198,8 @@ class HttpExecutionRuntime:
             observation={
                 "type": "http_error",
                 "method": method,
-                "requested_url": request.target_url,
+                "requested_url": requested_url,
+                "request_kind": request.request_kind.value,
                 "error_kind": _classify_error(error),
                 "message": str(getattr(error, "reason", error)),
                 # timeout까지 실제로 걸린 시간 — 지연 기반 판단에도 참고된다.

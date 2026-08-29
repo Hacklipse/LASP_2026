@@ -13,6 +13,8 @@ from hacklipse.domain import (
     Evidence,
     ExecutionRequest,
     Finding,
+    HttpRequestKind,
+    HttpRequestSpec,
     Run,
     RunPhase,
     RunRequest,
@@ -166,6 +168,23 @@ class ArchitectureInvariantTests(unittest.TestCase):
 
         with self.assertRaises(PolicyViolation):
             AllowlistPolicyGate().validate_execution(run, request)
+
+    def test_http_request_spec_rejects_runtime_controlled_or_injected_headers(self) -> None:
+        """Agent가 Scope·전송 경계를 바꾸는 헤더를 주입하지 못해야 한다."""
+
+        with self.assertRaises(DomainInvariantError):
+            HttpRequestSpec(headers=(("Host", "outside.test"),))
+        with self.assertRaises(DomainInvariantError):
+            HttpRequestSpec(headers=(("X-Test", "ok\r\nX-Injected: yes"),))
+        with self.assertRaises(DomainInvariantError):
+            HttpRequestSpec(request_kind="probe")  # type: ignore[arg-type]
+
+        spec = HttpRequestSpec(
+            query_parameters=(("name", "hacklipse7331"),),
+            headers=(("Accept", "text/html"),),
+            request_kind=HttpRequestKind.PROBE,
+        )
+        self.assertIs(spec.request_kind, HttpRequestKind.PROBE)
 
     def test_default_runtime_is_explicitly_disabled(self) -> None:
         """Runtime 미설정 상태에서는 외부 도구가 절대 실행되지 않아야 한다."""

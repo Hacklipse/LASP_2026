@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Mapping
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from .errors import DomainInvariantError
 
@@ -53,6 +55,30 @@ class ValidationVerdict(str, Enum):
     SUSPECTED = "suspected"
     REJECTED = "rejected"
     BLOCKED = "blocked"
+
+
+class HttpRequestKind(str, Enum):
+    """비교 기준 요청과 취약점 탐색 요청을 기계적으로 구분한다."""
+
+    CONTROL = "control"
+    PROBE = "probe"
+
+
+_HTTP_METHOD = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_FORBIDDEN_REQUEST_HEADERS = frozenset(
+    {
+        "accept-encoding",
+        "authorization",
+        "connection",
+        "content-length",
+        "cookie",
+        "host",
+        "proxy-authorization",
+        "proxy-connection",
+        "transfer-encoding",
+        "user-agent",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +135,39 @@ class Run:
 
 
 @dataclass(frozen=True, slots=True)
+class HttpRequestSpec:
+    """Agent가 공통 HTTP Runtime에 전달하는 구조화된 요청 명세."""
+
+    method: str = "GET"
+    query_parameters: tuple[tuple[str, str], ...] = ()
+    headers: tuple[tuple[str, str], ...] = ()
+    body: str | None = None
+    request_kind: HttpRequestKind = HttpRequestKind.CONTROL
+
+    def __post_init__(self) -> None:
+        if not self.method or _HTTP_METHOD.fullmatch(self.method) is None:
+            raise DomainInvariantError("HTTP method must be a valid token")
+        if not isinstance(self.request_kind, HttpRequestKind):
+            raise DomainInvariantError("HTTP request kind must be control or probe")
+        if self.body is not None and not isinstance(self.body, str):
+            raise DomainInvariantError("HTTP request body must be text")
+
+        for name, value in self.query_parameters:
+            if not isinstance(name, str) or not isinstance(value, str):
+                raise DomainInvariantError("HTTP query parameters must be string pairs")
+        for name, value in self.headers:
+            if not isinstance(name, str) or not isinstance(value, str):
+                raise DomainInvariantError("HTTP headers must be string pairs")
+            lowered = name.casefold()
+            if not name or _HTTP_METHOD.fullmatch(name) is None:
+                raise DomainInvariantError("HTTP header name must be a valid token")
+            if lowered in _FORBIDDEN_REQUEST_HEADERS:
+                raise DomainInvariantError(f"HTTP header is controlled by the runtime: {name}")
+            if "\r" in value or "\n" in value:
+                raise DomainInvariantError("HTTP header value cannot contain line breaks")
+
+
+@dataclass(frozen=True, slots=True)
 class EvidenceRequest:
     """Validation 등이 추가 증적이 필요할 때 Orchestrator에 보내는 요청."""
 
@@ -116,6 +175,7 @@ class EvidenceRequest:
     surface_id: str
     reason: str
     suggested_tool: str
+    http_request: HttpRequestSpec | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,6 +395,32 @@ class ExecutionRequest:
     surface_id: str | None
     purpose: str
     method: str = "GET"
+    query_parameters: tuple[tuple[str, str], ...] = ()
+    headers: tuple[tuple[str, str], ...] = ()
+    body: str | None = None
+    request_kind: HttpRequestKind = HttpRequestKind.CONTROL
+
+    def __post_init__(self) -> None:
+        # Runtime 직전 객체도 동일한 명세 검증을 통과시켜 직접 생성 경로의 우회를 막는다.
+        HttpRequestSpec(
+            method=self.method,
+            query_parameters=self.query_parameters,
+            headers=self.headers,
+            body=self.body,
+            request_kind=self.request_kind,
+        )
+
+    @property
+    def resolved_url(self) -> str:
+        """기존 query를 보존하면서 구조화 파라미터를 인코딩한 실제 요청 URL."""
+
+        parsed = urlsplit(self.target_url)
+        encoded = urlencode(self.query_parameters)
+        query = parsed.query
+        if encoded:
+            query = f"{query}&{encoded}" if query else encoded
+        # URL fragment는 HTTP 요청 대상에 포함되지 않는다.
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
 
 
 @dataclass(frozen=True, slots=True)
