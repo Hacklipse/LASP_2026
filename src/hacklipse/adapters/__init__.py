@@ -11,6 +11,7 @@ from .retry import BoundedRetryPolicy
 from .routing import RoutingRule, RuleBasedVulnerabilityRouter, SurfaceRoutingRule
 from .runtime import DisabledExecutionRuntime
 from .validation import ValidationAgent
+from .xss_analysis import HeuristicXssAnalyzer
 from .sqlite_budget import SQLiteBudgetManager
 from .sqlite_store import SQLiteStoreBundle
 
@@ -19,6 +20,7 @@ __all__ = [
     "BoundedRetryPolicy",
     "DisabledExecutionRuntime",
     "HttpExecutionRuntime",
+    "HeuristicXssAnalyzer",
     "InMemoryBudgetManager",
     "LocalTaskDispatcher",
     "MarkdownReportAgent",
