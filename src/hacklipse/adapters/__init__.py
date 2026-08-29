@@ -3,6 +3,7 @@
 from .budget import InMemoryBudgetManager
 from .dispatcher import LocalTaskDispatcher
 from .http_runtime import HttpExecutionRuntime
+from .llm_client import AnthropicLlmClient
 from .memory import MemoryStoreBundle
 from .policy import AllowlistPolicyGate
 from .recon import ReconAgent
@@ -20,6 +21,7 @@ __all__ = [
     "BoundedRetryPolicy",
     "DisabledExecutionRuntime",
     "HttpExecutionRuntime",
+    "AnthropicLlmClient",
     "HeuristicXssAnalyzer",
     "InMemoryBudgetManager",
     "LocalTaskDispatcher",

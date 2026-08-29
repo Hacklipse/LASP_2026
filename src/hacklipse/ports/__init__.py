@@ -3,6 +3,7 @@
 from .agents import Agent, TaskDispatcher, VulnerabilityRouter
 from .control import BudgetManager, PolicyGate, RetryPolicy
 from .knowledge import KnowledgeBase
+from .llm import LlmClient, LlmMessage, LlmRequest, LlmResponse, LlmUsage
 from .repositories import (
     CandidateStore,
     EvidenceStore,
@@ -22,6 +23,11 @@ __all__ = [
     "ExecutionRuntime",
     "FindingStore",
     "KnowledgeBase",
+    "LlmClient",
+    "LlmMessage",
+    "LlmRequest",
+    "LlmResponse",
+    "LlmUsage",
     "PolicyGate",
     "ReportStore",
     "RetryPolicy",
