@@ -157,6 +157,7 @@ class ReconAgent:
                 suggested_tool=RECON_TOOL,
             ),
             task_id=task.task_id,
+            timeout_seconds=task.timeout_seconds,
         )
         fetch_evidence = self._evidence.get(task.run_id, fetch_evidence_id)
 

@@ -114,11 +114,17 @@ class RunRequest:
     scope: RunScope
     policy_profile: str = "safe"
     request_budget: int = 100
+    timeout_seconds: int = 120
+    credential_ref: str | None = None
 
     def __post_init__(self) -> None:
         # 실행 예산은 이후 Runtime과 Agent 호출을 통제하는 상한선이다.
         if self.request_budget <= 0:
             raise DomainInvariantError("request budget must be positive")
+        if self.timeout_seconds <= 0:
+            raise DomainInvariantError("run timeout must be positive")
+        if self.credential_ref is not None and not self.credential_ref.strip():
+            raise DomainInvariantError("credential reference cannot be blank")
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +136,8 @@ class Run:
     scope: RunScope
     policy_profile: str
     request_budget: int
+    timeout_seconds: int = 120
+    credential_ref: str | None = None
     phase: RunPhase = RunPhase.INIT
     evidence_ids: tuple[str, ...] = ()
     surface_ids: tuple[str, ...] = ()
@@ -449,6 +457,9 @@ class ExecutionRequest:
     body: str | None = None
     request_kind: HttpRequestKind = HttpRequestKind.CONTROL
     validation_id: str | None = None
+    timeout_seconds: float = 120.0
+    credential_ref: str | None = None
+    approval_ref: str | None = None
 
     def __post_init__(self) -> None:
         # Runtime 직전 객체도 동일한 명세 검증을 통과시켜 직접 생성 경로의 우회를 막는다.
@@ -459,6 +470,12 @@ class ExecutionRequest:
             body=self.body,
             request_kind=self.request_kind,
         )
+        if self.timeout_seconds <= 0:
+            raise DomainInvariantError("execution timeout must be positive")
+        if self.credential_ref is not None and not self.credential_ref.strip():
+            raise DomainInvariantError("execution credential reference cannot be blank")
+        if self.approval_ref is not None and not self.approval_ref.strip():
+            raise DomainInvariantError("execution approval reference cannot be blank")
 
     @property
     def resolved_url(self) -> str:

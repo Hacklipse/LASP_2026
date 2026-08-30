@@ -29,6 +29,26 @@ class ExternalExecutionDisabled(ArchitectureError):
     """안전한 기본 Runtime이 외부 실행을 거부했음을 나타낸다."""
 
 
+class CredentialNotFound(ArchitectureError):
+    """credential_ref를 안전한 저장소에서 해석할 수 없다."""
+
+
+class AuthenticationFailed(ArchitectureError):
+    """중앙 인증 Worker가 세션을 확립하지 못했다."""
+
+
+class ApprovalRequired(PolicyViolation):
+    """상태 변경 가능 요청에 명시적 승인 참조가 없거나 승인되지 않았다."""
+
+
+class AgentToolNotAllowed(PolicyViolation):
+    """Task가 Agent 등록 시 고정된 도구 권한을 벗어났다."""
+
+
+class TaskTimeout(ArchitectureError):
+    """Task가 Orchestrator가 부여한 실행시간 제한을 초과했다."""
+
+
 class LlmError(ArchitectureError):
     """LLM 호출 경계에서 발생하는 오류의 공통 상위 타입."""
 

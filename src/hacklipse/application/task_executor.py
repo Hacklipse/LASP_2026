@@ -2,8 +2,20 @@
 
 from __future__ import annotations
 
-from hacklipse.domain import AgentResult, AgentResultStatus, TaskEnvelope, TaskRecord, TaskStatus
+import signal
+import threading
+import time
+from contextlib import contextmanager
+
+from hacklipse.domain import (
+    AgentResult,
+    AgentResultStatus,
+    TaskEnvelope,
+    TaskRecord,
+    TaskStatus,
+)
 from hacklipse.ports import BudgetManager, RetryPolicy, TaskDispatcher, TaskStore
+from hacklipse.ports.errors import TaskTimeout
 
 from .errors import AgentContractError
 
@@ -39,7 +51,8 @@ class TaskExecutor:
                 self._budget.ensure_available(envelope)
                 record = record.with_status(TaskStatus.RUNNING, attempts=attempt)
                 self._tasks.save(record)
-                result = self._dispatcher.dispatch(envelope)
+                with _task_deadline(envelope.timeout_seconds):
+                    result = self._dispatcher.dispatch(envelope)
                 self._validate_result(envelope, result)
                 record = record.with_status(TaskStatus.SUCCEEDED, attempts=attempt)
                 self._tasks.save(record)
@@ -61,3 +74,41 @@ class TaskExecutor:
             raise AgentContractError("agent result task_id does not match its envelope")
         if result.status is AgentResultStatus.FAILED:
             raise AgentContractError(result.message or "agent reported failure")
+
+
+@contextmanager
+def _task_deadline(timeout_seconds: float):
+    """동기식 로컬 Task에 wall-clock 제한을 적용한다.
+
+    POSIX 메인 스레드에서는 SIGALRM으로 블로킹 호출까지 중단한다. 신호를 안전하게
+    사용할 수 없는 스레드/플랫폼에서는 반환 직후 초과를 실패로 판정한다. 외부 HTTP와
+    LLM 호출은 별도 request timeout도 받아 이 fallback에서도 무한 대기를 피한다.
+    """
+
+    started = time.monotonic()
+    can_interrupt = bool(
+        threading.current_thread() is threading.main_thread()
+        and hasattr(signal, "SIGALRM")
+        and hasattr(signal, "setitimer")
+        and signal.getitimer(signal.ITIMER_REAL)[0] == 0
+    )
+    if not can_interrupt:
+        yield
+        elapsed = time.monotonic() - started
+        if elapsed > timeout_seconds:
+            raise TaskTimeout(f"task exceeded its {timeout_seconds}s deadline")
+        return
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def expire(signum, frame) -> None:
+        del signum, frame
+        raise TaskTimeout(f"task exceeded its {timeout_seconds}s deadline")
+
+    signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)

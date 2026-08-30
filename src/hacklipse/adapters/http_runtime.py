@@ -6,15 +6,16 @@ Safety Boundary의 바깥 끝. PolicyGate·Budget 검사를 통과한 ExecutionR
 `DisabledExecutionRuntime`을 이 구현으로 교체하는 순간 시스템이 처음으로 실제
 네트워크를 친다. 초기 대상은 로컬 컨테이너로 한정한다.
 
-설계 노트 — 응답 헤더는 마스킹하지 않고 원문 그대로(중복 포함) 캡처한다.
-관측은 사실의 원천이어야 하며, Auth state 채널(쿠키 리플레이로 IDOR 검증 등)이
-실제 Set-Cookie/Authorization 값을 필요로 하기 때문이다. 민감정보 비노출은
-LLM 프롬프트 직렬화·리포트 export 지점에서 처리한다(캡처 계층의 책임이 아님).
+설계 노트 — Runtime은 세션 갱신을 위해 응답 헤더를 원문 그대로 캡처하지만, 중앙
+RuntimeEvidenceCollector가 Evidence Store에 쓰기 전에 Cookie·Authorization·토큰을
+마스킹한다. Agent에는 마스킹된 저장본만 전달되고 원문 응답은 인증 Worker의 현재
+호출 스택 밖으로 나가지 않는다.
 """
 
 from __future__ import annotations
 
 import hashlib
+import http.cookiejar
 import socket
 import time
 import urllib.error
@@ -22,7 +23,8 @@ import urllib.parse
 import urllib.request
 
 from hacklipse.domain import ExecutionRequest, ExecutionResult
-from hacklipse.ports.errors import ExternalExecutionDisabled
+from hacklipse.ports import CredentialResolver
+from hacklipse.ports.errors import CredentialNotFound, ExternalExecutionDisabled
 
 # http(s)만 허용한다. file:·ftp: 등은 SSRF 표면이므로 Runtime 진입 전에 차단한다.
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
@@ -64,15 +66,17 @@ class HttpExecutionRuntime:
         timeout_seconds: float = _DEFAULT_TIMEOUT,
         max_body_bytes: int = _DEFAULT_MAX_BODY_BYTES,
         user_agent: str = _DEFAULT_USER_AGENT,
+        credential_resolver: CredentialResolver | None = None,
     ) -> None:
         self._timeout = timeout_seconds
         self._max_body = max_body_bytes
         self._user_agent = user_agent
-        # _NoRedirect: 리다이렉트로 allowlist 밖으로 나가는 것을 막는다.
-        # ProxyHandler({}): 환경변수(http_proxy 등) 프록시를 무시해 요청이 외부로 새지 않게 한다.
-        self._opener = urllib.request.build_opener(
-            _NoRedirect, urllib.request.ProxyHandler({})
-        )
+        self._credentials = credential_resolver
+        # CookieJar와 opener는 Run별로 격리한다. 다른 Run의 세션이 섞이면 인증 경계와
+        # 검증 provenance가 동시에 깨진다.
+        self._sessions: dict[tuple[str, str | None], urllib.request.OpenerDirector] = {}
+        self._session_jars: dict[tuple[str, str | None], http.cookiejar.CookieJar] = {}
+        self._seeded_sessions: set[tuple[str, str | None]] = set()
 
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
         """정책 검사를 통과한 요청을 실제로 전송하고 응답을 Evidence로 변환한다."""
@@ -87,6 +91,16 @@ class HttpExecutionRuntime:
             )
 
         headers = dict(request.headers)
+        opener = self._opener_for(request)
+        if request.credential_ref is not None:
+            if self._credentials is None:
+                raise CredentialNotFound(
+                    "execution references credentials but no resolver is configured"
+                )
+            credential = self._credentials.resolve(request.credential_ref)
+            if credential.authorization:
+                # Agent는 Authorization을 만들 수 없고 중앙 Resolver만 이 위치에 주입한다.
+                headers["Authorization"] = credential.authorization
         # 이 두 헤더는 Runtime의 안전·식별 경계이므로 Agent 명세로 덮어쓸 수 없다.
         headers.update(
             {
@@ -107,7 +121,9 @@ class HttpExecutionRuntime:
         # 응답 지연 측정 시작. time-based blind 탐지(예: SQLi SLEEP)의 유일한 신호원이다.
         started = time.perf_counter()
         try:
-            with self._opener.open(http_request, timeout=self._timeout) as response:
+            with opener.open(
+                http_request, timeout=min(self._timeout, request.timeout_seconds)
+            ) as response:
                 return self._response_result(
                     request, requested_url, method, response, started, redirect=False
                 )
@@ -124,6 +140,44 @@ class HttpExecutionRuntime:
         except (urllib.error.URLError, TimeoutError) as error:
             # DNS 실패·연결 거부·타임아웃 등 — 예상한 네트워크 예외만 관측 사실로 남긴다.
             return self._error_result(request, requested_url, method, error, started)
+
+    def close_session(self, run_id: str) -> None:
+        """Run 종료·폐기 시 메모리 CookieJar 참조를 제거한다."""
+
+        keys = [key for key in self._sessions if key[0] == run_id]
+        for key in keys:
+            self._sessions.pop(key, None)
+            self._session_jars.pop(key, None)
+            self._seeded_sessions.discard(key)
+
+    def _opener_for(self, request: ExecutionRequest) -> urllib.request.OpenerDirector:
+        """Run/credential 조합별 CookieJar를 만들고 초기 쿠키를 한 번만 주입한다."""
+
+        key = (request.run_id, request.credential_ref)
+        opener = self._sessions.get(key)
+        if opener is None:
+            jar = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(
+                _NoRedirect,
+                urllib.request.ProxyHandler({}),
+                urllib.request.HTTPCookieProcessor(jar),
+            )
+            self._sessions[key] = opener
+            self._session_jars[key] = jar
+
+        if request.credential_ref is not None and key not in self._seeded_sessions:
+            if self._credentials is None:
+                raise CredentialNotFound(
+                    "execution references credentials but no resolver is configured"
+                )
+            credential = self._credentials.resolve(request.credential_ref)
+            jar = self._session_jars[key]
+            parsed = urllib.parse.urlsplit(request.resolved_url)
+            hostname = parsed.hostname or ""
+            for name, value in credential.cookies:
+                jar.set_cookie(_session_cookie(name, value, hostname, parsed.scheme == "https"))
+            self._seeded_sessions.add(key)
+        return opener
 
     def _response_result(
         self,
@@ -238,3 +292,31 @@ def _charset(content_type: str) -> str:
         if part.startswith("charset="):
             return part[len("charset=") :] or "utf-8"
     return "utf-8"
+
+
+def _session_cookie(
+    name: str, value: str, domain: str, secure: bool
+) -> http.cookiejar.Cookie:
+    """Resolver의 초기 쿠키를 현재 대상 host에만 한정된 세션 쿠키로 만든다."""
+
+    if not name or not domain:
+        raise ValueError("session cookie requires a name and target domain")
+    return http.cookiejar.Cookie(
+        version=0,
+        name=name,
+        value=value,
+        port=None,
+        port_specified=False,
+        domain=domain,
+        domain_specified=False,
+        domain_initial_dot=False,
+        path="/",
+        path_specified=True,
+        secure=secure,
+        expires=None,
+        discard=True,
+        comment=None,
+        comment_url=None,
+        rest={"HttpOnly": None},
+        rfc2109=False,
+    )

@@ -219,13 +219,19 @@ class EndToEndWorkflowTests(unittest.TestCase):
             router=RuleBasedVulnerabilityRouter(surface_rules=()),
         )
         app.dispatcher.register(
-            "recon", ReconFixtureAgent(app.stores.evidence, app.stores.surfaces)
+            "recon",
+            ReconFixtureAgent(app.stores.evidence, app.stores.surfaces),
+            allowed_tools=("http_get",),
         )
         app.dispatcher.register(
-            "xss_analyzer", XssAnalysisFixtureAgent(app.stores.evidence)
+            "xss_analyzer",
+            XssAnalysisFixtureAgent(app.stores.evidence),
+            allowed_tools=("http_get",),
         )
         app.dispatcher.register(
-            "validation", validation_agent or SuspectingValidationFixtureAgent()
+            "validation",
+            validation_agent or SuspectingValidationFixtureAgent(),
+            allowed_tools=("http_get",),
         )
         return app
 

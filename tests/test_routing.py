@@ -113,7 +113,11 @@ class _SurfaceOnlyReconAgent:
 class SurfaceRoutingWorkflowTests(unittest.TestCase):
     def test_surface_without_observation_reaches_analyze_phase(self) -> None:
         app = build_local_application({})
-        app.dispatcher.register("recon", _SurfaceOnlyReconAgent(app.stores.surfaces))
+        app.dispatcher.register(
+            "recon",
+            _SurfaceOnlyReconAgent(app.stores.surfaces),
+            allowed_tools=("http_get",),
+        )
 
         with self.assertRaises(WorkflowExecutionError) as context:
             app.orchestrator.start(

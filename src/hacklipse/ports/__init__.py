@@ -14,14 +14,29 @@ from .repositories import (
     TaskStore,
 )
 from .runtime import ExecutionRuntime
+from .security import (
+    ApprovalGate,
+    CredentialResolver,
+    EvidenceSanitizer,
+    ExecutionAuditEvent,
+    ExecutionAuditLog,
+    FormLoginSpec,
+    ResolvedHttpCredential,
+)
 
 __all__ = [
     "Agent",
+    "ApprovalGate",
     "BudgetManager",
     "CandidateStore",
+    "CredentialResolver",
     "EvidenceStore",
+    "EvidenceSanitizer",
+    "ExecutionAuditEvent",
+    "ExecutionAuditLog",
     "ExecutionRuntime",
     "FindingStore",
+    "FormLoginSpec",
     "KnowledgeBase",
     "LlmClient",
     "LlmMessage",
@@ -31,6 +46,7 @@ __all__ = [
     "PolicyGate",
     "ReportStore",
     "RetryPolicy",
+    "ResolvedHttpCredential",
     "RunStore",
     "SurfaceStore",
     "TaskDispatcher",

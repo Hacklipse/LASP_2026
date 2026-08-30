@@ -11,14 +11,17 @@ from hacklipse.adapters import (
     AnthropicLlmClient,
     BoundedRetryPolicy,
     DisabledExecutionRuntime,
+    FormLoginWorker,
     HeuristicXssAnalyzer,
     InMemoryBudgetManager,
+    InMemoryExecutionAuditLog,
     LlmXssAnalyzer,
     LocalTaskDispatcher,
     MarkdownReportAgent,
     MemoryStoreBundle,
     ReconAgent,
     RuleBasedVulnerabilityRouter,
+    SensitiveDataSanitizer,
     ValidationAgent,
 )
 from hacklipse.adapters.routing import DEFAULT_RULES, DEFAULT_SURFACE_RULES
@@ -33,8 +36,11 @@ from hacklipse.application import (
 from hacklipse.ports import (
     Agent,
     BudgetManager,
+    ApprovalGate,
     CandidateStore,
     EvidenceStore,
+    EvidenceSanitizer,
+    ExecutionAuditLog,
     ExecutionRuntime,
     FindingStore,
     ReportStore,
@@ -42,6 +48,7 @@ from hacklipse.ports import (
     RunStore,
     SurfaceStore,
     LlmClient,
+    CredentialResolver,
     TaskStore,
     VulnerabilityRouter,
 )
@@ -95,6 +102,7 @@ class LocalApplication:
     policy_gate: AllowlistPolicyGate
     runtime: ExecutionRuntime
     collector: RuntimeEvidenceCollector
+    audit_log: ExecutionAuditLog
 
 
 def build_local_application(
@@ -106,6 +114,11 @@ def build_local_application(
     router: VulnerabilityRouter | None = None,
     retry_policy: RetryPolicy | None = None,
     config: OrchestratorConfig | None = None,
+    credential_resolver: CredentialResolver | None = None,
+    evidence_sanitizer: EvidenceSanitizer | None = None,
+    audit_log: ExecutionAuditLog | None = None,
+    approval_gate: ApprovalGate | None = None,
+    agent_allowed_tools: Mapping[str, tuple[str, ...]] | None = None,
 ) -> LocalApplication:
     """기본적으로 네트워크를 활성화하지 않는 로컬 시스템을 조립한다."""
 
@@ -115,10 +128,14 @@ def build_local_application(
     selected_budget = (
         budget_manager if budget_manager is not None else InMemoryBudgetManager()
     )
-    policy = AllowlistPolicyGate()
+    policy = AllowlistPolicyGate(approval_gate=approval_gate)
     # 명시적인 Runtime 주입이 없으면 외부 실행을 전부 거부하는 구현을 선택한다.
     selected_runtime = runtime or DisabledExecutionRuntime()
     selected_config = config or OrchestratorConfig()
+    selected_audit = audit_log or InMemoryExecutionAuditLog()
+    selected_sanitizer = evidence_sanitizer or SensitiveDataSanitizer(
+        credential_resolver
+    )
     # 항상 만들어 노출한다 — Recon처럼 이 collector를 직접 주입받아야 하는 Agent는
     # agents 인자로 들어가기 전에 이미 collector가 필요해서 순환이 생기기 때문에,
     # 호출자가 build 후 app.collector로 받아 별도로 등록한다.
@@ -128,11 +145,17 @@ def build_local_application(
         policy_gate=policy,
         budget_manager=selected_budget,
         runtime=selected_runtime,
+        evidence_sanitizer=selected_sanitizer,
+        audit_log=selected_audit,
     )
 
     for agent_type, agent in agents.items():
         # 실제 Recon/Analysis/Validation Agent는 호출자가 명시적으로 제공해야 한다.
-        dispatcher.register(agent_type, agent)
+        dispatcher.register(
+            agent_type,
+            agent,
+            allowed_tools=(agent_allowed_tools or {}).get(agent_type, ()),
+        )
 
     if selected_config.report_agent_type not in agents:
         # 별도 Report Agent가 없으면 판정을 바꾸지 않는 기본 Markdown 구현을 사용한다.
@@ -142,10 +165,24 @@ def build_local_application(
                 finding_store=selected_stores.findings,
                 evidence_store=selected_stores.evidence,
             ),
+            allowed_tools=(),
         )
     if selected_config.evidence_collector_agent_type not in agents:
         # 추가 증적 수집은 공통 정책·예산·Runtime 경계를 거치는 Worker로 연결한다.
-        dispatcher.register(selected_config.evidence_collector_agent_type, collector)
+        dispatcher.register(
+            selected_config.evidence_collector_agent_type,
+            collector,
+            allowed_tools=("http_get", "http_post"),
+        )
+    if credential_resolver is not None and selected_config.authentication_agent_type not in agents:
+        dispatcher.register(
+            selected_config.authentication_agent_type,
+            FormLoginWorker(
+                credential_resolver=credential_resolver,
+                collector=collector,
+            ),
+            allowed_tools=("http_get", "http_post"),
+        )
 
     # Task 실행기와 Orchestrator는 Port만 바라보며 구체 Adapter를 직접 생성하지 않는다.
     task_executor = TaskExecutor(
@@ -177,6 +214,7 @@ def build_local_application(
         policy_gate=policy,
         runtime=selected_runtime,
         collector=collector,
+        audit_log=selected_audit,
     )
 
 
@@ -222,6 +260,7 @@ def register_standard_agents(
             evidence_store=app.stores.evidence,
             surface_store=app.stores.surfaces,
         ),
+        allowed_tools=("http_get",),
     )
     if llm_client is None:
         analyzer: Agent = HeuristicXssAnalyzer(
@@ -238,11 +277,12 @@ def register_standard_agents(
             evidence_store=app.stores.evidence,
         )
         profile = "llm"
-    app.dispatcher.register("xss_analyzer", analyzer)
+    app.dispatcher.register("xss_analyzer", analyzer, allowed_tools=("http_get",))
     app.dispatcher.register(
         "validation",
         ValidationAgent(
             candidate_store=app.stores.candidates, evidence_store=app.stores.evidence
         ),
+        allowed_tools=("http_get",),
     )
     return profile

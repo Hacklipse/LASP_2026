@@ -38,7 +38,8 @@ class _FakeCollector:
         self._body = body
         self.calls: list[tuple[str, str]] = []
 
-    def collect(self, run_id, target_url, spec, *, task_id):
+    def collect(self, run_id, target_url, spec, *, task_id, timeout_seconds=120.0):
+        del timeout_seconds
         self.calls.append((run_id, target_url))
         evidence_id = f"evi-fetch-{task_id}"
         self._evidence.append(
@@ -174,6 +175,7 @@ class ReconDrivesRoutingTests(unittest.TestCase):
                 evidence_store=app.stores.evidence,
                 surface_store=app.stores.surfaces,
             ),
+            allowed_tools=("http_get",),
         )
 
         with self.assertRaises(WorkflowExecutionError) as ctx:

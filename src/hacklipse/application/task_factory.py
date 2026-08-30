@@ -106,6 +106,21 @@ class TaskFactory:
             finding_ids=run.finding_ids,
         )
 
+    def authentication(
+        self, run: Run, *, agent_type: str, request_budget: int
+    ) -> TaskEnvelope:
+        """비밀 원문 없이 credential_ref만 중앙 인증 Worker에 전달한다."""
+
+        if run.credential_ref is None:
+            raise ValueError("authentication task requires a credential reference")
+        return self._base(
+            run,
+            agent_type=agent_type,
+            request_budget=request_budget,
+            target_url=run.target_url,
+            allowed_tools=("http_get", "http_post"),
+        )
+
     def _base(
         self,
         run: Run,
@@ -135,6 +150,8 @@ class TaskFactory:
             allowed_tools=allowed_tools,
             request_budget=request_budget,
             policy_profile=run.policy_profile,
+            timeout_seconds=run.timeout_seconds,
+            credential_ref=run.credential_ref,
             validation_id=validation_id,
             evidence_request=evidence_request,
         )

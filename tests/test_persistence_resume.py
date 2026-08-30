@@ -78,6 +78,7 @@ class PersistenceResumeTests(unittest.TestCase):
                     evidence_store=app.stores.evidence,
                     surface_store=app.stores.surfaces,
                 ),
+                allowed_tools=("http_get",),
             )
 
             resumed = app.orchestrator.resume(run.run_id)

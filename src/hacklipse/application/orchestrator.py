@@ -52,6 +52,7 @@ class OrchestratorConfig:
     validation_agent_type: str = "validation"
     evidence_collector_agent_type: str = "evidence_collector"
     report_agent_type: str = "report"
+    authentication_agent_type: str = "session_authenticator"
     max_evidence_rounds: int = 1
 
     def __post_init__(self) -> None:
@@ -106,6 +107,8 @@ class Orchestrator:
             scope=request.scope,
             policy_profile=request.policy_profile,
             request_budget=request.request_budget,
+            timeout_seconds=request.timeout_seconds,
+            credential_ref=request.credential_ref,
         )
         # Run과 예산을 먼저 등록한 뒤 첫 단계인 RECON으로 전이한다.
         self._runs.add(run)
@@ -122,6 +125,23 @@ class Orchestrator:
             return run
 
         try:
+            if run.credential_ref is not None and run.phase in {
+                RunPhase.RECON,
+                RunPhase.ROUTE,
+                RunPhase.ANALYZE,
+                RunPhase.VALIDATE,
+            }:
+                # 프로세스 재시작 시 메모리 CookieJar가 사라질 수 있으므로 resume마다
+                # 중앙 인증 Worker를 다시 실행한다. 비밀 원문은 Task에 들어가지 않는다.
+                auth_task = self._task_factory.authentication(
+                    run,
+                    agent_type=self._config.authentication_agent_type,
+                    request_budget=self._budget.remaining(run.run_id),
+                )
+                auth_result = self._tasks.execute(auth_task)
+                self._require_completed(auth_result, "authentication")
+                run = self._merge_agent_result(run, auth_result)
+                self._runs.save(run)
             # 단계 순서와 분기만 판단하고 실제 작업은 하위 컴포넌트에 맡긴다.
             while run.phase not in {RunPhase.DONE, RunPhase.FAILED}:
                 if run.phase is RunPhase.RECON:

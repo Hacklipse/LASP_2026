@@ -7,6 +7,7 @@ from hacklipse.ports.errors import (
     BudgetExceeded,
     ExternalExecutionDisabled,
     PolicyViolation,
+    TaskTimeout,
 )
 
 
@@ -27,5 +28,6 @@ class BoundedRetryPolicy:
             BudgetExceeded,
             ExternalExecutionDisabled,
             PolicyViolation,
+            TaskTimeout,
         )
         return attempt < self._max_attempts and not isinstance(error, non_retryable)

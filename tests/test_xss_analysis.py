@@ -257,7 +257,11 @@ class HeuristicXssWorkflowTests(unittest.TestCase):
             surface_rules=(SurfaceRoutingRule("XSS", "xss_analyzer", priority=0.3),),
         )
         app = build_local_application({}, runtime=runtime, router=router)
-        app.dispatcher.register("recon", _SurfaceOnlyRecon(app.stores.surfaces))
+        app.dispatcher.register(
+            "recon",
+            _SurfaceOnlyRecon(app.stores.surfaces),
+            allowed_tools=("http_get",),
+        )
         app.dispatcher.register(
             "xss_analyzer",
             HeuristicXssAnalyzer(
@@ -265,8 +269,13 @@ class HeuristicXssWorkflowTests(unittest.TestCase):
                 surface_store=app.stores.surfaces,
                 evidence_store=app.stores.evidence,
             ),
+            allowed_tools=("http_get",),
         )
-        app.dispatcher.register("validation", _RejectingValidator())
+        app.dispatcher.register(
+            "validation",
+            _RejectingValidator(),
+            allowed_tools=("http_get",),
+        )
 
         run = app.orchestrator.start(
             RunRequest(

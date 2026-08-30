@@ -215,6 +215,7 @@ class LlmXssAnalyzer:
                 ),
                 system=_PLAN_SYSTEM,
                 response_schema=_PLAN_SCHEMA,
+                timeout_seconds=task.timeout_seconds,
             )
         )
         selected, dropped = _validate_selection(
@@ -272,7 +273,7 @@ class LlmXssAnalyzer:
         if not confirmed:
             return []
 
-        classifications = self._classify(marker, confirmed)
+        classifications = self._classify(marker, confirmed, task.timeout_seconds)
         new_ids: list[str] = []
         for parameter, probe, _ in confirmed:
             classification = classifications.get(
@@ -305,7 +306,10 @@ class LlmXssAnalyzer:
         return new_ids
 
     def _classify(
-        self, marker: str, confirmed: Sequence[tuple[str, Evidence, str]]
+        self,
+        marker: str,
+        confirmed: Sequence[tuple[str, Evidence, str]],
+        timeout_seconds: float,
     ) -> dict[str, dict[str, object]]:
         """반사가 확인된 파라미터의 맥락만 LLM에 묻는다."""
 
@@ -326,6 +330,7 @@ class LlmXssAnalyzer:
                 ),
                 system=_INTERPRETATION_SYSTEM,
                 response_schema=_INTERPRETATION_SCHEMA,
+                timeout_seconds=timeout_seconds,
             )
         )
         expected = {parameter for parameter, _, _ in confirmed}
@@ -397,10 +402,17 @@ def _validate_classifications(
             raise AgentContractError(
                 f"llm xss interpretation used an unknown reflection context: {context}"
             )
+        if not isinstance(encoded, bool):
+            raise AgentContractError(
+                "llm xss interpretation encoded field must be boolean"
+            )
+        note = item.get("note")
+        if not isinstance(note, str):
+            raise AgentContractError("llm xss interpretation note must be a string")
         classifications[str(parameter)] = {
             "context": str(context),
-            "encoded": bool(encoded),
-            "note": str(item.get("note", "")),
+            "encoded": encoded,
+            "note": note,
         }
     return classifications
 

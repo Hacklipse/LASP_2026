@@ -24,6 +24,12 @@ class LlmMessage:
     role: str
     content: str
 
+    def __post_init__(self) -> None:
+        if self.role not in {"user", "assistant"}:
+            raise ValueError("llm message role must be user or assistant")
+        if not self.content.strip():
+            raise ValueError("llm message content cannot be empty")
+
 
 @dataclass(frozen=True, slots=True)
 class LlmRequest:
@@ -39,6 +45,14 @@ class LlmRequest:
     response_schema: Mapping[str, object] | None = None
     # 취소 가능성은 Port 계약에 남긴다: 호출자가 상한을 정하고 초과 시 LlmTimeout이 난다.
     timeout_seconds: float = 60.0
+
+    def __post_init__(self) -> None:
+        if not self.messages:
+            raise ValueError("llm request requires at least one message")
+        if self.max_output_tokens <= 0:
+            raise ValueError("llm max output tokens must be positive")
+        if self.timeout_seconds <= 0:
+            raise ValueError("llm timeout must be positive")
 
 
 @dataclass(frozen=True, slots=True)

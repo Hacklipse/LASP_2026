@@ -5,7 +5,10 @@ from __future__ import annotations
 from urllib.parse import urlsplit
 
 from hacklipse.domain import ExecutionRequest, Run, RunRequest, RunScope
-from hacklipse.ports.errors import PolicyViolation
+from hacklipse.ports import ApprovalGate
+from hacklipse.ports.errors import ApprovalRequired, PolicyViolation
+
+from .security import DenyAllApprovalGate
 
 
 class AllowlistPolicyGate:
@@ -13,6 +16,9 @@ class AllowlistPolicyGate:
 
     # safe 프로필에서는 서버 상태를 바꿀 가능성이 낮은 메서드만 허용한다.
     _safe_methods = frozenset({"GET", "HEAD", "OPTIONS"})
+
+    def __init__(self, approval_gate: ApprovalGate | None = None) -> None:
+        self._approval = approval_gate or DenyAllApprovalGate()
 
     def validate_run(self, request: RunRequest) -> None:
         """Run 시작 대상이 선언된 Scope 안에 있는지 검사한다."""
@@ -26,8 +32,14 @@ class AllowlistPolicyGate:
             raise PolicyViolation("execution request belongs to another run")
         # 구조화 query까지 결합된 실제 전송 URL을 기준으로 Scope를 검사한다.
         self._validate_url(request.resolved_url, run.scope)
-        if run.policy_profile == "safe" and request.method.upper() not in self._safe_methods:
-            raise PolicyViolation("state-changing method requires a different policy profile")
+        if (
+            run.policy_profile == "safe"
+            and request.method.upper() not in self._safe_methods
+            and not self._approval.is_approved(run, request)
+        ):
+            raise ApprovalRequired(
+                "state-changing method requires an explicit approved action reference"
+            )
 
     @staticmethod
     def _validate_url(url: str, scope: RunScope) -> None:

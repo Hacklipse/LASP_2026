@@ -240,13 +240,19 @@ class ValidationDrivesEvidenceLoopTests(unittest.TestCase):
                 evidence_store=app.stores.evidence,
                 surface_store=app.stores.surfaces,
             ),
+            allowed_tools=("http_get",),
         )
-        app.dispatcher.register("path_traversal_analyzer", _PassthroughAnalysisAgent())
+        app.dispatcher.register(
+            "path_traversal_analyzer",
+            _PassthroughAnalysisAgent(),
+            allowed_tools=("http_get",),
+        )
         app.dispatcher.register(
             "validation",
             ValidationAgent(
                 candidate_store=app.stores.candidates, evidence_store=app.stores.evidence
             ),
+            allowed_tools=("http_get",),
         )
 
         run = app.orchestrator.start(
