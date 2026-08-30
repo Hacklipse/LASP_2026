@@ -13,8 +13,8 @@ control과 probe가 따옴표 하나만 다르므로 응답 차이의 원인이 
 보내지 않으며 도메인의 PROBE 값 화이트리스트가 애초에 이런 문자열을 거부한다.
 
 여기서 만드는 것은 "SQL 파서에 입력이 닿았다"는 관찰이지 취약점 판정이 아니다. 확정은
-독립 Validation의 책임이며, 현재 baseline은 SQLI_EFFECT proof를 만들지 않으므로
-Finding으로 승격되지 않는다.
+Validation이 별도 control/probe를 실행해 같은 차이를 재현하고 SQLI_EFFECT proof를
+만들었을 때만 가능하다.
 """
 
 from __future__ import annotations
@@ -123,7 +123,7 @@ class HeuristicSqliAnalyzer:
         for parameter, probe in zip(parameters, collected[1:]):
             if probe is None:  # missing 분기 이후에는 도달하지 않는 방어선.
                 raise AgentContractError("sqli baseline probe evidence was not collected")
-            signal = _syntax_error_signal(control, probe)
+            signal = sql_error_signal(control, probe)
             if signal is None:
                 continue
             if has_observation_record(
@@ -173,7 +173,7 @@ def _stable_seed(task: TaskEnvelope, candidate_id: str) -> str:
     return f"{task.run_id}{candidate_id}"
 
 
-def _syntax_error_signal(control: Evidence, probe: Evidence) -> dict[str, object] | None:
+def sql_error_signal(control: Evidence, probe: Evidence) -> dict[str, object] | None:
     """control에는 없고 probe에만 나타난 SQL 오류 신호를 찾는다."""
 
     control_body = (response_body(control) or "").casefold()

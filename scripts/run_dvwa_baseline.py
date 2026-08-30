@@ -1,14 +1,16 @@
-"""로컬 DVWA에 로그인한 뒤 reflected-XSS 결정적 baseline을 실행한다.
+"""로컬 DVWA에 로그인한 뒤 XSS 또는 SQLi 결정적 baseline을 실행한다.
 
 인증정보는 명령행 인자나 환경변수로 받지 않고 현재 프로세스에서만 입력받는다.
 Task/Evidence/Audit에는 credential_ref와 마스킹된 응답만 남는다.
 
     python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/
-    python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/DVWA/
+    python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/ --target sqli
+    python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/DVWA/ --target xss
 """
 
 from __future__ import annotations
 
+import argparse
 import getpass
 import sys
 from collections import Counter
@@ -36,14 +38,24 @@ _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1"})
 _CREDENTIAL_REF = "interactive-local-dvwa"
 _APPROVAL_REF = "interactive-local-dvwa-login"
 _DEFAULT_BUDGET = 30
+_TARGET_PATHS = {
+    "xss": "vulnerabilities/xss_r/?name=seed",
+    "sqli": "vulnerabilities/sqli/?id=1&Submit=Submit",
+}
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print(__doc__)
-        return 2
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("base_url", help="localhost/127.0.0.1 DVWA base URL")
+    parser.add_argument(
+        "--target",
+        choices=tuple(_TARGET_PATHS),
+        default="xss",
+        help="baseline target vulnerability (default: xss)",
+    )
+    args = parser.parse_args(argv[1:])
 
-    base_url = argv[1].rstrip("/") + "/"
+    base_url = args.base_url.rstrip("/") + "/"
     parsed = urlsplit(base_url)
     host = (parsed.hostname or "").casefold()
     if parsed.scheme not in {"http", "https"} or host not in _LOCAL_HOSTS:
@@ -57,7 +69,7 @@ def main(argv: list[str]) -> int:
         return 2
 
     login_url = urljoin(base_url, "login.php")
-    target_url = urljoin(base_url, "vulnerabilities/xss_r/?name=seed")
+    target_url = urljoin(base_url, _TARGET_PATHS[args.target])
     resolver = InMemoryCredentialResolver(
         {
             _CREDENTIAL_REF: ResolvedHttpCredential(
@@ -116,13 +128,22 @@ def main(argv: list[str]) -> int:
         for item in app.stores.evidence.list_by_run(run.run_id)
         if item.observation.get("type") == "reflection"
     )
+    sql_errors = tuple(
+        item
+        for item in app.stores.evidence.list_by_run(run.run_id)
+        if item.observation.get("type") == "sql_error"
+    )
+    findings = app.stores.findings.list_by_run(run.run_id)
     events = audit.list_by_run(run.run_id)
     print(f"구성              {profile}")
+    print(f"대상              {args.target}")
     print(f"phase             {run.phase.value}")
     print(f"Candidate         {dict(Counter(c.vulnerability_type for c in candidates))}")
     print(f"reflection 신호  {len(reflections)}")
+    print(f"SQL 오류 신호     {len(sql_errors)}")
     print(f"감사된 HTTP 실행 {len(events)}")
-    print(f"Finding           {len(app.stores.findings.list_by_run(run.run_id))}")
+    print(f"Finding           {len(findings)}")
+    print(f"Finding 유형      {dict(Counter(item.vulnerability_type for item in findings))}")
     return 0
 
 

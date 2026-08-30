@@ -97,32 +97,42 @@ def build_probe_requests(
     control_value: str,
     probe_value: str,
     purpose: str,
+    probe_parameters: Sequence[str] | None = None,
 ) -> tuple[EvidenceRequest, ...]:
-    """control 1개 + 파라미터별 probe N개를 만든다.
+    """control 1개 + 선택한 파라미터별 probe N개를 만든다.
 
     파라미터마다 하나씩만 값을 바꾼다. 전부 동시에 바꾸면 어느 파라미터가 신호를
-    만들었는지 구분할 수 없다. 값은 호출자가 넘긴 두 개로 고정되며, 그 형태는
-    도메인이 PROBE 요청에 대해 검증한다.
+    만들었는지 구분할 수 없다. ``parameters``는 요청이 성립하는 데 필요한 전체 입력을,
+    ``probe_parameters``는 그중 실제로 바꿀 입력을 뜻한다. 예를 들어 DVWA SQLi는 id를
+    probe하더라도 Submit이 함께 있어야 SQL 분기가 실행된다.
     """
 
-    if not parameters:
+    all_parameters = tuple(dict.fromkeys(parameters))
+    selected_parameters = (
+        tuple(dict.fromkeys(probe_parameters))
+        if probe_parameters is not None
+        else all_parameters
+    )
+    if not all_parameters or not selected_parameters:
         raise AgentContractError("probe plan must name at least one parameter")
+    if any(parameter not in all_parameters for parameter in selected_parameters):
+        raise AgentContractError("probe parameter must belong to the request surface")
 
     requests = [
         _request(
             surface.surface_id,
-            tuple((name, control_value) for name in parameters),
+            tuple((name, control_value) for name in all_parameters),
             HttpRequestKind.CONTROL,
             reason=f"control request for {purpose}",
         )
     ]
-    for parameter in parameters:
+    for parameter in selected_parameters:
         requests.append(
             _request(
                 surface.surface_id,
                 tuple(
                     (name, probe_value if name == parameter else control_value)
-                    for name in parameters
+                    for name in all_parameters
                 ),
                 HttpRequestKind.PROBE,
                 reason=f"probe for parameter {parameter} on {purpose}",

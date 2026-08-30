@@ -110,8 +110,6 @@ class LlmWiringEndToEndTests(unittest.TestCase):
                 "evidence_collector",
                 "validation",
                 "validation",
-                "evidence_collector",
-                "validation",
                 "report",
             ],
         )

@@ -297,7 +297,9 @@ def register_standard_agents(
     app.dispatcher.register(
         "validation",
         ValidationAgent(
-            candidate_store=app.stores.candidates, evidence_store=app.stores.evidence
+            candidate_store=app.stores.candidates,
+            evidence_store=app.stores.evidence,
+            surface_store=app.stores.surfaces,
         ),
         allowed_tools=("http_get",),
     )

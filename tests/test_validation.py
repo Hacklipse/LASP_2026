@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import unittest
 
-from hacklipse.adapters.memory import InMemoryCandidateStore, InMemoryEvidenceStore
+from hacklipse.adapters.memory import (
+    InMemoryCandidateStore,
+    InMemoryEvidenceStore,
+    InMemorySurfaceStore,
+)
 from hacklipse.adapters.recon import ReconAgent
 from hacklipse.adapters.routing import RuleBasedVulnerabilityRouter
 from hacklipse.adapters.validation import ValidationAgent
 from hacklipse.application.errors import AgentContractError
-from hacklipse.bootstrap import build_local_application
+from hacklipse.bootstrap import (
+    build_local_application,
+    register_standard_agents,
+    standard_router,
+)
 from hacklipse.domain import (
     AgentResult,
     AgentResultStatus,
@@ -17,10 +25,13 @@ from hacklipse.domain import (
     Evidence,
     ExecutionRequest,
     ExecutionResult,
+    HttpRequestKind,
     RunPhase,
     RunRequest,
     RunScope,
+    Surface,
     TaskEnvelope,
+    ValidationProofType,
     ValidationVerdict,
 )
 
@@ -77,6 +88,51 @@ def _reproduction_evidence(
     )
 
 
+def _sql_error_observation(evidence_id: str = "evi-sql-signal") -> Evidence:
+    return Evidence(
+        evidence_id=evidence_id,
+        run_id=_RUN_ID,
+        surface_id=_SURFACE_ID,
+        created_by="heuristic_sqli_analyzer",
+        evidence_type="observation",
+        observation={
+            "type": "sql_error",
+            "parameter": "q",
+            "signal": "error_message",
+            "engine": "mysql",
+        },
+    )
+
+
+def _collected_for_request(
+    evidence_id: str,
+    request,
+    *,
+    body: str,
+    observation_type: str = "http_response",
+    status: int | None = 200,
+) -> Evidence:
+    observation: dict[str, object] = {
+        "type": observation_type,
+        "method": "GET",
+        "request_kind": request.http_request.request_kind.value,
+        "request_fingerprint": request.request_fingerprint("http://localhost/search"),
+        "body": body,
+    }
+    if status is not None:
+        observation["status"] = status
+    return Evidence(
+        evidence_id=evidence_id,
+        run_id=_RUN_ID,
+        surface_id=_SURFACE_ID,
+        created_by="execution_runtime:http_get",
+        evidence_type=observation_type,
+        source_task_id=f"task-{evidence_id}",
+        validation_id=_VALIDATION_ID,
+        observation=observation,
+    )
+
+
 def _task(evidence_ids: tuple[str, ...], *, candidate_id: str | None = _CANDIDATE_ID) -> TaskEnvelope:
     return TaskEnvelope(
         task_id="task-validate",
@@ -91,19 +147,39 @@ def _task(evidence_ids: tuple[str, ...], *, candidate_id: str | None = _CANDIDAT
     )
 
 
-def _make_agent() -> tuple[ValidationAgent, InMemoryCandidateStore, InMemoryEvidenceStore]:
+def _make_agent() -> tuple[
+    ValidationAgent,
+    InMemoryCandidateStore,
+    InMemoryEvidenceStore,
+    InMemorySurfaceStore,
+]:
     candidates = InMemoryCandidateStore()
     evidence = InMemoryEvidenceStore()
+    surfaces = InMemorySurfaceStore()
+    surfaces.add(
+        Surface(
+            surface_id=_SURFACE_ID,
+            run_id=_RUN_ID,
+            url="http://localhost/search",
+            method="GET",
+            parameters=("q", "Submit"),
+        )
+    )
     return (
-        ValidationAgent(candidate_store=candidates, evidence_store=evidence),
+        ValidationAgent(
+            candidate_store=candidates,
+            evidence_store=evidence,
+            surface_store=surfaces,
+        ),
         candidates,
         evidence,
+        surfaces,
     )
 
 
 class ValidationAgentTests(unittest.TestCase):
     def test_requests_independent_reproduction_when_none_collected_yet(self) -> None:
-        agent, candidates, evidence = _make_agent()
+        agent, candidates, evidence, _ = _make_agent()
         candidates.add(_make_candidate(evidence_ids=("evi-seed", "evi-analysis-http")))
         evidence.append(_seed_evidence())
         # Analysis가 만든 일반 HTTP 응답은 Validation 재현 증적으로 인정하면 안 된다.
@@ -123,7 +199,7 @@ class ValidationAgentTests(unittest.TestCase):
         self.assertEqual(request.suggested_tool, "http_get")
 
     def test_successful_generic_reproduction_remains_suspected(self) -> None:
-        agent, candidates, evidence = _make_agent()
+        agent, candidates, evidence, _ = _make_agent()
         candidates.add(_make_candidate(evidence_ids=("evi-seed", "evi-repro")))
         evidence.append(_seed_evidence())
         evidence.append(_reproduction_evidence("evi-repro", status=200))
@@ -138,7 +214,7 @@ class ValidationAgentTests(unittest.TestCase):
         self.assertIsNone(result.validation.proof)
 
     def test_http_status_alone_never_confirms_or_rejects(self) -> None:
-        agent, candidates, evidence = _make_agent()
+        agent, candidates, evidence, _ = _make_agent()
         candidates.add(_make_candidate(evidence_ids=("evi-seed", "evi-repro")))
         evidence.append(_seed_evidence())
         evidence.append(_reproduction_evidence("evi-repro", status=404))
@@ -150,7 +226,7 @@ class ValidationAgentTests(unittest.TestCase):
         self.assertEqual(result.validation.verdict, ValidationVerdict.SUSPECTED)
 
     def test_network_error_marks_validation_blocked(self) -> None:
-        agent, candidates, evidence = _make_agent()
+        agent, candidates, evidence, _ = _make_agent()
         candidates.add(_make_candidate(evidence_ids=("evi-seed", "evi-error")))
         evidence.append(_seed_evidence())
         evidence.append(
@@ -165,7 +241,7 @@ class ValidationAgentTests(unittest.TestCase):
         self.assertEqual(result.validation.verdict, ValidationVerdict.BLOCKED)
 
     def test_evidence_from_another_validation_session_is_ignored(self) -> None:
-        agent, candidates, evidence = _make_agent()
+        agent, candidates, evidence, _ = _make_agent()
         candidates.add(_make_candidate(evidence_ids=("evi-seed", "evi-old")))
         evidence.append(_seed_evidence())
         evidence.append(
@@ -184,12 +260,126 @@ class ValidationAgentTests(unittest.TestCase):
             agent.handle(_task((), candidate_id=None))
 
     def test_unknown_vulnerability_type_is_a_contract_error(self) -> None:
-        agent, candidates, evidence = _make_agent()
+        agent, candidates, evidence, _ = _make_agent()
         candidates.add(_make_candidate(vulnerability_type="Unknown"))
         evidence.append(_seed_evidence())
 
         with self.assertRaises(AgentContractError):
             agent.handle(_task(("evi-seed",)))
+
+    def test_sqli_requests_independent_control_and_quote_probe(self) -> None:
+        agent, candidates, evidence, _ = _make_agent()
+        candidates.add(
+            _make_candidate(
+                vulnerability_type="SQLi", evidence_ids=("evi-sql-signal",)
+            )
+        )
+        evidence.append(_sql_error_observation())
+
+        result = agent.handle(_task(("evi-sql-signal",)))
+
+        self.assertIs(result.status, AgentResultStatus.NEEDS_EVIDENCE)
+        self.assertEqual(len(result.evidence_requests), 2)
+        control, probe = result.evidence_requests
+        assert control.http_request is not None
+        assert probe.http_request is not None
+        self.assertIs(control.http_request.request_kind, HttpRequestKind.CONTROL)
+        self.assertIs(probe.http_request.request_kind, HttpRequestKind.PROBE)
+        control_value = dict(control.http_request.query_parameters)["q"]
+        probe_value = dict(probe.http_request.query_parameters)["q"]
+        self.assertEqual(probe_value, control_value + "'")
+        self.assertEqual(
+            dict(probe.http_request.query_parameters)["Submit"], control_value
+        )
+
+    def test_sqli_independent_differential_creates_structured_proof(self) -> None:
+        agent, candidates, evidence, _ = _make_agent()
+        candidates.add(
+            _make_candidate(
+                vulnerability_type="SQLi", evidence_ids=("evi-sql-signal",)
+            )
+        )
+        evidence.append(_sql_error_observation())
+        first = agent.handle(_task(("evi-sql-signal",)))
+        control_request, probe_request = first.evidence_requests
+        control = _collected_for_request(
+            "evi-validation-control", control_request, body="normal result"
+        )
+        probe = _collected_for_request(
+            "evi-validation-probe",
+            probe_request,
+            body="You have an error in your SQL syntax",
+        )
+        evidence.append(control)
+        evidence.append(probe)
+
+        result = agent.handle(
+            _task(
+                (
+                    "evi-sql-signal",
+                    "evi-validation-control",
+                    "evi-validation-probe",
+                )
+            )
+        )
+
+        self.assertIs(result.status, AgentResultStatus.COMPLETED)
+        assert result.validation is not None
+        self.assertIs(result.validation.verdict, ValidationVerdict.CONFIRMED)
+        self.assertEqual(result.validation.reproduction_count, 2)
+        assert result.validation.proof is not None
+        self.assertIs(
+            result.validation.proof.proof_type, ValidationProofType.SQLI_EFFECT
+        )
+        self.assertEqual(
+            result.validation.proof.evidence_ids,
+            ("evi-validation-control", "evi-validation-probe"),
+        )
+
+    def test_sqli_identical_independent_responses_are_rejected(self) -> None:
+        agent, candidates, evidence, _ = _make_agent()
+        candidates.add(
+            _make_candidate(
+                vulnerability_type="SQLi", evidence_ids=("evi-sql-signal",)
+            )
+        )
+        evidence.append(_sql_error_observation())
+        first = agent.handle(_task(("evi-sql-signal",)))
+        control_request, probe_request = first.evidence_requests
+        control = _collected_for_request(
+            "evi-validation-control", control_request, body="same response"
+        )
+        probe = _collected_for_request(
+            "evi-validation-probe", probe_request, body="same response"
+        )
+        evidence.append(control)
+        evidence.append(probe)
+
+        result = agent.handle(
+            _task(
+                (
+                    "evi-sql-signal",
+                    "evi-validation-control",
+                    "evi-validation-probe",
+                )
+            )
+        )
+
+        assert result.validation is not None
+        self.assertIs(result.validation.verdict, ValidationVerdict.REJECTED)
+        self.assertIsNone(result.validation.proof)
+
+    def test_sqli_without_analysis_signal_is_rejected_without_requests(self) -> None:
+        agent, candidates, evidence, _ = _make_agent()
+        candidates.add(_make_candidate(vulnerability_type="SQLi", evidence_ids=()))
+
+        result = agent.handle(_task(()))
+
+        self.assertIs(result.status, AgentResultStatus.COMPLETED)
+        self.assertEqual(result.evidence_requests, ())
+        assert result.validation is not None
+        self.assertIs(result.validation.verdict, ValidationVerdict.REJECTED)
+        self.assertIsNone(result.validation.proof)
 
 
 _SAMPLE_TARGET = "http://localhost/vulnerabilities/fi/?page=include.php"
@@ -250,7 +440,9 @@ class ValidationDrivesEvidenceLoopTests(unittest.TestCase):
         app.dispatcher.register(
             "validation",
             ValidationAgent(
-                candidate_store=app.stores.candidates, evidence_store=app.stores.evidence
+                candidate_store=app.stores.candidates,
+                evidence_store=app.stores.evidence,
+                surface_store=app.stores.surfaces,
             ),
             allowed_tools=("http_get",),
         )
@@ -288,6 +480,65 @@ class ValidationDrivesEvidenceLoopTests(unittest.TestCase):
         )
         reports = app.stores.reports.list_by_run(run.run_id)
         self.assertEqual(len(reports), 1)
+
+
+class _SqliDifferentialRuntime:
+    """SQLi 페이지의 id 작은따옴표 probe에만 DB 오류를 반환하는 Runtime 대역."""
+
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        parameters = dict(request.query_parameters)
+        body = "normal database result"
+        if "Submit" in parameters and parameters.get("id", "").endswith("'"):
+            body = "You have an error in your SQL syntax"
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            evidence_type="http_response",
+            observation={
+                "type": "http_response",
+                "status": 200,
+                "body": body,
+                "method": request.method,
+                "request_kind": request.request_kind.value,
+                "requested_url": request.resolved_url,
+            },
+        )
+
+
+class SqliFindingEndToEndTests(unittest.TestCase):
+    def test_independent_sqli_reproduction_promotes_one_finding(self) -> None:
+        app = build_local_application(
+            {}, runtime=_SqliDifferentialRuntime(), router=standard_router()
+        )
+        register_standard_agents(app, recon_max_pages=1)
+
+        run = app.orchestrator.start(
+            RunRequest(
+                target_url=(
+                    "http://localhost/vulnerabilities/sqli/?id=1&Submit=Submit"
+                ),
+                scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+                request_budget=30,
+            )
+        )
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        findings = app.stores.findings.list_by_run(run.run_id)
+        self.assertEqual(len(findings), 1)
+        finding = findings[0]
+        self.assertEqual(finding.vulnerability_type, "SQLi")
+        self.assertEqual(len(finding.evidence_ids), 2)
+        proof_evidence = app.stores.evidence.get_many(
+            run.run_id, finding.evidence_ids
+        )
+        self.assertTrue(
+            all(item.validation_id == finding.validation_id for item in proof_evidence)
+        )
+        self.assertTrue(
+            all(
+                item.created_by.startswith("execution_runtime:")
+                for item in proof_evidence
+            )
+        )
 
 
 if __name__ == "__main__":
