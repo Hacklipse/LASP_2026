@@ -96,6 +96,23 @@ class FormLoginWorker:
         )
         evidence_ids.append(login_id)
         _require_login_success(login, response.observation)
+
+        if login.verification_url is not None:
+            verification_id, verification = self._collector.collect_with_result(
+                task.run_id,
+                login.verification_url,
+                EvidenceRequest(
+                    evidence_type="authentication_verification",
+                    surface_id="authentication",
+                    reason="verify authenticated access to a protected resource",
+                    suggested_tool="http_get",
+                    http_request=HttpRequestSpec(method="GET"),
+                ),
+                task_id=task.task_id,
+                timeout_seconds=task.timeout_seconds,
+            )
+            evidence_ids.append(verification_id)
+            _require_authenticated_access(login, verification.observation)
         return AgentResult(
             task_id=task.task_id,
             status=AgentResultStatus.COMPLETED,
@@ -137,3 +154,22 @@ def _require_login_success(login: FormLoginSpec, observation) -> None:
         and login.failure_marker in body
     ):
         raise AuthenticationFailed("form login response contained its failure marker")
+
+
+def _require_authenticated_access(login: FormLoginSpec, observation) -> None:
+    """보호 자원 응답으로 로그인 세션이 실제로 성립했는지 확인한다."""
+
+    status = observation.get("status")
+    if status not in login.verification_success_statuses:
+        raise AuthenticationFailed(
+            f"protected resource verification returned an unexpected status: {status}"
+        )
+    if observation.get("type") != "http_response":
+        raise AuthenticationFailed("protected resource verification was redirected")
+
+    marker = login.verification_marker
+    body = observation.get("body")
+    if marker is not None and (not isinstance(body, str) or marker not in body):
+        raise AuthenticationFailed(
+            "protected resource verification did not contain its success marker"
+        )

@@ -87,6 +87,17 @@ class SurfaceRoutingTests(unittest.TestCase):
         self.assertEqual(post, ())
         self.assertEqual(no_parameters, ())
 
+    def test_surface_rule_skips_state_changing_get_form(self) -> None:
+        router = RuleBasedVulnerabilityRouter()
+
+        decisions = router.route(
+            _run(),
+            (_surface(parameters=("password_new", "password_conf", "Change")),),
+            (),
+        )
+
+        self.assertEqual(decisions, ())
+
 
 class _SurfaceOnlyReconAgent:
     """Observation 없이 입력 가능한 Surface 하나만 반환하는 Recon 대역."""

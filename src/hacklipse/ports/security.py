@@ -25,6 +25,9 @@ class FormLoginSpec:
     extra_fields: tuple[tuple[str, str], ...] = field(default=(), repr=False)
     success_statuses: tuple[int, ...] = (200, 302, 303)
     failure_marker: str | None = None
+    verification_url: str | None = None
+    verification_success_statuses: tuple[int, ...] = (200,)
+    verification_marker: str | None = None
     approval_ref: str = ""
 
     def __post_init__(self) -> None:
@@ -41,6 +44,17 @@ class FormLoginSpec:
             for status in self.success_statuses
         ):
             raise ValueError("form login success statuses must be HTTP status codes")
+        if self.verification_url is not None and not self.verification_url.strip():
+            raise ValueError("form login verification URL cannot be empty")
+        if self.verification_url is not None and not self.verification_success_statuses:
+            raise ValueError("form login verification requires at least one success status")
+        if any(
+            not isinstance(status, int)
+            or isinstance(status, bool)
+            or not 100 <= status <= 599
+            for status in self.verification_success_statuses
+        ):
+            raise ValueError("form login verification statuses must be HTTP status codes")
         if not self.approval_ref:
             raise ValueError("form login POST requires an explicit approval reference")
 

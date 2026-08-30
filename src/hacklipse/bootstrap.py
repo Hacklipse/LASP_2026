@@ -26,6 +26,7 @@ from hacklipse.adapters import (
     ValidationAgent,
 )
 from hacklipse.adapters.routing import DEFAULT_RULES, DEFAULT_SURFACE_RULES
+from hacklipse.adapters.recon import DEFAULT_MAX_PAGES
 from hacklipse.application import (
     Orchestrator,
     OrchestratorConfig,
@@ -245,7 +246,10 @@ def standard_router() -> RuleBasedVulnerabilityRouter:
 
 
 def register_standard_agents(
-    app: LocalApplication, *, llm_client: LlmClient | None = None
+    app: LocalApplication,
+    *,
+    llm_client: LlmClient | None = None,
+    recon_max_pages: int = DEFAULT_MAX_PAGES,
 ) -> str:
     """Recon/Analysis/Validation을 표준 배선으로 등록하고 구성 이름을 돌려준다.
 
@@ -260,6 +264,7 @@ def register_standard_agents(
             collector=app.collector,
             evidence_store=app.stores.evidence,
             surface_store=app.stores.surfaces,
+            max_pages=recon_max_pages,
         ),
         allowed_tools=("http_get",),
     )

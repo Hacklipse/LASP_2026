@@ -138,6 +138,10 @@ class RuntimeEvidenceCollector:
             observation.setdefault("request_kind", request.request_kind.value)
             observation.setdefault("requested_url", request.resolved_url)
             observation.setdefault("method", request.method.upper())
+            # requested_url과 body는 저장 전에 마스킹될 수 있다. Agent가 표시 문자열을
+            # Evidence 연결 키로 쓰지 않도록, 실행 직전 명세의 비가역 fingerprint를
+            # Collector가 신뢰 가능한 값으로 덮어쓴다.
+            observation["request_fingerprint"] = spec.request_fingerprint(target_url)
             self._evidence.append(
                 Evidence(
                     evidence_id=evidence_id,

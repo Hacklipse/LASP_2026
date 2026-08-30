@@ -8,6 +8,8 @@ from uuid import uuid4
 
 from hacklipse.domain import Candidate, Evidence, RouteDecision, Run, Surface
 
+from .request_safety import has_state_changing_parameters
+
 
 @dataclass(frozen=True, slots=True)
 class RoutingRule:
@@ -31,6 +33,10 @@ class SurfaceRoutingRule:
 
     def matches(self, surface: Surface) -> bool:
         if surface.method.upper() not in self.methods:
+            return False
+        # GET 폼이어도 비밀번호 변경·삭제 등은 상태를 바꿀 수 있다. 자동 Analysis
+        # Candidate를 만들지 않되 Surface 자체는 Recon 결과로 보존한다.
+        if has_state_changing_parameters(surface.parameters):
             return False
         return bool(surface.parameters) if self.requires_parameters else True
 

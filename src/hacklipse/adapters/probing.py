@@ -160,11 +160,21 @@ def matching_evidence(
         return None
     expected_url = resolved_url(target_url, request.http_request.query_parameters)
     expected_kind = request.http_request.request_kind.value
+    expected_fingerprint = request.request_fingerprint(target_url)
     for item in reversed(evidence):
         observation = item.observation
+        fingerprint = observation.get("request_fingerprint")
         if (
             item.created_by.startswith("execution_runtime:")
-            and observation.get("requested_url") == expected_url
+            and (
+                fingerprint == expected_fingerprint
+                # 이전 저장본·테스트 대역과의 읽기 호환. 새 Collector Evidence에는
+                # 항상 fingerprint가 있으므로 마스킹 URL에 의존하지 않는다.
+                or (
+                    fingerprint is None
+                    and observation.get("requested_url") == expected_url
+                )
+            )
             and observation.get("request_kind") == expected_kind
             and str(observation.get("method", "GET")).upper() == "GET"
         ):

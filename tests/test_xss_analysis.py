@@ -194,6 +194,32 @@ class HeuristicXssAnalyzerTests(unittest.TestCase):
         ]
         self.assertEqual(observations, ["first", "second"])
 
+    def test_request_fingerprint_survives_sanitized_display_url(self) -> None:
+        """민감 query 값이 마스킹돼도 Analyzer가 수집 Evidence를 재연결한다."""
+
+        agent, app, _, task = _task(parameters=("csrf_token",))
+
+        requested = agent.handle(task)
+        collected_task = _collect_requested(requested, app, task)
+        result = agent.handle(collected_task)
+
+        self.assertIs(result.status, AgentResultStatus.COMPLETED)
+        self.assertEqual(len(result.new_evidence_ids), 1)
+        runtime_evidence = [
+            item
+            for item in app.stores.evidence.list_by_run(_RUN_ID)
+            if item.created_by.startswith("execution_runtime:")
+        ]
+        self.assertTrue(
+            all(item.observation.get("request_fingerprint") for item in runtime_evidence)
+        )
+        self.assertTrue(
+            all(
+                "%3Credacted%3E" in str(item.observation["requested_url"])
+                for item in runtime_evidence
+            )
+        )
+
     def test_rejects_missing_tool_and_insufficient_task_budget_before_requests(self) -> None:
         agent, _, runtime, task = _task(parameters=("name",), request_budget=1)
         with self.assertRaises(AgentContractError):

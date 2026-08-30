@@ -51,6 +51,33 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class _LocalhostCookiePolicy(http.cookiejar.DefaultCookiePolicy):
+    """정확한 localhost Domain 쿠키만 단일 호스트 예외로 허용한다.
+
+    Python CookieJar는 점이 없는 ``Domain=localhost``를 기본적으로 거부한다. 로컬
+    실습 서버가 이 속성을 명시하는 경우에만 받아들이되, 다른 단일 라벨 호스트나
+    서브도메인에는 예외를 확장하지 않는다.
+    """
+
+    @staticmethod
+    def _is_exact_localhost(cookie, request) -> bool:
+        request_host = http.cookiejar.request_host(request).casefold()
+        cookie_domain = cookie.domain.lstrip(".").casefold()
+        return request_host == "localhost" and cookie_domain == "localhost"
+
+    def set_ok_domain(self, cookie, request) -> bool:
+        if self._is_exact_localhost(cookie, request):
+            return not self.is_blocked(cookie.domain) and not self.is_not_allowed(
+                cookie.domain
+            )
+        return super().set_ok_domain(cookie, request)
+
+    def return_ok_domain(self, cookie, request) -> bool:
+        if self._is_exact_localhost(cookie, request):
+            return True
+        return super().return_ok_domain(cookie, request)
+
+
 class HttpExecutionRuntime:
     """urllib.request 기반 실제 HTTP 실행 구현.
 
@@ -156,7 +183,7 @@ class HttpExecutionRuntime:
         key = (request.run_id, request.credential_ref)
         opener = self._sessions.get(key)
         if opener is None:
-            jar = http.cookiejar.CookieJar()
+            jar = http.cookiejar.CookieJar(policy=_LocalhostCookiePolicy())
             opener = urllib.request.build_opener(
                 _NoRedirect,
                 urllib.request.ProxyHandler({}),

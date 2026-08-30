@@ -35,7 +35,7 @@ from hacklipse.ports import FormLoginSpec, ResolvedHttpCredential  # noqa: E402
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1"})
 _CREDENTIAL_REF = "interactive-local-dvwa"
 _APPROVAL_REF = "interactive-local-dvwa-login"
-_DEFAULT_BUDGET = 20
+_DEFAULT_BUDGET = 30
 
 
 def main(argv: list[str]) -> int:
@@ -70,6 +70,9 @@ def main(argv: list[str]) -> int:
                     csrf_field="user_token",
                     extra_fields=(("Login", "Login"),),
                     failure_marker="Login failed",
+                    # 로그인 POST의 302만으로는 성공·실패를 구분할 수 없다. 같은 Run
+                    # 세션으로 보호된 시작 페이지를 읽을 수 있어야 인증 성공이다.
+                    verification_url=target_url,
                     approval_ref=_APPROVAL_REF,
                 ),
             )
@@ -85,7 +88,10 @@ def main(argv: list[str]) -> int:
         approval_gate=StaticApprovalGate((_APPROVAL_REF,)),
         audit_log=audit,
     )
-    profile = register_standard_agents(app)
+    # 이 실행기는 DVWA reflected-XSS/SQLi 파이프라인의 재현 실험이다. 전 사이트를
+    # 크롤링하면 비밀번호 변경 같은 상태 변경 GET 폼까지 탐색 대상에 섞이고, 결과도
+    # 시작 Surface가 아닌 크롤링 순서에 좌우된다. 대상 페이지 한 장만 열거한다.
+    profile = register_standard_agents(app, recon_max_pages=1)
     base_path = parsed.path if parsed.path.endswith("/") else f"{parsed.path}/"
 
     try:

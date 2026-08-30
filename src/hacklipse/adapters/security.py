@@ -38,6 +38,10 @@ _KOREAN_RRN = re.compile(r"(?<!\d)\d{6}[- ]?[1-4]\d{6}(?!\d)")
 _FORM_SECRET = re.compile(
     r"(?i)(\b(?:password|passwd|csrf|token|secret|session(?:id)?)\b[^=&\r\n]{0,40}=)([^&\s<>\"']+)"
 )
+_JSON_SECRET = re.compile(
+    r'''(?i)(["'](?:password|passwd|csrf|token|secret|session(?:id)?)["']'''
+    r'''\s*:\s*["'])([^"']*)(["'])'''
+)
 _HTML_SECRET = re.compile(
     r"(?i)(name=[\"'](?:[^\"']*(?:csrf|token|password|session)[^\"']*)[\"'][^>]*value=[\"'])([^\"']*)([\"'])"
 )
@@ -47,6 +51,14 @@ _HTML_SECRET_VALUE_FIRST = re.compile(
 )
 _SENSITIVE_HEADER_NAMES = frozenset(
     {"authorization", "proxy-authorization", "cookie", "set-cookie"}
+)
+_SENSITIVE_FIELD_HINTS = (
+    "password",
+    "passwd",
+    "csrf",
+    "token",
+    "secret",
+    "session",
 )
 
 
@@ -131,18 +143,82 @@ class SensitiveDataSanitizer:
 
     @staticmethod
     def _sanitize_text(value: str, secrets: Sequence[str]) -> str:
-        sanitized = value
-        for secret in sorted((item for item in secrets if item), key=len, reverse=True):
-            sanitized = sanitized.replace(secret, _REDACTED)
-        sanitized = _BEARER.sub("Bearer <redacted>", sanitized)
-        sanitized = _JWT.sub(_REDACTED, sanitized)
-        sanitized = _EMAIL.sub("<redacted-email>", sanitized)
-        sanitized = _PHONE.sub("<redacted-phone>", sanitized)
-        sanitized = _KOREAN_RRN.sub("<redacted-id>", sanitized)
-        sanitized = _FORM_SECRET.sub(r"\1<redacted>", sanitized)
-        sanitized = _HTML_SECRET.sub(r"\1<redacted>\3", sanitized)
-        sanitized = _HTML_SECRET_VALUE_FIRST.sub(r"\1<redacted>\3", sanitized)
-        return _sanitize_url_query(sanitized, secrets)
+        # URL은 query 구조를 보존하는 전용 경로로 먼저 처리한다. 일반 FORM 정규식을
+        # URL 전체에 적용하면 `/csrf/?q=marker`의 경로 `csrf`를 필드명으로 오인해
+        # marker를 지우고, Analyzer가 자신의 Evidence를 다시 찾지 못한다.
+        url_sanitized = _sanitize_url_query(value, secrets)
+        if url_sanitized is not None:
+            return url_sanitized
+
+        # HTML 태그 안의 name/type 같은 구조는 Recon의 입력이다. 자격증명 값이 흔한
+        # 단어(`password`)라는 이유로 전역 replace하면 name="password_new"까지
+        # 훼손된다. 민감 input value는 전용 패턴으로 지우고, 알려진 비밀 원문 치환은
+        # 태그 바깥 텍스트에만 적용한다.
+        if _looks_like_html(value):
+            sanitized = _HTML_SECRET.sub(r"\1<redacted>\3", value)
+            sanitized = _HTML_SECRET_VALUE_FIRST.sub(r"\1<redacted>\3", sanitized)
+            parts = re.split(r"(<[^>]*>)", sanitized)
+            return "".join(
+                _sanitize_html_tag(part, secrets)
+                if part.startswith("<") and part.endswith(">")
+                else _sanitize_plain_text(part, secrets)
+                for part in parts
+            )
+
+        return _sanitize_plain_text(value, secrets)
+
+
+def _sanitize_plain_text(value: str, secrets: Sequence[str]) -> str:
+    sanitized = _replace_known_secrets(value, secrets)
+    sanitized = _BEARER.sub("Bearer <redacted>", sanitized)
+    sanitized = _JWT.sub(_REDACTED, sanitized)
+    sanitized = _EMAIL.sub("<redacted-email>", sanitized)
+    sanitized = _PHONE.sub("<redacted-phone>", sanitized)
+    sanitized = _KOREAN_RRN.sub("<redacted-id>", sanitized)
+    sanitized = _FORM_SECRET.sub(r"\1<redacted>", sanitized)
+    sanitized = _JSON_SECRET.sub(r"\1<redacted>\3", sanitized)
+    return sanitized
+
+
+def _replace_known_secrets(value: str, secrets: Sequence[str]) -> str:
+    """알려진 비밀값을 지우되 구조화 필드명으로 쓰인 동일 문자열은 보존한다."""
+
+    sanitized = value
+    for secret in sorted((item for item in secrets if item), key=len, reverse=True):
+        pattern = re.compile(re.escape(secret))
+
+        def replace(match: re.Match[str]) -> str:
+            tail = sanitized[match.end() :]
+            # form/JSON key와 식별자 일부는 데이터 구조이지 비밀값이 아니다.
+            if tail.startswith(("_", "-")) or re.match(r'''^["']?\s*[:=]''', tail):
+                return match.group(0)
+            return _REDACTED
+
+        sanitized = pattern.sub(replace, sanitized)
+    return sanitized
+
+
+def _looks_like_html(value: str) -> bool:
+    return bool(re.search(r"<[A-Za-z!/][^>]*>", value))
+
+
+def _sanitize_html_tag(tag: str, secrets: Sequence[str]) -> str:
+    """HTML 구조 속성은 보존하고, 일반 속성의 알려진 비밀값만 지운다."""
+
+    sanitized = tag
+    structural = frozenset({"class", "for", "id", "name", "type"})
+    for secret in sorted((item for item in secrets if item), key=len, reverse=True):
+        pattern = re.compile(
+            rf'''(\b([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*["']){re.escape(secret)}(["'])'''
+        )
+
+        def replace(match: re.Match[str]) -> str:
+            if match.group(2).casefold() in structural:
+                return match.group(0)
+            return f"{match.group(1)}{_REDACTED}{match.group(3)}"
+
+        sanitized = pattern.sub(replace, sanitized)
+    return sanitized
 
 
 class DenyAllApprovalGate:
@@ -220,20 +296,34 @@ class SQLiteExecutionAuditLog:
     def close(self) -> None:
         with self._lock:
             self._connection.close()
-def _sanitize_url_query(value: str, secrets: Sequence[str]) -> str:
-    """문자열 전체가 URL일 때 알려진 비밀값만 query에서 치환한다."""
+
+
+def _sanitize_url_query(value: str, secrets: Sequence[str]) -> str | None:
+    """절대 HTTP(S) URL이면 이름을 보존하고 민감 query 값만 치환한다."""
 
     try:
         parsed = urlsplit(value)
     except ValueError:
-        return value
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.query:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    if not parsed.query:
         return value
     secret_set = set(secrets)
     query = tuple(
-        (name, _REDACTED if item in secret_set else item)
+        (
+            name,
+            _REDACTED
+            if item in secret_set or _is_sensitive_field_name(name)
+            else item,
+        )
         for name, item in parse_qsl(parsed.query, keep_blank_values=True)
     )
     return urlunsplit(
         (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
     )
+
+
+def _is_sensitive_field_name(name: str) -> bool:
+    lowered = name.casefold()
+    return any(hint in lowered for hint in _SENSITIVE_FIELD_HINTS)

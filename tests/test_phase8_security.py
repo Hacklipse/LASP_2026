@@ -54,6 +54,10 @@ class _DvwaLikeHandler(BaseHTTPRequestHandler):
     login_posts = 0
     authenticated_gets = 0
 
+    def _localhost_domain(self) -> str:
+        host = self.headers.get("Host", "").partition(":")[0].casefold()
+        return "; Domain=localhost" if host == "localhost" else ""
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)
         if parsed.path == "/login.php":
@@ -65,7 +69,10 @@ class _DvwaLikeHandler(BaseHTTPRequestHandler):
             ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Set-Cookie", "bootstrap=dvwa-bootstrap-secret; Path=/")
+            self.send_header(
+                "Set-Cookie",
+                f"bootstrap=dvwa-bootstrap-secret; Path=/{self._localhost_domain()}",
+            )
             self.end_headers()
             self.wfile.write(body)
             return
@@ -106,11 +113,18 @@ class _DvwaLikeHandler(BaseHTTPRequestHandler):
             and fields.get("Login") == ["Login"]
         )
         if not valid:
-            self._html(200, b"Login failed")
+            # 실제 DVWA처럼 로그인 성공과 실패 모두 302다. 보호 페이지를 확인하지
+            # 않으면 상태 코드만으로 실패를 성공으로 오판한다.
+            self.send_response(302)
+            self.send_header("Location", "/login.php")
+            self.end_headers()
             return
         self.send_response(302)
         self.send_header("Location", "/vulnerabilities/xss_r/")
-        self.send_header("Set-Cookie", f"PHPSESSID={_SESSION}; Path=/; HttpOnly")
+        self.send_header(
+            "Set-Cookie",
+            f"PHPSESSID={_SESSION}; Path=/{self._localhost_domain()}; HttpOnly",
+        )
         self.end_headers()
 
     def _html(self, status: int, body: bytes) -> None:
@@ -138,8 +152,11 @@ class Phase8AuthenticatedWorkflowTests(unittest.TestCase):
         _DvwaLikeHandler.login_posts = 0
         _DvwaLikeHandler.authenticated_gets = 0
 
-    def _resolver(self) -> InMemoryCredentialResolver:
-        base = f"http://127.0.0.1:{self.port}"
+    def _resolver(
+        self, *, host: str = "127.0.0.1", password: str = _PASSWORD
+    ) -> InMemoryCredentialResolver:
+        base = f"http://{host}:{self.port}"
+        target = f"{base}/vulnerabilities/xss_r/?name=seed"
         return InMemoryCredentialResolver(
             {
                 "local-dvwa": ResolvedHttpCredential(
@@ -147,22 +164,23 @@ class Phase8AuthenticatedWorkflowTests(unittest.TestCase):
                     form_login=FormLoginSpec(
                         login_url=f"{base}/login.php",
                         username=_USERNAME,
-                        password=_PASSWORD,
+                        password=password,
                         csrf_field="user_token",
                         extra_fields=(("Login", "Login"),),
                         failure_marker="Login failed",
+                        verification_url=target,
                         approval_ref=_APPROVAL,
                     ),
                 )
             }
         )
 
-    def _request(self) -> RunRequest:
+    def _request(self, *, host: str = "127.0.0.1") -> RunRequest:
         return RunRequest(
             target_url=(
-                f"http://127.0.0.1:{self.port}/vulnerabilities/xss_r/?name=seed"
+                f"http://{host}:{self.port}/vulnerabilities/xss_r/?name=seed"
             ),
-            scope=RunScope(allowed_hosts=frozenset({"127.0.0.1"})),
+            scope=RunScope(allowed_hosts=frozenset({host})),
             request_budget=20,
             credential_ref="local-dvwa",
         )
@@ -185,8 +203,8 @@ class Phase8AuthenticatedWorkflowTests(unittest.TestCase):
 
         self.assertIs(run.phase, RunPhase.DONE)
         self.assertEqual(_DvwaLikeHandler.login_posts, 1)
-        # Recon + control + probe + Validation 재현 요청이 같은 인증 세션을 쓴다.
-        self.assertGreaterEqual(_DvwaLikeHandler.authenticated_gets, 4)
+        # 인증 검증 + Recon + control + probe + Validation이 같은 세션을 쓴다.
+        self.assertGreaterEqual(_DvwaLikeHandler.authenticated_gets, 5)
         self.assertEqual(
             app.stores.tasks.list_by_run(run.run_id)[0].envelope.agent_type,
             "session_authenticator",
@@ -208,6 +226,40 @@ class Phase8AuthenticatedWorkflowTests(unittest.TestCase):
         self.assertTrue(any(event.method == "POST" for event in events))
         self.assertTrue(all("?" not in event.target for event in events))
         self.assertTrue(all(event.outcome == "completed" for event in events))
+
+    def test_domain_localhost_cookies_are_reused_for_exact_localhost(self) -> None:
+        resolver = self._resolver(host="localhost")
+        app = build_local_application(
+            {},
+            runtime=HttpExecutionRuntime(credential_resolver=resolver),
+            router=standard_router(),
+            credential_resolver=resolver,
+            approval_gate=StaticApprovalGate((_APPROVAL,)),
+        )
+        register_standard_agents(app)
+
+        run = app.orchestrator.start(self._request(host="localhost"))
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(_DvwaLikeHandler.login_posts, 1)
+        self.assertGreaterEqual(_DvwaLikeHandler.authenticated_gets, 5)
+
+    def test_login_redirect_is_rejected_when_protected_page_redirects(self) -> None:
+        resolver = self._resolver(password="incorrect-test-password")
+        app = build_local_application(
+            {},
+            runtime=HttpExecutionRuntime(credential_resolver=resolver),
+            router=standard_router(),
+            credential_resolver=resolver,
+            approval_gate=StaticApprovalGate((_APPROVAL,)),
+        )
+        register_standard_agents(app)
+
+        with self.assertRaises(WorkflowExecutionError) as context:
+            app.orchestrator.start(self._request())
+
+        self.assertIn("protected resource verification", str(context.exception))
+        self.assertEqual(_DvwaLikeHandler.authenticated_gets, 0)
 
     def test_login_post_is_blocked_without_explicit_approval(self) -> None:
         resolver = self._resolver()
@@ -351,3 +403,38 @@ class PhoneMaskingPrecisionTests(unittest.TestCase):
                 self.assertEqual(
                     SensitiveDataSanitizer._sanitize_text(text, ()), text
                 )
+
+
+class SanitizerStructurePreservationTests(unittest.TestCase):
+    """마스킹이 Recon 구조와 Evidence 재연결 메타데이터를 훼손하지 않아야 한다."""
+
+    def test_preserves_html_field_names_while_masking_sensitive_values(self) -> None:
+        html = (
+            '<form><input type="password" name="password_new">'
+            '<input name="password" value="password">'
+            '<p>password</p></form>'
+        )
+
+        sanitized = SensitiveDataSanitizer._sanitize_text(html, ("password",))
+
+        self.assertIn('type="password"', sanitized)
+        self.assertIn('name="password_new"', sanitized)
+        self.assertIn('name="password"', sanitized)
+        self.assertIn('value="<redacted>"', sanitized)
+        self.assertNotIn("<p>password</p>", sanitized)
+
+    def test_csrf_path_does_not_redact_unrelated_query_value(self) -> None:
+        url = "http://local.test/vulnerabilities/csrf/?q=hacklipse-control"
+
+        sanitized = SensitiveDataSanitizer._sanitize_text(url, ())
+
+        self.assertEqual(sanitized, url)
+
+    def test_sensitive_query_value_is_redacted_without_renaming_parameter(self) -> None:
+        url = "http://local.test/search?csrf_token=marker"
+
+        sanitized = SensitiveDataSanitizer._sanitize_text(url, ())
+        parsed = urlsplit(sanitized)
+
+        self.assertEqual(parsed.path, "/search")
+        self.assertEqual(parse_qs(parsed.query), {"csrf_token": ["<redacted>"]})

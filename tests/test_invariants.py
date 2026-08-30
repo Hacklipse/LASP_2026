@@ -178,6 +178,30 @@ class ArchitectureInvariantTests(unittest.TestCase):
         with self.assertRaises(PolicyViolation):
             AllowlistPolicyGate().validate_execution(run, request)
 
+    def test_safe_policy_rejects_state_changing_get_parameters(self) -> None:
+        """GET으로 잘못 구현된 변경 폼도 자동 probe 안전 범위가 아니다."""
+
+        run = Run(
+            run_id="run-1",
+            target_url="https://local.test/",
+            scope=RunScope(allowed_hosts=frozenset({"local.test"})),
+            policy_profile="safe",
+            request_budget=1,
+        )
+        request = ExecutionRequest(
+            execution_id="exec-1",
+            run_id=run.run_id,
+            task_id="task-1",
+            tool="http_get",
+            target_url="https://local.test/account",
+            surface_id="surface-account",
+            purpose="unsafe GET fixture",
+            query_parameters=(("password_new", "marker"),),
+        )
+
+        with self.assertRaises(PolicyViolation):
+            AllowlistPolicyGate().validate_execution(run, request)
+
     def test_http_request_spec_rejects_runtime_controlled_or_injected_headers(self) -> None:
         """Agent가 Scope·전송 경계를 바꾸는 헤더를 주입하지 못해야 한다."""
 

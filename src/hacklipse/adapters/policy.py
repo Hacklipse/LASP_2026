@@ -8,6 +8,7 @@ from hacklipse.domain import ExecutionRequest, Run, RunRequest, RunScope
 from hacklipse.ports import ApprovalGate
 from hacklipse.ports.errors import ApprovalRequired, PolicyViolation
 
+from .request_safety import has_state_changing_parameters
 from .security import DenyAllApprovalGate
 
 
@@ -34,11 +35,19 @@ class AllowlistPolicyGate:
         self._validate_url(request.resolved_url, run.scope)
         if (
             run.policy_profile == "safe"
-            and request.method.upper() not in self._safe_methods
+            and (
+                request.method.upper() not in self._safe_methods
+                or (
+                    request.method.upper() == "GET"
+                    and has_state_changing_parameters(
+                        tuple(name for name, _ in request.query_parameters)
+                    )
+                )
+            )
             and not self._approval.is_approved(run, request)
         ):
             raise ApprovalRequired(
-                "state-changing method requires an explicit approved action reference"
+                "state-changing request requires an explicit approved action reference"
             )
 
     @staticmethod

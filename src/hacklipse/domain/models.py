@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Mapping
-from urllib.parse import urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .errors import DomainInvariantError
 
@@ -218,6 +220,44 @@ class EvidenceRequest:
     reason: str
     suggested_tool: str
     http_request: HttpRequestSpec | None = None
+
+    def request_fingerprint(self, target_url: str) -> str:
+        """비밀값 없이 동일 EvidenceRequest를 재연결하는 결정적 식별자.
+
+        URL·query·body 원문을 해시하면 짧은 비밀번호나 토큰을 오프라인 추측할 수 있다.
+        따라서 대상 origin/path, 파라미터·헤더 *이름*, 요청 목적과 kind만 사용한다.
+        probe별 ``reason``에는 대상 파라미터명이 들어가므로 같은 Surface의 여러 probe도
+        서로 구분된다.
+        """
+
+        request = self.http_request or HttpRequestSpec()
+        parsed = urlsplit(target_url)
+        target_query_names = tuple(
+            name for name, _ in parse_qsl(parsed.query, keep_blank_values=True)
+        )
+        canonical = json.dumps(
+            {
+                "body_present": request.body is not None,
+                "evidence_type": self.evidence_type,
+                "header_names": [name.casefold() for name, _ in request.headers],
+                "method": request.method.upper(),
+                "purpose": self.reason,
+                "query_names": [name for name, _ in request.query_parameters],
+                "request_kind": request.request_kind.value,
+                "surface_id": self.surface_id,
+                "target": [
+                    parsed.scheme.casefold(),
+                    parsed.netloc.casefold(),
+                    parsed.path or "/",
+                    target_query_names,
+                ],
+                "tool": self.suggested_tool,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -512,7 +552,6 @@ class ExecutionRequest:
             query = f"{query}&{encoded}" if query else encoded
         # URL fragment는 HTTP 요청 대상에 포함되지 않는다.
         return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
-
 
 @dataclass(frozen=True, slots=True)
 class ExecutionResult:
