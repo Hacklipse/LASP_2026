@@ -12,6 +12,7 @@ from hacklipse.adapters import (
     BoundedRetryPolicy,
     DisabledExecutionRuntime,
     FormLoginWorker,
+    HeuristicSqliAnalyzer,
     HeuristicXssAnalyzer,
     InMemoryBudgetManager,
     InMemoryExecutionAuditLog,
@@ -221,7 +222,7 @@ def build_local_application(
 # 실제로 구현된 Analysis Agent. Router가 이 목록 밖 Candidate를 만들면 Dispatcher가
 # AgentUnavailable로 Run 전체를 실패시키므로, 배선과 라우팅 규칙이 같은 목록을 봐야 한다.
 # Analyzer를 추가하면 여기 한 줄만 늘리면 Router가 따라온다.
-IMPLEMENTED_ANALYZERS = ("xss_analyzer",)
+IMPLEMENTED_ANALYZERS = ("xss_analyzer", "sqli_analyzer")
 
 
 def standard_router() -> RuleBasedVulnerabilityRouter:
@@ -278,6 +279,16 @@ def register_standard_agents(
         )
         profile = "llm"
     app.dispatcher.register("xss_analyzer", analyzer, allowed_tools=("http_get",))
+    # SQLi는 아직 결정적 구현만 있다. LLM 구성에서도 같은 baseline을 쓴다.
+    app.dispatcher.register(
+        "sqli_analyzer",
+        HeuristicSqliAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        ),
+        allowed_tools=("http_get",),
+    )
     app.dispatcher.register(
         "validation",
         ValidationAgent(

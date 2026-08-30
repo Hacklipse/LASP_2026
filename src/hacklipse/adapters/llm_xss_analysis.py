@@ -32,12 +32,14 @@ from hacklipse.domain import (
 from hacklipse.ports import CandidateStore, EvidenceStore, LlmClient, SurfaceStore
 from hacklipse.ports.llm import LlmMessage, LlmRequest
 
-from .xss_analysis import (
+from .probing import (
+    CONTROL_VALUE,
     build_probe_requests,
-    has_reflection_record,
+    has_observation_record,
     marker_reflected,
     matching_evidence,
-    resolve_xss_task,
+    probe_marker,
+    resolve_analysis_task,
     response_body,
 )
 
@@ -129,8 +131,11 @@ class LlmXssAnalyzer:
     def handle(self, task: TaskEnvelope) -> AgentResult:
         """계획이 없으면 세우고, 증적이 모이면 해석한다. 요청은 직접 실행하지 않는다."""
 
-        candidate, surface, parameters = resolve_xss_task(
-            task, candidate_store=self._candidates, surface_store=self._surfaces
+        candidate, surface, parameters = resolve_analysis_task(
+            task,
+            vulnerability_type="XSS",
+            candidate_store=self._candidates,
+            surface_store=self._surfaces,
         )
         evidence = tuple(self._evidence.get_many(task.run_id, task.evidence_ids))
 
@@ -154,7 +159,11 @@ class LlmXssAnalyzer:
             )
 
         requests = build_probe_requests(
-            surface, selected, marker=marker, purpose=f"candidate {candidate.candidate_id}"
+            surface,
+            selected,
+            control_value=CONTROL_VALUE,
+            probe_value=marker,
+            purpose=f"XSS candidate {candidate.candidate_id}",
         )
         collected = tuple(
             matching_evidence(evidence, surface.url, request) for request in requests
@@ -224,7 +233,7 @@ class LlmXssAnalyzer:
         plan: dict[str, object] = {
             "type": _PLAN_OBSERVATION,
             "parameters": list(selected),
-            "marker": f"hacklipse{self._id_factory()}",
+            "marker": probe_marker(self._id_factory()),
             "reason": str(response.payload.get("reason", "")),
             "offered_parameters": list(parameters),
             # 예산 때문에 잘라낸 대상을 남긴다. 조용한 축소는 "전부 봤다"로 읽힌다.
@@ -264,8 +273,13 @@ class LlmXssAnalyzer:
             # 반사 "여부"는 LLM에게 묻지 않는다. 원문 대조가 사실의 원천이다.
             if not marker_reflected(control_body, probe_body, marker):
                 continue
-            if has_reflection_record(
-                evidence, LLM_XSS_ANALYZER, parameter, control.evidence_id, probe.evidence_id
+            if has_observation_record(
+                evidence,
+                LLM_XSS_ANALYZER,
+                "reflection",
+                parameter,
+                control.evidence_id,
+                probe.evidence_id,
             ):
                 continue
             confirmed.append((parameter, probe, _excerpt(probe_body or "", marker)))

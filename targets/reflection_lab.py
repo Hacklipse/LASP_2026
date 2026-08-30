@@ -47,7 +47,21 @@ GROUND_TRUTH: dict[tuple[str, str], dict[str, object]] = {
     ("/multi", "a"): {"reflected": True, "context": "html_text", "encoded": False},
 }
 
-_PATHS = tuple(dict.fromkeys(path for path, _ in GROUND_TRUTH))
+# SQLi 신호 정답. 값 뒤 작은따옴표가 SQL 파서에 닿는지를 세 가지 방식으로 나눈다.
+SQL_GROUND_TRUTH: dict[tuple[str, str], dict[str, object]] = {
+    # 오류 메시지를 그대로 노출한다(개발 설정에서 흔하다).
+    ("/sqli-error", "id"): {"vulnerable": True, "signal": "error_message", "engine": "sqlite"},
+    # 오류를 감추지만 500으로 갈린다(운영 설정에서 흔하다).
+    ("/sqli-status", "id"): {"vulnerable": True, "signal": "status_differential"},
+    # 파라미터 바인딩을 써서 따옴표가 값으로만 취급된다.
+    ("/sqli-safe", "id"): {"vulnerable": False},
+}
+
+_PATHS = tuple(
+    dict.fromkeys(
+        [path for path, _ in GROUND_TRUTH] + [path for path, _ in SQL_GROUND_TRUTH]
+    )
+)
 
 # /filtered가 제거하는 패턴. 영숫자 8자 이상 연속 토큰을 지운다 — marker가 여기 걸린다.
 _FILTER = re.compile(r"[A-Za-z0-9]{8,}")
@@ -57,7 +71,7 @@ def _page(body: str) -> str:
     return f"<!doctype html><html><body>{body}</body></html>"
 
 
-def _render(path: str, params: dict[str, list[str]]) -> tuple[str, str]:
+def _render(path: str, params: dict[str, list[str]]):
     """경로별 반사 동작. GROUND_TRUTH와 반드시 일치해야 한다."""
 
     q = params.get("q", [""])[0]
@@ -79,6 +93,22 @@ def _render(path: str, params: dict[str, list[str]]) -> tuple[str, str]:
         return "text/html", _page(f"<p>검색어: {_FILTER.sub('[removed]', q)}</p>")
     if path == "/static":
         return "text/html", _page("<p>결과가 없습니다.</p>")
+    if path == "/sqli-error":
+        # 따옴표가 구문을 깨고 엔진 오류가 응답에 노출된다.
+        if "'" in params.get("id", [""])[0]:
+            return "text/html", _page(
+                "<h1>Error</h1><pre>SQLITE_ERROR: unrecognized token: "
+                f"&quot;{html.escape(params['id'][0])}&quot;</pre>"
+            )
+        return "text/html", _page("<p>항목 1건</p>")
+    if path == "/sqli-status":
+        # 오류 본문은 감추지만 상태 코드가 갈린다.
+        if "'" in params.get("id", [""])[0]:
+            return "text/html", _page("<p>일시적인 오류입니다.</p>"), 500
+        return "text/html", _page("<p>항목 1건</p>")
+    if path == "/sqli-safe":
+        # 바인딩 파라미터. 따옴표는 값의 일부일 뿐 구문을 깨지 않는다.
+        return "text/html", _page("<p>일치하는 항목이 없습니다.</p>")
     if path == "/json":
         return "application/json", json.dumps({"status": "success", "data": []})
     if path == "/multi":
@@ -101,9 +131,11 @@ def _index() -> str:
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)
-        content_type, body = _render(parsed.path, parse_qs(parsed.query))
+        rendered = _render(parsed.path, parse_qs(parsed.query))
+        content_type, body = rendered[0], rendered[1]
+        status = rendered[2] if len(rendered) > 2 else 200
         raw = body.encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", f"{content_type}; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
@@ -117,8 +149,9 @@ class _Handler(BaseHTTPRequestHandler):
 def main(argv: list[str]) -> int:
     port = int(argv[1]) if len(argv) > 1 else DEFAULT_PORT
     reflected = sum(1 for v in GROUND_TRUTH.values() if v["reflected"])
+    injectable = sum(1 for v in SQL_GROUND_TRUTH.values() if v["vulnerable"])
     print(f"reflection lab  http://{BIND_HOST}:{port}/")
-    print(f"정답: 파라미터 {len(GROUND_TRUTH)}개 중 반사 {reflected}개")
+    print(f"정답: 반사 {reflected}/{len(GROUND_TRUTH)} · SQLi {injectable}/{len(SQL_GROUND_TRUTH)}")
     ThreadingHTTPServer((BIND_HOST, port), _Handler).serve_forever()
     return 0
 

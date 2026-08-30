@@ -75,6 +75,20 @@ class HttpRequestKind(str, Enum):
 
 
 _HTTP_METHOD = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+
+# PROBE 요청이 쿼리에 실을 수 있는 값의 형태. 영숫자 marker 뒤에 허용된 메타문자만
+# 최대 4개까지 붙일 수 있다.
+#
+# 왜 메타문자를 아예 막지 않는가 — SQLi는 따옴표 없이, 출력 인코딩 여부는 꺾쇠 없이
+# 원리적으로 확인할 수 없다. 이 문자들은 구문 오류를 유발하거나 인코딩 적용 여부를
+# 드러낼 뿐 실행되지 않고 대상 상태를 바꾸지 않는다(실제 스캐너의 canary 기법).
+#
+# 왜 그래도 형태를 강제하는가 — 이 검사가 없으면 Agent가, 나중에는 LLM이 임의 문자열을
+# 쿼리에 실을 수 있다. 공백·괄호·세미콜론·등호가 막히므로 "' OR 1=1--", "UNION SELECT",
+# "; DROP", "../", "<script>alert(1)</script>"는 전부 도메인에서 거부된다.
+# 새 탐침 기법이 다른 문자를 필요로 하면 여기를 늘리는 것이 명시적 결정이 된다.
+PROBE_METACHARACTERS = "'\"<>"
+_PROBE_VALUE = re.compile(r"^[A-Za-z0-9_-]+['\"<>]{0,4}$")
 _FORBIDDEN_REQUEST_HEADERS = frozenset(
     {
         "accept-encoding",
@@ -173,6 +187,16 @@ class HttpRequestSpec:
         for name, value in self.query_parameters:
             if not isinstance(name, str) or not isinstance(value, str):
                 raise DomainInvariantError("HTTP query parameters must be string pairs")
+            # 탐침 요청만 값 형태를 강제한다. CONTROL 요청은 대상이 원래 갖고 있던
+            # 값(Recon이 수집한 쿼리)을 그대로 실어야 하므로 제한하지 않는다.
+            if (
+                self.request_kind is HttpRequestKind.PROBE
+                and _PROBE_VALUE.fullmatch(value) is None
+            ):
+                raise DomainInvariantError(
+                    "probe query value must be a marker with allowed metacharacters "
+                    f"({PROBE_METACHARACTERS}): {value!r}"
+                )
         for name, value in self.headers:
             if not isinstance(name, str) or not isinstance(value, str):
                 raise DomainInvariantError("HTTP headers must be string pairs")

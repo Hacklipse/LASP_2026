@@ -9,6 +9,7 @@ from .llm_xss_analysis import LlmXssAnalyzer
 from .memory import MemoryStoreBundle
 from .policy import AllowlistPolicyGate
 from .recon import ReconAgent
+from .sqli_analysis import HeuristicSqliAnalyzer
 from .reporting import MarkdownReportAgent
 from .retry import BoundedRetryPolicy
 from .routing import RoutingRule, RuleBasedVulnerabilityRouter, SurfaceRoutingRule
@@ -34,6 +35,7 @@ __all__ = [
     "HttpExecutionRuntime",
     "FormLoginWorker",
     "AnthropicLlmClient",
+    "HeuristicSqliAnalyzer",
     "HeuristicXssAnalyzer",
     "InMemoryBudgetManager",
     "InMemoryCredentialResolver",

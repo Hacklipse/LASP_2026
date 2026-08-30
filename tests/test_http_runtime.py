@@ -258,7 +258,7 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
                     ("id", "1"),
                     ("id", "2"),
                 ),
-                request_kind=HttpRequestKind.PROBE,
+                request_kind=HttpRequestKind.CONTROL,
             )
         )
 
@@ -267,6 +267,17 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
             "[('existing', '1'), ('name', 'hacklipse 7331'), ('id', '1'), ('id', '2')]",
         )
         self.assertNotIn("#ignored", r.observation["requested_url"])
+        self.assertEqual(r.observation["request_kind"], "control")
+
+    def test_probe_kind_is_recorded_on_the_observation(self) -> None:
+        r = self.runtime.execute(
+            self._req(
+                "/echo-query",
+                query_parameters=(("name", "hacklipsez1a2z3b4'"),),
+                request_kind=HttpRequestKind.PROBE,
+            )
+        )
+
         self.assertEqual(r.observation["request_kind"], "probe")
 
     def test_custom_header_is_sent_without_overriding_runtime_headers(self) -> None:

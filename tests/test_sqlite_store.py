@@ -82,7 +82,7 @@ class SQLiteStoreTests(unittest.TestCase):
                         query_parameters=(("next", "/home"), ("id", "1"), ("id", "2")),
                         headers=(("Content-Type", "application/x-www-form-urlencoded"),),
                         body="name=테스트",
-                        request_kind=HttpRequestKind.PROBE,
+                        request_kind=HttpRequestKind.CONTROL,
                     ),
                 ),
             ),

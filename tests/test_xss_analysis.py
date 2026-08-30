@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
 import unittest
 from dataclasses import replace
+from uuid import uuid4
 
 from hacklipse.adapters import (
     HeuristicXssAnalyzer,
@@ -310,3 +312,37 @@ class HeuristicXssWorkflowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProbeMarkerSurvivesSanitizationTests(unittest.TestCase):
+    """marker가 PII 마스킹에 삭제되면 반사를 놓치고 '취약하지 않음'으로 보고하게 된다.
+
+    한때 _PHONE 정규식이 "1"로 시작하는 9자리 숫자열을 전부 전화번호로 보아 UUID 기반
+    marker의 0.29%가 삭제됐다. 확률적 실패는 재현이 어렵고 조용해서 특히 위험하다.
+    """
+
+    def test_generated_markers_have_no_long_digit_runs(self) -> None:
+        from hacklipse.adapters.probing import probe_marker
+
+        for raw in ("d3cdc8ab-018c-4d91-864c-182698169bc0", "0" * 40, "1234567890" * 4):
+            marker = probe_marker(raw)
+            longest = max(
+                (len(run) for run in re.findall(r"\d+", marker)), default=0
+            )
+            self.assertLessEqual(longest, 4, f"{marker}에 긴 숫자열이 남았다")
+
+    def test_markers_survive_the_evidence_sanitizer(self) -> None:
+        from hacklipse.adapters.security import SensitiveDataSanitizer
+        from hacklipse.adapters.probing import probe_marker
+
+        for index in range(3000):
+            marker = probe_marker(str(uuid4()))
+            body = f'<html><body><input value="{marker}"></body></html>'
+            sanitized = SensitiveDataSanitizer._sanitize_text(body, ())
+            self.assertIn(marker, sanitized, f"{index}번째 marker가 삭제됐다: {marker}")
+
+    def test_rejects_a_source_with_no_usable_characters(self) -> None:
+        from hacklipse.adapters.probing import probe_marker
+
+        with self.assertRaises(AgentContractError):
+            probe_marker("---")

@@ -102,6 +102,13 @@ class LlmWiringEndToEndTests(unittest.TestCase):
                 "evidence_collector",
                 "evidence_collector",
                 "xss_analyzer",
+                "sqli_analyzer",
+                "evidence_collector",
+                "evidence_collector",
+                "sqli_analyzer",
+                "validation",
+                "evidence_collector",
+                "validation",
                 "validation",
                 "evidence_collector",
                 "validation",
@@ -153,7 +160,9 @@ class LlmWiringEndToEndTests(unittest.TestCase):
         app, run, _, _ = _run(llm_client=_FakeLlmClient())
 
         types = {c.vulnerability_type for c in app.stores.candidates.list_by_run(run.run_id)}
-        self.assertEqual(types, {"XSS"})
+        # 구현된 Analyzer가 담당하는 유형만 나온다. SSTI·Path Traversal은 Router 규칙이
+        # 있어도 Analyzer가 없으므로 Candidate 자체가 만들어지지 않는다.
+        self.assertEqual(types, {"XSS", "SQLi"})
 
 
 if __name__ == "__main__":
