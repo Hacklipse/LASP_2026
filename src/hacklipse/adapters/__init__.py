@@ -4,6 +4,7 @@ from .budget import InMemoryBudgetManager
 from .dispatcher import LocalTaskDispatcher
 from .http_runtime import HttpExecutionRuntime
 from .llm_client import AnthropicLlmClient
+from .llm_xss_analysis import LlmXssAnalyzer
 from .memory import MemoryStoreBundle
 from .policy import AllowlistPolicyGate
 from .recon import ReconAgent
@@ -24,6 +25,7 @@ __all__ = [
     "AnthropicLlmClient",
     "HeuristicXssAnalyzer",
     "InMemoryBudgetManager",
+    "LlmXssAnalyzer",
     "LocalTaskDispatcher",
     "MarkdownReportAgent",
     "MemoryStoreBundle",

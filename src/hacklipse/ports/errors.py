@@ -69,3 +69,11 @@ class LlmRefused(LlmError):
     def __init__(self, message: str, *, category: str | None = None) -> None:
         super().__init__(message)
         self.category = category
+
+
+class LlmCredentialsMissing(LlmError):
+    """LLM 자격증명이 주입되지 않았다.
+
+    조용히 LLM 없이 진행하지 않고 명시적으로 실패한다. "키가 없어서 휴리스틱으로
+    돌았는데 LLM 결과인 줄 알았다"가 실험에서 가장 위험한 오독이다.
+    """

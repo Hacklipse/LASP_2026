@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Mapping, Protocol
 
 from hacklipse.adapters import (
     AllowlistPolicyGate,
+    AnthropicLlmClient,
     BoundedRetryPolicy,
     DisabledExecutionRuntime,
+    HeuristicXssAnalyzer,
     InMemoryBudgetManager,
+    LlmXssAnalyzer,
     LocalTaskDispatcher,
     MarkdownReportAgent,
     MemoryStoreBundle,
+    ReconAgent,
     RuleBasedVulnerabilityRouter,
+    ValidationAgent,
 )
+from hacklipse.adapters.routing import DEFAULT_RULES, DEFAULT_SURFACE_RULES
 from hacklipse.application import (
     Orchestrator,
     OrchestratorConfig,
@@ -34,9 +41,35 @@ from hacklipse.ports import (
     RetryPolicy,
     RunStore,
     SurfaceStore,
+    LlmClient,
     TaskStore,
     VulnerabilityRouter,
 )
+from hacklipse.ports.errors import LlmCredentialsMissing
+
+# 자격증명은 환경변수로만 받는다. 파일에 두면 커밋에 딸려 들어갈 수 있고, Task에 실으면
+# 감사 로그·프롬프트로 새어 나간다(TaskEnvelope에는 원문 필드 자체가 없다).
+API_KEY_ENV = "ANTHROPIC_API_KEY"
+
+# 주 실험은 단일 모델로 고정한다. 역할별로 모델을 섞으면 성능 차이가 아키텍처 덕인지
+# 모델 덕인지 분리되지 않는다. 더 강한 모델은 같은 배선에서 model만 바꿔 2차 실험으로 돌린다.
+DEFAULT_LLM_MODEL = "claude-sonnet-5"
+
+
+def build_llm_client_from_env(*, model: str = DEFAULT_LLM_MODEL) -> AnthropicLlmClient:
+    """환경변수에서 자격증명을 읽어 LLM Client를 만든다.
+
+    build_local_application이 자동으로 부르지 않는다. DisabledExecutionRuntime과 같은
+    규칙이다 — 호출자가 명시적으로 주입해야 LLM이 붙는다. 키가 없으면 조용히 비활성화되지
+    않고 여기서 실패한다.
+    """
+
+    api_key = os.environ.get(API_KEY_ENV, "").strip()
+    if not api_key:
+        raise LlmCredentialsMissing(
+            f"{API_KEY_ENV} is not set; export it or pass an explicit LlmClient"
+        )
+    return AnthropicLlmClient(api_key=api_key, model=model)
 
 
 class StoreBundle(Protocol):
@@ -145,3 +178,71 @@ def build_local_application(
         runtime=selected_runtime,
         collector=collector,
     )
+
+
+# 실제로 구현된 Analysis Agent. Router가 이 목록 밖 Candidate를 만들면 Dispatcher가
+# AgentUnavailable로 Run 전체를 실패시키므로, 배선과 라우팅 규칙이 같은 목록을 봐야 한다.
+# Analyzer를 추가하면 여기 한 줄만 늘리면 Router가 따라온다.
+IMPLEMENTED_ANALYZERS = ("xss_analyzer",)
+
+
+def standard_router() -> RuleBasedVulnerabilityRouter:
+    """구현된 Analyzer로만 라우팅하는 Router를 만든다.
+
+    미구현 취약점 유형을 조용히 건너뛰는 것이 아니라 애초에 Candidate를 만들지 않는다.
+    "검사했는데 없었다"와 "검사하지 않았다"를 결과에서 구분할 수 있어야 한다.
+    """
+
+    return RuleBasedVulnerabilityRouter(
+        rules=tuple(
+            rule for rule in DEFAULT_RULES if rule.agent_type in IMPLEMENTED_ANALYZERS
+        ),
+        surface_rules=tuple(
+            rule
+            for rule in DEFAULT_SURFACE_RULES
+            if rule.agent_type in IMPLEMENTED_ANALYZERS
+        ),
+    )
+
+
+def register_standard_agents(
+    app: LocalApplication, *, llm_client: LlmClient | None = None
+) -> str:
+    """Recon/Analysis/Validation을 표준 배선으로 등록하고 구성 이름을 돌려준다.
+
+    llm_client가 없으면 결정적 baseline(대조군), 있으면 LLM 구현을 꽂는다. 두 구성은
+    같은 Surface에서 같은 Observation 유형을 만들어야 비교가 성립하므로, 갈라지는 지점을
+    이 함수 하나로 제한한다.
+    """
+
+    app.dispatcher.register(
+        "recon",
+        ReconAgent(
+            collector=app.collector,
+            evidence_store=app.stores.evidence,
+            surface_store=app.stores.surfaces,
+        ),
+    )
+    if llm_client is None:
+        analyzer: Agent = HeuristicXssAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
+        profile = "heuristic"
+    else:
+        analyzer = LlmXssAnalyzer(
+            llm_client=llm_client,
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
+        profile = "llm"
+    app.dispatcher.register("xss_analyzer", analyzer)
+    app.dispatcher.register(
+        "validation",
+        ValidationAgent(
+            candidate_store=app.stores.candidates, evidence_store=app.stores.evidence
+        ),
+    )
+    return profile

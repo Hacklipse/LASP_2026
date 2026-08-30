@@ -1,4 +1,9 @@
-"""LLM 없이 고정 규칙으로 reflected-input 신호를 수집하는 XSS baseline Agent."""
+"""LLM 없이 고정 규칙으로 reflected-input 신호를 수집하는 XSS baseline Agent.
+
+여기 있는 모듈 함수(`resolve_xss_task`, `build_probe_requests`, `matching_evidence`,
+`marker_reflected`)는 LLM 구현과 공유한다. 두 구현이 같은 사전 조건·같은 요청 형태·
+같은 반사 판정을 써야 동일 Surface에서의 결과를 비교할 수 있다(연구 대조군 요건).
+"""
 
 from __future__ import annotations
 
@@ -21,8 +26,84 @@ from hacklipse.domain import (
 from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 
 XSS_ANALYSIS_TOOL = "http_get"
-_CONTROL_VALUE = "hacklipse-control"
+CONTROL_VALUE = "hacklipse-control"
 _REFLECTION_MARKER = "hacklipse7331"
+
+HEURISTIC_XSS_ANALYZER = "heuristic_xss_analyzer"
+
+
+def resolve_xss_task(
+    task: TaskEnvelope,
+    *,
+    candidate_store: CandidateStore,
+    surface_store: SurfaceStore,
+) -> tuple[Candidate, Surface, tuple[str, ...]]:
+    """XSS Analysis Task의 Candidate/Surface를 확인하고 탐침 대상 파라미터를 정리한다.
+
+    Task가 지시한 target_url과 Store에 저장된 Surface가 다르면 거부한다 — Task를 통해
+    다른 대상으로 요청을 유도하는 경로를 막는다.
+    """
+
+    if task.candidate_id is None or task.surface_id is None or task.target_url is None:
+        raise AgentContractError("xss analysis task is missing candidate or surface context")
+    if XSS_ANALYSIS_TOOL not in task.allowed_tools:
+        raise AgentContractError("xss analysis HTTP tool is not allowed by the task")
+
+    candidate = candidate_store.get(task.run_id, task.candidate_id)
+    if candidate.vulnerability_type != "XSS":
+        raise AgentContractError("xss analyzer received a non-XSS candidate")
+    if candidate.surface_id != task.surface_id:
+        raise AgentContractError("xss candidate and task reference different surfaces")
+
+    surface = surface_store.get(task.run_id, task.surface_id)
+    if surface.url != task.target_url:
+        raise AgentContractError("xss analysis task target does not match its surface")
+    if surface.method.upper() != "GET" or not surface.parameters:
+        raise AgentContractError("xss analysis supports parameterized GET surfaces only")
+
+    # 중복 파라미터명(?a=1&a=2)은 하나로 접는다. 안 그러면 같은 곳에 프로브를 두 번 보낸다.
+    parameters = tuple(dict.fromkeys(surface.parameters))
+    return candidate, surface, parameters
+
+
+def build_probe_requests(
+    surface: Surface,
+    parameters: Sequence[str],
+    *,
+    marker: str,
+    purpose: str,
+) -> tuple[EvidenceRequest, ...]:
+    """control 1개 + 파라미터별 probe N개를 만든다.
+
+    파라미터마다 하나씩만 marker로 바꾼다. 전부 동시에 넣으면 어느 파라미터가 반사됐는지
+    구분할 수 없다. 값은 호출자가 아니라 이 함수가 정한 marker/CONTROL_VALUE로 고정되며
+    페이로드가 실릴 자리가 없다.
+    """
+
+    if not parameters:
+        raise AgentContractError("xss probe plan must name at least one parameter")
+
+    requests = [
+        _request(
+            surface.surface_id,
+            tuple((name, CONTROL_VALUE) for name in parameters),
+            HttpRequestKind.CONTROL,
+            reason=f"XSS control request for {purpose}",
+        )
+    ]
+    for parameter in parameters:
+        requests.append(
+            _request(
+                surface.surface_id,
+                tuple(
+                    (name, marker if name == parameter else CONTROL_VALUE)
+                    for name in parameters
+                ),
+                HttpRequestKind.PROBE,
+                reason=f"XSS reflection probe for parameter {parameter} on {purpose}",
+            )
+        )
+    return tuple(requests)
 
 
 class HeuristicXssAnalyzer:
@@ -48,11 +129,18 @@ class HeuristicXssAnalyzer:
     def handle(self, task: TaskEnvelope) -> AgentResult:
         """필요한 요청은 중앙 수집으로 반환하고, 수집 뒤 반사를 판정한다."""
 
-        candidate, surface, parameters = self._resolve_task(task)
-        requests = self._requests(candidate, surface, parameters)
+        candidate, surface, parameters = resolve_xss_task(
+            task, candidate_store=self._candidates, surface_store=self._surfaces
+        )
+        requests = build_probe_requests(
+            surface,
+            parameters,
+            marker=_REFLECTION_MARKER,
+            purpose=f"candidate {candidate.candidate_id}",
+        )
         evidence = tuple(self._evidence.get_many(task.run_id, task.evidence_ids))
         collected = tuple(
-            _matching_evidence(evidence, surface.url, request) for request in requests
+            matching_evidence(evidence, surface.url, request) for request in requests
         )
         missing = tuple(
             request for request, item in zip(requests, collected) if item is None
@@ -73,14 +161,20 @@ class HeuristicXssAnalyzer:
         control = collected[0]
         if control is None:  # missing 분기 이후에는 도달하지 않는 방어선.
             raise AgentContractError("xss baseline control evidence was not collected")
-        control_body = _body(control)
+        control_body = response_body(control)
         new_evidence_ids: list[str] = []
 
         for parameter, probe in zip(parameters, collected[1:]):
             if probe is None:  # missing 분기 이후에는 도달하지 않는 방어선.
                 raise AgentContractError("xss baseline probe evidence was not collected")
-            if _is_reflected(control_body, _body(probe)) and not _has_reflection(
-                evidence, parameter, control.evidence_id, probe.evidence_id
+            if marker_reflected(
+                control_body, response_body(probe), _REFLECTION_MARKER
+            ) and not has_reflection_record(
+                evidence,
+                HEURISTIC_XSS_ANALYZER,
+                parameter,
+                control.evidence_id,
+                probe.evidence_id,
             ):
                 reflection_id = f"evi-{self._id_factory()}"
                 self._evidence.append(
@@ -88,7 +182,7 @@ class HeuristicXssAnalyzer:
                         evidence_id=reflection_id,
                         run_id=task.run_id,
                         surface_id=surface.surface_id,
-                        created_by="heuristic_xss_analyzer",
+                        created_by=HEURISTIC_XSS_ANALYZER,
                         evidence_type="observation",
                         observation={
                             "type": "reflection",
@@ -106,66 +200,6 @@ class HeuristicXssAnalyzer:
             new_evidence_ids=tuple(new_evidence_ids),
             candidate_ids=(candidate.candidate_id,),
         )
-
-    def _resolve_task(
-        self, task: TaskEnvelope
-    ) -> tuple[Candidate, Surface, tuple[str, ...]]:
-        if task.candidate_id is None or task.surface_id is None or task.target_url is None:
-            raise AgentContractError("xss analysis task is missing candidate or surface context")
-        if XSS_ANALYSIS_TOOL not in task.allowed_tools:
-            raise AgentContractError("xss analysis HTTP tool is not allowed by the task")
-
-        candidate = self._candidates.get(task.run_id, task.candidate_id)
-        if candidate.vulnerability_type != "XSS":
-            raise AgentContractError("heuristic XSS analyzer received a non-XSS candidate")
-        if candidate.surface_id != task.surface_id:
-            raise AgentContractError("xss candidate and task reference different surfaces")
-
-        surface = self._surfaces.get(task.run_id, task.surface_id)
-        if surface.url != task.target_url:
-            raise AgentContractError("xss analysis task target does not match its surface")
-        if surface.method.upper() != "GET" or not surface.parameters:
-            raise AgentContractError("xss baseline supports parameterized GET surfaces only")
-
-        parameters = tuple(dict.fromkeys(surface.parameters))
-        return candidate, surface, parameters
-
-    @staticmethod
-    def _requests(
-        candidate: Candidate,
-        surface: Surface,
-        parameters: tuple[str, ...],
-    ) -> tuple[EvidenceRequest, ...]:
-        requests = [
-            _request(
-                surface.surface_id,
-                tuple((name, _CONTROL_VALUE) for name in parameters),
-                HttpRequestKind.CONTROL,
-                reason=(
-                    f"XSS baseline control request for candidate "
-                    f"{candidate.candidate_id}"
-                ),
-            )
-        ]
-        for parameter in parameters:
-            requests.append(
-                _request(
-                    surface.surface_id,
-                    tuple(
-                        (
-                            name,
-                            _REFLECTION_MARKER if name == parameter else _CONTROL_VALUE,
-                        )
-                        for name in parameters
-                    ),
-                    HttpRequestKind.PROBE,
-                    reason=(
-                        f"XSS baseline reflection probe for parameter {parameter} "
-                        f"on candidate {candidate.candidate_id}"
-                    ),
-                )
-            )
-        return tuple(requests)
 
 
 def _request(
@@ -188,9 +222,11 @@ def _request(
     )
 
 
-def _matching_evidence(
+def matching_evidence(
     evidence: Sequence[Evidence], target_url: str, request: EvidenceRequest
 ) -> Evidence | None:
+    """자신이 요청한 명세와 일치하는 중앙 수집 Evidence를 최신 것부터 찾는다."""
+
     if request.http_request is None:
         return None
     expected_url = _resolved_url(target_url, request.http_request.query_parameters)
@@ -218,19 +254,22 @@ def _resolved_url(
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
 
 
-def _body(evidence: Evidence) -> str | None:
+def response_body(evidence: Evidence) -> str | None:
     body = evidence.observation.get("body")
     return body if isinstance(body, str) else None
 
 
-def _has_reflection(
+def has_reflection_record(
     evidence: Sequence[Evidence],
+    created_by: str,
     parameter: str,
     control_evidence_id: str,
     probe_evidence_id: str,
 ) -> bool:
+    """같은 근거 조합의 reflection Observation이 이미 있는지 확인한다(재개 시 중복 방지)."""
+
     return any(
-        item.created_by == "heuristic_xss_analyzer"
+        item.created_by == created_by
         and item.observation.get("type") == "reflection"
         and item.observation.get("parameter") == parameter
         and item.observation.get("control_evidence_id") == control_evidence_id
@@ -239,11 +278,17 @@ def _has_reflection(
     )
 
 
-def _is_reflected(control_body: str | None, probe_body: str | None) -> bool:
-    """고정 marker가 control에는 없고 probe에는 있을 때만 반사로 인정한다."""
+def marker_reflected(
+    control_body: str | None, probe_body: str | None, marker: str
+) -> bool:
+    """marker가 control에는 없고 probe에는 있을 때만 반사로 인정한다.
+
+    control 비교가 오탐을 막는다 — 페이지가 원래부터 그 문자열을 갖고 있으면
+    probe만 봐서는 반사인지 구분할 수 없다.
+    """
 
     return bool(
         probe_body is not None
-        and _REFLECTION_MARKER in probe_body
-        and (control_body is None or _REFLECTION_MARKER not in control_body)
+        and marker in probe_body
+        and (control_body is None or marker not in control_body)
     )
