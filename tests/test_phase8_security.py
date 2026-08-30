@@ -18,6 +18,7 @@ from hacklipse.adapters import (
     InMemoryExecutionAuditLog,
     LocalTaskDispatcher,
     MemoryStoreBundle,
+    SensitiveDataSanitizer,
     SQLiteExecutionAuditLog,
     StaticApprovalGate,
 )
@@ -320,3 +321,33 @@ class Phase8TaskBoundaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PhoneMaskingPrecisionTests(unittest.TestCase):
+    """마스킹은 개인정보만 지워야 한다. 관측을 훼손하면 탐지 누락으로 이어진다."""
+
+    def test_masks_real_korean_mobile_numbers(self) -> None:
+        for number in (
+            "010-1234-5678",
+            "01012345678",
+            "+82 10-1234-5678",
+            "+821012345678",
+            "019-123-4567",
+        ):
+            with self.subTest(number=number):
+                masked = SensitiveDataSanitizer._sanitize_text(f"연락처 {number}", ())
+                self.assertNotIn(number, masked)
+
+    def test_keeps_digit_runs_that_are_not_phone_numbers(self) -> None:
+        # 앞자리 0 없이 1로 시작하는 숫자열은 전화번호가 아니다. UUID·주문번호·오류
+        # 메시지에 흔하며, 지워지면 반사·SQL 오류 신호가 함께 사라진다.
+        for text in (
+            "182698169",
+            "114098404",
+            "order-1234567890",
+            "hacklipsed3cdc8ab-018c-4d91-864c-182698169bc0",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    SensitiveDataSanitizer._sanitize_text(text, ()), text
+                )
