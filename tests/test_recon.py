@@ -41,7 +41,7 @@ class _FakeCollector:
     def collect(self, run_id, target_url, spec, *, task_id, timeout_seconds=120.0):
         del timeout_seconds
         self.calls.append((run_id, target_url))
-        evidence_id = f"evi-fetch-{task_id}"
+        evidence_id = f"evi-fetch-{task_id}-{len(self.calls)}"
         self._evidence.append(
             Evidence(
                 evidence_id=evidence_id,
@@ -194,3 +194,145 @@ class ReconDrivesRoutingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+_SPA_HTML = """
+<html><body><div id="app"></div>
+<script src="/main.js"></script>
+<script src="https://cdn.example.com/vendor.js"></script>
+</body></html>
+"""
+
+_BUNDLE = """
+class Api{
+  search(e){ return this.http.get(`${this.host}/rest/products/search?q=${e}`) }
+  question(e){ return fetch(`${this.host}/rest/user/security-question?email=${e}`) }
+  list(){ return fetch("/api/Products") }
+  share(){ return "https://twitter.com/intent/tweet?text=hi" }
+}
+"""
+
+_PAGE_TWO = """
+<html><body>
+<a href="/deep.php?file=secret.txt">deep</a>
+<a href="https://evil.example.com/out">external</a>
+</body></html>
+"""
+
+
+class _RoutingCollector:
+    """URL별로 다른 응답을 돌려주는 대역. 크롤링 동작 검증에 쓴다."""
+
+    def __init__(self, evidence_store, bodies: dict[str, str]) -> None:
+        self._evidence = evidence_store
+        self._bodies = bodies
+        self.calls: list[str] = []
+
+    def collect(self, run_id, target_url, spec, *, task_id, timeout_seconds=120.0):
+        del timeout_seconds
+        self.calls.append(target_url)
+        evidence_id = f"evi-page-{len(self.calls)}"
+        self._evidence.append(
+            Evidence(
+                evidence_id=evidence_id,
+                run_id=run_id,
+                surface_id=spec.surface_id,
+                created_by="execution_runtime:http_get",
+                evidence_type="http_response",
+                observation={
+                    "type": "http_response",
+                    "status": 200,
+                    "body": self._bodies.get(target_url, "<html></html>"),
+                },
+            )
+        )
+        return evidence_id
+
+
+def _crawling_agent(bodies: dict[str, str], **kwargs):
+    evidence_store = InMemoryEvidenceStore()
+    surface_store = InMemorySurfaceStore()
+    collector = _RoutingCollector(evidence_store, bodies)
+    counter = iter(range(10_000))
+    agent = ReconAgent(
+        collector=collector,
+        evidence_store=evidence_store,
+        surface_store=surface_store,
+        id_factory=lambda: str(next(counter)),
+        **kwargs,
+    )
+    return agent, collector, surface_store
+
+
+class ReconCrawlTests(unittest.TestCase):
+    def test_follows_links_and_finds_surfaces_on_later_pages(self) -> None:
+        agent, collector, surfaces = _crawling_agent(
+            {
+                "http://localhost/": '<html><a href="/two.php">two</a></html>',
+                "http://localhost/two.php": _PAGE_TWO,
+            }
+        )
+        agent.handle(_task("run-c1", "http://localhost/"))
+
+        self.assertIn("http://localhost/two.php", collector.calls)
+        urls = {surface.url for surface in surfaces.list_by_run("run-c1")}
+        # 2단계 페이지에서만 발견되는 표면이다.
+        self.assertIn("http://localhost/deep.php", urls)
+
+    def test_does_not_crawl_other_origins(self) -> None:
+        agent, collector, surfaces = _crawling_agent(
+            {"http://localhost/": _PAGE_TWO}
+        )
+        agent.handle(_task("run-c2", "http://localhost/"))
+
+        self.assertTrue(all("evil.example.com" not in url for url in collector.calls))
+        urls = {surface.url for surface in surfaces.list_by_run("run-c2")}
+        self.assertTrue(all("evil.example.com" not in url for url in urls))
+
+    def test_discovers_endpoints_from_a_javascript_bundle(self) -> None:
+        """SPA는 초기 HTML이 비어 있고 엔드포인트는 번들에 문자열로 남는다."""
+
+        agent, collector, surfaces = _crawling_agent(
+            {"http://localhost/": _SPA_HTML, "http://localhost/main.js": _BUNDLE}
+        )
+        agent.handle(_task("run-c3", "http://localhost/"))
+
+        self.assertIn("http://localhost/main.js", collector.calls)
+        # 다른 출처의 스크립트는 받지 않는다.
+        self.assertTrue(all("cdn.example.com" not in url for url in collector.calls))
+
+        found = {
+            surface.url: surface.parameters
+            for surface in surfaces.list_by_run("run-c3")
+        }
+        self.assertEqual(found.get("http://localhost/rest/products/search"), ("q",))
+        self.assertEqual(
+            found.get("http://localhost/rest/user/security-question"), ("email",)
+        )
+        self.assertIn("http://localhost/api/Products", found)
+        # 외부 URL의 경로 조각이 표면으로 새어 들어오면 안 된다.
+        self.assertTrue(all("twitter.com" not in url for url in found))
+
+    def test_leaves_request_budget_for_later_phases(self) -> None:
+        chain = {
+            f"http://localhost/p{index}.php": f'<html><a href="/p{index + 1}.php">n</a></html>'
+            for index in range(30)
+        }
+        chain["http://localhost/"] = '<html><a href="/p0.php">n</a></html>'
+        agent, collector, _ = _crawling_agent(chain)
+
+        task = _task("run-c4", "http://localhost/")  # request_budget=5
+        agent.handle(task)
+
+        # 정찰이 예산을 다 먹으면 Analysis가 아무 요청도 못 한다.
+        self.assertLessEqual(len(collector.calls), task.request_budget // 2)
+
+    def test_discovered_links_become_surfaces_even_when_not_crawled(self) -> None:
+        agent, collector, surfaces = _crawling_agent(
+            {"http://localhost/": _PAGE_TWO}, max_pages=1
+        )
+        agent.handle(_task("run-c5", "http://localhost/"))
+
+        self.assertEqual(len(collector.calls), 1)
+        urls = {surface.url for surface in surfaces.list_by_run("run-c5")}
+        self.assertIn("http://localhost/deep.php", urls)
