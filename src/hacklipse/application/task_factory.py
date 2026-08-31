@@ -56,9 +56,15 @@ class TaskFactory:
         validation_id: str,
         agent_type: str,
         request_budget: int,
+        browser_xss_enabled: bool = False,
     ) -> TaskEnvelope:
         """Candidate/Evidence 참조만 전달하는 Validation Task를 생성한다."""
 
+        allowed_tools = (
+            ("http_get", "browser_xss")
+            if candidate.vulnerability_type == "XSS" and browser_xss_enabled
+            else ("http_get",)
+        )
         return self._base(
             run,
             agent_type=agent_type,
@@ -66,7 +72,7 @@ class TaskFactory:
             surface_id=candidate.surface_id,
             candidate_id=candidate.candidate_id,
             evidence_ids=candidate.evidence_ids,
-            allowed_tools=("http_get",),
+            allowed_tools=allowed_tools,
             validation_id=validation_id,
         )
 

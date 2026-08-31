@@ -23,9 +23,11 @@ from hacklipse.adapters import (  # noqa: E402
     HttpExecutionRuntime,
     InMemoryCredentialResolver,
     InMemoryExecutionAuditLog,
+    PlaywrightBrowserRuntime,
     StaticApprovalGate,
 )
 from hacklipse.application.errors import WorkflowExecutionError  # noqa: E402
+from hacklipse.application import OrchestratorConfig  # noqa: E402
 from hacklipse.bootstrap import (  # noqa: E402
     build_local_application,
     register_standard_agents,
@@ -62,7 +64,8 @@ def _print_summary(
     candidate_counts: Counter[str],
     reflection_count: int,
     sql_error_count: int,
-    http_execution_count: int,
+    browser_execution_count: int,
+    audited_execution_count: int,
     finding_counts: Counter[str],
 ) -> None:
     finding_count = finding_counts.total()
@@ -79,12 +82,13 @@ def _print_summary(
     print(f"  상태            완료 ({phase})")
     print(f"  분석 대상       {target_label}")
     print(f"  Agent 구성      {profile}")
-    print(f"  HTTP 실행       {http_execution_count}회")
+    print(f"  감사된 실행     {audited_execution_count}회")
     print()
     print("[분석 신호]")
     print(f"  Candidate       {_format_counts(candidate_counts)}")
     print(f"  Reflection      {reflection_count}개")
     print(f"  SQL 오류        {sql_error_count}개")
+    print(f"  XSS 실행        {browser_execution_count}개")
     print()
     print("[최종 판정]")
     print(f"  결과            {verdict}")
@@ -139,15 +143,17 @@ def main(argv: list[str]) -> int:
             )
         }
     )
-    runtime = HttpExecutionRuntime(credential_resolver=resolver)
+    http_runtime = HttpExecutionRuntime(credential_resolver=resolver)
+    runtime = PlaywrightBrowserRuntime(http_runtime=http_runtime)
     audit = InMemoryExecutionAuditLog()
     app = build_local_application(
         {},
         runtime=runtime,
-        router=standard_router(),
+        router=standard_router(vulnerability_types=(_TARGET_LABELS[args.target],)),
         credential_resolver=resolver,
         approval_gate=StaticApprovalGate((_APPROVAL_REF,)),
         audit_log=audit,
+        config=OrchestratorConfig(browser_xss_validation=args.target == "xss"),
     )
     # 이 실행기는 DVWA reflected-XSS/SQLi 파이프라인의 재현 실험이다. 전 사이트를
     # 크롤링하면 비밀번호 변경 같은 상태 변경 GET 폼까지 탐색 대상에 섞이고, 결과도
@@ -182,6 +188,12 @@ def main(argv: list[str]) -> int:
         for item in app.stores.evidence.list_by_run(run.run_id)
         if item.observation.get("type") == "sql_error"
     )
+    browser_executions = tuple(
+        item
+        for item in app.stores.evidence.list_by_run(run.run_id)
+        if item.observation.get("type") == "browser_execution"
+        and item.observation.get("script_executed") is True
+    )
     findings = app.stores.findings.list_by_run(run.run_id)
     events = audit.list_by_run(run.run_id)
     _print_summary(
@@ -191,7 +203,8 @@ def main(argv: list[str]) -> int:
         candidate_counts=Counter(c.vulnerability_type for c in candidates),
         reflection_count=len(reflections),
         sql_error_count=len(sql_errors),
-        http_execution_count=len(events),
+        browser_execution_count=len(browser_executions),
+        audited_execution_count=len(events),
         finding_counts=Counter(item.vulnerability_type for item in findings),
     )
     return 0

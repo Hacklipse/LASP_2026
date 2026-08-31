@@ -111,6 +111,7 @@ class RuntimeEvidenceCollector:
             timeout_seconds=min(timeout_seconds, run.timeout_seconds),
             credential_ref=run.credential_ref,
             approval_ref=approval_ref,
+            scope=run.scope,
         )
         # 실제 호출 직전에 Scope와 예산을 검사해 우회 실행을 막는다.
         try:

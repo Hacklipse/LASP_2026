@@ -2,6 +2,7 @@
 
 from .budget import InMemoryBudgetManager
 from .authentication import FormLoginWorker
+from .browser_runtime import PlaywrightBrowserRuntime
 from .dispatcher import LocalTaskDispatcher
 from .http_runtime import HttpExecutionRuntime
 from .llm_client import AnthropicLlmClient
@@ -44,6 +45,7 @@ __all__ = [
     "LocalTaskDispatcher",
     "MarkdownReportAgent",
     "MemoryStoreBundle",
+    "PlaywrightBrowserRuntime",
     "ReconAgent",
     "RoutingRule",
     "RuleBasedVulnerabilityRouter",

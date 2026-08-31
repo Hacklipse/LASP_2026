@@ -13,6 +13,7 @@ from hacklipse.adapters.recon import ReconAgent
 from hacklipse.adapters.routing import RuleBasedVulnerabilityRouter
 from hacklipse.adapters.validation import ValidationAgent
 from hacklipse.application.errors import AgentContractError
+from hacklipse.application import OrchestratorConfig
 from hacklipse.bootstrap import (
     build_local_application,
     register_standard_agents,
@@ -104,6 +105,46 @@ def _sql_error_observation(evidence_id: str = "evi-sql-signal") -> Evidence:
     )
 
 
+def _reflection_observation(evidence_id: str = "evi-reflection") -> Evidence:
+    return Evidence(
+        evidence_id=evidence_id,
+        run_id=_RUN_ID,
+        surface_id=_SURFACE_ID,
+        created_by="heuristic_xss_analyzer",
+        evidence_type="observation",
+        observation={"type": "reflection", "parameter": "q"},
+    )
+
+
+def _browser_collected_for_request(
+    evidence_id: str,
+    request,
+    *,
+    executed: bool,
+    marker: str | None,
+) -> Evidence:
+    return Evidence(
+        evidence_id=evidence_id,
+        run_id=_RUN_ID,
+        surface_id=_SURFACE_ID,
+        created_by="execution_runtime:browser_xss",
+        evidence_type="browser_execution",
+        source_task_id=f"task-{evidence_id}",
+        validation_id=_VALIDATION_ID,
+        observation={
+            "type": "browser_execution",
+            "status": 200,
+            "method": "GET",
+            "request_kind": request.http_request.request_kind.value,
+            "request_fingerprint": request.request_fingerprint(
+                "http://localhost/search"
+            ),
+            "script_executed": executed,
+            "execution_marker": marker,
+        },
+    )
+
+
 def _collected_for_request(
     evidence_id: str,
     request,
@@ -178,6 +219,127 @@ def _make_agent() -> tuple[
 
 
 class ValidationAgentTests(unittest.TestCase):
+    def test_xss_browser_execution_creates_structured_proof(self) -> None:
+        agent, candidates, evidence, _ = _make_agent()
+        candidates.add(
+            _make_candidate("XSS", evidence_ids=("evi-reflection",))
+        )
+        evidence.append(_reflection_observation())
+        task = TaskEnvelope(
+            task_id="task-validate",
+            run_id=_RUN_ID,
+            agent_type="validation",
+            surface_id=_SURFACE_ID,
+            candidate_id=_CANDIDATE_ID,
+            evidence_ids=("evi-reflection",),
+            allowed_tools=("http_get", "browser_xss"),
+            request_budget=5,
+            validation_id=_VALIDATION_ID,
+        )
+
+        first = agent.handle(task)
+
+        self.assertIs(first.status, AgentResultStatus.NEEDS_EVIDENCE)
+        self.assertEqual(len(first.evidence_requests), 2)
+        control_request, probe_request = first.evidence_requests
+        self.assertEqual(control_request.suggested_tool, "browser_xss")
+        self.assertEqual(probe_request.suggested_tool, "browser_xss")
+        assert probe_request.http_request is not None
+        marker = dict(probe_request.http_request.query_parameters)["q"]
+        control = _browser_collected_for_request(
+            "evi-browser-control",
+            control_request,
+            executed=False,
+            marker=None,
+        )
+        probe = _browser_collected_for_request(
+            "evi-browser-probe",
+            probe_request,
+            executed=True,
+            marker=marker,
+        )
+        evidence.append(control)
+        evidence.append(probe)
+        second = agent.handle(
+            TaskEnvelope(
+                task_id="task-validate-2",
+                run_id=_RUN_ID,
+                agent_type="validation",
+                surface_id=_SURFACE_ID,
+                candidate_id=_CANDIDATE_ID,
+                evidence_ids=(
+                    "evi-reflection",
+                    "evi-browser-control",
+                    "evi-browser-probe",
+                ),
+                allowed_tools=("http_get", "browser_xss"),
+                request_budget=3,
+                validation_id=_VALIDATION_ID,
+            )
+        )
+
+        assert second.validation is not None
+        self.assertIs(second.validation.verdict, ValidationVerdict.CONFIRMED)
+        assert second.validation.proof is not None
+        self.assertIs(
+            second.validation.proof.proof_type,
+            ValidationProofType.XSS_EXECUTION,
+        )
+        self.assertEqual(
+            second.validation.proof.evidence_ids,
+            ("evi-browser-control", "evi-browser-probe"),
+        )
+
+    def test_xss_reflection_without_browser_execution_is_rejected(self) -> None:
+        agent, candidates, evidence, _ = _make_agent()
+        candidates.add(_make_candidate("XSS", evidence_ids=("evi-reflection",)))
+        evidence.append(_reflection_observation())
+        task = TaskEnvelope(
+            task_id="task-validate",
+            run_id=_RUN_ID,
+            agent_type="validation",
+            surface_id=_SURFACE_ID,
+            candidate_id=_CANDIDATE_ID,
+            evidence_ids=("evi-reflection",),
+            allowed_tools=("http_get", "browser_xss"),
+            request_budget=5,
+            validation_id=_VALIDATION_ID,
+        )
+        first = agent.handle(task)
+        control_request, probe_request = first.evidence_requests
+        evidence.append(
+            _browser_collected_for_request(
+                "evi-browser-control", control_request, executed=False, marker=None
+            )
+        )
+        evidence.append(
+            _browser_collected_for_request(
+                "evi-browser-probe", probe_request, executed=False, marker=None
+            )
+        )
+
+        result = agent.handle(
+            TaskEnvelope(
+                task_id="task-validate-2",
+                run_id=_RUN_ID,
+                agent_type="validation",
+                surface_id=_SURFACE_ID,
+                candidate_id=_CANDIDATE_ID,
+                evidence_ids=(
+                    "evi-reflection",
+                    "evi-browser-control",
+                    "evi-browser-probe",
+                ),
+                allowed_tools=("http_get", "browser_xss"),
+                request_budget=3,
+                validation_id=_VALIDATION_ID,
+            )
+        )
+
+        assert result.validation is not None
+        self.assertIs(result.validation.verdict, ValidationVerdict.REJECTED)
+        self.assertIsNone(result.validation.proof)
+
     def test_requests_independent_reproduction_when_none_collected_yet(self) -> None:
         agent, candidates, evidence, _ = _make_agent()
         candidates.add(_make_candidate(evidence_ids=("evi-seed", "evi-analysis-http")))
@@ -504,6 +666,51 @@ class _SqliDifferentialRuntime:
         )
 
 
+class _XssBrowserExecutionRuntime:
+    """HTTP 반사와 별개의 브라우저 실행 결과를 돌려주는 Runtime 대역."""
+
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        parameters = dict(request.query_parameters)
+        if request.tool == "browser_xss":
+            marker = next(
+                (
+                    value
+                    for value in parameters.values()
+                    if value.startswith("hacklipsexecution")
+                ),
+                None,
+            )
+            return ExecutionResult(
+                execution_id=request.execution_id,
+                evidence_type="browser_execution",
+                observation={
+                    "type": "browser_execution",
+                    "status": 200,
+                    "method": "GET",
+                    "request_kind": request.request_kind.value,
+                    "requested_url": request.resolved_url,
+                    "script_executed": marker is not None,
+                    "execution_marker": marker,
+                },
+            )
+
+        body = " ".join(parameters.values()) or (
+            '<form method="GET"><input name="name"></form>'
+        )
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            evidence_type="http_response",
+            observation={
+                "type": "http_response",
+                "status": 200,
+                "body": body,
+                "method": request.method,
+                "request_kind": request.request_kind.value,
+                "requested_url": request.resolved_url,
+            },
+        )
+
+
 class SqliFindingEndToEndTests(unittest.TestCase):
     def test_independent_sqli_reproduction_promotes_one_finding(self) -> None:
         app = build_local_application(
@@ -538,6 +745,41 @@ class SqliFindingEndToEndTests(unittest.TestCase):
                 item.created_by.startswith("execution_runtime:")
                 for item in proof_evidence
             )
+        )
+
+
+class XssFindingEndToEndTests(unittest.TestCase):
+    def test_independent_browser_execution_promotes_one_finding(self) -> None:
+        app = build_local_application(
+            {},
+            runtime=_XssBrowserExecutionRuntime(),
+            router=standard_router(vulnerability_types=("XSS",)),
+            config=OrchestratorConfig(browser_xss_validation=True),
+        )
+        register_standard_agents(app, recon_max_pages=1)
+
+        run = app.orchestrator.start(
+            RunRequest(
+                target_url="http://localhost/vulnerabilities/xss_r/?name=seed",
+                scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+                request_budget=30,
+            )
+        )
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        findings = app.stores.findings.list_by_run(run.run_id)
+        self.assertEqual(len(findings), 1)
+        finding = findings[0]
+        self.assertEqual(finding.vulnerability_type, "XSS")
+        proof_evidence = app.stores.evidence.get_many(
+            run.run_id, finding.evidence_ids
+        )
+        self.assertEqual(
+            [item.evidence_type for item in proof_evidence],
+            ["browser_execution", "browser_execution"],
+        )
+        self.assertTrue(
+            all(item.validation_id == finding.validation_id for item in proof_evidence)
         )
 
 

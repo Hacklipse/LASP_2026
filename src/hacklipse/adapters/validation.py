@@ -22,6 +22,7 @@ from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 from .probing import build_probe_requests, matching_evidence, probe_marker
 from .routing import DEFAULT_RULES
 from .sqli_analysis import sql_error_signal
+from .xss_execution import BROWSER_XSS_TOOL, XSS_EXECUTION_MARKER_PREFIX
 
 # Router가 Candidate를 만들 때 쓴 것과 같은 taxonomy. Candidate가 알려진 취약점
 # 유형을 벗어나면(Router가 만들 수 없는 값) 계약 위반으로 간주한다. Analysis
@@ -31,7 +32,15 @@ _EXPECTED_SIGNAL = {rule.vulnerability_type: rule.observation_type for rule in D
 # HttpExecutionRuntime(및 그 대역)이 실제 재현 요청 결과에 붙이는 Observation 유형.
 # 최초 Recon이 남긴 신호 관측(예: "url_or_file_parameter")과는 구분되는, Validator
 # 자신이 직접 수행을 요청한 독립적인 재요청의 결과만 재현 근거로 인정한다.
-_REPRODUCTION_EVIDENCE_TYPES = frozenset({"http_response", "http_error", "http_redirect"})
+_REPRODUCTION_EVIDENCE_TYPES = frozenset(
+    {
+        "http_response",
+        "http_error",
+        "http_redirect",
+        "browser_execution",
+        "browser_error",
+    }
+)
 
 _REPRODUCTION_TOOL = "http_get"
 _SQLI_SYNTAX_BREAKER = "'"
@@ -63,9 +72,6 @@ class ValidationAgent:
             raise AgentContractError(
                 "validation task is missing a candidate or validation session"
             )
-        if _REPRODUCTION_TOOL not in task.allowed_tools:
-            raise AgentContractError("validation HTTP tool is not allowed by the task")
-
         candidate = self._candidates.get(task.run_id, task.candidate_id)
         if task.surface_id != candidate.surface_id:
             raise AgentContractError(
@@ -75,6 +81,10 @@ class ValidationAgent:
             raise AgentContractError(
                 "validation agent has no reproduction rule for "
                 f"vulnerability type: {candidate.vulnerability_type}"
+            )
+        if _REPRODUCTION_TOOL not in task.allowed_tools:
+            raise AgentContractError(
+                f"validation tool is not allowed by the task: {_REPRODUCTION_TOOL}"
             )
 
         evidence_ids = tuple(dict.fromkeys(task.evidence_ids))
@@ -87,12 +97,124 @@ class ValidationAgent:
 
         if candidate.vulnerability_type == "SQLi":
             return self._validate_sqli(task, candidate, evidence, reproduction)
+        if (
+            candidate.vulnerability_type == "XSS"
+            and BROWSER_XSS_TOOL in task.allowed_tools
+        ):
+            return self._validate_xss(task, candidate, evidence, reproduction)
 
         if not reproduction:
             return self._needs_evidence(
                 task, candidate.surface_id, candidate.vulnerability_type
             )
         return self._decide(task, reproduction)
+
+    def _validate_xss(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        evidence: Sequence[Evidence],
+        reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """Analysis의 반사 위치를 실제 브라우저에서 독립적으로 실행 검증한다."""
+
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        signaled_parameters = tuple(
+            dict.fromkeys(
+                parameter
+                for item in evidence
+                if item.surface_id == candidate.surface_id
+                and item.observation.get("type") == "reflection"
+                and isinstance((parameter := item.observation.get("parameter")), str)
+                and parameter in surface.parameters
+            )
+        )
+        if not signaled_parameters:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no reflected parameter to execute",
+            )
+
+        marker = probe_marker(
+            f"{task.validation_id}{candidate.candidate_id}",
+            prefix=XSS_EXECUTION_MARKER_PREFIX,
+        )
+        requests = build_probe_requests(
+            surface,
+            surface.parameters,
+            control_value="hacklipse-control",
+            probe_value=marker,
+            purpose=f"XSS execution validation {task.validation_id}",
+            probe_parameters=signaled_parameters,
+            suggested_tool=BROWSER_XSS_TOOL,
+        )
+        collected = tuple(
+            matching_evidence(reproduction, surface.url, request) for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise AgentContractError(
+                    "XSS validation lacks budget for independent browser control/probe requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+
+        reproduced = tuple(item for item in collected if item is not None)
+        if any(item.observation.get("type") == "browser_error" for item in reproduced):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=reproduced,
+                reason="independent browser reproduction could not execute",
+            )
+
+        control = reproduced[0]
+        if control.observation.get("script_executed") is True:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=reproduced,
+                reason="browser control unexpectedly contained an execution signal",
+            )
+
+        for parameter, probe in zip(signaled_parameters, reproduced[1:]):
+            if (
+                probe.observation.get("type") != "browser_execution"
+                or probe.observation.get("script_executed") is not True
+                or probe.observation.get("execution_marker") != marker
+            ):
+                continue
+            proof_evidence = (control, probe)
+            proof = ValidationProof(
+                proof_type=ValidationProofType.XSS_EXECUTION,
+                evidence_ids=tuple(item.evidence_id for item in proof_evidence),
+                summary=(
+                    "independent headless browser execution reproduced the XSS effect "
+                    f"for parameter {parameter}"
+                ),
+            )
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence=proof_evidence,
+                reason="independent browser control/probe comparison executed the XSS marker",
+                proof=proof,
+            )
+
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.REJECTED,
+            evidence=reproduced,
+            reason="independent browser probe did not execute the XSS marker",
+        )
 
     def _validate_sqli(
         self,
@@ -115,7 +237,7 @@ class ValidationAgent:
             )
         )
         if not signaled_parameters:
-            return self._sql_validation_result(
+            return self._validation_result(
                 task,
                 verdict=ValidationVerdict.REJECTED,
                 evidence=(),
@@ -156,7 +278,7 @@ class ValidationAgent:
             item.observation.get("type") in {"http_error", "http_redirect"}
             for item in reproduced
         ):
-            return self._sql_validation_result(
+            return self._validation_result(
                 task,
                 verdict=ValidationVerdict.BLOCKED,
                 evidence=reproduced,
@@ -178,7 +300,7 @@ class ValidationAgent:
                     f"for parameter {parameter} (engine={engine})"
                 ),
             )
-            return self._sql_validation_result(
+            return self._validation_result(
                 task,
                 verdict=ValidationVerdict.CONFIRMED,
                 evidence=proof_evidence,
@@ -186,7 +308,7 @@ class ValidationAgent:
                 proof=proof,
             )
 
-        return self._sql_validation_result(
+        return self._validation_result(
             task,
             verdict=ValidationVerdict.REJECTED,
             evidence=reproduced,
@@ -194,7 +316,7 @@ class ValidationAgent:
         )
 
     @staticmethod
-    def _sql_validation_result(
+    def _validation_result(
         task: TaskEnvelope,
         *,
         verdict: ValidationVerdict,

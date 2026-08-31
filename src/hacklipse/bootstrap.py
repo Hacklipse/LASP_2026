@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Mapping, Protocol
+from typing import Collection, Mapping, Protocol
 
 from hacklipse.adapters import (
     AllowlistPolicyGate,
@@ -174,7 +174,7 @@ def build_local_application(
         dispatcher.register(
             selected_config.evidence_collector_agent_type,
             collector,
-            allowed_tools=("http_get", "http_post"),
+            allowed_tools=("http_get", "http_post", "browser_xss"),
         )
     if credential_resolver is not None and selected_config.authentication_agent_type not in agents:
         dispatcher.register(
@@ -226,21 +226,30 @@ def build_local_application(
 IMPLEMENTED_ANALYZERS = ("xss_analyzer", "sqli_analyzer")
 
 
-def standard_router() -> RuleBasedVulnerabilityRouter:
+def standard_router(
+    vulnerability_types: Collection[str] | None = None,
+) -> RuleBasedVulnerabilityRouter:
     """구현된 Analyzer로만 라우팅하는 Router를 만든다.
 
     미구현 취약점 유형을 조용히 건너뛰는 것이 아니라 애초에 Candidate를 만들지 않는다.
     "검사했는데 없었다"와 "검사하지 않았다"를 결과에서 구분할 수 있어야 한다.
     """
 
+    selected_types = (
+        frozenset(vulnerability_types) if vulnerability_types is not None else None
+    )
     return RuleBasedVulnerabilityRouter(
         rules=tuple(
-            rule for rule in DEFAULT_RULES if rule.agent_type in IMPLEMENTED_ANALYZERS
+            rule
+            for rule in DEFAULT_RULES
+            if rule.agent_type in IMPLEMENTED_ANALYZERS
+            and (selected_types is None or rule.vulnerability_type in selected_types)
         ),
         surface_rules=tuple(
             rule
             for rule in DEFAULT_SURFACE_RULES
             if rule.agent_type in IMPLEMENTED_ANALYZERS
+            and (selected_types is None or rule.vulnerability_type in selected_types)
         ),
     )
 
@@ -301,6 +310,6 @@ def register_standard_agents(
             evidence_store=app.stores.evidence,
             surface_store=app.stores.surfaces,
         ),
-        allowed_tools=("http_get",),
+        allowed_tools=("http_get", "browser_xss"),
     )
     return profile

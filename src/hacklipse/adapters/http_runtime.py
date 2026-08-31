@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import http.cookiejar
+import http.cookies
 import socket
 import time
 import urllib.error
@@ -28,6 +29,7 @@ from hacklipse.ports.errors import CredentialNotFound, ExternalExecutionDisabled
 
 # http(s)만 허용한다. file:·ftp: 등은 SSRF 표면이므로 Runtime 진입 전에 차단한다.
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
+_HTTP_TOOLS = frozenset({"http_get", "http_post"})
 # 실제 리다이렉트 상태만 리다이렉트로 분류한다. 300/304/305/306은 리다이렉트가 아니다.
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _DEFAULT_TIMEOUT = 15.0
@@ -108,6 +110,10 @@ class HttpExecutionRuntime:
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
         """정책 검사를 통과한 요청을 실제로 전송하고 응답을 Evidence로 변환한다."""
 
+        if request.tool not in _HTTP_TOOLS:
+            raise ExternalExecutionDisabled(
+                f"http runtime does not implement tool: {request.tool}"
+            )
         requested_url = request.resolved_url
         scheme = urllib.parse.urlsplit(requested_url).scheme.lower()
         method = request.method.upper()
@@ -176,6 +182,25 @@ class HttpExecutionRuntime:
             self._sessions.pop(key, None)
             self._session_jars.pop(key, None)
             self._seeded_sessions.discard(key)
+
+    def session_cookies(self, request: ExecutionRequest) -> tuple[tuple[str, str], ...]:
+        """현재 Run에서 이 URL로 실제 전송될 Cookie만 브라우저 경계에 전달한다.
+
+        반환값은 메모리 안에서 Browser Runtime으로만 이동해야 하며 Evidence나 감사
+        이벤트에 넣지 않는다. CookieJar의 domain/path/secure 정책을 그대로 적용하기
+        위해 임시 urllib Request에 Cookie 헤더를 계산한 뒤 이름·값만 추출한다.
+        """
+
+        self._opener_for(request)
+        jar = self._session_jars[(request.run_id, request.credential_ref)]
+        cookie_request = urllib.request.Request(request.resolved_url)
+        jar.add_cookie_header(cookie_request)
+        header = cookie_request.get_header("Cookie")
+        if not header:
+            return ()
+        parsed = http.cookies.SimpleCookie()
+        parsed.load(header)
+        return tuple((name, morsel.value) for name, morsel in parsed.items())
 
     def _opener_for(self, request: ExecutionRequest) -> urllib.request.OpenerDirector:
         """Run/credential 조합별 CookieJar를 만들고 초기 쿠키를 한 번만 주입한다."""

@@ -524,6 +524,7 @@ class ExecutionRequest:
     timeout_seconds: float = 120.0
     credential_ref: str | None = None
     approval_ref: str | None = None
+    scope: RunScope | None = None
 
     def __post_init__(self) -> None:
         # Runtime 직전 객체도 동일한 명세 검증을 통과시켜 직접 생성 경로의 우회를 막는다.

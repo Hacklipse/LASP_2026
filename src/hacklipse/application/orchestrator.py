@@ -54,6 +54,7 @@ class OrchestratorConfig:
     report_agent_type: str = "report"
     authentication_agent_type: str = "session_authenticator"
     max_evidence_rounds: int = 1
+    browser_xss_validation: bool = False
 
     def __post_init__(self) -> None:
         if self.max_evidence_rounds < 0:
@@ -282,6 +283,7 @@ class Orchestrator:
                     validation_id=validation_id,
                     agent_type=self._config.validation_agent_type,
                     request_budget=self._budget.remaining(run.run_id),
+                    browser_xss_enabled=self._config.browser_xss_validation,
                 )
                 result = self._tasks.execute(task)
                 if result.status is AgentResultStatus.COMPLETED:

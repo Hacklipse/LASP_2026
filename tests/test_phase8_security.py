@@ -32,6 +32,7 @@ from hacklipse.bootstrap import (
 from hacklipse.domain import (
     AgentResult,
     AgentResultStatus,
+    ExecutionRequest,
     RunPhase,
     RunRequest,
     RunScope,
@@ -226,6 +227,25 @@ class Phase8AuthenticatedWorkflowTests(unittest.TestCase):
         self.assertTrue(any(event.method == "POST" for event in events))
         self.assertTrue(all("?" not in event.target for event in events))
         self.assertTrue(all(event.outcome == "completed" for event in events))
+
+        # Browser Runtime에는 현재 Run에서 실제 전송 가능한 Cookie만 메모리로 넘긴다.
+        browser_cookies = dict(
+            runtime.session_cookies(
+                ExecutionRequest(
+                    execution_id="exec-browser-cookie-check",
+                    run_id=run.run_id,
+                    task_id="task-browser-cookie-check",
+                    tool="browser_xss",
+                    target_url=self._request().target_url,
+                    surface_id=None,
+                    purpose="test authenticated browser cookie handoff",
+                    credential_ref="local-dvwa",
+                    scope=run.scope,
+                )
+            )
+        )
+        self.assertEqual(browser_cookies["security"], "low")
+        self.assertEqual(browser_cookies["PHPSESSID"], _SESSION)
 
     def test_domain_localhost_cookies_are_reused_for_exact_localhost(self) -> None:
         resolver = self._resolver(host="localhost")

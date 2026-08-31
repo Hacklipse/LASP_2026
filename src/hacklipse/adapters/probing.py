@@ -98,6 +98,7 @@ def build_probe_requests(
     probe_value: str,
     purpose: str,
     probe_parameters: Sequence[str] | None = None,
+    suggested_tool: str = ANALYSIS_TOOL,
 ) -> tuple[EvidenceRequest, ...]:
     """control 1개 + 선택한 파라미터별 probe N개를 만든다.
 
@@ -124,6 +125,7 @@ def build_probe_requests(
             tuple((name, control_value) for name in all_parameters),
             HttpRequestKind.CONTROL,
             reason=f"control request for {purpose}",
+            suggested_tool=suggested_tool,
         )
     ]
     for parameter in selected_parameters:
@@ -136,6 +138,7 @@ def build_probe_requests(
                 ),
                 HttpRequestKind.PROBE,
                 reason=f"probe for parameter {parameter} on {purpose}",
+                suggested_tool=suggested_tool,
             )
         )
     return tuple(requests)
@@ -147,12 +150,13 @@ def _request(
     request_kind: HttpRequestKind,
     *,
     reason: str,
+    suggested_tool: str,
 ) -> EvidenceRequest:
     return EvidenceRequest(
         evidence_type="http_response",
         surface_id=surface_id,
         reason=reason,
-        suggested_tool=ANALYSIS_TOOL,
+        suggested_tool=suggested_tool,
         http_request=HttpRequestSpec(
             method="GET",
             query_parameters=query_parameters,

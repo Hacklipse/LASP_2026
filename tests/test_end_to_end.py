@@ -231,7 +231,7 @@ class EndToEndWorkflowTests(unittest.TestCase):
         app.dispatcher.register(
             "validation",
             validation_agent or SuspectingValidationFixtureAgent(),
-            allowed_tools=("http_get",),
+            allowed_tools=("http_get", "browser_xss"),
         )
         return app
 
