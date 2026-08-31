@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Collection, Mapping, Protocol
+from typing import Callable, Collection, Mapping, Protocol
 
 from hacklipse.adapters import (
     AllowlistPolicyGate,
@@ -12,10 +12,12 @@ from hacklipse.adapters import (
     BoundedRetryPolicy,
     DisabledExecutionRuntime,
     FormLoginWorker,
+    GeminiLlmClient,
     HeuristicSqliAnalyzer,
     HeuristicXssAnalyzer,
     InMemoryBudgetManager,
     InMemoryExecutionAuditLog,
+    LlmSqliAnalyzer,
     LlmXssAnalyzer,
     LocalTaskDispatcher,
     MarkdownReportAgent,
@@ -35,6 +37,7 @@ from hacklipse.application import (
     TaskExecutor,
     TaskFactory,
 )
+from hacklipse.domain import TaskEnvelope
 from hacklipse.ports import (
     Agent,
     BudgetManager,
@@ -58,11 +61,17 @@ from hacklipse.ports.errors import LlmCredentialsMissing
 
 # 자격증명은 환경변수로만 받는다. 파일에 두면 커밋에 딸려 들어갈 수 있고, Task에 실으면
 # 감사 로그·프롬프트로 새어 나간다(TaskEnvelope에는 원문 필드 자체가 없다).
-API_KEY_ENV = "ANTHROPIC_API_KEY"
+ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+# 기존 호출자와 테스트의 공개 이름을 유지한다.
+API_KEY_ENV = ANTHROPIC_API_KEY_ENV
 
 # 주 실험은 단일 모델로 고정한다. 역할별로 모델을 섞으면 성능 차이가 아키텍처 덕인지
 # 모델 덕인지 분리되지 않는다. 더 강한 모델은 같은 배선에서 model만 바꿔 2차 실험으로 돌린다.
-DEFAULT_LLM_MODEL = "claude-sonnet-5"
+DEFAULT_ANTHROPIC_LLM_MODEL = "claude-sonnet-5"
+DEFAULT_GEMINI_LLM_MODEL = "gemini-3.5-flash-lite"
+# 기존 Anthropic builder의 기본값 이름을 호환성 목적으로 유지한다.
+DEFAULT_LLM_MODEL = DEFAULT_ANTHROPIC_LLM_MODEL
 
 
 def build_llm_client_from_env(*, model: str = DEFAULT_LLM_MODEL) -> AnthropicLlmClient:
@@ -73,12 +82,27 @@ def build_llm_client_from_env(*, model: str = DEFAULT_LLM_MODEL) -> AnthropicLlm
     않고 여기서 실패한다.
     """
 
-    api_key = os.environ.get(API_KEY_ENV, "").strip()
+    api_key = os.environ.get(ANTHROPIC_API_KEY_ENV, "").strip()
     if not api_key:
         raise LlmCredentialsMissing(
-            f"{API_KEY_ENV} is not set; export it or pass an explicit LlmClient"
+            f"{ANTHROPIC_API_KEY_ENV} is not set; "
+            "export it or pass an explicit LlmClient"
         )
     return AnthropicLlmClient(api_key=api_key, model=model)
+
+
+def build_gemini_llm_client_from_env(
+    *, model: str = DEFAULT_GEMINI_LLM_MODEL
+) -> GeminiLlmClient:
+    """환경변수의 Gemini API Key로 공급자 중립 LlmClient를 만든다."""
+
+    api_key = os.environ.get(GEMINI_API_KEY_ENV, "").strip()
+    if not api_key:
+        raise LlmCredentialsMissing(
+            f"{GEMINI_API_KEY_ENV} is not set; "
+            "export it or pass an explicit LlmClient"
+        )
+    return GeminiLlmClient(api_key=api_key, model=model)
 
 
 class StoreBundle(Protocol):
@@ -121,6 +145,8 @@ def build_local_application(
     audit_log: ExecutionAuditLog | None = None,
     approval_gate: ApprovalGate | None = None,
     agent_allowed_tools: Mapping[str, tuple[str, ...]] | None = None,
+    task_progress_callback: Callable[[str, TaskEnvelope, int, float], None]
+    | None = None,
 ) -> LocalApplication:
     """기본적으로 네트워크를 활성화하지 않는 로컬 시스템을 조립한다."""
 
@@ -192,6 +218,7 @@ def build_local_application(
         task_store=selected_stores.tasks,
         budget_manager=selected_budget,
         retry_policy=retry_policy or BoundedRetryPolicy(),
+        progress_callback=task_progress_callback,
     )
     orchestrator = Orchestrator(
         run_store=selected_stores.runs,
@@ -278,29 +305,37 @@ def register_standard_agents(
         allowed_tools=("http_get",),
     )
     if llm_client is None:
-        analyzer: Agent = HeuristicXssAnalyzer(
+        xss_analyzer: Agent = HeuristicXssAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
+        sqli_analyzer: Agent = HeuristicSqliAnalyzer(
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
         profile = "heuristic"
     else:
-        analyzer = LlmXssAnalyzer(
+        xss_analyzer = LlmXssAnalyzer(
+            llm_client=llm_client,
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
+        sqli_analyzer = LlmSqliAnalyzer(
             llm_client=llm_client,
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
         profile = "llm"
-    app.dispatcher.register("xss_analyzer", analyzer, allowed_tools=("http_get",))
-    # SQLi는 아직 결정적 구현만 있다. LLM 구성에서도 같은 baseline을 쓴다.
+    app.dispatcher.register(
+        "xss_analyzer", xss_analyzer, allowed_tools=("http_get",)
+    )
     app.dispatcher.register(
         "sqli_analyzer",
-        HeuristicSqliAnalyzer(
-            candidate_store=app.stores.candidates,
-            surface_store=app.stores.surfaces,
-            evidence_store=app.stores.evidence,
-        ),
+        sqli_analyzer,
         allowed_tools=("http_get",),
     )
     app.dispatcher.register(

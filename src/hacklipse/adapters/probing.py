@@ -90,6 +90,41 @@ def resolve_analysis_task(
     return candidate, surface, tuple(dict.fromkeys(surface.parameters))
 
 
+def validate_probe_selection(
+    raw: object,
+    offered: tuple[str, ...],
+    request_budget: int,
+    *,
+    analyzer_name: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """LLM 선택을 실제 Surface와 요청 예산 안으로 제한한다.
+
+    control 한 건이 항상 필요하므로 선택 가능한 probe 수는 남은 예산보다 하나 적다.
+    존재하지 않는 파라미터는 조용히 버리지 않고 Agent 계약 위반으로 처리한다.
+    """
+
+    if not isinstance(raw, list):
+        raise AgentContractError(f"{analyzer_name} plan did not return a parameter list")
+    selected: list[str] = []
+    for name in raw:
+        if not isinstance(name, str):
+            raise AgentContractError(
+                f"{analyzer_name} plan returned a non-string parameter"
+            )
+        if name not in offered:
+            raise AgentContractError(
+                f"{analyzer_name} plan named a parameter that is not on the surface: "
+                f"{name}"
+            )
+        if name not in selected:
+            selected.append(name)
+
+    affordable = max(request_budget - 1, 0)
+    if len(selected) <= affordable:
+        return tuple(selected), ()
+    return tuple(selected[:affordable]), tuple(selected[affordable:])
+
+
 def build_probe_requests(
     surface: Surface,
     parameters: Sequence[str],

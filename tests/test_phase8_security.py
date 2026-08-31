@@ -348,6 +348,65 @@ class _SlowAgent:
 
 
 class Phase8TaskBoundaryTests(unittest.TestCase):
+    def test_task_progress_callback_observes_start_and_completion(self) -> None:
+        stores = MemoryStoreBundle()
+        budget = InMemoryBudgetManager()
+        budget.open_run("run-progress", 1)
+        dispatcher = LocalTaskDispatcher()
+        dispatcher.register("worker", _CompletingAgent(), allowed_tools=())
+        events: list[tuple[str, str, int, float]] = []
+        executor = TaskExecutor(
+            dispatcher=dispatcher,
+            task_store=stores.tasks,
+            budget_manager=budget,
+            retry_policy=BoundedRetryPolicy(),
+            progress_callback=lambda event, task, attempt, elapsed: events.append(
+                (event, task.task_id, attempt, elapsed)
+            ),
+        )
+
+        executor.execute(
+            TaskEnvelope(
+                task_id="task-progress",
+                run_id="run-progress",
+                agent_type="worker",
+            )
+        )
+
+        self.assertEqual([event[0] for event in events], ["started", "succeeded"])
+        self.assertTrue(all(event[1] == "task-progress" for event in events))
+        self.assertTrue(all(event[2] == 1 for event in events))
+        self.assertGreaterEqual(events[-1][3], 0.0)
+
+    def test_task_progress_callback_failure_does_not_change_task_result(self) -> None:
+        stores = MemoryStoreBundle()
+        budget = InMemoryBudgetManager()
+        budget.open_run("run-progress-error", 1)
+        dispatcher = LocalTaskDispatcher()
+        dispatcher.register("worker", _CompletingAgent(), allowed_tools=())
+
+        def broken_callback(*args) -> None:
+            del args
+            raise RuntimeError("debug output unavailable")
+
+        executor = TaskExecutor(
+            dispatcher=dispatcher,
+            task_store=stores.tasks,
+            budget_manager=budget,
+            retry_policy=BoundedRetryPolicy(),
+            progress_callback=broken_callback,
+        )
+
+        result = executor.execute(
+            TaskEnvelope(
+                task_id="task-progress-error",
+                run_id="run-progress-error",
+                agent_type="worker",
+            )
+        )
+
+        self.assertIs(result.status, AgentResultStatus.COMPLETED)
+
     def test_dispatcher_rejects_tools_not_granted_at_registration(self) -> None:
         dispatcher = LocalTaskDispatcher()
         dispatcher.register("restricted", _CompletingAgent(), allowed_tools=())

@@ -41,6 +41,7 @@ from .probing import (
     probe_marker,
     resolve_analysis_task,
     response_body,
+    validate_probe_selection,
 )
 
 LLM_XSS_ANALYZER = "llm_xss_analyzer"
@@ -227,8 +228,11 @@ class LlmXssAnalyzer:
                 timeout_seconds=task.timeout_seconds,
             )
         )
-        selected, dropped = _validate_selection(
-            response.payload.get("parameters"), parameters, task.request_budget
+        selected, dropped = validate_probe_selection(
+            response.payload.get("parameters"),
+            parameters,
+            task.request_budget,
+            analyzer_name="llm xss analyzer",
         )
         plan: dict[str, object] = {
             "type": _PLAN_OBSERVATION,
@@ -367,32 +371,6 @@ def _stored_plan(
             if isinstance(parameters, list) and isinstance(marker, str) and marker:
                 return {"parameters": [str(name) for name in parameters], "marker": marker}
     return None
-
-
-def _validate_selection(
-    raw: object, offered: tuple[str, ...], request_budget: int
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """LLM이 고른 파라미터가 실재하는지 확인하고 예산에 맞게 자른다."""
-
-    if not isinstance(raw, list):
-        raise AgentContractError("llm xss plan did not return a parameter list")
-    selected: list[str] = []
-    for name in raw:
-        if not isinstance(name, str):
-            raise AgentContractError("llm xss plan returned a non-string parameter")
-        if name not in offered:
-            # 존재하지 않는 파라미터를 만들어낸 것은 계약 위반이다. 조용히 버리지 않는다.
-            raise AgentContractError(
-                f"llm xss plan named a parameter that is not on the surface: {name}"
-            )
-        if name not in selected:
-            selected.append(name)
-
-    # control 1개 + probe N개가 필요하므로 예산에서 1을 뺀 만큼만 탐침할 수 있다.
-    affordable = max(request_budget - 1, 0)
-    if len(selected) <= affordable:
-        return tuple(selected), ()
-    return tuple(selected[:affordable]), tuple(selected[affordable:])
 
 
 def _validate_classifications(

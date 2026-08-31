@@ -5,7 +5,9 @@ from .authentication import FormLoginWorker
 from .browser_runtime import PlaywrightBrowserRuntime
 from .dispatcher import LocalTaskDispatcher
 from .http_runtime import HttpExecutionRuntime
+from .gemini_llm_client import GeminiLlmClient
 from .llm_client import AnthropicLlmClient
+from .llm_sqli_analysis import LlmSqliAnalyzer
 from .llm_xss_analysis import LlmXssAnalyzer
 from .memory import MemoryStoreBundle
 from .policy import AllowlistPolicyGate
@@ -36,11 +38,13 @@ __all__ = [
     "HttpExecutionRuntime",
     "FormLoginWorker",
     "AnthropicLlmClient",
+    "GeminiLlmClient",
     "HeuristicSqliAnalyzer",
     "HeuristicXssAnalyzer",
     "InMemoryBudgetManager",
     "InMemoryCredentialResolver",
     "InMemoryExecutionAuditLog",
+    "LlmSqliAnalyzer",
     "LlmXssAnalyzer",
     "LocalTaskDispatcher",
     "MarkdownReportAgent",

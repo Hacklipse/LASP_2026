@@ -5,6 +5,7 @@ from __future__ import annotations
 import signal
 import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 
 from hacklipse.domain import (
@@ -30,11 +31,14 @@ class TaskExecutor:
         task_store: TaskStore,
         budget_manager: BudgetManager,
         retry_policy: RetryPolicy,
+        progress_callback: Callable[[str, TaskEnvelope, int, float], None]
+        | None = None,
     ) -> None:
         self._dispatcher = dispatcher
         self._tasks = task_store
         self._budget = budget_manager
         self._retry = retry_policy
+        self._progress = progress_callback
 
     def execute(self, envelope: TaskEnvelope) -> AgentResult:
         """Task를 기록하고 성공하거나 재시도 한도에 도달할 때까지 실행한다."""
@@ -46,6 +50,8 @@ class TaskExecutor:
 
         while True:
             attempt += 1
+            started = time.monotonic()
+            self._notify("started", envelope, attempt, 0.0)
             try:
                 # Agent를 호출하기 전에 남은 Run 예산을 확인한다.
                 self._budget.ensure_available(envelope)
@@ -56,6 +62,9 @@ class TaskExecutor:
                 self._validate_result(envelope, result)
                 record = record.with_status(TaskStatus.SUCCEEDED, attempts=attempt)
                 self._tasks.save(record)
+                self._notify(
+                    "succeeded", envelope, attempt, time.monotonic() - started
+                )
                 return result
             except Exception as error:
                 # 실패를 기록한 후 RetryPolicy에 다음 시도 여부를 위임한다.
@@ -63,8 +72,26 @@ class TaskExecutor:
                     TaskStatus.FAILED, attempts=attempt, error=str(error)
                 )
                 self._tasks.save(record)
+                self._notify("failed", envelope, attempt, time.monotonic() - started)
                 if not self._retry.should_retry(attempt, error):
                     raise
+
+    def _notify(
+        self,
+        event: str,
+        envelope: TaskEnvelope,
+        attempt: int,
+        elapsed_seconds: float,
+    ) -> None:
+        """관찰용 callback 실패가 실제 Task 결과를 바꾸지 않게 격리한다."""
+
+        if self._progress is None:
+            return
+        try:
+            self._progress(event, envelope, attempt, elapsed_seconds)
+        except Exception:
+            # Debug UI는 Control Plane의 성공·실패 의미를 바꿀 권한이 없다.
+            return
 
     @staticmethod
     def _validate_result(envelope: TaskEnvelope, result: AgentResult) -> None:
