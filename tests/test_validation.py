@@ -10,7 +10,7 @@ from hacklipse.adapters.memory import (
     InMemorySurfaceStore,
 )
 from hacklipse.adapters.recon import ReconAgent
-from hacklipse.adapters.routing import RuleBasedVulnerabilityRouter
+from hacklipse.adapters.routing import RoutingRule, RuleBasedVulnerabilityRouter
 from hacklipse.adapters.validation import ValidationAgent
 from hacklipse.application.errors import AgentContractError
 from hacklipse.application import OrchestratorConfig
@@ -579,11 +579,20 @@ class ValidationDrivesEvidenceLoopTests(unittest.TestCase):
     """중앙 수집 Evidence가 현재 Validation 세션 provenance를 갖는지 검증한다."""
 
     def test_generic_reproduction_stays_suspected_and_reaches_report(self) -> None:
-        # 취약점별 proof가 없는 Path Traversal baseline은 Finding을 만들지 않는다.
+        # 취약점별 proof가 아직 없는 Access Control은 Finding을 만들지 않는다.
         app = build_local_application(
             agents={},
             runtime=_RouteThenReproduceRuntime(),
-            router=RuleBasedVulnerabilityRouter(surface_rules=()),
+            router=RuleBasedVulnerabilityRouter(
+                rules=(
+                    RoutingRule(
+                        "url_or_file_parameter",
+                        "Access Control",
+                        "access_control_analyzer",
+                    ),
+                ),
+                surface_rules=(),
+            ),
         )
         app.dispatcher.register(
             "recon",
@@ -595,7 +604,7 @@ class ValidationDrivesEvidenceLoopTests(unittest.TestCase):
             allowed_tools=("http_get",),
         )
         app.dispatcher.register(
-            "path_traversal_analyzer",
+            "access_control_analyzer",
             _PassthroughAnalysisAgent(),
             allowed_tools=("http_get",),
         )
@@ -633,7 +642,7 @@ class ValidationDrivesEvidenceLoopTests(unittest.TestCase):
             [item.envelope.agent_type for item in tasks],
             [
                 "recon",
-                "path_traversal_analyzer",
+                "access_control_analyzer",
                 "validation",
                 "evidence_collector",
                 "validation",

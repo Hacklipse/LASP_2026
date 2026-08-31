@@ -14,10 +14,12 @@ from hacklipse.adapters import (
     FormLoginWorker,
     GeminiLlmClient,
     HeuristicSqliAnalyzer,
+    HeuristicPathTraversalAnalyzer,
     HeuristicXssAnalyzer,
     InMemoryBudgetManager,
     InMemoryExecutionAuditLog,
     LlmSqliAnalyzer,
+    LlmPathTraversalAnalyzer,
     LlmXssAnalyzer,
     LocalTaskDispatcher,
     MarkdownReportAgent,
@@ -200,7 +202,12 @@ def build_local_application(
         dispatcher.register(
             selected_config.evidence_collector_agent_type,
             collector,
-            allowed_tools=("http_get", "http_post", "browser_xss"),
+            allowed_tools=(
+                "http_get",
+                "http_post",
+                "browser_xss",
+                "path_traversal_probe",
+            ),
         )
     if credential_resolver is not None and selected_config.authentication_agent_type not in agents:
         dispatcher.register(
@@ -250,7 +257,11 @@ def build_local_application(
 # 실제로 구현된 Analysis Agent. Router가 이 목록 밖 Candidate를 만들면 Dispatcher가
 # AgentUnavailable로 Run 전체를 실패시키므로, 배선과 라우팅 규칙이 같은 목록을 봐야 한다.
 # Analyzer를 추가하면 여기 한 줄만 늘리면 Router가 따라온다.
-IMPLEMENTED_ANALYZERS = ("xss_analyzer", "sqli_analyzer")
+IMPLEMENTED_ANALYZERS = (
+    "xss_analyzer",
+    "sqli_analyzer",
+    "path_traversal_analyzer",
+)
 
 
 def standard_router(
@@ -315,6 +326,11 @@ def register_standard_agents(
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
+        path_traversal_analyzer: Agent = HeuristicPathTraversalAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
         profile = "heuristic"
     else:
         xss_analyzer = LlmXssAnalyzer(
@@ -324,6 +340,12 @@ def register_standard_agents(
             evidence_store=app.stores.evidence,
         )
         sqli_analyzer = LlmSqliAnalyzer(
+            llm_client=llm_client,
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
+        path_traversal_analyzer = LlmPathTraversalAnalyzer(
             llm_client=llm_client,
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
@@ -339,12 +361,17 @@ def register_standard_agents(
         allowed_tools=("http_get",),
     )
     app.dispatcher.register(
+        "path_traversal_analyzer",
+        path_traversal_analyzer,
+        allowed_tools=("path_traversal_probe",),
+    )
+    app.dispatcher.register(
         "validation",
         ValidationAgent(
             candidate_store=app.stores.candidates,
             evidence_store=app.stores.evidence,
             surface_store=app.stores.surfaces,
         ),
-        allowed_tools=("http_get", "browser_xss"),
+        allowed_tools=("http_get", "browser_xss", "path_traversal_probe"),
     )
     return profile

@@ -11,6 +11,7 @@ from .models import (
     ExecutionResult,
     Finding,
     PROBE_METACHARACTERS,
+    PATH_TRAVERSAL_SAFE_PROBE_PATH,
     HttpRequestKind,
     HttpRequestSpec,
     KnowledgeCase,
@@ -29,6 +30,7 @@ from .models import (
     ValidationProof,
     ValidationProofType,
     ValidationVerdict,
+    is_path_traversal_safe_probe_value,
 )
 
 __all__ = [
@@ -42,6 +44,7 @@ __all__ = [
     "ExecutionResult",
     "Finding",
     "PROBE_METACHARACTERS",
+    "PATH_TRAVERSAL_SAFE_PROBE_PATH",
     "HttpRequestKind",
     "HttpRequestSpec",
     "KnowledgeCase",
@@ -60,4 +63,5 @@ __all__ = [
     "ValidationProof",
     "ValidationProofType",
     "ValidationVerdict",
+    "is_path_traversal_safe_probe_value",
 ]

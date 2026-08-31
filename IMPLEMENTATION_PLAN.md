@@ -8,10 +8,12 @@
 ## 1. 현재 상태
 
 현재는 로컬 DVWA에서 **휴리스틱과 Gemini LLM 기반 XSS·SQLi가 모두 Finding까지
-도달하는 E2E**와 Phase 7 영속 저장소, Phase 8 안전 통제 baseline이 동작한다.
+도달하는 E2E**가 동작하고, Path Traversal도 고정 `/etc/os-release` 기반 휴리스틱·LLM Agent와
+독립 proof/Finding E2E가 구현되어 실제 DVWA 실험만 남았다. Phase 7 영속 저장소와
+Phase 8 안전 통제 baseline도 동작한다.
 Control Plane은 모든 외부 실행을 중앙 수집 경계로 중재하고, Data Plane은 Validation
 provenance와 취약점별 proof 불변식을 강제한다. 남은 핵심은 Phase 6의 Access Control·
-Path Traversal·SSTI Agent와 baseline 대비 정식 비교 실험이다.
+SSTI Agent, Path Traversal DVWA 실험과 baseline 대비 정식 비교 실험이다.
 
 | 계층 | 상태 |
 |---|---|
@@ -19,7 +21,7 @@ Path Traversal·SSTI Agent와 baseline 대비 정식 비교 실험이다.
 | `ports/` | ✅ 완성 — 계약 12종 정의됨 |
 | `application/` | ✅ Orchestrator, StateMachine, TaskExecutor, TaskFactory, RuntimeEvidenceCollector |
 | `adapters/` | ✅ HTTP·브라우저 Runtime, 메모리·SQLite 저장소, 인증·감사 Adapter 구현 |
-| Agent 구현 | ⚠️ Recon·XSS·SQLi·Validation 구현, Access Control·Path Traversal·SSTI 미구현 |
+| Agent 구현 | ⚠️ Recon·XSS·SQLi·Path Traversal·Validation 구현, Access Control·SSTI 미구현 |
 | 안전 통제 | ✅ Phase 8 baseline 구현 완료 |
 
 ### 지금 존재하는 Agent
@@ -31,14 +33,14 @@ session_authenticator → adapters/authentication.py   ✅
 recon               → adapters/recon.py              ✅
 xss_analyzer        → heuristic / Gemini LLM 구현    ✅
 sqli_analyzer       → heuristic / Gemini LLM 구현    ✅
-validation          → XSS·SQLi proof 구현            ✅
+path_traversal_analyzer → heuristic / Gemini LLM 구현 ✅
+validation          → XSS·SQLi·Path Traversal proof 구현 ✅
 access_control_analyzer → 미구현                      ❌
-path_traversal_analyzer → 미구현                      ❌
 ssti_analyzer       → 미구현                          ❌
 ```
 
 `bootstrap.build_local_application()`은 공통 Worker를 조립하고,
-`register_standard_agents()`가 Recon·XSS·SQLi·Validation 구현을 등록한다. Router는 실제로
+`register_standard_agents()`가 Recon·XSS·SQLi·Path Traversal·Validation 구현을 등록한다. Router는 실제로
 등록된 Analyzer 유형만 Candidate로 만든다.
 
 ---
@@ -89,7 +91,7 @@ flowchart TB
     style RP fill:#e0ffe0,stroke:#0a0
 ```
 
-초록색은 구현 완료, 노란색 Analysis는 XSS·SQLi만 완료된 부분 구현 상태다.
+초록색은 구현 완료, 노란색 Analysis는 XSS·SQLi·Path Traversal이 완료된 부분 구현 상태다.
 
 ### 현재 워크플로 상태
 
@@ -103,8 +105,9 @@ flowchart LR
     style REPORT fill:#e0ffe0,stroke:#0a0
 ```
 
-전체 단계는 휴리스틱 XSS·SQLi와 Gemini LLM XSS·SQLi 구성에서 실제로 완주한다.
-`ANALYZE`만 5개 목표 유형 중 Access Control·Path Traversal·SSTI가 남아 있어 노란색이다.
+전체 단계는 휴리스틱과 Gemini LLM XSS·SQLi 구성에서 실제로 완주했고,
+Path Traversal은 Fake LLM E2E까지 완주했다. `ANALYZE`는 5개 목표 유형 중
+Access Control·SSTI가 남아 있어 노란색이다.
 
 ---
 
@@ -270,11 +273,12 @@ Router가 Candidate를 만들 수 없고 워크플로가 ROUTE에서 REPORT로 �
 
 ### Phase 6 — Analysis Agent (LLM)
 
-**상태: ⚠️ XSS·SQLi 구현 및 DVWA E2E 완료, 나머지 3종과 비교 실험 미완료.**
+**상태: ⚠️ XSS·SQLi DVWA E2E 완료, Path Traversal 구현/Fake E2E 완료,
+Access Control·SSTI와 비교 실험 미완료.**
 
-현재 구현은 `adapters/llm_xss_analysis.py`, `adapters/llm_sqli_analysis.py`에 있으며
-`register_standard_agents()`가 같은 등록 키(`xss_analyzer`, `sqli_analyzer`) 아래에서
-휴리스틱과 LLM 구현을 교체한다. 공급자 중립 계약은 `ports/llm.py`, Anthropic Adapter는
+현재 구현은 `adapters/llm_xss_analysis.py`, `adapters/llm_sqli_analysis.py`,
+`adapters/llm_path_traversal_analysis.py`에 있으며 `register_standard_agents()`가 같은
+등록 키 아래에서 휴리스틱과 LLM 구현을 교체한다. 공급자 중립 계약은 `ports/llm.py`, Anthropic Adapter는
 `adapters/llm_client.py`, Gemini Adapter는 `adapters/gemini_llm_client.py`에 있다.
 주 실험 기본 모델은 `gemini-3.5-flash-lite`이고 Anthropic 구현도 제거하지 않고 유지한다.
 
@@ -291,7 +295,7 @@ Validation이 별도 control/probe를 재현해 `XSS_EXECUTION` 또는 `SQLI_EFF
 | XSS | ✅ | ✅ Gemini | ✅ DVWA → `XSS_EXECUTION` → Finding |
 | SQLi | ✅ | ✅ Gemini | ✅ DVWA → `SQLI_EFFECT` → Finding |
 | Access Control | ❌ | ❌ | ❌ |
-| Path Traversal | ❌ | ❌ | ❌ |
+| Path Traversal | ✅ 고정 `/etc/os-release` | ✅ Gemini | ✅ Fake E2E / ⏳ DVWA 실험 |
 | SSTI | ❌ | ❌ | ❌ |
 
 **왜 마지막인가** **연구의 본체이자 가장 비싼 부분이다.** Phase 1~5가 없으면 LLM에게 줄 입력(구조화된 Surface, 실제 응답 Evidence)이 없어서 프롬프트를 설계할 수 없다. 그리고 대조군이 먼저 있어야 "LLM이 실제로 나은가"를 측정할 수 있다.
@@ -450,10 +454,13 @@ Evidence는 "이번 대상에서 직접 관찰한 사실", Knowledge는 "민감�
 | ✅ | `src/hacklipse/adapters/llm_sqli_analysis.py` | LLM 파라미터 선택, Python control/probe SQL 오류 차이 판정 |
 | ✅ | `src/hacklipse/adapters/probing.py` | XSS·SQLi 공용 probe와 LLM 선택값 검증 |
 | ❌ | `src/hacklipse/adapters/llm_access_control_analysis.py` | 미구현 |
-| ❌ | `src/hacklipse/adapters/llm_path_traversal_analysis.py` | 미구현 |
+| ✅ | `src/hacklipse/adapters/path_traversal_analysis.py` | 고정 `/etc/os-release` baseline과 전용 요청 안전 계약 |
+| ✅ | `src/hacklipse/adapters/llm_path_traversal_analysis.py` | LLM 파라미터 선택, Python safe-file 읽기 판정 |
 | ❌ | `src/hacklipse/adapters/llm_ssti_analysis.py` | 미구현 |
 | ✅ | `tests/test_llm_xss_analysis.py` | FakeLLM 계약·프롬프트 위생·중앙 중재 검증 |
 | ✅ | `tests/test_llm_sqli_analysis.py` | FakeLLM 선택·안전 probe·SQL 오류 신호 검증 |
+| ✅ | `tests/test_path_traversal_analysis.py` | safe-file 안전 계약·휴리스틱·proof/Finding E2E |
+| ✅ | `tests/test_llm_path_traversal_analysis.py` | FakeLLM 선택값 격리와 safe-file 판정 검증 |
 | ✅ | `tests/test_llm_end_to_end.py` | FakeLLM 전체 배선 및 SQLi proof/Finding 완주 검증 |
 | ✅ | `scripts/run_dvwa_baseline.py` | Gemini XSS·SQLi 실제 E2E와 안전한 디버그 출력 |
 
@@ -537,6 +544,8 @@ src/hacklipse/
 │   ├── gemini_llm_client.py         ✅ P6  Gemini Adapter
 │   ├── llm_xss_analysis.py          ✅ P6  XSS LLM Agent
 │   ├── llm_sqli_analysis.py         ✅ P6  SQLi LLM Agent
+│   ├── path_traversal_analysis.py   ✅ P6  Path Traversal baseline
+│   ├── llm_path_traversal_analysis.py ✅ P6 Path Traversal LLM Agent
 │   ├── probing.py                   ✅ P6  공용 control/probe 계약
 │   ├── sqlite_store.py              ✅ P7  7개 영속 Store
 │   ├── sqlite_budget.py             ✅ P7  영속 요청 예산
@@ -562,6 +571,8 @@ tests/
 ├── test_validation.py               🆕 P5
 ├── test_llm_xss_analysis.py         ✅ P6
 ├── test_llm_sqli_analysis.py        ✅ P6
+├── test_path_traversal_analysis.py  ✅ P6
+├── test_llm_path_traversal_analysis.py ✅ P6
 ├── test_llm_end_to_end.py           ✅ P6
 ├── test_gemini_llm_client.py        ✅ P6
 ├── test_sqlite_store.py             ✅ P7
@@ -599,8 +610,9 @@ Phase 5  [x] ValidationAgent (독립 재현 → 판정)
 
 Phase 6  [x] XSS 휴리스틱 / Gemini LLM Agent와 DVWA E2E
          [x] SQLi 휴리스틱 / Gemini LLM Agent와 DVWA E2E
+         [x] Path Traversal 휴리스틱 / Gemini LLM Agent와 Fake E2E
+         [ ] Path Traversal DVWA `/etc/os-release` E2E
          [ ] Access Control Agent
-         [ ] Path Traversal Agent
          [ ] SSTI Agent
          [ ] 🎯 마일스톤 B — baseline 대비 측정
 

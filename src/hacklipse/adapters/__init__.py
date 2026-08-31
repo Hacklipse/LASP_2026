@@ -7,10 +7,12 @@ from .dispatcher import LocalTaskDispatcher
 from .http_runtime import HttpExecutionRuntime
 from .gemini_llm_client import GeminiLlmClient
 from .llm_client import AnthropicLlmClient
+from .llm_path_traversal_analysis import LlmPathTraversalAnalyzer
 from .llm_sqli_analysis import LlmSqliAnalyzer
 from .llm_xss_analysis import LlmXssAnalyzer
 from .memory import MemoryStoreBundle
 from .policy import AllowlistPolicyGate
+from .path_traversal_analysis import HeuristicPathTraversalAnalyzer
 from .recon import ReconAgent
 from .sqli_analysis import HeuristicSqliAnalyzer
 from .reporting import MarkdownReportAgent
@@ -40,11 +42,13 @@ __all__ = [
     "AnthropicLlmClient",
     "GeminiLlmClient",
     "HeuristicSqliAnalyzer",
+    "HeuristicPathTraversalAnalyzer",
     "HeuristicXssAnalyzer",
     "InMemoryBudgetManager",
     "InMemoryCredentialResolver",
     "InMemoryExecutionAuditLog",
     "LlmSqliAnalyzer",
+    "LlmPathTraversalAnalyzer",
     "LlmXssAnalyzer",
     "LocalTaskDispatcher",
     "MarkdownReportAgent",

@@ -20,6 +20,12 @@ from hacklipse.domain import (
 from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 
 from .probing import build_probe_requests, matching_evidence, probe_marker
+from .path_traversal_analysis import (
+    PATH_TRAVERSAL_OBSERVATION,
+    PATH_TRAVERSAL_TOOL,
+    build_path_traversal_requests,
+    path_traversal_signal,
+)
 from .routing import DEFAULT_RULES
 from .sqli_analysis import sql_error_signal
 from .xss_execution import BROWSER_XSS_TOOL, XSS_EXECUTION_MARKER_PREFIX
@@ -82,9 +88,18 @@ class ValidationAgent:
                 "validation agent has no reproduction rule for "
                 f"vulnerability type: {candidate.vulnerability_type}"
             )
-        if _REPRODUCTION_TOOL not in task.allowed_tools:
+        specialized_path_validation = (
+            candidate.vulnerability_type == "Path Traversal"
+            and PATH_TRAVERSAL_TOOL in task.allowed_tools
+        )
+        required_tool = (
+            PATH_TRAVERSAL_TOOL
+            if specialized_path_validation
+            else _REPRODUCTION_TOOL
+        )
+        if required_tool not in task.allowed_tools:
             raise AgentContractError(
-                f"validation tool is not allowed by the task: {_REPRODUCTION_TOOL}"
+                f"validation tool is not allowed by the task: {required_tool}"
             )
 
         evidence_ids = tuple(dict.fromkeys(task.evidence_ids))
@@ -97,6 +112,10 @@ class ValidationAgent:
 
         if candidate.vulnerability_type == "SQLi":
             return self._validate_sqli(task, candidate, evidence, reproduction)
+        if specialized_path_validation:
+            return self._validate_path_traversal(
+                task, candidate, evidence, reproduction
+            )
         if (
             candidate.vulnerability_type == "XSS"
             and BROWSER_XSS_TOOL in task.allowed_tools
@@ -313,6 +332,98 @@ class ValidationAgent:
             verdict=ValidationVerdict.REJECTED,
             evidence=reproduced,
             reason="independent quote probe did not reproduce the SQL error differential",
+        )
+
+    def _validate_path_traversal(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        evidence: Sequence[Evidence],
+        reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """고정된 비민감 파일 읽기를 현재 Validation 세션에서 독립 재현한다."""
+
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        signaled_parameters = tuple(
+            dict.fromkeys(
+                parameter
+                for item in evidence
+                if item.surface_id == candidate.surface_id
+                and item.observation.get("type") == PATH_TRAVERSAL_OBSERVATION
+                and isinstance((parameter := item.observation.get("parameter")), str)
+                and parameter in surface.parameters
+            )
+        )
+        if not signaled_parameters:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no safe-file read signal to reproduce",
+            )
+
+        requests = build_path_traversal_requests(
+            surface,
+            surface.parameters,
+            signaled_parameters,
+            purpose=f"Path Traversal validation {task.validation_id}",
+        )
+        collected = tuple(
+            matching_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise AgentContractError(
+                    "Path Traversal validation lacks budget for independent requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+
+        reproduced = tuple(item for item in collected if item is not None)
+        if any(
+            item.observation.get("type") in {"http_error", "http_redirect"}
+            for item in reproduced
+        ):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=reproduced,
+                reason="independent safe-file reproduction could not obtain comparable responses",
+            )
+
+        control = reproduced[0]
+        for parameter, probe in zip(signaled_parameters, reproduced[1:]):
+            if not path_traversal_signal(control, probe):
+                continue
+            proof_evidence = (control, probe)
+            proof = ValidationProof(
+                proof_type=ValidationProofType.PATH_TRAVERSAL_FILE_READ,
+                evidence_ids=tuple(item.evidence_id for item in proof_evidence),
+                summary=(
+                    "independent fixed safe-file probe reproduced an out-of-directory "
+                    f"file read for parameter {parameter}"
+                ),
+            )
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence=proof_evidence,
+                reason="independent control/probe comparison reproduced the safe-file read",
+                proof=proof,
+            )
+
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.REJECTED,
+            evidence=reproduced,
+            reason="independent probe did not reproduce the safe-file read",
         )
 
     @staticmethod

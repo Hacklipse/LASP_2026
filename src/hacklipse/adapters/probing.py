@@ -60,6 +60,7 @@ def resolve_analysis_task(
     vulnerability_type: str,
     candidate_store: CandidateStore,
     surface_store: SurfaceStore,
+    required_tool: str = ANALYSIS_TOOL,
 ) -> tuple[Candidate, Surface, tuple[str, ...]]:
     """Analysis Task의 Candidate/Surface를 확인하고 탐침 대상 파라미터를 정리한다.
 
@@ -69,8 +70,8 @@ def resolve_analysis_task(
 
     if task.candidate_id is None or task.surface_id is None or task.target_url is None:
         raise AgentContractError("analysis task is missing candidate or surface context")
-    if ANALYSIS_TOOL not in task.allowed_tools:
-        raise AgentContractError("analysis HTTP tool is not allowed by the task")
+    if required_tool not in task.allowed_tools:
+        raise AgentContractError("analysis execution tool is not allowed by the task")
 
     candidate = candidate_store.get(task.run_id, task.candidate_id)
     if candidate.vulnerability_type != vulnerability_type:

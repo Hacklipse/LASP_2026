@@ -10,6 +10,10 @@ from hacklipse.ports.errors import ApprovalRequired, PolicyViolation
 
 from .request_safety import has_state_changing_parameters
 from .security import DenyAllApprovalGate
+from .path_traversal_analysis import (
+    PATH_TRAVERSAL_TOOL,
+    validate_path_traversal_request,
+)
 from .xss_execution import BROWSER_XSS_TOOL, validate_browser_xss_request
 
 
@@ -37,6 +41,11 @@ class AllowlistPolicyGate:
                 raise PolicyViolation("browser execution scope does not match its run")
             try:
                 validate_browser_xss_request(request)
+            except ValueError as error:
+                raise PolicyViolation(str(error)) from error
+        if request.tool == PATH_TRAVERSAL_TOOL:
+            try:
+                validate_path_traversal_request(request)
             except ValueError as error:
                 raise PolicyViolation(str(error)) from error
         # 구조화 query까지 결합된 실제 전송 URL을 기준으로 Scope를 검사한다.

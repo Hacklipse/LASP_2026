@@ -1,10 +1,11 @@
-"""로컬 DVWA에 로그인한 뒤 XSS 또는 SQLi 분석을 실행한다.
+"""로컬 DVWA에 로그인한 뒤 XSS·SQLi·Path Traversal 분석을 실행한다.
 
 DVWA 인증정보는 명령행 인자나 환경변수로 받지 않고 현재 프로세스에서만 입력받는다.
 Task/Evidence/Audit에는 credential_ref와 마스킹된 응답만 남는다.
 
     python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/
     python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/ --target sqli
+    python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/ --target path_traversal
     python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/DVWA/ --target xss
     python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/ --target xss --profile llm
     python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/ --target xss --profile llm --debug
@@ -63,10 +64,12 @@ _MAX_LLM_CONTENT_LOG_CHARS = 8_000
 _TARGET_PATHS = {
     "xss": "vulnerabilities/xss_r/?name=seed",
     "sqli": "vulnerabilities/sqli/?id=1&Submit=Submit",
+    "path_traversal": "vulnerabilities/fi/?page=include.php",
 }
 _TARGET_LABELS = {
     "xss": "XSS",
     "sqli": "SQLi",
+    "path_traversal": "Path Traversal",
 }
 
 _AGENT_LABELS = {
@@ -74,6 +77,7 @@ _AGENT_LABELS = {
     "recon": "Recon",
     "xss_analyzer": "XSS Analysis",
     "sqli_analyzer": "SQLi Analysis",
+    "path_traversal_analyzer": "Path Traversal Analysis",
     "evidence_collector": "Evidence 수집",
     "validation": "Validation",
     "report": "Report",
@@ -324,6 +328,7 @@ def _print_summary(
     candidate_counts: Counter[str],
     reflection_count: int,
     sql_error_count: int,
+    path_traversal_count: int,
     browser_execution_count: int,
     audited_execution_count: int,
     finding_counts: Counter[str],
@@ -348,6 +353,7 @@ def _print_summary(
     print(f"  Candidate       {_format_counts(candidate_counts)}")
     print(f"  Reflection      {reflection_count}개")
     print(f"  SQL 오류        {sql_error_count}개")
+    print(f"  OS 파일 읽기 {path_traversal_count}개")
     print(f"  XSS 실행        {browser_execution_count}개")
     print()
     print("[최종 판정]")
@@ -395,6 +401,12 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv[1:])
     debug_enabled = args.debug or args.debug_llm_content
     progress = _DebugProgress(debug_enabled)
+
+    if args.target == "path_traversal":
+        print(
+            "Path Traversal은 별도 파일 생성 없이 고정된 "
+            "/etc/os-release 읽기로 검증합니다."
+        )
 
     base_url = args.base_url.rstrip("/") + "/"
     parsed = urlsplit(base_url)
@@ -519,6 +531,11 @@ def main(argv: list[str]) -> int:
         for item in app.stores.evidence.list_by_run(run.run_id)
         if item.observation.get("type") == "sql_error"
     )
+    path_traversals = tuple(
+        item
+        for item in app.stores.evidence.list_by_run(run.run_id)
+        if item.observation.get("type") == "path_traversal_file_read"
+    )
     browser_executions = tuple(
         item
         for item in app.stores.evidence.list_by_run(run.run_id)
@@ -534,6 +551,7 @@ def main(argv: list[str]) -> int:
         candidate_counts=Counter(c.vulnerability_type for c in candidates),
         reflection_count=len(reflections),
         sql_error_count=len(sql_errors),
+        path_traversal_count=len(path_traversals),
         browser_execution_count=len(browser_executions),
         audited_execution_count=len(events),
         finding_counts=Counter(item.vulnerability_type for item in findings),

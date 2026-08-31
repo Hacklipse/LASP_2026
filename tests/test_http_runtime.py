@@ -131,6 +131,7 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
         self,
         path: str,
         *,
+        tool: str = "http_get",
         method: str = "GET",
         host: str | None = None,
         query_parameters: tuple[tuple[str, str], ...] = (),
@@ -143,7 +144,7 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
             execution_id="exec-1",
             run_id="run-1",
             task_id="task-1",
-            tool="http_get",
+            tool=tool,
             target_url=f"{base}{path}",
             surface_id=None,
             purpose="test",
@@ -162,6 +163,18 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
         self.assertIn("REFLECTED_MARKER", r.observation["body"])
         self.assertTrue(r.observation["headers"])
         self.assertIsNotNone(r.content_hash)
+
+    def test_path_traversal_probe_tool_uses_the_shared_http_runtime(self) -> None:
+        r = self.runtime.execute(
+            self._req(
+                "/echo-query",
+                tool="path_traversal_probe",
+                query_parameters=(("page", "../../../../../etc/os-release"),),
+                request_kind=HttpRequestKind.PATH_TRAVERSAL_PROBE,
+            )
+        )
+        self.assertEqual(r.observation["status"], 200)
+        self.assertIn("etc/os-release", r.observation["body"])
 
     # 2 + 3
     def test_302_not_followed_and_target_untouched(self) -> None:

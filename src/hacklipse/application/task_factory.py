@@ -7,6 +7,8 @@ from uuid import uuid4
 
 from hacklipse.domain import Candidate, EvidenceRequest, Run, TaskEnvelope
 
+_PATH_TRAVERSAL_TOOL = "path_traversal_probe"
+
 
 class TaskFactory:
     """Evidence 본문이나 Agent 추론을 넣지 않고 최소 작업 메시지만 생성한다."""
@@ -37,6 +39,11 @@ class TaskFactory:
     ) -> TaskEnvelope:
         """Candidate의 실제 Surface URL과 Evidence 참조를 Analysis Task에 담는다."""
 
+        allowed_tools = (
+            (_PATH_TRAVERSAL_TOOL,)
+            if candidate.vulnerability_type == "Path Traversal"
+            else ("http_get",)
+        )
         return self._base(
             run,
             agent_type=candidate.assigned_agent,
@@ -45,7 +52,7 @@ class TaskFactory:
             surface_id=candidate.surface_id,
             candidate_id=candidate.candidate_id,
             evidence_ids=candidate.evidence_ids,
-            allowed_tools=("http_get",),
+            allowed_tools=allowed_tools,
         )
 
     def validation(
@@ -60,11 +67,12 @@ class TaskFactory:
     ) -> TaskEnvelope:
         """Candidate/Evidence 참조만 전달하는 Validation Task를 생성한다."""
 
-        allowed_tools = (
-            ("http_get", "browser_xss")
-            if candidate.vulnerability_type == "XSS" and browser_xss_enabled
-            else ("http_get",)
-        )
+        if candidate.vulnerability_type == "XSS" and browser_xss_enabled:
+            allowed_tools = ("http_get", "browser_xss")
+        elif candidate.vulnerability_type == "Path Traversal":
+            allowed_tools = (_PATH_TRAVERSAL_TOOL,)
+        else:
+            allowed_tools = ("http_get",)
         return self._base(
             run,
             agent_type=agent_type,

@@ -74,6 +74,7 @@ class HttpRequestKind(str, Enum):
 
     CONTROL = "control"
     PROBE = "probe"
+    PATH_TRAVERSAL_PROBE = "path_traversal_probe"
 
 
 _HTTP_METHOD = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -91,6 +92,10 @@ _HTTP_METHOD = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 # 새 탐침 기법이 다른 문자를 필요로 하면 여기를 늘리는 것이 명시적 결정이 된다.
 PROBE_METACHARACTERS = "'\"<>"
 _PROBE_VALUE = re.compile(r"^[A-Za-z0-9_-]+['\"<>]{0,4}$")
+# Path Traversal 자동 검증이 읽을 수 있는 유일한 값이다. 컨테이너에 기본 존재하는
+# 비민감 OS 식별 파일을 정확한 상대 경로 하나로 고정해 LLM이나 Agent가 다른 파일
+# (예: /etc/passwd)을 선택하지 못하게 한다.
+PATH_TRAVERSAL_SAFE_PROBE_PATH = "../../../../../etc/os-release"
 _FORBIDDEN_REQUEST_HEADERS = frozenset(
     {
         "accept-encoding",
@@ -105,6 +110,12 @@ _FORBIDDEN_REQUEST_HEADERS = frozenset(
         "user-agent",
     }
 )
+
+
+def is_path_traversal_safe_probe_value(value: str) -> bool:
+    """고정된 비민감 증명 파일 상대 경로와 정확히 같은지 확인한다."""
+
+    return value == PATH_TRAVERSAL_SAFE_PROBE_PATH
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,13 +202,20 @@ class HttpRequestSpec:
                 raise DomainInvariantError("HTTP query parameters must be string pairs")
             # 탐침 요청만 값 형태를 강제한다. CONTROL 요청은 대상이 원래 갖고 있던
             # 값(Recon이 수집한 쿼리)을 그대로 실어야 하므로 제한하지 않는다.
-            if (
-                self.request_kind is HttpRequestKind.PROBE
-                and _PROBE_VALUE.fullmatch(value) is None
-            ):
+            if self.request_kind is HttpRequestKind.PROBE and _PROBE_VALUE.fullmatch(
+                value
+            ) is None:
                 raise DomainInvariantError(
                     "probe query value must be a marker with allowed metacharacters "
                     f"({PROBE_METACHARACTERS}): {value!r}"
+                )
+            if (
+                self.request_kind is HttpRequestKind.PATH_TRAVERSAL_PROBE
+                and _PROBE_VALUE.fullmatch(value) is None
+                and not is_path_traversal_safe_probe_value(value)
+            ):
+                raise DomainInvariantError(
+                    "path traversal probe may only use markers and the fixed safe path"
                 )
         for name, value in self.headers:
             if not isinstance(name, str) or not isinstance(value, str):

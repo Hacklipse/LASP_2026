@@ -14,6 +14,10 @@ from hacklipse.bootstrap import (
     register_standard_agents,
     standard_router,
 )
+from hacklipse.adapters.path_traversal_analysis import (
+    PATH_TRAVERSAL_PROBE_PATH,
+    PATH_TRAVERSAL_PROOF_MARKERS,
+)
 from hacklipse.domain import ExecutionRequest, ExecutionResult, RunPhase, RunRequest, RunScope
 from hacklipse.ports.llm import LlmRequest, LlmResponse
 
@@ -66,6 +70,21 @@ class _SqliDifferentialRuntime:
         )
 
 
+class _PathTraversalSafeFileRuntime:
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        values = dict(request.query_parameters).values()
+        body = (
+            "\n".join(PATH_TRAVERSAL_PROOF_MARKERS)
+            if PATH_TRAVERSAL_PROBE_PATH in values
+            else "normal include response"
+        )
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            evidence_type="http_response",
+            observation={"type": "http_response", "status": 200, "body": body},
+        )
+
+
 class _FakeLlmClient:
     def __init__(self) -> None:
         self.calls: list[LlmRequest] = []
@@ -84,6 +103,8 @@ class _FakeLlmClient:
                     }
                 ]
             }
+        elif "server-side file path" in (request.system or ""):
+            payload = {"parameters": ["page"], "reason": "file include input"}
         elif "SQL parser reachability" in (request.system or ""):
             content = "\n".join(message.content for message in request.messages)
             selected = "id" if "Parameters: id" in content else "q"
@@ -229,6 +250,37 @@ class LlmWiringEndToEndTests(unittest.TestCase):
         self.assertTrue(
             all(item.validation_id == findings[0].validation_id for item in proof_evidence)
         )
+
+    def test_llm_path_traversal_reaches_independent_proof_and_finding(self) -> None:
+        llm = _FakeLlmClient()
+        app = build_local_application(
+            {},
+            runtime=_PathTraversalSafeFileRuntime(),
+            router=standard_router(vulnerability_types=("Path Traversal",)),
+        )
+        register_standard_agents(app, llm_client=llm, recon_max_pages=1)
+
+        run = app.orchestrator.start(
+            RunRequest(
+                target_url=(
+                    "http://local.test/vulnerabilities/fi/?page=include.php"
+                ),
+                scope=RunScope(allowed_hosts=frozenset({_HOST})),
+                request_budget=20,
+            )
+        )
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(len(llm.calls), 1)
+        findings = app.stores.findings.list_by_run(run.run_id)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].vulnerability_type, "Path Traversal")
+        signal = next(
+            item
+            for item in app.stores.evidence.list_by_run(run.run_id)
+            if item.observation.get("type") == "path_traversal_file_read"
+        )
+        self.assertEqual(signal.created_by, "llm_path_traversal_analyzer")
 
 
 if __name__ == "__main__":
