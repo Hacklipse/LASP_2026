@@ -6,7 +6,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from uuid import uuid4
 
-from hacklipse.domain import Candidate, Evidence, RouteDecision, Run
+from hacklipse.domain import Candidate, Evidence, RouteDecision, Run, Surface
+
+from .request_safety import has_state_changing_parameters
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +21,26 @@ class RoutingRule:
     priority: float = 0.5
 
 
+@dataclass(frozen=True, slots=True)
+class SurfaceRoutingRule:
+    """구조화된 Surface만으로 탐색용 Candidate를 만드는 낮은 우선순위 규칙."""
+
+    vulnerability_type: str
+    agent_type: str
+    methods: tuple[str, ...] = ("GET",)
+    requires_parameters: bool = True
+    priority: float = 0.25
+
+    def matches(self, surface: Surface) -> bool:
+        if surface.method.upper() not in self.methods:
+            return False
+        # GET 폼이어도 비밀번호 변경·삭제 등은 상태를 바꿀 수 있다. 자동 Analysis
+        # Candidate를 만들지 않되 Surface 자체는 Recon 결과로 보존한다.
+        if has_state_changing_parameters(surface.parameters):
+            return False
+        return bool(surface.parameters) if self.requires_parameters else True
+
+
 # 첫 버전은 설명 가능하고 재현하기 쉬운 명시적 규칙으로 라우팅한다.
 DEFAULT_RULES = (
     RoutingRule("reflection", "XSS", "xss_analyzer", 0.8),
@@ -28,23 +50,38 @@ DEFAULT_RULES = (
     RoutingRule("template_error", "SSTI", "ssti_analyzer", 0.7),
 )
 
+# Observation이 아직 없어도 입력 가능한 GET Surface를 담당 Analyzer까지 보낸다.
+# 실제 취약점 판정이 아니라 탐색 대상을 만드는 규칙이므로 기존 Evidence 규칙보다
+# 낮은 priority를 사용한다.
+DEFAULT_SURFACE_RULES = (
+    SurfaceRoutingRule("XSS", "xss_analyzer", priority=0.30),
+    SurfaceRoutingRule("SQLi", "sqli_analyzer", priority=0.30),
+    SurfaceRoutingRule("SSTI", "ssti_analyzer", priority=0.20),
+)
+
 
 class RuleBasedVulnerabilityRouter:
-    """결정적인 초기 Router이며 모호한 사례는 향후 다른 구현으로 교체할 수 있다."""
+    """Surface 탐색 규칙과 강한 Observation 규칙을 함께 사용하는 결정적 Router."""
 
     def __init__(
         self,
         rules: Sequence[RoutingRule] = DEFAULT_RULES,
+        surface_rules: Sequence[SurfaceRoutingRule] = DEFAULT_SURFACE_RULES,
         id_factory: Callable[[], str] | None = None,
     ) -> None:
         self._rules = {rule.observation_type: rule for rule in rules}
+        self._surface_rules = tuple(surface_rules)
         self._id_factory = id_factory or (lambda: str(uuid4()))
 
-    def route(self, run: Run, evidence: Sequence[Evidence]) -> tuple[RouteDecision, ...]:
-        """Evidence Observation을 규칙과 대조해 중복 없는 Candidate를 만든다."""
+    def route(
+        self,
+        run: Run,
+        surfaces: Sequence[Surface],
+        evidence: Sequence[Evidence],
+    ) -> tuple[RouteDecision, ...]:
+        """Surface와 Evidence를 대조해 중복 없는 Candidate를 만든다."""
 
-        decisions: list[RouteDecision] = []
-        routed: set[tuple[str, str]] = set()
+        decisions: dict[tuple[str, str], RouteDecision] = {}
         for item in evidence:
             observation_type = str(item.observation.get("type", ""))
             rule = self._rules.get(observation_type)
@@ -52,9 +89,8 @@ class RuleBasedVulnerabilityRouter:
                 continue
             key = (item.surface_id, rule.vulnerability_type)
             # 동일 Surface와 취약점 유형 조합은 하나의 Candidate만 생성한다.
-            if key in routed:
+            if key in decisions:
                 continue
-            routed.add(key)
             candidate = Candidate(
                 candidate_id=f"candidate-{self._id_factory()}",
                 run_id=run.run_id,
@@ -64,6 +100,33 @@ class RuleBasedVulnerabilityRouter:
                 assigned_agent=rule.agent_type,
                 evidence_ids=(item.evidence_id,),
             )
-            decisions.append(RouteDecision(candidate=candidate, priority=rule.priority))
+            decisions[key] = RouteDecision(candidate=candidate, priority=rule.priority)
+
+        for surface in surfaces:
+            if surface.run_id != run.run_id:
+                continue
+            for rule in self._surface_rules:
+                if not rule.matches(surface):
+                    continue
+                key = (surface.surface_id, rule.vulnerability_type)
+                # 같은 취약점에 강한 Evidence 규칙이 이미 매칭됐다면 그것을 유지한다.
+                if key in decisions:
+                    continue
+                candidate = Candidate(
+                    candidate_id=f"candidate-{self._id_factory()}",
+                    run_id=run.run_id,
+                    surface_id=surface.surface_id,
+                    vulnerability_type=rule.vulnerability_type,
+                    hypothesis=(
+                        f"{rule.vulnerability_type} exploration candidate from "
+                        f"parameterized {surface.method.upper()} surface"
+                    ),
+                    assigned_agent=rule.agent_type,
+                    evidence_ids=(),
+                )
+                decisions[key] = RouteDecision(candidate=candidate, priority=rule.priority)
+
         # 우선순위가 높은 분석 대상을 먼저 처리하도록 정렬한다.
-        return tuple(sorted(decisions, key=lambda item: item.priority, reverse=True))
+        return tuple(
+            sorted(decisions.values(), key=lambda item: item.priority, reverse=True)
+        )

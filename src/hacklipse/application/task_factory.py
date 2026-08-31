@@ -28,17 +28,24 @@ class TaskFactory:
         )
 
     def analysis(
-        self, run: Run, candidate: Candidate, *, request_budget: int
+        self,
+        run: Run,
+        candidate: Candidate,
+        *,
+        target_url: str,
+        request_budget: int,
     ) -> TaskEnvelope:
-        """Candidate와 연결된 Evidence ID만 포함한 Analysis Task를 생성한다."""
+        """Candidate의 실제 Surface URL과 Evidence 참조를 Analysis Task에 담는다."""
 
         return self._base(
             run,
             agent_type=candidate.assigned_agent,
             request_budget=request_budget,
+            target_url=target_url,
             surface_id=candidate.surface_id,
             candidate_id=candidate.candidate_id,
             evidence_ids=candidate.evidence_ids,
+            allowed_tools=("http_get",),
         )
 
     def validation(
@@ -46,11 +53,18 @@ class TaskFactory:
         run: Run,
         candidate: Candidate,
         *,
+        validation_id: str,
         agent_type: str,
         request_budget: int,
+        browser_xss_enabled: bool = False,
     ) -> TaskEnvelope:
         """Candidate/Evidence 참조만 전달하는 Validation Task를 생성한다."""
 
+        allowed_tools = (
+            ("http_get", "browser_xss")
+            if candidate.vulnerability_type == "XSS" and browser_xss_enabled
+            else ("http_get",)
+        )
         return self._base(
             run,
             agent_type=agent_type,
@@ -58,6 +72,8 @@ class TaskFactory:
             surface_id=candidate.surface_id,
             candidate_id=candidate.candidate_id,
             evidence_ids=candidate.evidence_ids,
+            allowed_tools=allowed_tools,
+            validation_id=validation_id,
         )
 
     def evidence_collection(
@@ -66,8 +82,10 @@ class TaskFactory:
         candidate: Candidate,
         request: EvidenceRequest,
         *,
+        target_url: str,
         agent_type: str,
         request_budget: int,
+        validation_id: str | None = None,
     ) -> TaskEnvelope:
         """추가 증적 요청을 공통 Runtime Worker용 Task로 변환한다."""
 
@@ -75,11 +93,12 @@ class TaskFactory:
             run,
             agent_type=agent_type,
             request_budget=request_budget,
-            target_url=run.target_url,
+            target_url=target_url,
             surface_id=candidate.surface_id,
             candidate_id=candidate.candidate_id,
             evidence_ids=candidate.evidence_ids,
             allowed_tools=(request.suggested_tool,),
+            validation_id=validation_id,
             evidence_request=request,
         )
 
@@ -91,6 +110,21 @@ class TaskFactory:
             agent_type=agent_type,
             request_budget=0,
             finding_ids=run.finding_ids,
+        )
+
+    def authentication(
+        self, run: Run, *, agent_type: str, request_budget: int
+    ) -> TaskEnvelope:
+        """비밀 원문 없이 credential_ref만 중앙 인증 Worker에 전달한다."""
+
+        if run.credential_ref is None:
+            raise ValueError("authentication task requires a credential reference")
+        return self._base(
+            run,
+            agent_type=agent_type,
+            request_budget=request_budget,
+            target_url=run.target_url,
+            allowed_tools=("http_get", "http_post"),
         )
 
     def _base(
@@ -105,6 +139,7 @@ class TaskFactory:
         evidence_ids: tuple[str, ...] = (),
         finding_ids: tuple[str, ...] = (),
         allowed_tools: tuple[str, ...] = (),
+        validation_id: str | None = None,
         evidence_request: EvidenceRequest | None = None,
     ) -> TaskEnvelope:
         """모든 Task에 공통인 Run·정책·예산 정보를 조립한다."""
@@ -121,5 +156,8 @@ class TaskFactory:
             allowed_tools=allowed_tools,
             request_budget=request_budget,
             policy_profile=run.policy_profile,
+            timeout_seconds=run.timeout_seconds,
+            credential_ref=run.credential_ref,
+            validation_id=validation_id,
             evidence_request=evidence_request,
         )

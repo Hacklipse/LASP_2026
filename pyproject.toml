@@ -7,7 +7,15 @@ name = "hacklipse"
 version = "0.1.0"
 description = "Evidence-driven multi-agent security research architecture"
 requires-python = ">=3.10"
-dependencies = []
+# 계층별 의존성 정책 — tests/test_dependency_direction.py가 강제한다.
+#   domain / ports / application : 표준 라이브러리만. 불변식과 중재 로직이 사는 곳이라
+#                                  외부 패키지에 묶이면 감사와 이식이 어려워진다.
+#   adapters                     : 바깥세상과 붙는 곳이므로 자유롭게 쓴다.
+dependencies = [
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+    "playwright>=1.40",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

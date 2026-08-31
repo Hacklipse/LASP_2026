@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol, Sequence
 
-from hacklipse.domain import AgentResult, Evidence, RouteDecision, Run, TaskEnvelope
+from hacklipse.domain import AgentResult, Evidence, RouteDecision, Run, Surface, TaskEnvelope
 
 
 class Agent(Protocol):
@@ -20,6 +20,11 @@ class TaskDispatcher(Protocol):
 
 
 class VulnerabilityRouter(Protocol):
-    """Observation을 Candidate와 담당 Analysis Agent 결정으로 변환한다."""
+    """Surface와 Observation을 Candidate·담당 Analysis Agent 결정으로 변환한다."""
 
-    def route(self, run: Run, evidence: Sequence[Evidence]) -> tuple[RouteDecision, ...]: ...
+    def route(
+        self,
+        run: Run,
+        surfaces: Sequence[Surface],
+        evidence: Sequence[Evidence],
+    ) -> tuple[RouteDecision, ...]: ...

@@ -1,0 +1,214 @@
+"""로컬 DVWA에 로그인한 뒤 XSS 또는 SQLi 결정적 baseline을 실행한다.
+
+인증정보는 명령행 인자나 환경변수로 받지 않고 현재 프로세스에서만 입력받는다.
+Task/Evidence/Audit에는 credential_ref와 마스킹된 응답만 남는다.
+
+    python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/
+    python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/ --target sqli
+    python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/DVWA/ --target xss
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import sys
+from collections import Counter
+from pathlib import Path
+from urllib.parse import urljoin, urlsplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from hacklipse.adapters import (  # noqa: E402
+    HttpExecutionRuntime,
+    InMemoryCredentialResolver,
+    InMemoryExecutionAuditLog,
+    PlaywrightBrowserRuntime,
+    StaticApprovalGate,
+)
+from hacklipse.application.errors import WorkflowExecutionError  # noqa: E402
+from hacklipse.application import OrchestratorConfig  # noqa: E402
+from hacklipse.bootstrap import (  # noqa: E402
+    build_local_application,
+    register_standard_agents,
+    standard_router,
+)
+from hacklipse.domain import RunRequest, RunScope  # noqa: E402
+from hacklipse.ports import FormLoginSpec, ResolvedHttpCredential  # noqa: E402
+
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1"})
+_CREDENTIAL_REF = "interactive-local-dvwa"
+_APPROVAL_REF = "interactive-local-dvwa-login"
+_DEFAULT_BUDGET = 30
+_TARGET_PATHS = {
+    "xss": "vulnerabilities/xss_r/?name=seed",
+    "sqli": "vulnerabilities/sqli/?id=1&Submit=Submit",
+}
+_TARGET_LABELS = {
+    "xss": "XSS",
+    "sqli": "SQLi",
+}
+
+
+def _format_counts(counts: Counter[str]) -> str:
+    if not counts:
+        return "없음"
+    return ", ".join(f"{name} {count}개" for name, count in counts.items())
+
+
+def _print_summary(
+    *,
+    profile: str,
+    target: str,
+    phase: str,
+    candidate_counts: Counter[str],
+    reflection_count: int,
+    sql_error_count: int,
+    browser_execution_count: int,
+    audited_execution_count: int,
+    finding_counts: Counter[str],
+) -> None:
+    finding_count = finding_counts.total()
+    target_label = _TARGET_LABELS[target]
+    target_confirmed = finding_counts[target_label] > 0
+    verdict = "CONFIRMED (취약점 확인)" if target_confirmed else "미확정"
+
+    print()
+    print("=" * 54)
+    print("  DVWA Baseline 실행 결과")
+    print("=" * 54)
+    print()
+    print("[실행 정보]")
+    print(f"  상태            완료 ({phase})")
+    print(f"  분석 대상       {target_label}")
+    print(f"  Agent 구성      {profile}")
+    print(f"  감사된 실행     {audited_execution_count}회")
+    print()
+    print("[분석 신호]")
+    print(f"  Candidate       {_format_counts(candidate_counts)}")
+    print(f"  Reflection      {reflection_count}개")
+    print(f"  SQL 오류        {sql_error_count}개")
+    print(f"  XSS 실행        {browser_execution_count}개")
+    print()
+    print("[최종 판정]")
+    print(f"  결과            {verdict}")
+    print(f"  Finding         {finding_count}개")
+    print(f"  취약점 유형     {_format_counts(finding_counts)}")
+    print("=" * 54)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("base_url", help="localhost/127.0.0.1 DVWA base URL")
+    parser.add_argument(
+        "--target",
+        choices=tuple(_TARGET_PATHS),
+        default="xss",
+        help="baseline target vulnerability (default: xss)",
+    )
+    args = parser.parse_args(argv[1:])
+
+    base_url = args.base_url.rstrip("/") + "/"
+    parsed = urlsplit(base_url)
+    host = (parsed.hostname or "").casefold()
+    if parsed.scheme not in {"http", "https"} or host not in _LOCAL_HOSTS:
+        print("거부: 이 실행기는 localhost/127.0.0.1의 HTTP(S) DVWA만 허용한다.")
+        return 2
+
+    username = input("DVWA username: ")
+    password = getpass.getpass("DVWA password: ")
+    if input("로컬 DVWA에 로그인 POST를 실행할까요? [y/N] ").strip().casefold() != "y":
+        print("취소했습니다.")
+        return 2
+
+    login_url = urljoin(base_url, "login.php")
+    target_url = urljoin(base_url, _TARGET_PATHS[args.target])
+    resolver = InMemoryCredentialResolver(
+        {
+            _CREDENTIAL_REF: ResolvedHttpCredential(
+                # DVWA의 보안 단계가 reflected-XSS 실습 동작을 가리지 않게 고정한다.
+                cookies=(("security", "low"),),
+                form_login=FormLoginSpec(
+                    login_url=login_url,
+                    username=username,
+                    password=password,
+                    csrf_field="user_token",
+                    extra_fields=(("Login", "Login"),),
+                    failure_marker="Login failed",
+                    # 로그인 POST의 302만으로는 성공·실패를 구분할 수 없다. 같은 Run
+                    # 세션으로 보호된 시작 페이지를 읽을 수 있어야 인증 성공이다.
+                    verification_url=target_url,
+                    approval_ref=_APPROVAL_REF,
+                ),
+            )
+        }
+    )
+    http_runtime = HttpExecutionRuntime(credential_resolver=resolver)
+    runtime = PlaywrightBrowserRuntime(http_runtime=http_runtime)
+    audit = InMemoryExecutionAuditLog()
+    app = build_local_application(
+        {},
+        runtime=runtime,
+        router=standard_router(vulnerability_types=(_TARGET_LABELS[args.target],)),
+        credential_resolver=resolver,
+        approval_gate=StaticApprovalGate((_APPROVAL_REF,)),
+        audit_log=audit,
+        config=OrchestratorConfig(browser_xss_validation=args.target == "xss"),
+    )
+    # 이 실행기는 DVWA reflected-XSS/SQLi 파이프라인의 재현 실험이다. 전 사이트를
+    # 크롤링하면 비밀번호 변경 같은 상태 변경 GET 폼까지 탐색 대상에 섞이고, 결과도
+    # 시작 Surface가 아닌 크롤링 순서에 좌우된다. 대상 페이지 한 장만 열거한다.
+    profile = register_standard_agents(app, recon_max_pages=1)
+    base_path = parsed.path if parsed.path.endswith("/") else f"{parsed.path}/"
+
+    try:
+        run = app.orchestrator.start(
+            RunRequest(
+                target_url=target_url,
+                scope=RunScope(
+                    allowed_hosts=frozenset({host}),
+                    allowed_path_prefixes=(base_path or "/",),
+                ),
+                request_budget=_DEFAULT_BUDGET,
+                credential_ref=_CREDENTIAL_REF,
+            )
+        )
+    except WorkflowExecutionError as error:
+        print(f"Run 실패: {error}")
+        return 1
+
+    candidates = app.stores.candidates.list_by_run(run.run_id)
+    reflections = tuple(
+        item
+        for item in app.stores.evidence.list_by_run(run.run_id)
+        if item.observation.get("type") == "reflection"
+    )
+    sql_errors = tuple(
+        item
+        for item in app.stores.evidence.list_by_run(run.run_id)
+        if item.observation.get("type") == "sql_error"
+    )
+    browser_executions = tuple(
+        item
+        for item in app.stores.evidence.list_by_run(run.run_id)
+        if item.observation.get("type") == "browser_execution"
+        and item.observation.get("script_executed") is True
+    )
+    findings = app.stores.findings.list_by_run(run.run_id)
+    events = audit.list_by_run(run.run_id)
+    _print_summary(
+        profile=profile,
+        target=args.target,
+        phase=run.phase.value,
+        candidate_counts=Counter(c.vulnerability_type for c in candidates),
+        reflection_count=len(reflections),
+        sql_error_count=len(sql_errors),
+        browser_execution_count=len(browser_executions),
+        audited_execution_count=len(events),
+        finding_counts=Counter(item.vulnerability_type for item in findings),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

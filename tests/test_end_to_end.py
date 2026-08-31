@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import unittest
 
+from hacklipse.adapters import RuleBasedVulnerabilityRouter
+from hacklipse.application.errors import WorkflowExecutionError
 from hacklipse.bootstrap import build_local_application
 from hacklipse.domain import (
     AgentResult,
@@ -11,11 +13,16 @@ from hacklipse.domain import (
     Evidence,
     EvidenceRequest,
     ExecutionResult,
+    HttpRequestKind,
+    HttpRequestSpec,
     RunPhase,
     RunRequest,
     RunScope,
+    Surface,
     TaskEnvelope,
     TaskStatus,
+    ValidationProof,
+    ValidationProofType,
     ValidationResult,
     ValidationVerdict,
 )
@@ -24,12 +31,22 @@ from hacklipse.domain import (
 class ReconFixtureAgent:
     """Reflection Observation 하나를 생성하는 로컬 Recon 대역."""
 
-    def __init__(self, evidence_store) -> None:
+    def __init__(self, evidence_store, surface_store) -> None:
         self._evidence = evidence_store
+        self._surfaces = surface_store
 
     def handle(self, task: TaskEnvelope) -> AgentResult:
         # 실제 HTTP 요청 대신 고정된 Surface와 Observation을 Evidence Store에 기록한다.
         evidence_id = f"evi-recon-{task.run_id}"
+        self._surfaces.add(
+            Surface(
+                surface_id="surface-search",
+                run_id=task.run_id,
+                url="http://local.test/discovered-search",
+                method="GET",
+                parameters=("q",),
+            )
+        )
         self._evidence.append(
             Evidence(
                 evidence_id=evidence_id,
@@ -76,8 +93,8 @@ class XssAnalysisFixtureAgent:
         )
 
 
-class ConfirmingValidationFixtureAgent:
-    """현재 Evidence를 두 번 재현했다고 가정하는 확정 Validator 대역."""
+class SuspectingValidationFixtureAgent:
+    """취약점별 재현 proof가 없으면 확정하지 않는 Validator 대역."""
 
     def handle(self, task: TaskEnvelope) -> AgentResult:
         assert task.candidate_id is not None
@@ -85,13 +102,12 @@ class ConfirmingValidationFixtureAgent:
             task_id=task.task_id,
             status=AgentResultStatus.COMPLETED,
             validation=ValidationResult(
-                validation_id=f"validation-{task.task_id}",
+                validation_id=task.validation_id or "",
                 run_id=task.run_id,
                 candidate_id=task.candidate_id,
-                verdict=ValidationVerdict.CONFIRMED,
-                evidence_ids=task.evidence_ids,
-                reason="local fixture reproduced the observation",
-                reproduction_count=2,
+                verdict=ValidationVerdict.SUSPECTED,
+                evidence_ids=(),
+                reason="fixture has no vulnerability-specific proof",
             ),
         )
 
@@ -99,8 +115,12 @@ class ConfirmingValidationFixtureAgent:
 class EvidenceSeekingValidationFixtureAgent:
     """첫 호출에는 추가 증적을 요구하고 두 번째 호출에 확정하는 대역."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        proof_type: ValidationProofType = ValidationProofType.XSS_EXECUTION,
+    ) -> None:
         self.calls = 0
+        self.proof_type = proof_type
 
     def handle(self, task: TaskEnvelope) -> AgentResult:
         self.calls += 1
@@ -108,10 +128,16 @@ class EvidenceSeekingValidationFixtureAgent:
         if self.calls == 1:
             # Validator가 Runtime을 직접 호출하지 않고 EvidenceRequest만 반환하는지 검증한다.
             request = EvidenceRequest(
-                evidence_type="browser_execution",
+                evidence_type="http_response",
                 surface_id=task.surface_id or "surface-search",
-                reason="browser confirmation is required",
-                suggested_tool="browser_render",
+                reason="structured reflection probe is required",
+                suggested_tool="http_get",
+                http_request=HttpRequestSpec(
+                    method="GET",
+                    query_parameters=(("name", "hacklipse7331"),),
+                    headers=(("Accept", "text/html"),),
+                    request_kind=HttpRequestKind.PROBE,
+                ),
             )
             return AgentResult(
                 task_id=task.task_id,
@@ -122,26 +148,60 @@ class EvidenceSeekingValidationFixtureAgent:
             task_id=task.task_id,
             status=AgentResultStatus.COMPLETED,
             validation=ValidationResult(
-                validation_id=f"validation-{task.task_id}",
+                validation_id=task.validation_id or "",
                 run_id=task.run_id,
                 candidate_id=task.candidate_id,
                 verdict=ValidationVerdict.CONFIRMED,
-                evidence_ids=task.evidence_ids,
-                reason="local runtime evidence confirmed the candidate",
+                evidence_ids=(task.evidence_ids[-1],),
+                reason="structured fixture proof confirmed the candidate",
                 reproduction_count=1,
+                proof=ValidationProof(
+                    proof_type=self.proof_type,
+                    evidence_ids=(task.evidence_ids[-1],),
+                    summary="fixture observed the expected XSS execution signal",
+                ),
+            ),
+        )
+
+
+class ForgedAnalysisEvidenceValidationFixtureAgent:
+    """Analysis Evidence를 Validation proof로 가장하는 잘못된 Agent 대역."""
+
+    def handle(self, task: TaskEnvelope) -> AgentResult:
+        assert task.candidate_id is not None
+        forged_evidence_id = task.evidence_ids[-1]
+        return AgentResult(
+            task_id=task.task_id,
+            status=AgentResultStatus.COMPLETED,
+            validation=ValidationResult(
+                validation_id=task.validation_id or "",
+                run_id=task.run_id,
+                candidate_id=task.candidate_id,
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence_ids=(forged_evidence_id,),
+                reason="fixture tries to reuse analysis evidence",
+                reproduction_count=1,
+                proof=ValidationProof(
+                    proof_type=ValidationProofType.XSS_EXECUTION,
+                    evidence_ids=(forged_evidence_id,),
+                    summary="forged proof",
+                ),
             ),
         )
 
 
 class LocalFixtureRuntime:
-    """네트워크 호출 없이 브라우저 실행 결과 형태만 반환하는 Runtime 대역."""
+    """네트워크 호출 없이 구조화 HTTP 요청을 기록하는 Runtime 대역."""
+
+    def __init__(self) -> None:
+        self.requests = []
 
     def execute(self, request):
+        self.requests.append(request)
         return ExecutionResult(
             execution_id=request.execution_id,
-            evidence_type="browser_execution",
-            observation={"type": "browser_marker_observed"},
-            artifact_refs={"render": "fixture://render/result"},
+            evidence_type="http_response",
+            observation={"type": "http_response", "status": 200},
         )
 
 
@@ -151,13 +211,27 @@ class EndToEndWorkflowTests(unittest.TestCase):
     def _application(self, *, validation_agent=None, runtime=None):
         """테스트마다 격리된 메모리 Application과 fixture Agent를 조립한다."""
 
-        app = build_local_application({}, runtime=runtime)
-        app.dispatcher.register("recon", ReconFixtureAgent(app.stores.evidence))
-        app.dispatcher.register(
-            "xss_analyzer", XssAnalysisFixtureAgent(app.stores.evidence)
+        # 이 테스트는 기존 Reflection Evidence 경로 하나의 E2E만 검증한다.
+        # Surface 기반 다중 Candidate 규칙은 tests/test_routing.py에서 별도로 고정한다.
+        app = build_local_application(
+            {},
+            runtime=runtime,
+            router=RuleBasedVulnerabilityRouter(surface_rules=()),
         )
         app.dispatcher.register(
-            "validation", validation_agent or ConfirmingValidationFixtureAgent()
+            "recon",
+            ReconFixtureAgent(app.stores.evidence, app.stores.surfaces),
+            allowed_tools=("http_get",),
+        )
+        app.dispatcher.register(
+            "xss_analyzer",
+            XssAnalysisFixtureAgent(app.stores.evidence),
+            allowed_tools=("http_get",),
+        )
+        app.dispatcher.register(
+            "validation",
+            validation_agent or SuspectingValidationFixtureAgent(),
+            allowed_tools=("http_get", "browser_xss"),
         )
         return app
 
@@ -171,8 +245,8 @@ class EndToEndWorkflowTests(unittest.TestCase):
             request_budget=10,
         )
 
-    def test_confirmed_candidate_reaches_finding_and_report(self) -> None:
-        """confirmed Candidate만 Finding과 보고서로 이어지는지 확인한다."""
+    def test_suspected_candidate_does_not_create_finding(self) -> None:
+        """취약점별 proof가 없는 Candidate는 Finding으로 승격되지 않아야 한다."""
 
         app = self._application()
 
@@ -186,11 +260,9 @@ class EndToEndWorkflowTests(unittest.TestCase):
         tasks = app.stores.tasks.list_by_run(run.run_id)
         self.assertEqual(len(evidence), 2)
         self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0].status, "confirmed")
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].status, "confirmed")
+        self.assertEqual(candidates[0].status, "suspected")
+        self.assertEqual(findings, ())
         self.assertEqual(len(reports), 1)
-        self.assertIn(findings[0].finding_id, reports[0].content)
         self.assertEqual(
             [item.envelope.agent_type for item in tasks],
             ["recon", "xss_analyzer", "validation", "report"],
@@ -201,7 +273,8 @@ class EndToEndWorkflowTests(unittest.TestCase):
         """추가 증적이 Orchestrator와 공통 Runtime 경계를 왕복하는지 확인한다."""
 
         validator = EvidenceSeekingValidationFixtureAgent()
-        app = self._application(validation_agent=validator, runtime=LocalFixtureRuntime())
+        runtime = LocalFixtureRuntime()
+        app = self._application(validation_agent=validator, runtime=runtime)
 
         run = app.orchestrator.start(self._request())
 
@@ -209,7 +282,13 @@ class EndToEndWorkflowTests(unittest.TestCase):
         tasks = app.stores.tasks.list_by_run(run.run_id)
         self.assertIs(run.phase, RunPhase.DONE)
         self.assertEqual(validator.calls, 2)
-        self.assertIn("browser_execution", {item.evidence_type for item in evidence})
+        self.assertIn("http_response", {item.evidence_type for item in evidence})
+        collected = next(
+            item for item in evidence if item.created_by == "execution_runtime:http_get"
+        )
+        self.assertIsNotNone(collected.validation_id)
+        self.assertIsNotNone(collected.source_task_id)
+        self.assertEqual(collected.observation["request_kind"], "probe")
         self.assertEqual(
             [item.envelope.agent_type for item in tasks],
             [
@@ -222,6 +301,61 @@ class EndToEndWorkflowTests(unittest.TestCase):
             ],
         )
         self.assertEqual(app.budget_manager.remaining(run.run_id), 9)
+        findings = app.stores.findings.list_by_run(run.run_id)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].evidence_ids, (collected.evidence_id,))
+        self.assertEqual(
+            [request.target_url for request in runtime.requests],
+            ["http://local.test/discovered-search"],
+        )
+        request = runtime.requests[0]
+        self.assertEqual(request.validation_id, collected.validation_id)
+        self.assertEqual(request.method, "GET")
+        self.assertEqual(request.query_parameters, (("name", "hacklipse7331"),))
+        self.assertEqual(request.headers, (("Accept", "text/html"),))
+        self.assertIs(request.request_kind, HttpRequestKind.PROBE)
+        self.assertEqual(
+            request.resolved_url,
+            "http://local.test/discovered-search?name=hacklipse7331",
+        )
+        validation_tasks = [
+            item.envelope
+            for item in tasks
+            if item.envelope.agent_type == "validation"
+        ]
+        self.assertEqual(len(validation_tasks), 2)
+        self.assertEqual(
+            validation_tasks[0].validation_id,
+            validation_tasks[1].validation_id,
+        )
+
+    def test_analysis_evidence_cannot_be_reused_as_validation_proof(self) -> None:
+        """형식이 맞아도 현재 Validation 세션 provenance가 없으면 거부한다."""
+
+        app = self._application(
+            validation_agent=ForgedAnalysisEvidenceValidationFixtureAgent()
+        )
+
+        with self.assertRaises(WorkflowExecutionError) as caught:
+            app.orchestrator.start(self._request())
+
+        self.assertIn("another provenance", str(caught.exception))
+
+    def test_proof_type_must_match_candidate_vulnerability(self) -> None:
+        """현재 세션 Evidence라도 다른 취약점 proof로는 확정할 수 없다."""
+
+        validator = EvidenceSeekingValidationFixtureAgent(
+            proof_type=ValidationProofType.SQLI_EFFECT
+        )
+        app = self._application(
+            validation_agent=validator,
+            runtime=LocalFixtureRuntime(),
+        )
+
+        with self.assertRaises(WorkflowExecutionError) as caught:
+            app.orchestrator.start(self._request())
+
+        self.assertIn("proof type", str(caught.exception))
 
 
 if __name__ == "__main__":

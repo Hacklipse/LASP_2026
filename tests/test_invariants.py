@@ -13,11 +13,15 @@ from hacklipse.domain import (
     Evidence,
     ExecutionRequest,
     Finding,
+    HttpRequestKind,
+    HttpRequestSpec,
     Run,
     RunPhase,
     RunRequest,
     RunScope,
     Surface,
+    ValidationProof,
+    ValidationProofType,
     ValidationResult,
     ValidationVerdict,
 )
@@ -58,30 +62,37 @@ class ArchitectureInvariantTests(unittest.TestCase):
                 finding_id="finding-1", candidate=candidate, validation=validation
             )
 
-    def test_confirmed_finding_requires_supporting_evidence(self) -> None:
-        """confirmed라도 근거 Evidence가 없으면 Finding 생성이 실패해야 한다."""
-
-        candidate = Candidate(
-            candidate_id="candidate-1",
-            run_id="run-1",
-            surface_id="surface-1",
-            vulnerability_type="XSS",
-            hypothesis="reflection",
-            assigned_agent="xss_analyzer",
-            evidence_ids=("evi-1",),
-        )
-        validation = ValidationResult(
-            validation_id="validation-1",
-            run_id="run-1",
-            candidate_id="candidate-1",
-            verdict=ValidationVerdict.CONFIRMED,
-            evidence_ids=(),
-            reason="invalid fixture",
-        )
+    def test_confirmed_validation_requires_vulnerability_specific_proof(self) -> None:
+        """confirmed 판정 자체가 구조화 proof 없이는 생성되지 않아야 한다."""
 
         with self.assertRaises(DomainInvariantError):
-            Finding.from_confirmed(
-                finding_id="finding-1", candidate=candidate, validation=validation
+            ValidationResult(
+                validation_id="validation-1",
+                run_id="run-1",
+                candidate_id="candidate-1",
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence_ids=("evi-1",),
+                reason="invalid fixture",
+                reproduction_count=1,
+            )
+
+    def test_validation_proof_evidence_must_be_part_of_result(self) -> None:
+        """LLM이 판정 근거 목록 밖의 Evidence를 proof로 주장할 수 없어야 한다."""
+
+        with self.assertRaises(DomainInvariantError):
+            ValidationResult(
+                validation_id="validation-1",
+                run_id="run-1",
+                candidate_id="candidate-1",
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence_ids=("evi-validation",),
+                reason="invalid proof reference",
+                reproduction_count=1,
+                proof=ValidationProof(
+                    proof_type=ValidationProofType.XSS_EXECUTION,
+                    evidence_ids=("evi-analysis",),
+                    summary="claimed script execution",
+                ),
             )
 
     def test_evidence_is_append_only_and_run_scoped(self) -> None:
@@ -166,6 +177,47 @@ class ArchitectureInvariantTests(unittest.TestCase):
 
         with self.assertRaises(PolicyViolation):
             AllowlistPolicyGate().validate_execution(run, request)
+
+    def test_safe_policy_rejects_state_changing_get_parameters(self) -> None:
+        """GET으로 잘못 구현된 변경 폼도 자동 probe 안전 범위가 아니다."""
+
+        run = Run(
+            run_id="run-1",
+            target_url="https://local.test/",
+            scope=RunScope(allowed_hosts=frozenset({"local.test"})),
+            policy_profile="safe",
+            request_budget=1,
+        )
+        request = ExecutionRequest(
+            execution_id="exec-1",
+            run_id=run.run_id,
+            task_id="task-1",
+            tool="http_get",
+            target_url="https://local.test/account",
+            surface_id="surface-account",
+            purpose="unsafe GET fixture",
+            query_parameters=(("password_new", "marker"),),
+        )
+
+        with self.assertRaises(PolicyViolation):
+            AllowlistPolicyGate().validate_execution(run, request)
+
+    def test_http_request_spec_rejects_runtime_controlled_or_injected_headers(self) -> None:
+        """Agent가 Scope·전송 경계를 바꾸는 헤더를 주입하지 못해야 한다."""
+
+        with self.assertRaises(DomainInvariantError):
+            HttpRequestSpec(headers=(("Host", "outside.test"),))
+        with self.assertRaises(DomainInvariantError):
+            HttpRequestSpec(headers=(("X-Test", "ok\r\nX-Injected: yes"),))
+        with self.assertRaises(DomainInvariantError):
+            HttpRequestSpec(request_kind="probe")  # type: ignore[arg-type]
+
+        spec = HttpRequestSpec(
+            query_parameters=(("name", "hacklipse7331"),),
+            headers=(("Accept", "text/html"),),
+            request_kind=HttpRequestKind.PROBE,
+        )
+        self.assertIs(spec.request_kind, HttpRequestKind.PROBE)
 
     def test_default_runtime_is_explicitly_disabled(self) -> None:
         """Runtime 미설정 상태에서는 외부 도구가 절대 실행되지 않아야 한다."""

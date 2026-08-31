@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Mapping
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .errors import DomainInvariantError
 
@@ -55,6 +59,54 @@ class ValidationVerdict(str, Enum):
     BLOCKED = "blocked"
 
 
+class ValidationProofType(str, Enum):
+    """취약점 유형별 CONFIRMED 판정이 요구하는 구조화된 증명 종류."""
+
+    XSS_EXECUTION = "xss_execution"
+    SQLI_EFFECT = "sqli_effect"
+    UNAUTHORIZED_OBJECT_ACCESS = "unauthorized_object_access"
+    PATH_TRAVERSAL_FILE_READ = "path_traversal_file_read"
+    SSTI_EXECUTION = "ssti_execution"
+
+
+class HttpRequestKind(str, Enum):
+    """비교 기준 요청과 취약점 탐색 요청을 기계적으로 구분한다."""
+
+    CONTROL = "control"
+    PROBE = "probe"
+
+
+_HTTP_METHOD = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+
+# PROBE 요청이 쿼리에 실을 수 있는 값의 형태. 영숫자 marker 뒤에 허용된 메타문자만
+# 최대 4개까지 붙일 수 있다.
+#
+# 왜 메타문자를 아예 막지 않는가 — SQLi는 따옴표 없이, 출력 인코딩 여부는 꺾쇠 없이
+# 원리적으로 확인할 수 없다. 이 문자들은 구문 오류를 유발하거나 인코딩 적용 여부를
+# 드러낼 뿐 실행되지 않고 대상 상태를 바꾸지 않는다(실제 스캐너의 canary 기법).
+#
+# 왜 그래도 형태를 강제하는가 — 이 검사가 없으면 Agent가, 나중에는 LLM이 임의 문자열을
+# 쿼리에 실을 수 있다. 공백·괄호·세미콜론·등호가 막히므로 "' OR 1=1--", "UNION SELECT",
+# "; DROP", "../", "<script>alert(1)</script>"는 전부 도메인에서 거부된다.
+# 새 탐침 기법이 다른 문자를 필요로 하면 여기를 늘리는 것이 명시적 결정이 된다.
+PROBE_METACHARACTERS = "'\"<>"
+_PROBE_VALUE = re.compile(r"^[A-Za-z0-9_-]+['\"<>]{0,4}$")
+_FORBIDDEN_REQUEST_HEADERS = frozenset(
+    {
+        "accept-encoding",
+        "authorization",
+        "connection",
+        "content-length",
+        "cookie",
+        "host",
+        "proxy-authorization",
+        "proxy-connection",
+        "transfer-encoding",
+        "user-agent",
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class RunScope:
     """한 Run에서 접근이 허용된 호스트와 경로 범위."""
@@ -78,11 +130,17 @@ class RunRequest:
     scope: RunScope
     policy_profile: str = "safe"
     request_budget: int = 100
+    timeout_seconds: int = 120
+    credential_ref: str | None = None
 
     def __post_init__(self) -> None:
         # 실행 예산은 이후 Runtime과 Agent 호출을 통제하는 상한선이다.
         if self.request_budget <= 0:
             raise DomainInvariantError("request budget must be positive")
+        if self.timeout_seconds <= 0:
+            raise DomainInvariantError("run timeout must be positive")
+        if self.credential_ref is not None and not self.credential_ref.strip():
+            raise DomainInvariantError("credential reference cannot be blank")
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +152,8 @@ class Run:
     scope: RunScope
     policy_profile: str
     request_budget: int
+    timeout_seconds: int = 120
+    credential_ref: str | None = None
     phase: RunPhase = RunPhase.INIT
     evidence_ids: tuple[str, ...] = ()
     surface_ids: tuple[str, ...] = ()
@@ -109,6 +169,49 @@ class Run:
 
 
 @dataclass(frozen=True, slots=True)
+class HttpRequestSpec:
+    """Agent가 공통 HTTP Runtime에 전달하는 구조화된 요청 명세."""
+
+    method: str = "GET"
+    query_parameters: tuple[tuple[str, str], ...] = ()
+    headers: tuple[tuple[str, str], ...] = ()
+    body: str | None = None
+    request_kind: HttpRequestKind = HttpRequestKind.CONTROL
+
+    def __post_init__(self) -> None:
+        if not self.method or _HTTP_METHOD.fullmatch(self.method) is None:
+            raise DomainInvariantError("HTTP method must be a valid token")
+        if not isinstance(self.request_kind, HttpRequestKind):
+            raise DomainInvariantError("HTTP request kind must be control or probe")
+        if self.body is not None and not isinstance(self.body, str):
+            raise DomainInvariantError("HTTP request body must be text")
+
+        for name, value in self.query_parameters:
+            if not isinstance(name, str) or not isinstance(value, str):
+                raise DomainInvariantError("HTTP query parameters must be string pairs")
+            # 탐침 요청만 값 형태를 강제한다. CONTROL 요청은 대상이 원래 갖고 있던
+            # 값(Recon이 수집한 쿼리)을 그대로 실어야 하므로 제한하지 않는다.
+            if (
+                self.request_kind is HttpRequestKind.PROBE
+                and _PROBE_VALUE.fullmatch(value) is None
+            ):
+                raise DomainInvariantError(
+                    "probe query value must be a marker with allowed metacharacters "
+                    f"({PROBE_METACHARACTERS}): {value!r}"
+                )
+        for name, value in self.headers:
+            if not isinstance(name, str) or not isinstance(value, str):
+                raise DomainInvariantError("HTTP headers must be string pairs")
+            lowered = name.casefold()
+            if not name or _HTTP_METHOD.fullmatch(name) is None:
+                raise DomainInvariantError("HTTP header name must be a valid token")
+            if lowered in _FORBIDDEN_REQUEST_HEADERS:
+                raise DomainInvariantError(f"HTTP header is controlled by the runtime: {name}")
+            if "\r" in value or "\n" in value:
+                raise DomainInvariantError("HTTP header value cannot contain line breaks")
+
+
+@dataclass(frozen=True, slots=True)
 class EvidenceRequest:
     """Validation 등이 추가 증적이 필요할 때 Orchestrator에 보내는 요청."""
 
@@ -116,6 +219,45 @@ class EvidenceRequest:
     surface_id: str
     reason: str
     suggested_tool: str
+    http_request: HttpRequestSpec | None = None
+
+    def request_fingerprint(self, target_url: str) -> str:
+        """비밀값 없이 동일 EvidenceRequest를 재연결하는 결정적 식별자.
+
+        URL·query·body 원문을 해시하면 짧은 비밀번호나 토큰을 오프라인 추측할 수 있다.
+        따라서 대상 origin/path, 파라미터·헤더 *이름*, 요청 목적과 kind만 사용한다.
+        probe별 ``reason``에는 대상 파라미터명이 들어가므로 같은 Surface의 여러 probe도
+        서로 구분된다.
+        """
+
+        request = self.http_request or HttpRequestSpec()
+        parsed = urlsplit(target_url)
+        target_query_names = tuple(
+            name for name, _ in parse_qsl(parsed.query, keep_blank_values=True)
+        )
+        canonical = json.dumps(
+            {
+                "body_present": request.body is not None,
+                "evidence_type": self.evidence_type,
+                "header_names": [name.casefold() for name, _ in request.headers],
+                "method": request.method.upper(),
+                "purpose": self.reason,
+                "query_names": [name for name, _ in request.query_parameters],
+                "request_kind": request.request_kind.value,
+                "surface_id": self.surface_id,
+                "target": [
+                    parsed.scheme.casefold(),
+                    parsed.netloc.casefold(),
+                    parsed.path or "/",
+                    target_query_names,
+                ],
+                "tool": self.suggested_tool,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +280,7 @@ class TaskEnvelope:
     policy_profile: str = "safe"
     timeout_seconds: int = 120
     credential_ref: str | None = None
+    validation_id: str | None = None
     evidence_request: EvidenceRequest | None = None
 
     def __post_init__(self) -> None:
@@ -179,6 +322,8 @@ class Evidence:
     surface_id: str | None
     created_by: str
     evidence_type: str
+    source_task_id: str | None = None
+    validation_id: str | None = None
     observation: Mapping[str, object] = field(default_factory=dict)
     artifact_refs: Mapping[str, str] = field(default_factory=dict)
     content_hash: str | None = None
@@ -231,6 +376,23 @@ class RouteDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class ValidationProof:
+    """CONFIRMED 판정을 뒷받침하는 취약점별 증명과 직접 Evidence 참조."""
+
+    proof_type: ValidationProofType
+    evidence_ids: tuple[str, ...]
+    summary: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.proof_type, ValidationProofType):
+            raise DomainInvariantError("validation proof type must be structured")
+        if not self.evidence_ids:
+            raise DomainInvariantError("validation proof must reference evidence")
+        if not self.summary.strip():
+            raise DomainInvariantError("validation proof must explain the reproduced effect")
+
+
+@dataclass(frozen=True, slots=True)
 class ValidationResult:
     """Candidate에 대한 독립 검증 결과와 근거 Evidence."""
 
@@ -241,7 +403,26 @@ class ValidationResult:
     evidence_ids: tuple[str, ...]
     reason: str
     reproduction_count: int = 0
-    evidence_requests: tuple[EvidenceRequest, ...] = ()
+    proof: ValidationProof | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.verdict, ValidationVerdict):
+            raise DomainInvariantError("validation verdict must be structured")
+        if not self.validation_id:
+            raise DomainInvariantError("validation result must identify its session")
+        if not self.reason.strip():
+            raise DomainInvariantError("validation result must explain its verdict")
+        if self.reproduction_count < 0:
+            raise DomainInvariantError("validation reproduction count cannot be negative")
+        if self.verdict is ValidationVerdict.CONFIRMED:
+            if self.proof is None:
+                raise DomainInvariantError(
+                    "confirmed validation requires vulnerability-specific proof"
+                )
+            if not set(self.proof.evidence_ids).issubset(self.evidence_ids):
+                raise DomainInvariantError(
+                    "validation proof evidence must be included in validation evidence"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,7 +516,43 @@ class ExecutionRequest:
     surface_id: str | None
     purpose: str
     method: str = "GET"
+    query_parameters: tuple[tuple[str, str], ...] = ()
+    headers: tuple[tuple[str, str], ...] = ()
+    body: str | None = None
+    request_kind: HttpRequestKind = HttpRequestKind.CONTROL
+    validation_id: str | None = None
+    timeout_seconds: float = 120.0
+    credential_ref: str | None = None
+    approval_ref: str | None = None
+    scope: RunScope | None = None
 
+    def __post_init__(self) -> None:
+        # Runtime 직전 객체도 동일한 명세 검증을 통과시켜 직접 생성 경로의 우회를 막는다.
+        HttpRequestSpec(
+            method=self.method,
+            query_parameters=self.query_parameters,
+            headers=self.headers,
+            body=self.body,
+            request_kind=self.request_kind,
+        )
+        if self.timeout_seconds <= 0:
+            raise DomainInvariantError("execution timeout must be positive")
+        if self.credential_ref is not None and not self.credential_ref.strip():
+            raise DomainInvariantError("execution credential reference cannot be blank")
+        if self.approval_ref is not None and not self.approval_ref.strip():
+            raise DomainInvariantError("execution approval reference cannot be blank")
+
+    @property
+    def resolved_url(self) -> str:
+        """기존 query를 보존하면서 구조화 파라미터를 인코딩한 실제 요청 URL."""
+
+        parsed = urlsplit(self.target_url)
+        encoded = urlencode(self.query_parameters)
+        query = parsed.query
+        if encoded:
+            query = f"{query}&{encoded}" if query else encoded
+        # URL fragment는 HTTP 요청 대상에 포함되지 않는다.
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
 
 @dataclass(frozen=True, slots=True)
 class ExecutionResult:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import sys
 import unittest
 from pathlib import Path
 
@@ -42,6 +43,33 @@ class DependencyDirectionTests(unittest.TestCase):
                             for prefix in prefixes
                         ):
                             violations.append(f"{path.relative_to(PACKAGE_ROOT)} imports {name}")
+
+        self.assertEqual(violations, [])
+
+    def test_core_layers_use_only_the_standard_library(self) -> None:
+        """domain·ports·application은 외부 패키지에 의존하지 않아야 한다.
+
+        불변식과 중재 로직이 사는 계층이라 감사 대상이고, 외부 패키지에 묶이면
+        검증과 이식이 어려워진다. adapters는 바깥세상과 붙는 곳이므로 예외다.
+        """
+
+        violations: list[str] = []
+        for layer in ("domain", "ports", "application"):
+            for path in (PACKAGE_ROOT / layer).rglob("*.py"):
+                tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        names = [alias.name for alias in node.names]
+                    elif isinstance(node, ast.ImportFrom):
+                        # 상대 import는 같은 패키지 안이므로 검사 대상이 아니다.
+                        names = [node.module] if node.level == 0 and node.module else []
+                    else:
+                        continue
+                    for name in names:
+                        root = name.split(".")[0]
+                        if root == "hacklipse" or root in sys.stdlib_module_names:
+                            continue
+                        violations.append(f"{path.relative_to(PACKAGE_ROOT)} imports {name}")
 
         self.assertEqual(violations, [])
 

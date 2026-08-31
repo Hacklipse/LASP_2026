@@ -13,6 +13,8 @@ from hacklipse.domain import (
     Evidence,
     EvidenceRequest,
     Finding,
+    HttpRequestKind,
+    HttpRequestSpec,
     ReportArtifact,
     Run,
     RunPhase,
@@ -69,11 +71,19 @@ class SQLiteStoreTests(unittest.TestCase):
                 allowed_tools=("http_get",),
                 request_budget=9,
                 credential_ref="credential-local",
+                validation_id="validation-1",
                 evidence_request=EvidenceRequest(
                     evidence_type="page_fetch",
                     surface_id="surface-1",
                     reason="round trip",
                     suggested_tool="http_get",
+                    http_request=HttpRequestSpec(
+                        method="POST",
+                        query_parameters=(("next", "/home"), ("id", "1"), ("id", "2")),
+                        headers=(("Content-Type", "application/x-www-form-urlencoded"),),
+                        body="name=테스트",
+                        request_kind=HttpRequestKind.CONTROL,
+                    ),
                 ),
             ),
             status=TaskStatus.RUNNING,
@@ -89,6 +99,8 @@ class SQLiteStoreTests(unittest.TestCase):
             surface_id="surface-1",
             created_by="execution_runtime:http_get",
             evidence_type="http_response",
+            source_task_id="task-1",
+            validation_id="validation-1",
             observation={
                 "status": 200,
                 "headers": [

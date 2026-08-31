@@ -14,6 +14,7 @@ from hacklipse.domain import (
     Run,
     RunPhase,
     RunRequest,
+    ValidationProofType,
     ValidationVerdict,
 )
 from hacklipse.ports import (
@@ -24,6 +25,7 @@ from hacklipse.ports import (
     PolicyGate,
     ReportStore,
     RunStore,
+    SurfaceStore,
     VulnerabilityRouter,
 )
 
@@ -31,6 +33,15 @@ from .errors import AgentContractError, WorkflowExecutionError
 from .state_machine import RunStateMachine
 from .task_executor import TaskExecutor
 from .task_factory import TaskFactory
+
+
+_PROOF_TYPE_BY_VULNERABILITY = {
+    "XSS": ValidationProofType.XSS_EXECUTION,
+    "SQLi": ValidationProofType.SQLI_EFFECT,
+    "Access Control": ValidationProofType.UNAUTHORIZED_OBJECT_ACCESS,
+    "Path Traversal": ValidationProofType.PATH_TRAVERSAL_FILE_READ,
+    "SSTI": ValidationProofType.SSTI_EXECUTION,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +52,9 @@ class OrchestratorConfig:
     validation_agent_type: str = "validation"
     evidence_collector_agent_type: str = "evidence_collector"
     report_agent_type: str = "report"
+    authentication_agent_type: str = "session_authenticator"
     max_evidence_rounds: int = 1
+    browser_xss_validation: bool = False
 
     def __post_init__(self) -> None:
         if self.max_evidence_rounds < 0:
@@ -59,6 +72,7 @@ class Orchestrator:
         candidate_store: CandidateStore,
         finding_store: FindingStore,
         report_store: ReportStore,
+        surface_store: SurfaceStore,
         policy_gate: PolicyGate,
         budget_manager: BudgetManager,
         router: VulnerabilityRouter,
@@ -73,6 +87,7 @@ class Orchestrator:
         self._candidates = candidate_store
         self._findings = finding_store
         self._reports = report_store
+        self._surfaces = surface_store
         self._policy = policy_gate
         self._budget = budget_manager
         self._router = router
@@ -93,6 +108,8 @@ class Orchestrator:
             scope=request.scope,
             policy_profile=request.policy_profile,
             request_budget=request.request_budget,
+            timeout_seconds=request.timeout_seconds,
+            credential_ref=request.credential_ref,
         )
         # Run과 예산을 먼저 등록한 뒤 첫 단계인 RECON으로 전이한다.
         self._runs.add(run)
@@ -109,6 +126,23 @@ class Orchestrator:
             return run
 
         try:
+            if run.credential_ref is not None and run.phase in {
+                RunPhase.RECON,
+                RunPhase.ROUTE,
+                RunPhase.ANALYZE,
+                RunPhase.VALIDATE,
+            }:
+                # 프로세스 재시작 시 메모리 CookieJar가 사라질 수 있으므로 resume마다
+                # 중앙 인증 Worker를 다시 실행한다. 비밀 원문은 Task에 들어가지 않는다.
+                auth_task = self._task_factory.authentication(
+                    run,
+                    agent_type=self._config.authentication_agent_type,
+                    request_budget=self._budget.remaining(run.run_id),
+                )
+                auth_result = self._tasks.execute(auth_task)
+                self._require_completed(auth_result, "authentication")
+                run = self._merge_agent_result(run, auth_result)
+                self._runs.save(run)
             # 단계 순서와 분기만 판단하고 실제 작업은 하위 컴포넌트에 맡긴다.
             while run.phase not in {RunPhase.DONE, RunPhase.FAILED}:
                 if run.phase is RunPhase.RECON:
@@ -150,10 +184,11 @@ class Orchestrator:
         return self._merge_agent_result(run, result)
 
     def _route(self, run: Run) -> Run:
-        """저장된 Evidence를 Router에 전달하고 생성된 Candidate를 저장한다."""
+        """저장된 Surface·Evidence를 Router에 전달하고 Candidate를 저장한다."""
 
+        surfaces = self._surfaces.list_by_run(run.run_id)
         evidence = self._evidence.get_many(run.run_id, run.evidence_ids)
-        decisions = self._router.route(run, evidence)
+        decisions = self._router.route(run, surfaces, evidence)
         candidate_ids = list(run.candidate_ids)
         for decision in decisions:
             candidate = decision.candidate
@@ -165,7 +200,7 @@ class Orchestrator:
         return run.with_updates(candidate_ids=tuple(dict.fromkeys(candidate_ids)))
 
     def _analyze(self, run: Run) -> Run:
-        """라우팅된 각 Candidate를 담당 Analysis Agent에 전달한다."""
+        """Analysis 요청·중앙 Evidence 수집·재호출을 반복해 Candidate를 분석한다."""
 
         current = run
         for candidate_id in run.candidate_ids:
@@ -173,16 +208,58 @@ class Orchestrator:
             # 이미 처리된 Candidate는 재개 시 중복 분석하지 않는다.
             if candidate.status != "routed":
                 continue
-            task = self._task_factory.analysis(
-                current,
-                candidate,
-                request_budget=self._budget.remaining(run.run_id),
-            )
-            result = self._tasks.execute(task)
-            self._require_completed(result, "analysis")
-            current = self._merge_agent_result(current, result)
-            candidate = candidate.add_evidence(result.new_evidence_ids).set_status("analyzed")
-            self._candidates.save(candidate)
+            # Candidate가 참조하는 Run-scoped Surface를 실제 Analysis 대상으로 해석한다.
+            surface = self._surfaces.get(run.run_id, candidate.surface_id)
+            for evidence_round in range(self._config.max_evidence_rounds + 1):
+                task = self._task_factory.analysis(
+                    current,
+                    candidate,
+                    target_url=surface.url,
+                    request_budget=self._budget.remaining(run.run_id),
+                )
+                result = self._tasks.execute(task)
+
+                # Agent가 요청 계획과 함께 만든 Observation이 있다면 먼저 병합한다.
+                current = self._merge_agent_result(current, result)
+                candidate = candidate.add_evidence(result.new_evidence_ids)
+                self._candidates.save(candidate)
+
+                if result.status is AgentResultStatus.COMPLETED:
+                    candidate = candidate.set_status("analyzed")
+                    self._candidates.save(candidate)
+                    break
+                if result.status is not AgentResultStatus.NEEDS_EVIDENCE:
+                    raise AgentContractError("analysis did not complete")
+                if not result.evidence_requests:
+                    raise AgentContractError(
+                        "analysis requested evidence without an EvidenceRequest"
+                    )
+                if evidence_round >= self._config.max_evidence_rounds:
+                    raise AgentContractError("analysis evidence rounds exhausted")
+
+                # Agent는 실행하지 않고 요청만 반환한다. 실제 실행은 중앙 수집 Task가 맡는다.
+                for request in result.evidence_requests:
+                    if request.surface_id != candidate.surface_id:
+                        raise AgentContractError(
+                            "analysis evidence request references a different surface"
+                        )
+                    if request.suggested_tool not in task.allowed_tools:
+                        raise AgentContractError(
+                            "analysis requested a tool that is not allowed by its task"
+                        )
+                    collection_task = self._task_factory.evidence_collection(
+                        current,
+                        candidate,
+                        request,
+                        target_url=surface.url,
+                        agent_type=self._config.evidence_collector_agent_type,
+                        request_budget=self._budget.remaining(run.run_id),
+                    )
+                    collection = self._tasks.execute(collection_task)
+                    self._require_completed(collection, "evidence collection")
+                    current = self._merge_agent_result(current, collection)
+                    candidate = candidate.add_evidence(collection.new_evidence_ids)
+                    self._candidates.save(candidate)
         return current
 
     def _validate(self, run: Run) -> Run:
@@ -196,39 +273,72 @@ class Orchestrator:
             if candidate.status != "analyzed":
                 continue
             validation = None
+            validation_id = f"validation-{self._id_factory()}"
 
             for evidence_round in range(self._config.max_evidence_rounds + 1):
                 # Analysis 결론 대신 Candidate와 Evidence 참조만 Validator에 전달한다.
                 task = self._task_factory.validation(
                     current,
                     candidate,
+                    validation_id=validation_id,
                     agent_type=self._config.validation_agent_type,
                     request_budget=self._budget.remaining(run.run_id),
+                    browser_xss_enabled=self._config.browser_xss_validation,
                 )
                 result = self._tasks.execute(task)
-                validation = result.validation
-                requests = result.evidence_requests
-                if validation is not None:
-                    self._validate_validation_contract(run, candidate, validation)
-                    requests = requests or validation.evidence_requests
-
-                if requests and evidence_round < self._config.max_evidence_rounds:
-                    # Validator가 Worker를 직접 호출하지 않고 Orchestrator가 수집 Task를 만든다.
-                    for request in requests:
-                        collection_task = self._task_factory.evidence_collection(
-                            current,
-                            candidate,
-                            request,
-                            agent_type=self._config.evidence_collector_agent_type,
-                            request_budget=self._budget.remaining(run.run_id),
+                if result.status is AgentResultStatus.COMPLETED:
+                    if result.evidence_requests:
+                        raise AgentContractError(
+                            "completed validation cannot request more evidence"
                         )
-                        collection = self._tasks.execute(collection_task)
-                        self._require_completed(collection, "evidence collection")
-                        current = self._merge_agent_result(current, collection)
-                        candidate = candidate.add_evidence(collection.new_evidence_ids)
-                        self._candidates.save(candidate)
-                    continue
-                break
+                    validation = result.validation
+                    if validation is None:
+                        raise AgentContractError(
+                            "completed validation did not return a verdict"
+                        )
+                    self._validate_validation_contract(
+                        run, candidate, validation, validation_id
+                    )
+                    break
+
+                if result.status is not AgentResultStatus.NEEDS_EVIDENCE:
+                    raise AgentContractError("validation did not complete")
+                if result.validation is not None:
+                    raise AgentContractError(
+                        "incomplete validation cannot return a final verdict"
+                    )
+                if not result.evidence_requests:
+                    raise AgentContractError(
+                        "validation requested evidence without an EvidenceRequest"
+                    )
+                if evidence_round >= self._config.max_evidence_rounds:
+                    break
+
+                # Validator는 요청만 제안한다. 실제 실행과 provenance 부여는 중앙에서 한다.
+                for request in result.evidence_requests:
+                    if request.surface_id != candidate.surface_id:
+                        raise AgentContractError(
+                            "validation evidence request references a different surface"
+                        )
+                    if request.suggested_tool not in task.allowed_tools:
+                        raise AgentContractError(
+                            "validation requested a tool that is not allowed by its task"
+                        )
+                    surface = self._surfaces.get(run.run_id, request.surface_id)
+                    collection_task = self._task_factory.evidence_collection(
+                        current,
+                        candidate,
+                        request,
+                        target_url=surface.url,
+                        agent_type=self._config.evidence_collector_agent_type,
+                        request_budget=self._budget.remaining(run.run_id),
+                        validation_id=validation_id,
+                    )
+                    collection = self._tasks.execute(collection_task)
+                    self._require_completed(collection, "evidence collection")
+                    current = self._merge_agent_result(current, collection)
+                    candidate = candidate.add_evidence(collection.new_evidence_ids)
+                    self._candidates.save(candidate)
 
             if validation is None:
                 # 반복 상한 안에 판정을 얻지 못하면 Finding으로 승격하지 않는다.
@@ -277,9 +387,13 @@ class Orchestrator:
         )
 
     def _validate_validation_contract(
-        self, run: Run, candidate: Candidate, validation: object
+        self,
+        run: Run,
+        candidate: Candidate,
+        validation: object,
+        expected_validation_id: str,
     ) -> None:
-        """Validation 결과의 타입·소유 관계·Evidence 실재 여부를 검사한다."""
+        """판정 소유 관계와 현재 Validation 세션 Evidence만 사용했는지 검사한다."""
 
         from hacklipse.domain import ValidationResult
 
@@ -287,7 +401,44 @@ class Orchestrator:
             raise AgentContractError("validation agent returned an invalid result")
         if validation.run_id != run.run_id or validation.candidate_id != candidate.candidate_id:
             raise AgentContractError("validation result references the wrong run or candidate")
-        self._evidence.get_many(run.run_id, validation.evidence_ids)
+        if validation.validation_id != expected_validation_id:
+            raise AgentContractError("validation result references a different session")
+
+        evidence = self._evidence.get_many(run.run_id, validation.evidence_ids)
+        if validation.reproduction_count != len(evidence):
+            raise AgentContractError(
+                "validation reproduction count does not match its evidence"
+            )
+        for item in evidence:
+            if item.validation_id != expected_validation_id:
+                raise AgentContractError(
+                    "validation result references evidence from another provenance"
+                )
+            if not item.created_by.startswith("execution_runtime:"):
+                raise AgentContractError(
+                    "validation result must reference centrally collected runtime evidence"
+                )
+            if item.source_task_id is None:
+                raise AgentContractError(
+                    "validation evidence is missing its collection task provenance"
+                )
+            if item.surface_id != candidate.surface_id:
+                raise AgentContractError(
+                    "validation result references evidence from another surface"
+                )
+
+        if validation.verdict is ValidationVerdict.CONFIRMED:
+            expected_proof = _PROOF_TYPE_BY_VULNERABILITY.get(
+                candidate.vulnerability_type
+            )
+            if expected_proof is None or validation.proof is None:
+                raise AgentContractError(
+                    "confirmed validation has no supported vulnerability proof"
+                )
+            if validation.proof.proof_type is not expected_proof:
+                raise AgentContractError(
+                    "validation proof type does not match the candidate vulnerability"
+                )
 
     @staticmethod
     def _require_completed(result: AgentResult, role: str) -> None:

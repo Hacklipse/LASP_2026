@@ -10,6 +10,9 @@ from .models import (
     ExecutionRequest,
     ExecutionResult,
     Finding,
+    PROBE_METACHARACTERS,
+    HttpRequestKind,
+    HttpRequestSpec,
     KnowledgeCase,
     KnowledgeQuery,
     ReportArtifact,
@@ -23,6 +26,8 @@ from .models import (
     TaskRecord,
     TaskStatus,
     ValidationResult,
+    ValidationProof,
+    ValidationProofType,
     ValidationVerdict,
 )
 
@@ -36,6 +41,9 @@ __all__ = [
     "ExecutionRequest",
     "ExecutionResult",
     "Finding",
+    "PROBE_METACHARACTERS",
+    "HttpRequestKind",
+    "HttpRequestSpec",
     "KnowledgeCase",
     "KnowledgeQuery",
     "ReportArtifact",
@@ -49,5 +57,7 @@ __all__ = [
     "TaskRecord",
     "TaskStatus",
     "ValidationResult",
+    "ValidationProof",
+    "ValidationProofType",
     "ValidationVerdict",
 ]
