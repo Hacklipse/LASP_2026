@@ -42,6 +42,55 @@ _TARGET_PATHS = {
     "xss": "vulnerabilities/xss_r/?name=seed",
     "sqli": "vulnerabilities/sqli/?id=1&Submit=Submit",
 }
+_TARGET_LABELS = {
+    "xss": "XSS",
+    "sqli": "SQLi",
+}
+
+
+def _format_counts(counts: Counter[str]) -> str:
+    if not counts:
+        return "없음"
+    return ", ".join(f"{name} {count}개" for name, count in counts.items())
+
+
+def _print_summary(
+    *,
+    profile: str,
+    target: str,
+    phase: str,
+    candidate_counts: Counter[str],
+    reflection_count: int,
+    sql_error_count: int,
+    http_execution_count: int,
+    finding_counts: Counter[str],
+) -> None:
+    finding_count = finding_counts.total()
+    target_label = _TARGET_LABELS[target]
+    target_confirmed = finding_counts[target_label] > 0
+    verdict = "CONFIRMED (취약점 확인)" if target_confirmed else "미확정"
+
+    print()
+    print("=" * 54)
+    print("  DVWA Baseline 실행 결과")
+    print("=" * 54)
+    print()
+    print("[실행 정보]")
+    print(f"  상태            완료 ({phase})")
+    print(f"  분석 대상       {target_label}")
+    print(f"  Agent 구성      {profile}")
+    print(f"  HTTP 실행       {http_execution_count}회")
+    print()
+    print("[분석 신호]")
+    print(f"  Candidate       {_format_counts(candidate_counts)}")
+    print(f"  Reflection      {reflection_count}개")
+    print(f"  SQL 오류        {sql_error_count}개")
+    print()
+    print("[최종 판정]")
+    print(f"  결과            {verdict}")
+    print(f"  Finding         {finding_count}개")
+    print(f"  취약점 유형     {_format_counts(finding_counts)}")
+    print("=" * 54)
 
 
 def main(argv: list[str]) -> int:
@@ -135,15 +184,16 @@ def main(argv: list[str]) -> int:
     )
     findings = app.stores.findings.list_by_run(run.run_id)
     events = audit.list_by_run(run.run_id)
-    print(f"구성              {profile}")
-    print(f"대상              {args.target}")
-    print(f"phase             {run.phase.value}")
-    print(f"Candidate         {dict(Counter(c.vulnerability_type for c in candidates))}")
-    print(f"reflection 신호  {len(reflections)}")
-    print(f"SQL 오류 신호     {len(sql_errors)}")
-    print(f"감사된 HTTP 실행 {len(events)}")
-    print(f"Finding           {len(findings)}")
-    print(f"Finding 유형      {dict(Counter(item.vulnerability_type for item in findings))}")
+    _print_summary(
+        profile=profile,
+        target=args.target,
+        phase=run.phase.value,
+        candidate_counts=Counter(c.vulnerability_type for c in candidates),
+        reflection_count=len(reflections),
+        sql_error_count=len(sql_errors),
+        http_execution_count=len(events),
+        finding_counts=Counter(item.vulnerability_type for item in findings),
+    )
     return 0
 
 
