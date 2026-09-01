@@ -82,6 +82,32 @@ class _LocalhostCookiePolicy(http.cookiejar.DefaultCookiePolicy):
         return super().return_ok_domain(cookie, request)
 
 
+class _RotatingSessionCookieJar(http.cookiejar.CookieJar):
+    """같은 이름의 Cookie는 Domain 속성이 달라져도 최신 값 하나만 남긴다.
+
+    RFC 6265는 Cookie를 (name, domain, path)로 구분한다. 그래서 서버가 로그인
+    직후 세션 Cookie를 재발급하면서 Domain 속성만 새로 붙이면, 인증 이전의
+    Cookie가 별개 항목으로 남아 두 값이 함께 전송된다. 서버가 그중 낡은 쪽을
+    집으면 방금 성공한 로그인이 다음 요청에서 사라진다.
+
+    이 Runtime의 CookieJar는 (run_id, credential_ref) 하나에만 묶인 단일 세션이라
+    같은 호스트에 같은 이름의 Cookie를 여러 벌 들고 있을 이유가 없다. 이름과
+    호스트가 같으면 이전 값을 지우고 새 값으로 대체한다.
+    """
+
+    def set_cookie(self, cookie) -> None:
+        host = cookie.domain.lstrip(".").casefold()
+        stale = [
+            existing
+            for existing in self
+            if existing.name == cookie.name
+            and existing.domain.lstrip(".").casefold() == host
+        ]
+        for existing in stale:
+            self.clear(existing.domain, existing.path, existing.name)
+        super().set_cookie(cookie)
+
+
 class HttpExecutionRuntime:
     """urllib.request 기반 실제 HTTP 실행 구현.
 
@@ -210,7 +236,7 @@ class HttpExecutionRuntime:
         key = (request.run_id, request.credential_ref)
         opener = self._sessions.get(key)
         if opener is None:
-            jar = http.cookiejar.CookieJar(policy=_LocalhostCookiePolicy())
+            jar = _RotatingSessionCookieJar(policy=_LocalhostCookiePolicy())
             opener = urllib.request.build_opener(
                 _NoRedirect,
                 urllib.request.ProxyHandler({}),
