@@ -14,6 +14,7 @@ from .path_traversal_analysis import (
     PATH_TRAVERSAL_TOOL,
     validate_path_traversal_request,
 )
+from .ssti_analysis import SSTI_TOOL, validate_ssti_request
 from .xss_execution import BROWSER_XSS_TOOL, validate_browser_xss_request
 
 
@@ -46,6 +47,11 @@ class AllowlistPolicyGate:
         if request.tool == PATH_TRAVERSAL_TOOL:
             try:
                 validate_path_traversal_request(request)
+            except ValueError as error:
+                raise PolicyViolation(str(error)) from error
+        if request.tool == SSTI_TOOL:
+            try:
+                validate_ssti_request(request)
             except ValueError as error:
                 raise PolicyViolation(str(error)) from error
         # 구조화 query까지 결합된 실제 전송 URL을 기준으로 Scope를 검사한다.

@@ -75,6 +75,8 @@ class HttpRequestKind(str, Enum):
     CONTROL = "control"
     PROBE = "probe"
     PATH_TRAVERSAL_PROBE = "path_traversal_probe"
+    SSTI_PROBE = "ssti_probe"
+    SSTI_CLEANUP = "ssti_cleanup"
 
 
 _HTTP_METHOD = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -238,6 +240,13 @@ class EvidenceRequest:
     reason: str
     suggested_tool: str
     http_request: HttpRequestSpec | None = None
+    # 상태 변경 요청의 승인 참조는 비밀이 아니라 사용자가 부여한 권한의 식별자다.
+    # 실제 허용 여부는 Agent가 아니라 중앙 ApprovalGate가 판단한다.
+    approval_ref: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.approval_ref is not None and not self.approval_ref.strip():
+            raise DomainInvariantError("evidence request approval reference cannot be blank")
 
     def request_fingerprint(self, target_url: str) -> str:
         """비밀값 없이 동일 EvidenceRequest를 재연결하는 결정적 식별자.
@@ -256,6 +265,7 @@ class EvidenceRequest:
         canonical = json.dumps(
             {
                 "body_present": request.body is not None,
+                "approval_present": self.approval_ref is not None,
                 "evidence_type": self.evidence_type,
                 "header_names": [name.casefold() for name, _ in request.headers],
                 "method": request.method.upper(),

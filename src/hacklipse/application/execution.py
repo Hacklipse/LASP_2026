@@ -214,6 +214,7 @@ class RuntimeEvidenceCollector:
             task_id=task.task_id,
             validation_id=task.validation_id,
             timeout_seconds=task.timeout_seconds,
+            approval_ref=request_spec.approval_ref,
         )
         return AgentResult(
             task_id=task.task_id,

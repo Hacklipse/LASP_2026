@@ -8,6 +8,7 @@ from uuid import uuid4
 from hacklipse.domain import Candidate, EvidenceRequest, Run, TaskEnvelope
 
 _PATH_TRAVERSAL_TOOL = "path_traversal_probe"
+_SSTI_TOOL = "ssti_probe"
 
 
 class TaskFactory:
@@ -39,11 +40,12 @@ class TaskFactory:
     ) -> TaskEnvelope:
         """Candidate의 실제 Surface URL과 Evidence 참조를 Analysis Task에 담는다."""
 
-        allowed_tools = (
-            (_PATH_TRAVERSAL_TOOL,)
-            if candidate.vulnerability_type == "Path Traversal"
-            else ("http_get",)
-        )
+        if candidate.vulnerability_type == "Path Traversal":
+            allowed_tools = (_PATH_TRAVERSAL_TOOL,)
+        elif candidate.vulnerability_type == "SSTI":
+            allowed_tools = (_SSTI_TOOL,)
+        else:
+            allowed_tools = ("http_get",)
         return self._base(
             run,
             agent_type=candidate.assigned_agent,
@@ -71,6 +73,8 @@ class TaskFactory:
             allowed_tools = ("http_get", "browser_xss")
         elif candidate.vulnerability_type == "Path Traversal":
             allowed_tools = (_PATH_TRAVERSAL_TOOL,)
+        elif candidate.vulnerability_type == "SSTI":
+            allowed_tools = (_SSTI_TOOL,)
         else:
             allowed_tools = ("http_get",)
         return self._base(
