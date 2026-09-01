@@ -7,7 +7,7 @@ basket ID를 메모리에서만 사용한다. 비밀은 Task·Evidence·감사 �
 
     py scripts/run_juice_shop_baseline.py http://127.0.0.1:3000/
     py scripts/run_juice_shop_baseline.py http://127.0.0.1:3000/ --profile llm --debug-llm-content
-    py scripts/run_juice_shop_baseline.py http://127.0.0.1:3000/ --target access_control
+    py scripts/run_juice_shop_baseline.py http://127.0.0.1:3000/ --vuln access_control
 """
 
 from __future__ import annotations
@@ -345,10 +345,10 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base_url", help="localhost/127.0.0.1 Juice Shop base URL")
     parser.add_argument(
-        "--target",
+        "--vuln",
         choices=("ssti", "access_control"),
         default="ssti",
-        help="검증 대상 (default: ssti)",
+        help="취약점 유형 (default: ssti)",
     )
     parser.add_argument(
         "--profile",
@@ -381,7 +381,7 @@ def main(argv: list[str]) -> int:
     if parsed.scheme not in {"http", "https"} or host not in _LOCAL_HOSTS:
         print("거부: 이 실행기는 localhost/127.0.0.1의 Juice Shop만 허용합니다.")
         return 2
-    access_control = args.target == "access_control"
+    access_control = args.vuln == "access_control"
     if access_control:
         target_label = "Access Control"
         try:
@@ -510,7 +510,7 @@ def main(argv: list[str]) -> int:
             profile = f"llm/{args.llm_provider} ({_safe_log_value(selected_model)})"
         try:
             progress.log(
-                f"Run 시작: target={target_label}, profile={profile}, "
+                f"Run 시작: vuln={target_label}, profile={profile}, "
                 f"request_budget={_DEFAULT_BUDGET}"
             )
             run = app.orchestrator.start(

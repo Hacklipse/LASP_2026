@@ -4,11 +4,11 @@ DVWA 인증정보는 명령행 인자나 환경변수로 받지 않고 현재 �
 Task/Evidence/Audit에는 credential_ref와 마스킹된 응답만 남는다.
 
     python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/
-    python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/ --target sqli
-    python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/ --target path_traversal
-    python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/DVWA/ --target xss
-    python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/ --target xss --profile llm
-    python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/ --target xss --profile llm --debug
+    python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/ --vuln sqli
+    python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/ --vuln path_traversal
+    python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/DVWA/ --vuln xss
+    python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/ --vuln xss --profile llm
+    python3 scripts/run_dvwa_baseline.py http://127.0.0.1:8080/ --vuln xss --profile llm --debug
 """
 
 from __future__ import annotations
@@ -327,7 +327,7 @@ def _format_counts(counts: Counter[str]) -> str:
 def _print_summary(
     *,
     profile: str,
-    target: str,
+    vuln: str,
     phase: str,
     candidate_counts: Counter[str],
     reflection_count: int,
@@ -339,7 +339,7 @@ def _print_summary(
     finding_counts: Counter[str],
 ) -> None:
     finding_count = finding_counts.total()
-    target_label = _TARGET_LABELS[target]
+    target_label = _TARGET_LABELS[vuln]
     target_confirmed = finding_counts[target_label] > 0
     verdict = "CONFIRMED (취약점 확인)" if target_confirmed else "미확정"
 
@@ -373,10 +373,10 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base_url", help="localhost/127.0.0.1 DVWA base URL")
     parser.add_argument(
-        "--target",
+        "--vuln",
         choices=tuple(_TARGET_PATHS),
         default="xss",
-        help="baseline target vulnerability (default: xss)",
+        help="baseline vulnerability type (default: xss)",
     )
     parser.add_argument(
         "--profile",
@@ -422,7 +422,7 @@ def main(argv: list[str]) -> int:
     debug_enabled = args.debug or args.debug_llm_content
     progress = _DebugProgress(debug_enabled)
 
-    if args.target == "path_traversal":
+    if args.vuln == "path_traversal":
         print(
             "Path Traversal은 별도 파일 생성 없이 고정된 "
             "/etc/os-release 읽기로 검증합니다."
@@ -468,7 +468,7 @@ def main(argv: list[str]) -> int:
                 "LLM content 로그 활성화: prompt와 구조화 응답을 로컬 터미널에 출력"
             )
 
-    access_control = args.target == "access_control"
+    access_control = args.vuln == "access_control"
     if access_control:
         if not (args.actor_object_id and args.owner_object_id):
             print("access_control 대상은 --actor-object-id와 --owner-object-id가 필요합니다.")
@@ -482,7 +482,7 @@ def main(argv: list[str]) -> int:
         )
 
     login_url = urljoin(base_url, "login.php")
-    target_url = urljoin(base_url, _TARGET_PATHS[args.target])
+    target_url = urljoin(base_url, _TARGET_PATHS[args.vuln])
 
     def _login_spec(user: str, secret: str) -> FormLoginSpec:
         return FormLoginSpec(
@@ -547,11 +547,11 @@ def main(argv: list[str]) -> int:
     app = build_local_application(
         {},
         runtime=runtime,
-        router=standard_router(vulnerability_types=(_TARGET_LABELS[args.target],)),
+        router=standard_router(vulnerability_types=(_TARGET_LABELS[args.vuln],)),
         credential_resolver=resolver,
         approval_gate=StaticApprovalGate((_APPROVAL_REF,)),
         audit_log=audit,
-        config=OrchestratorConfig(browser_xss_validation=args.target == "xss"),
+        config=OrchestratorConfig(browser_xss_validation=args.vuln == "xss"),
         task_progress_callback=progress.task_event if debug_enabled else None,
     )
     # 이 실행기는 DVWA reflected-XSS/SQLi 파이프라인의 재현 실험이다. 전 사이트를
@@ -570,7 +570,7 @@ def main(argv: list[str]) -> int:
 
     try:
         progress.log(
-            f"Run 시작: target={_TARGET_LABELS[args.target]}, profile={profile}, "
+            f"Run 시작: vuln={_TARGET_LABELS[args.vuln]}, profile={profile}, "
             f"request_budget={_DEFAULT_BUDGET}"
         )
         run = app.orchestrator.start(
@@ -621,7 +621,7 @@ def main(argv: list[str]) -> int:
     events = audit.list_by_run(run.run_id)
     _print_summary(
         profile=profile,
-        target=args.target,
+        vuln=args.vuln,
         phase=run.phase.value,
         candidate_counts=Counter(c.vulnerability_type for c in candidates),
         reflection_count=len(reflections),
