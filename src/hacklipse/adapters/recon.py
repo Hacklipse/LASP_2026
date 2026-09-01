@@ -129,14 +129,21 @@ class ReconAgent:
         # (url, method, parameters) 조합으로 중복을 막는다.
         surfaces: dict[tuple[str, str, tuple[str, ...]], str] = {}
 
-        def remember(url: str, method: str, names: tuple[str, ...]) -> str:
+        def remember(
+            url: str,
+            method: str,
+            names: tuple[str, ...],
+            observed: tuple[tuple[str, str], ...] = (),
+        ) -> str:
             key = (url.split("?", 1)[0], method, names)
             existing = surfaces.get(key)
             if existing is not None:
                 return existing
             surface_id = f"surface-{self._id_factory()}"
             surfaces[key] = surface_id
-            self._store_surface(task.run_id, surface_id, key[0], method, names)
+            self._store_surface(
+                task.run_id, surface_id, key[0], method, names, observed=observed
+            )
             evidence_ids.extend(
                 self._flag_suspect_parameters(task.run_id, surface_id, names)
             )
@@ -148,7 +155,7 @@ class ReconAgent:
                 continue
             fetched.add(url)
 
-            surface_id = remember(url, "GET", _query_names(url))
+            surface_id = remember(url, "GET", _query_names(url), _query_pairs(url))
             evidence_id, evidence = self._fetch(task, url, surface_id)
             evidence_ids.append(evidence_id)
 
@@ -163,7 +170,7 @@ class ReconAgent:
                 if not _same_origin(link, origin):
                     continue
                 # 예산과 무관하게 표면으로 기록하고, 여유가 있으면 크롤링까지 한다.
-                remember(link, "GET", _query_names(link))
+                remember(link, "GET", _query_names(link), _query_pairs(link))
                 if link not in fetched and link not in pending:
                     pending.append(link)
             for source in sources:
@@ -235,7 +242,14 @@ class ReconAgent:
         ]
 
     def _store_surface(
-        self, run_id: str, surface_id: str, url: str, method: str, params: tuple[str, ...]
+        self,
+        run_id: str,
+        surface_id: str,
+        url: str,
+        method: str,
+        params: tuple[str, ...],
+        *,
+        observed: tuple[tuple[str, str], ...] = (),
     ) -> None:
         self._surfaces.add(
             Surface(
@@ -244,6 +258,7 @@ class ReconAgent:
                 url=url,
                 method=method,
                 parameters=params,
+                observed_query=observed,
             )
         )
 
@@ -316,6 +331,15 @@ def _parse_page(
 
 def _query_names(url: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(name for name, _ in parse_qsl(urlsplit(url).query)))
+
+
+def _query_pairs(url: str) -> tuple[tuple[str, str], ...]:
+    """관측된 query 값을 이름별로 한 번씩 보존한다."""
+
+    pairs: dict[str, str] = {}
+    for name, value in parse_qsl(urlsplit(url).query, keep_blank_values=True):
+        pairs.setdefault(name, value)
+    return tuple(pairs.items())
 
 
 def _same_origin(url: str, origin) -> bool:

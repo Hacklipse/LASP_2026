@@ -58,15 +58,19 @@ from hacklipse.ports.errors import LlmCredentialsMissing  # noqa: E402
 
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1"})
 _CREDENTIAL_REF = "interactive-local-dvwa"
+_ACTOR_CREDENTIAL_REF = "interactive-local-dvwa-actor"
+_OWNER_CREDENTIAL_REF = "interactive-local-dvwa-owner"
 _APPROVAL_REF = "interactive-local-dvwa-login"
 _DEFAULT_BUDGET = 30
 _MAX_LLM_CONTENT_LOG_CHARS = 8_000
 _TARGET_PATHS = {
+    "access_control": "vulnerabilities/bac/?user_id=1&action=View+Profile",
     "xss": "vulnerabilities/xss_r/?name=seed",
     "sqli": "vulnerabilities/sqli/?id=1&Submit=Submit",
     "path_traversal": "vulnerabilities/fi/?page=include.php",
 }
 _TARGET_LABELS = {
+    "access_control": "Access Control",
     "xss": "XSS",
     "sqli": "SQLi",
     "path_traversal": "Path Traversal",
@@ -328,6 +332,7 @@ def _print_summary(
     candidate_counts: Counter[str],
     reflection_count: int,
     sql_error_count: int,
+    object_id_auth_count: int,
     path_traversal_count: int,
     browser_execution_count: int,
     audited_execution_count: int,
@@ -353,6 +358,7 @@ def _print_summary(
     print(f"  Candidate       {_format_counts(candidate_counts)}")
     print(f"  Reflection      {reflection_count}개")
     print(f"  SQL 오류        {sql_error_count}개")
+    print(f"  객체 권한 우회  {object_id_auth_count}개")
     print(f"  OS 파일 읽기 {path_traversal_count}개")
     print(f"  XSS 실행        {browser_execution_count}개")
     print()
@@ -387,6 +393,20 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--llm-model",
         help="provider model id; provider default is used when omitted",
+    )
+    parser.add_argument(
+        "--dvwa-security",
+        choices=("low", "medium", "high", "impossible"),
+        default="low",
+        help="DVWA security level cookie (default: low)",
+    )
+    parser.add_argument(
+        "--actor-object-id",
+        help="권한이 낮은 요청 주체가 소유한 객체 ID (access_control 전용)",
+    )
+    parser.add_argument(
+        "--owner-object-id",
+        help="검사 대상 객체의 정상 소유자 객체 ID (access_control 전용)",
     )
     parser.add_argument(
         "--debug",
@@ -448,34 +468,79 @@ def main(argv: list[str]) -> int:
                 "LLM content 로그 활성화: prompt와 구조화 응답을 로컬 터미널에 출력"
             )
 
-    username = input("DVWA username: ")
-    password = getpass.getpass("DVWA password: ")
-    if input("로컬 DVWA에 로그인 POST를 실행할까요? [y/N] ").strip().casefold() != "y":
-        print("취소했습니다.")
-        return 2
+    access_control = args.target == "access_control"
+    if access_control:
+        if not (args.actor_object_id and args.owner_object_id):
+            print("access_control 대상은 --actor-object-id와 --owner-object-id가 필요합니다.")
+            return 2
+        if args.actor_object_id == args.owner_object_id:
+            print("actor와 owner 객체 ID가 같으면 권한 대조가 성립하지 않습니다.")
+            return 2
+        print(
+            "주의: DVWA Broken Access Control 페이지는 조회 요청도 접근 로그를 남깁니다.\n"
+            "     서로 다른 두 계정으로 각각 로그인하며, 요청 횟수를 최소로 유지합니다."
+        )
 
     login_url = urljoin(base_url, "login.php")
     target_url = urljoin(base_url, _TARGET_PATHS[args.target])
-    resolver = InMemoryCredentialResolver(
-        {
-            _CREDENTIAL_REF: ResolvedHttpCredential(
-                # DVWA의 보안 단계가 reflected-XSS 실습 동작을 가리지 않게 고정한다.
-                cookies=(("security", "low"),),
-                form_login=FormLoginSpec(
-                    login_url=login_url,
-                    username=username,
-                    password=password,
-                    csrf_field="user_token",
-                    extra_fields=(("Login", "Login"),),
-                    failure_marker="Login failed",
-                    # 로그인 POST의 302만으로는 성공·실패를 구분할 수 없다. 같은 Run
-                    # 세션으로 보호된 시작 페이지를 읽을 수 있어야 인증 성공이다.
-                    verification_url=target_url,
-                    approval_ref=_APPROVAL_REF,
+
+    def _login_spec(user: str, secret: str) -> FormLoginSpec:
+        return FormLoginSpec(
+            login_url=login_url,
+            username=user,
+            password=secret,
+            csrf_field="user_token",
+            extra_fields=(("Login", "Login"),),
+            failure_marker="Login failed",
+            # 로그인 POST의 302만으로는 성공·실패를 구분할 수 없다. 같은 Run
+            # 세션으로 보호된 시작 페이지를 읽을 수 있어야 인증 성공이다.
+            verification_url=target_url,
+            approval_ref=_APPROVAL_REF,
+        )
+
+    if access_control:
+        actor_user = input("ACTOR (권한 낮은 계정) username: ")
+        actor_password = getpass.getpass("ACTOR password: ")
+        owner_user = input("OWNER (객체 소유 계정) username: ")
+        owner_password = getpass.getpass("OWNER password: ")
+        if input("로컬 DVWA에 두 계정 로그인 POST를 실행할까요? [y/N] ").strip().casefold() != "y":
+            print("취소했습니다.")
+            return 2
+        # security Cookie는 중앙 Resolver가 관리한다. Agent와 LLM에는 전달되지 않는다.
+        resolver = InMemoryCredentialResolver(
+            {
+                _ACTOR_CREDENTIAL_REF: ResolvedHttpCredential(
+                    cookies=(("security", args.dvwa_security),),
+                    form_login=_login_spec(actor_user, actor_password),
                 ),
-            )
-        }
-    )
+                _OWNER_CREDENTIAL_REF: ResolvedHttpCredential(
+                    cookies=(("security", args.dvwa_security),),
+                    form_login=_login_spec(owner_user, owner_password),
+                ),
+            }
+        )
+        principal_credentials = (
+            ("actor", _ACTOR_CREDENTIAL_REF),
+            ("owner", _OWNER_CREDENTIAL_REF),
+        )
+        run_credential_ref = _ACTOR_CREDENTIAL_REF
+    else:
+        username = input("DVWA username: ")
+        password = getpass.getpass("DVWA password: ")
+        if input("로컬 DVWA에 로그인 POST를 실행할까요? [y/N] ").strip().casefold() != "y":
+            print("취소했습니다.")
+            return 2
+        principal_credentials = ()
+        run_credential_ref = _CREDENTIAL_REF
+        resolver = InMemoryCredentialResolver(
+            {
+                _CREDENTIAL_REF: ResolvedHttpCredential(
+                    # DVWA의 보안 단계가 실습 동작을 가리지 않게 고정한다.
+                    cookies=(("security", args.dvwa_security),),
+                    form_login=_login_spec(username, password),
+                )
+            }
+        )
     http_runtime = HttpExecutionRuntime(credential_resolver=resolver)
     runtime = PlaywrightBrowserRuntime(http_runtime=http_runtime)
     audit = _DebugAuditLog(progress) if debug_enabled else InMemoryExecutionAuditLog()
@@ -493,7 +558,11 @@ def main(argv: list[str]) -> int:
     # 크롤링하면 비밀번호 변경 같은 상태 변경 GET 폼까지 탐색 대상에 섞이고, 결과도
     # 시작 Surface가 아닌 크롤링 순서에 좌우된다. 대상 페이지 한 장만 열거한다.
     profile = register_standard_agents(
-        app, llm_client=llm_client, recon_max_pages=1
+        app,
+        llm_client=llm_client,
+        recon_max_pages=1,
+        actor_object_id=args.actor_object_id,
+        owner_object_id=args.owner_object_id,
     )
     if profile == "llm":
         profile = f"llm/{args.llm_provider} ({_safe_log_value(selected_model)})"
@@ -512,7 +581,8 @@ def main(argv: list[str]) -> int:
                     allowed_path_prefixes=(base_path or "/",),
                 ),
                 request_budget=_DEFAULT_BUDGET,
-                credential_ref=_CREDENTIAL_REF,
+                credential_ref=run_credential_ref,
+                principal_credentials=principal_credentials,
             )
         )
     except WorkflowExecutionError as error:
@@ -536,6 +606,11 @@ def main(argv: list[str]) -> int:
         for item in app.stores.evidence.list_by_run(run.run_id)
         if item.observation.get("type") == "path_traversal_file_read"
     )
+    object_id_auths = tuple(
+        item
+        for item in app.stores.evidence.list_by_run(run.run_id)
+        if item.observation.get("type") == "object_id_auth"
+    )
     browser_executions = tuple(
         item
         for item in app.stores.evidence.list_by_run(run.run_id)
@@ -551,6 +626,7 @@ def main(argv: list[str]) -> int:
         candidate_counts=Counter(c.vulnerability_type for c in candidates),
         reflection_count=len(reflections),
         sql_error_count=len(sql_errors),
+        object_id_auth_count=len(object_id_auths),
         path_traversal_count=len(path_traversals),
         browser_execution_count=len(browser_executions),
         audited_execution_count=len(events),

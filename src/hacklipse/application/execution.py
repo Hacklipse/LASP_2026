@@ -6,6 +6,7 @@ from collections.abc import Callable
 from uuid import uuid4
 
 from hacklipse.domain import (
+    AccessPrincipalRole,
     AgentResult,
     AgentResultStatus,
     Evidence,
@@ -13,6 +14,7 @@ from hacklipse.domain import (
     ExecutionRequest,
     ExecutionResult,
     HttpRequestSpec,
+    Run,
     TaskEnvelope,
 )
 from hacklipse.ports import (
@@ -25,6 +27,7 @@ from hacklipse.ports import (
     PolicyGate,
     RunStore,
 )
+from hacklipse.ports.errors import PolicyViolation
 
 from .errors import AgentContractError
 
@@ -63,6 +66,7 @@ class RuntimeEvidenceCollector:
         validation_id: str | None = None,
         timeout_seconds: float = 120.0,
         approval_ref: str | None = None,
+        credential_ref: str | None = None,
     ) -> str:
         """정책·예산·Runtime 경계를 거쳐 Evidence를 저장하고 ID를 반환한다."""
 
@@ -74,6 +78,7 @@ class RuntimeEvidenceCollector:
             validation_id=validation_id,
             timeout_seconds=timeout_seconds,
             approval_ref=approval_ref,
+            credential_ref=credential_ref,
         )
         return evidence_id
 
@@ -87,6 +92,7 @@ class RuntimeEvidenceCollector:
         validation_id: str | None = None,
         timeout_seconds: float = 120.0,
         approval_ref: str | None = None,
+        credential_ref: str | None = None,
     ) -> tuple[str, ExecutionResult]:
         """중앙 인증 Worker가 raw 결과를 일시적으로 읽되 저장본은 마스킹한다."""
 
@@ -107,9 +113,10 @@ class RuntimeEvidenceCollector:
             headers=http_request.headers,
             body=http_request.body,
             request_kind=http_request.request_kind,
+            identifier_parameter=http_request.identifier_parameter,
             validation_id=validation_id,
             timeout_seconds=min(timeout_seconds, run.timeout_seconds),
-            credential_ref=run.credential_ref,
+            credential_ref=_credential_for(run, spec.principal_role, credential_ref),
             approval_ref=approval_ref,
             scope=run.scope,
         )
@@ -220,3 +227,37 @@ class RuntimeEvidenceCollector:
             status=AgentResultStatus.COMPLETED,
             new_evidence_ids=(evidence_id,),
         )
+
+
+def _credential_for(
+    run: Run,
+    role: AccessPrincipalRole | None,
+    requested: str | None = None,
+) -> str | None:
+    """Agent가 지정한 역할을 Run에 등록된 자격증명으로만 해석한다.
+
+    Agent와 LLM은 credential_ref를 직접 고를 수 없다. `EvidenceRequest`에는 역할만
+    담을 수 있고, 그 역할이 현재 Run에 등록되어 있지 않으면 요청이 거부된다. 이 해석이
+    중앙에 있어야 ACTOR/OWNER 세션이 섞이지 않는다.
+
+    `requested`는 중앙 인증 Worker처럼 어떤 주체의 세션을 세울지 Orchestrator가 이미
+    정해 둔 경우에만 쓴다. 그 경우에도 Run에 등록된 참조가 아니면 거부하므로, 임의
+    자격증명을 끌어다 쓰는 경로는 되지 않는다.
+    """
+
+    if role is not None:
+        registered = dict(run.principal_credentials)
+        credential_ref = registered.get(role.value)
+        if not credential_ref:
+            raise PolicyViolation(
+                f"run has no credential registered for principal role: {role.value}"
+            )
+        return credential_ref
+    if requested is not None:
+        allowed = {run.credential_ref, *(ref for _, ref in run.principal_credentials)}
+        if requested not in allowed:
+            raise PolicyViolation(
+                "execution requested a credential that is not registered for this run"
+            )
+        return requested
+    return run.credential_ref

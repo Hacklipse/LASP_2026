@@ -75,6 +75,19 @@ class HttpRequestKind(str, Enum):
     CONTROL = "control"
     PROBE = "probe"
     PATH_TRAVERSAL_PROBE = "path_traversal_probe"
+    ACCESS_CONTROL_PROBE = "access_control_probe"
+
+
+class AccessPrincipalRole(str, Enum):
+    """Access Control 탐침이 지정할 수 있는 인증 주체 역할.
+
+    Agent와 LLM은 credential_ref를 직접 고를 수 없고 역할만 지정한다. 역할에서
+    자격증명으로의 해석은 중앙 Collector가 Run에 등록된 매핑으로만 수행하므로,
+    Agent는 username·password·Cookie·Authorization을 알 수도 고를 수도 없다.
+    """
+
+    ACTOR = "actor"
+    OWNER = "owner"
 
 
 _HTTP_METHOD = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -96,6 +109,9 @@ _PROBE_VALUE = re.compile(r"^[A-Za-z0-9_-]+['\"<>]{0,4}$")
 # 비민감 OS 식별 파일을 정확한 상대 경로 하나로 고정해 LLM이나 Agent가 다른 파일
 # (예: /etc/passwd)을 선택하지 못하게 한다.
 PATH_TRAVERSAL_SAFE_PROBE_PATH = "../../../../../etc/os-release"
+# Access Control 탐침이 식별자 파라미터에 실을 수 있는 값. 숫자만 허용해 LLM이나 Agent가
+# 경로·따옴표·와일드카드를 객체 ID 자리에 넣지 못하게 한다.
+_OBJECT_IDENTIFIER = re.compile(r"^[0-9]{1,10}$")
 _FORBIDDEN_REQUEST_HEADERS = frozenset(
     {
         "accept-encoding",
@@ -143,6 +159,9 @@ class RunRequest:
     request_budget: int = 100
     timeout_seconds: int = 120
     credential_ref: str | None = None
+    # 역할 → credential_ref 매핑. Access Control처럼 두 주체가 필요한 검사에서만 채운다.
+    # 여기에 등록되지 않은 역할은 중앙 Collector가 거부한다.
+    principal_credentials: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         # 실행 예산은 이후 Runtime과 Agent 호출을 통제하는 상한선이다.
@@ -165,6 +184,9 @@ class Run:
     request_budget: int
     timeout_seconds: int = 120
     credential_ref: str | None = None
+    # 역할 → credential_ref 매핑. Access Control처럼 두 주체가 필요한 검사에서만 채운다.
+    # 여기에 등록되지 않은 역할은 중앙 Collector가 거부한다.
+    principal_credentials: tuple[tuple[str, str], ...] = ()
     phase: RunPhase = RunPhase.INIT
     evidence_ids: tuple[str, ...] = ()
     surface_ids: tuple[str, ...] = ()
@@ -188,6 +210,9 @@ class HttpRequestSpec:
     headers: tuple[tuple[str, str], ...] = ()
     body: str | None = None
     request_kind: HttpRequestKind = HttpRequestKind.CONTROL
+    # ACCESS_CONTROL_PROBE에서 값이 바뀌는 유일한 파라미터. 나머지 query는 Recon이 관측한
+    # 원본을 그대로 보존해야 하므로 어느 것이 식별자인지 명시적으로 지정한다.
+    identifier_parameter: str | None = None
 
     def __post_init__(self) -> None:
         if not self.method or _HTTP_METHOD.fullmatch(self.method) is None:
@@ -217,6 +242,9 @@ class HttpRequestSpec:
                 raise DomainInvariantError(
                     "path traversal probe may only use markers and the fixed safe path"
                 )
+        if self.request_kind is HttpRequestKind.ACCESS_CONTROL_PROBE:
+            self._validate_access_control_probe()
+
         for name, value in self.headers:
             if not isinstance(name, str) or not isinstance(value, str):
                 raise DomainInvariantError("HTTP headers must be string pairs")
@@ -228,6 +256,37 @@ class HttpRequestSpec:
             if "\r" in value or "\n" in value:
                 raise DomainInvariantError("HTTP header value cannot contain line breaks")
 
+    def _validate_access_control_probe(self) -> None:
+        """객체 권한 탐침이 식별자 값 하나만 바꾸도록 강제한다.
+
+        다른 사용자의 객체를 읽어보는 요청이므로 표면을 최대한 좁힌다. 헤더·본문을
+        금지해 Cookie나 Authorization을 명세로 주입할 수 없게 하고, 값이 바뀌는 자리를
+        식별자 파라미터 하나로 한정한다. 나머지 query(action·token 등)는 Recon이 관측한
+        원본을 그대로 실어야 대상 페이지가 정상 동작한다.
+        """
+
+        if self.method.upper() != "GET":
+            raise DomainInvariantError("access control probe must be a GET request")
+        if self.headers:
+            raise DomainInvariantError("access control probe cannot set request headers")
+        if self.body is not None:
+            raise DomainInvariantError("access control probe cannot carry a body")
+        if not self.identifier_parameter:
+            raise DomainInvariantError("access control probe must name its identifier parameter")
+
+        names = [name for name, _ in self.query_parameters]
+        if names.count(self.identifier_parameter) != 1:
+            raise DomainInvariantError(
+                "access control probe identifier must appear exactly once in the query"
+            )
+        for name, value in self.query_parameters:
+            if name != self.identifier_parameter:
+                continue
+            if _OBJECT_IDENTIFIER.fullmatch(value) is None:
+                raise DomainInvariantError(
+                    f"access control object id must be numeric: {value!r}"
+                )
+
 
 @dataclass(frozen=True, slots=True)
 class EvidenceRequest:
@@ -238,6 +297,15 @@ class EvidenceRequest:
     reason: str
     suggested_tool: str
     http_request: HttpRequestSpec | None = None
+    # Agent는 어떤 자격증명을 쓸지 고를 수 없고 역할만 지정한다. 역할 → credential_ref
+    # 해석은 중앙 Collector가 Run에 등록된 매핑으로만 수행한다.
+    principal_role: AccessPrincipalRole | None = None
+
+    def __post_init__(self) -> None:
+        if self.principal_role is not None and not isinstance(
+            self.principal_role, AccessPrincipalRole
+        ):
+            raise DomainInvariantError("principal role must be a structured role")
 
     def request_fingerprint(self, target_url: str) -> str:
         """비밀값 없이 동일 EvidenceRequest를 재연결하는 결정적 식별자.
@@ -260,6 +328,9 @@ class EvidenceRequest:
                 "header_names": [name.casefold() for name, _ in request.headers],
                 "method": request.method.upper(),
                 "purpose": self.reason,
+                "principal_role": (
+                    self.principal_role.value if self.principal_role is not None else None
+                ),
                 "query_names": [name for name, _ in request.query_parameters],
                 "request_kind": request.request_kind.value,
                 "surface_id": self.surface_id,
@@ -358,6 +429,10 @@ class Surface:
     method: str
     parameters: tuple[str, ...] = ()
     requires_auth: bool = False
+    # Recon이 실제로 관측한 query 값. 이름만으로는 재요청이 성립하지 않는 페이지가 있다
+    # (예: action=View Profile, token=...). 식별자만 바꾸고 나머지를 원본 그대로 실으려면
+    # 관측 시점의 값이 필요하다.
+    observed_query: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -538,6 +613,7 @@ class ExecutionRequest:
     headers: tuple[tuple[str, str], ...] = ()
     body: str | None = None
     request_kind: HttpRequestKind = HttpRequestKind.CONTROL
+    identifier_parameter: str | None = None
     validation_id: str | None = None
     timeout_seconds: float = 120.0
     credential_ref: str | None = None
@@ -552,6 +628,7 @@ class ExecutionRequest:
             headers=self.headers,
             body=self.body,
             request_kind=self.request_kind,
+            identifier_parameter=self.identifier_parameter,
         )
         if self.timeout_seconds <= 0:
             raise DomainInvariantError("execution timeout must be positive")

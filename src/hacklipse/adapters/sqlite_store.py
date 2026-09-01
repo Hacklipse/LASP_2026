@@ -189,6 +189,10 @@ def _decode_run(data: str) -> Run:
         allowed_path_prefixes=tuple(scope["allowed_path_prefixes"]),
     )
     value["phase"] = RunPhase(value["phase"])
+    # 역할 → credential_ref 매핑은 쌍의 튜플이므로 안쪽까지 복원한다.
+    value["principal_credentials"] = tuple(
+        tuple(item) for item in value.get("principal_credentials", ())
+    )
     for name in (
         "evidence_ids",
         "surface_ids",
@@ -236,6 +240,9 @@ def _decode_evidence(data: str) -> Evidence:
 
 def _decode_surface(data: str) -> Surface:
     value = _load(data)
+    value["observed_query"] = tuple(
+        tuple(item) for item in value.get("observed_query", ())
+    )
     value["parameters"] = tuple(value["parameters"])
     return Surface(**value)
 

@@ -29,7 +29,9 @@ from hacklipse.ports.errors import CredentialNotFound, ExternalExecutionDisabled
 
 # http(s)만 허용한다. file:·ftp: 등은 SSRF 표면이므로 Runtime 진입 전에 차단한다.
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
-_HTTP_TOOLS = frozenset({"http_get", "http_post", "path_traversal_probe"})
+_HTTP_TOOLS = frozenset(
+    {"http_get", "http_post", "path_traversal_probe", "access_control_probe"}
+)
 # 실제 리다이렉트 상태만 리다이렉트로 분류한다. 300/304/305/306은 리다이렉트가 아니다.
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _DEFAULT_TIMEOUT = 15.0
@@ -78,6 +80,32 @@ class _LocalhostCookiePolicy(http.cookiejar.DefaultCookiePolicy):
         if self._is_exact_localhost(cookie, request):
             return True
         return super().return_ok_domain(cookie, request)
+
+
+class _RotatingSessionCookieJar(http.cookiejar.CookieJar):
+    """같은 이름의 Cookie는 Domain 속성이 달라져도 최신 값 하나만 남긴다.
+
+    RFC 6265는 Cookie를 (name, domain, path)로 구분한다. 그래서 서버가 로그인
+    직후 세션 Cookie를 재발급하면서 Domain 속성만 새로 붙이면, 인증 이전의
+    Cookie가 별개 항목으로 남아 두 값이 함께 전송된다. 서버가 그중 낡은 쪽을
+    집으면 방금 성공한 로그인이 다음 요청에서 사라진다.
+
+    이 Runtime의 CookieJar는 (run_id, credential_ref) 하나에만 묶인 단일 세션이라
+    같은 호스트에 같은 이름의 Cookie를 여러 벌 들고 있을 이유가 없다. 이름과
+    호스트가 같으면 이전 값을 지우고 새 값으로 대체한다.
+    """
+
+    def set_cookie(self, cookie) -> None:
+        host = cookie.domain.lstrip(".").casefold()
+        stale = [
+            existing
+            for existing in self
+            if existing.name == cookie.name
+            and existing.domain.lstrip(".").casefold() == host
+        ]
+        for existing in stale:
+            self.clear(existing.domain, existing.path, existing.name)
+        super().set_cookie(cookie)
 
 
 class HttpExecutionRuntime:
@@ -208,7 +236,7 @@ class HttpExecutionRuntime:
         key = (request.run_id, request.credential_ref)
         opener = self._sessions.get(key)
         if opener is None:
-            jar = http.cookiejar.CookieJar(policy=_LocalhostCookiePolicy())
+            jar = _RotatingSessionCookieJar(policy=_LocalhostCookiePolicy())
             opener = urllib.request.build_opener(
                 _NoRedirect,
                 urllib.request.ProxyHandler({}),

@@ -26,6 +26,11 @@ from .path_traversal_analysis import (
     build_path_traversal_requests,
     path_traversal_signal,
 )
+from .access_control_analysis import (
+    ACCESS_CONTROL_TOOL,
+    build_access_control_requests,
+    unauthorized_object_exposed,
+)
 from .routing import DEFAULT_RULES
 from .sqli_analysis import sql_error_signal
 from .xss_execution import BROWSER_XSS_TOOL, XSS_EXECUTION_MARKER_PREFIX
@@ -92,11 +97,16 @@ class ValidationAgent:
             candidate.vulnerability_type == "Path Traversal"
             and PATH_TRAVERSAL_TOOL in task.allowed_tools
         )
-        required_tool = (
-            PATH_TRAVERSAL_TOOL
-            if specialized_path_validation
-            else _REPRODUCTION_TOOL
+        specialized_access_validation = (
+            candidate.vulnerability_type == "Access Control"
+            and ACCESS_CONTROL_TOOL in task.allowed_tools
         )
+        if specialized_path_validation:
+            required_tool = PATH_TRAVERSAL_TOOL
+        elif specialized_access_validation:
+            required_tool = ACCESS_CONTROL_TOOL
+        else:
+            required_tool = _REPRODUCTION_TOOL
         if required_tool not in task.allowed_tools:
             raise AgentContractError(
                 f"validation tool is not allowed by the task: {required_tool}"
@@ -116,6 +126,8 @@ class ValidationAgent:
             return self._validate_path_traversal(
                 task, candidate, evidence, reproduction
             )
+        if specialized_access_validation:
+            return self._validate_access_control(task, candidate, evidence)
         if (
             candidate.vulnerability_type == "XSS"
             and BROWSER_XSS_TOOL in task.allowed_tools
@@ -334,6 +346,122 @@ class ValidationAgent:
             reason="independent quote probe did not reproduce the SQL error differential",
         )
 
+    def _validate_access_control(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        evidence: Sequence[Evidence],
+    ) -> AgentResult:
+        """Analysis 결론을 쓰지 않고 자기 세션에서 세 요청을 다시 수행해 판정한다.
+
+        Analysis가 만든 object_id_auth Observation은 "어디를 어떤 객체 ID로 볼지"를 알려주는
+        지시일 뿐 확정 근거가 아니다. 실제 판정은 이 validation_id로 새로 수집한 Evidence
+        세 개로만 한다.
+        """
+
+        plan = _access_control_plan(evidence)
+        if plan is None:
+            # Analysis 신호가 없으면 무엇을 재현해야 하는지 알 수 없다. 조용히 통과시키지
+            # 않고 미확정으로 남긴다.
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.COMPLETED,
+                validation=self._validation_result(
+                    task,
+                    verdict=ValidationVerdict.SUSPECTED,
+                    evidence=(),
+                    reason="no object_id_auth observation to reproduce independently",
+                ).validation,
+            )
+
+        identifier, actor_id, owner_id = plan
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        requests = build_access_control_requests(
+            surface,
+            identifier,
+            actor_object_id=actor_id,
+            owner_object_id=owner_id,
+            purpose=f"independent access control validation {task.validation_id}",
+        )
+        collected = [
+            matching_evidence(evidence, surface.url, request) for request in requests
+        ]
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                return AgentResult(
+                    task_id=task.task_id,
+                    status=AgentResultStatus.COMPLETED,
+                    validation=self._validation_result(
+                        task,
+                        verdict=ValidationVerdict.SUSPECTED,
+                        evidence=(),
+                        reason="independent access control reproduction exceeded the request budget",
+                    ).validation,
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+
+        actor_control, owner_control, probe = collected
+        session_evidence = tuple(
+            item for item in (actor_control, owner_control, probe) if item is not None
+        )
+        # 세 요청 모두 이번 validation 세션의 중앙 수집 Evidence여야 한다.
+        if len(session_evidence) != 3 or any(
+            not _is_reproduction_evidence(item, task.validation_id)
+            for item in (actor_control, owner_control, probe)
+            if item is not None
+        ):
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.COMPLETED,
+                validation=self._validation_result(
+                    task,
+                    verdict=ValidationVerdict.SUSPECTED,
+                    evidence=(),
+                    reason="access control reproduction did not belong to this validation session",
+                ).validation,
+            )
+
+        assert owner_control is not None and probe is not None
+        if not unauthorized_object_exposed(owner_control, probe, owner_id):
+            # owner 객체가 actor 세션에서 보이지 않는다. 권한 검사가 동작한 것이다.
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.COMPLETED,
+                validation=self._validation_result(
+                    task,
+                    verdict=ValidationVerdict.REJECTED,
+                    evidence=session_evidence,
+                    reason="actor session did not expose the owner object",
+                ).validation,
+            )
+
+        proof = ValidationProof(
+            proof_type=ValidationProofType.UNAUTHORIZED_OBJECT_ACCESS,
+            evidence_ids=tuple(item.evidence_id for item in session_evidence),
+            summary=(
+                f"actor session read object {owner_id} owned by another principal "
+                f"through parameter {identifier}"
+            ),
+        )
+        return AgentResult(
+            task_id=task.task_id,
+            status=AgentResultStatus.COMPLETED,
+            validation=self._validation_result(
+                task,
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence=session_evidence,
+                reason="independent reproduction exposed another principal's object",
+                proof=proof,
+            ).validation,
+        )
+
     def _validate_path_traversal(
         self,
         task: TaskEnvelope,
@@ -511,3 +639,20 @@ def _is_reproduction_evidence(evidence: Evidence, validation_id: str) -> bool:
         and evidence.created_by.startswith("execution_runtime:")
         and str(evidence.observation.get("type")) in _REPRODUCTION_EVIDENCE_TYPES
     )
+
+
+def _access_control_plan(
+    evidence: Sequence[Evidence],
+) -> tuple[str, str, str] | None:
+    """Analysis Observation에서 재현에 필요한 좌표만 읽는다(판정은 읽지 않는다)."""
+
+    for item in reversed(list(evidence)):
+        observation = item.observation
+        if observation.get("type") != "object_id_auth":
+            continue
+        identifier = observation.get("identifier_parameter")
+        actor_id = observation.get("actor_object_id")
+        owner_id = observation.get("owner_object_id")
+        if all(isinstance(value, str) and value for value in (identifier, actor_id, owner_id)):
+            return str(identifier), str(actor_id), str(owner_id)
+    return None

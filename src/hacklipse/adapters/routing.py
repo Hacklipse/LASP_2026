@@ -8,7 +8,10 @@ from uuid import uuid4
 
 from hacklipse.domain import Candidate, Evidence, RouteDecision, Run, Surface
 
-from .request_safety import has_state_changing_parameters
+from .request_safety import (
+    has_state_changing_parameters,
+    object_identifier_parameters,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +44,29 @@ class SurfaceRoutingRule:
         return bool(surface.parameters) if self.requires_parameters else True
 
 
+@dataclass(frozen=True, slots=True)
+class IdentifierSurfaceRoutingRule:
+    """객체 식별자 파라미터가 있는 Surface만 Access Control 탐색 대상으로 만든다.
+
+    Access Control은 "다른 사람의 객체를 가리키는 입력"이 있어야 성립한다. 파라미터가
+    있다는 것만으로 후보를 만들면 검색어·정렬 옵션까지 전부 권한 검사 대상이 되어
+    예산만 소모하고 신호는 나오지 않는다.
+    """
+
+    vulnerability_type: str
+    agent_type: str
+    methods: tuple[str, ...] = ("GET",)
+    priority: float = 0.35
+
+    def matches(self, surface: Surface) -> bool:
+        if surface.method.upper() not in self.methods:
+            return False
+        # 비밀번호 변경·삭제처럼 상태를 바꾸는 GET 폼은 자동 탐침 대상에서 제외한다.
+        if has_state_changing_parameters(surface.parameters):
+            return False
+        return bool(object_identifier_parameters(surface.parameters))
+
+
 # 첫 버전은 설명 가능하고 재현하기 쉬운 명시적 규칙으로 라우팅한다.
 DEFAULT_RULES = (
     RoutingRule("reflection", "XSS", "xss_analyzer", 0.8),
@@ -57,6 +83,7 @@ DEFAULT_SURFACE_RULES = (
     SurfaceRoutingRule("XSS", "xss_analyzer", priority=0.30),
     SurfaceRoutingRule("SQLi", "sqli_analyzer", priority=0.30),
     SurfaceRoutingRule("SSTI", "ssti_analyzer", priority=0.20),
+    IdentifierSurfaceRoutingRule("Access Control", "access_control_analyzer", priority=0.35),
 )
 
 
