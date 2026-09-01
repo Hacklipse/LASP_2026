@@ -22,10 +22,12 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Sequence
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from hacklipse.application.errors import AgentContractError
 from hacklipse.domain import (
+    AccessIdentifierLocation,
     AccessPrincipalRole,
     AgentResult,
     AgentResultStatus,
@@ -45,6 +47,7 @@ ACCESS_CONTROL_TOOL = "access_control_probe"
 HEURISTIC_ACCESS_CONTROL_ANALYZER = "heuristic_access_control_analyzer"
 
 _OBSERVATION_TYPE = "object_id_auth"
+_PATH_IDENTIFIER_PREFIX = "path:"
 
 # 접근이 거부됐거나 세션이 끊겼음을 나타내는 문구. 이런 응답을 정상 객체 접근으로
 # 오인하면 안전한 대상을 취약하다고 보고하게 된다.
@@ -101,8 +104,10 @@ class HeuristicAccessControlAnalyzer:
             candidate_store=self._candidates,
             surface_store=self._surfaces,
             required_tool=ACCESS_CONTROL_TOOL,
+            allow_parameterless_get=True,
         )
-        identifier = self._select_identifier(parameters)
+        identifiers = access_identifier_options(surface, parameters)
+        identifier = self._select_identifier(identifiers)
         if identifier is None:
             # 객체 식별자가 없으면 권한 우회를 판정할 수 없다. 조용히 통과시키지 않고
             # 요청도 쓰지 않은 채 끝낸다.
@@ -140,9 +145,19 @@ class HeuristicAccessControlAnalyzer:
         if actor_control is None or owner_control is None or probe is None:
             raise AgentContractError("access control evidence was not collected")
 
-        if not unauthorized_object_exposed(owner_control, probe, owner_id):
+        location, logical_identifier = _identifier_coordinates(surface, identifier)
+        if not unauthorized_object_exposed(
+            actor_control, owner_control, probe, actor_id, owner_id
+        ):
             return self._completed(task, candidate.candidate_id, ())
-        if _has_record(evidence, identifier, actor_control, owner_control, probe):
+        if _has_record(
+            evidence,
+            logical_identifier,
+            location.value,
+            actor_control,
+            owner_control,
+            probe,
+        ):
             return self._completed(task, candidate.candidate_id, ())
 
         observation_id = f"evi-{self._id_factory()}"
@@ -156,7 +171,13 @@ class HeuristicAccessControlAnalyzer:
                 observation={
                     # Router.DEFAULT_RULES의 "object_id_auth" 규칙과 맞는 유형이어야 한다.
                     "type": _OBSERVATION_TYPE,
-                    "identifier_parameter": identifier,
+                    "identifier_parameter": logical_identifier,
+                    "identifier_location": location.value,
+                    "path_identifier_index": (
+                        surface.path_identifier_index
+                        if location is AccessIdentifierLocation.PATH
+                        else None
+                    ),
                     "actor_object_id": actor_id,
                     "owner_object_id": owner_id,
                     "actor_control_evidence_id": actor_control.evidence_id,
@@ -189,8 +210,40 @@ class HeuristicAccessControlAnalyzer:
 def _first_identifier(parameters: Sequence[str]) -> str | None:
     """이름 규칙으로 객체 식별자를 고르는 기본 선택자."""
 
-    candidates = object_identifier_parameters(parameters)
+    candidates = tuple(
+        name
+        for name in parameters
+        if name.startswith(_PATH_IDENTIFIER_PREFIX)
+        or object_identifier_parameters((name,))
+    )
     return candidates[0] if candidates else None
+
+
+def access_identifier_options(
+    surface: Surface, parameters: Sequence[str]
+) -> tuple[str, ...]:
+    """Surface가 제공하는 query/path 객체 식별자 선택지를 반환한다."""
+
+    query = object_identifier_parameters(parameters)
+    path = (
+        (f"{_PATH_IDENTIFIER_PREFIX}{surface.path_identifier}",)
+        if surface.path_identifier is not None
+        else ()
+    )
+    return tuple(dict.fromkeys((*query, *path)))
+
+
+def _identifier_coordinates(
+    surface: Surface, identifier: str
+) -> tuple[AccessIdentifierLocation, str]:
+    if identifier.startswith(_PATH_IDENTIFIER_PREFIX):
+        logical = identifier.removeprefix(_PATH_IDENTIFIER_PREFIX)
+        if not logical or logical != surface.path_identifier:
+            raise AgentContractError("path identifier is not present on the surface")
+        return AccessIdentifierLocation.PATH, logical
+    if identifier not in surface.parameters:
+        raise AgentContractError("query identifier is not present on the surface")
+    return AccessIdentifierLocation.QUERY, identifier
 
 
 def build_access_control_requests(
@@ -207,6 +260,7 @@ def build_access_control_requests(
     값이 바뀌는 자리를 하나로 묶어야 응답 차이의 원인이 권한 하나로 좁혀진다.
     """
 
+    location, logical_identifier = _identifier_coordinates(surface, identifier)
     plans = (
         (AccessPrincipalRole.ACTOR, actor_object_id, "actor self control"),
         (AccessPrincipalRole.OWNER, owner_object_id, "owner control"),
@@ -221,9 +275,22 @@ def build_access_control_requests(
             principal_role=role,
             http_request=HttpRequestSpec(
                 method="GET",
-                query_parameters=_query_for(surface, identifier, object_id),
+                query_parameters=(
+                    _query_for(surface, logical_identifier, object_id)
+                    if location is AccessIdentifierLocation.QUERY
+                    else surface.observed_query
+                ),
                 request_kind=HttpRequestKind.ACCESS_CONTROL_PROBE,
-                identifier_parameter=identifier,
+                identifier_parameter=logical_identifier,
+                identifier_location=location,
+                path_identifier_index=(
+                    surface.path_identifier_index
+                    if location is AccessIdentifierLocation.PATH
+                    else None
+                ),
+                path_identifier_value=(
+                    object_id if location is AccessIdentifierLocation.PATH else None
+                ),
             ),
         )
         for role, object_id, label in plans
@@ -243,7 +310,11 @@ def _query_for(
 
 
 def unauthorized_object_exposed(
-    owner_control: Evidence, probe: Evidence, owner_object_id: str
+    actor_control: Evidence,
+    owner_control: Evidence,
+    probe: Evidence,
+    actor_object_id: str,
+    owner_object_id: str,
 ) -> bool:
     """owner 객체가 actor 세션 응답에서도 확인되는지 판정한다.
 
@@ -252,9 +323,13 @@ def unauthorized_object_exposed(
     대신 "그 객체를 가리키는 안정적인 구조 신호"가 양쪽에 함께 있는지를 본다.
     """
 
+    actor_body = response_body(actor_control)
     owner_body = response_body(owner_control)
     probe_body = response_body(probe)
-    if owner_body is None or probe_body is None:
+    if actor_body is None or owner_body is None or probe_body is None:
+        return False
+    # actor의 정상 객체도 보여야 인증 세션과 이 표면의 정상 응답 형태가 성립한다.
+    if not _shows_object(actor_control, actor_body, actor_object_id):
         return False
     # owner가 자기 객체를 못 봤다면 그 객체가 실재하는지 자체가 불확실하다.
     if not _shows_object(owner_control, owner_body, owner_object_id):
@@ -285,17 +360,41 @@ def _object_signal(lowered_body: str, object_id: str) -> bool:
     페이지 어딘가에 남을 수 있다. 필드 이름과 함께 나타난 경우만 인정한다.
     """
 
+    # JSON API 응답은 `{"id": 1}`처럼 필드명이 따옴표로 감싸진다.
+    try:
+        import json
+
+        payload = json.loads(lowered_body)
+        if _json_contains_object_id(payload, object_id):
+            return True
+    except (TypeError, ValueError):
+        pass
+
     patterns = (
         rf"user\s*id\s*[:=]?\s*{re.escape(object_id)}\b",
-        rf"\bid\s*[:=]\s*{re.escape(object_id)}\b",
+        rf'["\']?(?:user_?id|userid|id)["\']?\s*[:=]\s*["\']?{re.escape(object_id)}\b',
         rf'name="user_?id"[^>]*value="{re.escape(object_id)}"',
     )
     return any(re.search(pattern, lowered_body) for pattern in patterns)
 
 
+def _json_contains_object_id(value: object, object_id: str) -> bool:
+    if isinstance(value, dict):
+        for name, item in value.items():
+            normalized = str(name).casefold().replace("_", "")
+            if normalized in {"id", "userid"} and str(item) == object_id:
+                return True
+            if _json_contains_object_id(item, object_id):
+                return True
+    elif isinstance(value, list):
+        return any(_json_contains_object_id(item, object_id) for item in value)
+    return False
+
+
 def _has_record(
     evidence: Sequence[Evidence],
     identifier: str,
+    location: str,
     actor_control: Evidence,
     owner_control: Evidence,
     probe: Evidence,
@@ -306,6 +405,7 @@ def _has_record(
         item.created_by == HEURISTIC_ACCESS_CONTROL_ANALYZER
         and item.observation.get("type") == _OBSERVATION_TYPE
         and item.observation.get("identifier_parameter") == identifier
+        and item.observation.get("identifier_location", "query") == location
         and item.observation.get("actor_control_evidence_id") == actor_control.evidence_id
         and item.observation.get("owner_control_evidence_id") == owner_control.evidence_id
         and item.observation.get("probe_evidence_id") == probe.evidence_id
@@ -331,6 +431,25 @@ def validate_access_control_request(request) -> None:
     identifier = request.identifier_parameter
     if not identifier:
         raise ValueError("access control probe must name its identifier parameter")
+    location = request.identifier_location or AccessIdentifierLocation.QUERY
+    if location is AccessIdentifierLocation.PATH:
+        parsed = urlsplit(request.target_url)
+        resolved = urlsplit(request.resolved_url)
+        before, after = parsed.path.split("/"), resolved.path.split("/")
+        index = request.path_identifier_index
+        if index is None or not (1 <= index < len(before)) or len(before) != len(after):
+            raise ValueError("access control path identifier index is invalid")
+        if _OBJECT_ID.fullmatch(before[index]) is None:
+            raise ValueError("access control target path must contain a numeric object id")
+        if any(
+            left != right
+            for position, (left, right) in enumerate(zip(before, after))
+            if position != index
+        ):
+            raise ValueError("access control probe changed more than one path segment")
+        if _OBJECT_ID.fullmatch(after[index]) is None:
+            raise ValueError("access control path object id must be numeric")
+        return
     names = [name for name, _ in request.query_parameters]
     if names.count(identifier) != 1:
         raise ValueError("access control identifier must appear exactly once")

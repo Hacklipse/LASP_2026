@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
+from urllib.parse import urlsplit
 
 from hacklipse.adapters import HeuristicAccessControlAnalyzer, LlmAccessControlAnalyzer
 from hacklipse.adapters.access_control_analysis import (
@@ -24,6 +25,7 @@ from hacklipse.application.errors import AgentContractError
 from hacklipse.bootstrap import build_local_application
 from hacklipse.domain import (
     AccessPrincipalRole,
+    AccessIdentifierLocation,
     AgentResultStatus,
     Candidate,
     DomainInvariantError,
@@ -66,6 +68,8 @@ class _PrincipalRuntime:
             request.credential_ref or ""
         )
         requested = dict(request.query_parameters).get("user_id", "")
+        if request.identifier_location is AccessIdentifierLocation.PATH:
+            requested = urlsplit(request.resolved_url).path.rstrip("/").rsplit("/", 1)[-1]
         if session_user is None:
             body, status = "<form><input type='password'></form>", 200
         elif self.enforces_ownership and requested != session_user:
@@ -84,13 +88,16 @@ class _PrincipalRuntime:
         )
 
 
-def _fixture(*, enforces_ownership: bool, parameters=("user_id", "action")):
+def _fixture(
+    *, enforces_ownership: bool, parameters=("user_id", "action"), path=False
+):
     runtime = _PrincipalRuntime(enforces_ownership=enforces_ownership)
     app = build_local_application({}, runtime=runtime)
+    url = "http://local.test/users/2" if path else _URL
     app.stores.runs.add(
         Run(
             run_id=_RUN_ID,
-            target_url=_URL,
+            target_url=url,
             scope=RunScope(allowed_hosts=frozenset({"local.test"})),
             policy_profile="safe",
             request_budget=40,
@@ -102,10 +109,13 @@ def _fixture(*, enforces_ownership: bool, parameters=("user_id", "action")):
         Surface(
             surface_id=_SURFACE_ID,
             run_id=_RUN_ID,
-            url=_URL,
+            url=url,
             method="GET",
-            parameters=parameters,
-            observed_query=(("user_id", "1"), ("action", "view")),
+            parameters=() if path else parameters,
+            observed_query=() if path else (("user_id", "1"), ("action", "view")),
+            path_identifier="user_id" if path else None,
+            path_identifier_index=2 if path else None,
+            observed_path_identifier="2" if path else None,
         )
     )
     app.stores.candidates.add(
@@ -124,7 +134,7 @@ def _fixture(*, enforces_ownership: bool, parameters=("user_id", "action")):
         task_id="task-ac",
         run_id=_RUN_ID,
         agent_type="access_control_analyzer",
-        target_url=_URL,
+        target_url=url,
         surface_id=_SURFACE_ID,
         candidate_id=_CANDIDATE_ID,
         allowed_tools=(ACCESS_CONTROL_TOOL,),
@@ -194,6 +204,31 @@ class AccessControlAnalysisTests(unittest.TestCase):
 
     def test_access_denied_produces_no_observation(self) -> None:
         app, _, task = _fixture(enforces_ownership=True)
+        agent = _analyzer(app)
+
+        requested = agent.handle(task)
+        agent.handle(_collect(requested, app, task))
+
+        self.assertEqual(_signals(app), [])
+
+    def test_path_segment_identifier_produces_the_same_observation(self) -> None:
+        app, runtime, task = _fixture(enforces_ownership=False, path=True)
+        agent = _analyzer(app)
+
+        requested = agent.handle(task)
+        agent.handle(_collect(requested, app, task))
+
+        self.assertEqual(
+            [urlsplit(item.resolved_url).path for item in runtime.requests],
+            ["/users/2", "/users/1", "/users/1"],
+        )
+        signals = _signals(app)
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0]["identifier_parameter"], "user_id")
+        self.assertEqual(signals[0]["identifier_location"], "path")
+
+    def test_path_segment_ownership_denial_produces_no_observation(self) -> None:
+        app, _, task = _fixture(enforces_ownership=True, path=True)
         agent = _analyzer(app)
 
         requested = agent.handle(task)
@@ -300,6 +335,36 @@ class AccessControlAnalysisTests(unittest.TestCase):
             with self.subTest(description), self.assertRaises(DomainInvariantError):
                 HttpRequestSpec(**{**base, **override})
 
+    def test_path_probe_replaces_only_the_declared_numeric_segment(self) -> None:
+        request = ExecutionRequest(
+            execution_id="e-path",
+            run_id=_RUN_ID,
+            task_id="t-path",
+            tool=ACCESS_CONTROL_TOOL,
+            target_url="http://local.test/api/users/2?view=full",
+            surface_id=_SURFACE_ID,
+            purpose="path probe",
+            request_kind=HttpRequestKind.ACCESS_CONTROL_PROBE,
+            identifier_parameter="user_id",
+            identifier_location=AccessIdentifierLocation.PATH,
+            path_identifier_index=3,
+            path_identifier_value="1",
+        )
+
+        self.assertEqual(
+            request.resolved_url, "http://local.test/api/users/1?view=full"
+        )
+        validate_access_control_request(request)
+
+        for value in ("../admin", "1 OR 1=1", ""):
+            with self.subTest(value), self.assertRaises(DomainInvariantError):
+                replace(request, path_identifier_value=value)
+
+        with self.assertRaises(ValueError):
+            validate_access_control_request(
+                replace(request, target_url="http://local.test/api/users/current")
+            )
+
     def test_policy_repeats_the_same_checks_at_the_execution_boundary(self) -> None:
         """도메인을 우회해 ExecutionRequest를 직접 만들어도 같은 제약을 받는다."""
 
@@ -379,6 +444,27 @@ class LlmAccessControlAnalysisTests(unittest.TestCase):
         signals = _signals(app)
         self.assertEqual(len(signals), 1)
         self.assertEqual(signals[0]["identifier_parameter"], "user_id")
+
+    def test_llm_can_select_a_path_identifier(self) -> None:
+        app, _, task = _fixture(enforces_ownership=False, path=True)
+        prompts: list[str] = []
+
+        class _CapturingPathLlm(_FakeLlm):
+            def complete(self, request):
+                prompts.append(request.messages[0].content)
+                return super().complete(request)
+
+        llm = _CapturingPathLlm(["path:user_id"])
+        agent = self._agent(app, llm)
+
+        requested = agent.handle(task)
+        result = agent.handle(_collect(requested, app, task))
+
+        self.assertEqual(llm.calls, 1)
+        self.assertTrue(result.new_evidence_ids)
+        self.assertEqual(_signals(app)[0]["identifier_location"], "path")
+        self.assertIn("/users/{user_id}", prompts[0])
+        self.assertNotIn("/users/2", prompts[0])
 
     def test_prompt_carries_no_secrets_or_object_ids(self) -> None:
         app, _, task = _fixture(enforces_ownership=False)

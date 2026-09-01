@@ -14,6 +14,8 @@ from threading import RLock
 from typing import Any
 
 from hacklipse.domain import (
+    AccessIdentifierLocation,
+    AccessPrincipalRole,
     Candidate,
     Evidence,
     EvidenceRequest,
@@ -216,7 +218,13 @@ def _decode_task(data: str) -> TaskRecord:
             )
             http_request["headers"] = tuple(tuple(item) for item in http_request["headers"])
             http_request["request_kind"] = HttpRequestKind(http_request["request_kind"])
+            location = http_request.get("identifier_location")
+            if location is not None:
+                http_request["identifier_location"] = AccessIdentifierLocation(location)
             request["http_request"] = HttpRequestSpec(**http_request)
+        role = request.get("principal_role")
+        if role is not None:
+            request["principal_role"] = AccessPrincipalRole(role)
         envelope["evidence_request"] = EvidenceRequest(**request)
     else:
         envelope["evidence_request"] = None

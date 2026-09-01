@@ -6,6 +6,7 @@ import unittest
 
 from hacklipse.adapters.memory import InMemoryEvidenceStore, InMemorySurfaceStore
 from hacklipse.adapters.recon import ReconAgent
+from hacklipse.adapters.routing import RuleBasedVulnerabilityRouter
 from hacklipse.application.errors import AgentContractError, WorkflowExecutionError
 from hacklipse.bootstrap import build_local_application
 from hacklipse.domain import (
@@ -14,6 +15,7 @@ from hacklipse.domain import (
     ExecutionRequest,
     ExecutionResult,
     RunRequest,
+    Run,
     RunScope,
     TaskEnvelope,
 )
@@ -124,6 +126,50 @@ class ReconAgentTests(unittest.TestCase):
         self.assertEqual(root.parameters, ("page",))
         observations = [item.observation for item in evidence.list_by_run("run-3")]
         self.assertTrue(any(o.get("type") == "url_or_file_parameter" for o in observations))
+
+    def test_extracts_numeric_rest_path_as_an_object_identifier(self) -> None:
+        body = '<html><body><a href="/users/17">profile</a></body></html>'
+        agent, _, surfaces = _make_agent(body=body)
+
+        agent.handle(_task("run-path", "http://localhost/index.php"))
+
+        profile = next(
+            surface
+            for surface in surfaces.list_by_run("run-path")
+            if surface.url == "http://localhost/users/17"
+        )
+        self.assertEqual(profile.path_identifier, "user_id")
+        self.assertEqual(profile.path_identifier_index, 2)
+        self.assertEqual(profile.observed_path_identifier, "17")
+
+        decisions = RuleBasedVulnerabilityRouter(
+            id_factory=iter(str(index) for index in range(100)).__next__
+        ).route(
+            Run(
+                run_id="run-path",
+                target_url="http://localhost/index.php",
+                scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+                policy_profile="safe",
+                request_budget=10,
+            ),
+            (profile,),
+            (),
+        )
+        self.assertEqual(
+            [item.candidate.vulnerability_type for item in decisions],
+            ["Access Control"],
+        )
+
+    def test_extracts_juice_shop_singular_basket_path_identifier(self) -> None:
+        agent, _, surfaces = _make_agent(body="<html><body>basket</body></html>")
+
+        agent.handle(_task("run-basket", "http://localhost/rest/basket/7"))
+
+        basket = surfaces.list_by_run("run-basket")[0]
+        self.assertEqual(basket.url, "http://localhost/rest/basket/7")
+        self.assertEqual(basket.path_identifier, "basket_id")
+        self.assertEqual(basket.path_identifier_index, 3)
+        self.assertEqual(basket.observed_path_identifier, "7")
 
     def test_missing_target_url_is_a_contract_error(self) -> None:
         agent, *_ = _make_agent()

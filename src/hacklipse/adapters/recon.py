@@ -81,6 +81,21 @@ _FILE_OR_URL_PARAM_HINTS = (
 )
 
 _MAX_SCRIPT_BYTES = 4 * 1024 * 1024
+_PATH_OBJECT_ID = re.compile(r"^[0-9]{1,10}$")
+_PATH_RESOURCE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
+_SINGULAR_OBJECT_RESOURCES = frozenset(
+    {
+        "account",
+        "address",
+        "basket",
+        "cart",
+        "invoice",
+        "order",
+        "profile",
+        "record",
+        "user",
+    }
+)
 
 
 def _looks_like_file_or_url_parameter(name: str) -> bool:
@@ -135,14 +150,23 @@ class ReconAgent:
             names: tuple[str, ...],
             observed: tuple[tuple[str, str], ...] = (),
         ) -> str:
-            key = (url.split("?", 1)[0], method, names)
+            clean_url = url.split("?", 1)[0]
+            path_identifier = _path_identifier(clean_url)
+            key_url = _canonical_surface_url(clean_url, path_identifier)
+            key = (key_url, method, names)
             existing = surfaces.get(key)
             if existing is not None:
                 return existing
             surface_id = f"surface-{self._id_factory()}"
             surfaces[key] = surface_id
             self._store_surface(
-                task.run_id, surface_id, key[0], method, names, observed=observed
+                task.run_id,
+                surface_id,
+                clean_url,
+                method,
+                names,
+                observed=observed,
+                path_identifier=path_identifier,
             )
             evidence_ids.extend(
                 self._flag_suspect_parameters(task.run_id, surface_id, names)
@@ -250,7 +274,9 @@ class ReconAgent:
         params: tuple[str, ...],
         *,
         observed: tuple[tuple[str, str], ...] = (),
+        path_identifier: tuple[str, int, str] | None = None,
     ) -> None:
+        path_name, path_index, path_value = path_identifier or (None, None, None)
         self._surfaces.add(
             Surface(
                 surface_id=surface_id,
@@ -259,6 +285,9 @@ class ReconAgent:
                 method=method,
                 parameters=params,
                 observed_query=observed,
+                path_identifier=path_name,
+                path_identifier_index=path_index,
+                observed_path_identifier=path_value,
             )
         )
 
@@ -340,6 +369,47 @@ def _query_pairs(url: str) -> tuple[tuple[str, str], ...]:
     for name, value in parse_qsl(urlsplit(url).query, keep_blank_values=True):
         pairs.setdefault(name, value)
     return tuple(pairs.items())
+
+
+def _path_identifier(url: str) -> tuple[str, int, str] | None:
+    """`/users/17` 형태에서 논리 식별자명·세그먼트 위치·관측값을 얻는다.
+
+    모든 숫자 경로를 객체로 보면 버전(`/v1/`)이나 연도까지 후보가 된다. 따라서 숫자
+    바로 앞이 복수형 리소스명인 경우만 결정적으로 인정한다.
+    """
+
+    segments = urlsplit(url).path.split("/")
+    for index in range(len(segments) - 1, 1, -1):
+        value = segments[index]
+        resource = segments[index - 1]
+        if _PATH_OBJECT_ID.fullmatch(value) is None:
+            continue
+        lowered = resource.casefold()
+        if _PATH_RESOURCE.fullmatch(resource) is None:
+            continue
+        if lowered.endswith("s") and len(resource) > 1:
+            singular = resource[:-1]
+        elif lowered in _SINGULAR_OBJECT_RESOURCES:
+            singular = resource
+        else:
+            continue
+        return f"{singular.casefold()}_id", index, value
+    return None
+
+
+def _canonical_surface_url(
+    url: str, path_identifier: tuple[str, int, str] | None
+) -> str:
+    """서로 다른 concrete ID 링크를 동일 REST Surface 하나로 중복 제거한다."""
+
+    if path_identifier is None:
+        return url
+    name, index, _ = path_identifier
+    parsed = urlsplit(url)
+    segments = parsed.path.split("/")
+    segments[index] = "{" + name + "}"
+    path = "/".join(segments)
+    return parsed._replace(path=path).geturl()
 
 
 def _same_origin(url: str, origin) -> bool:

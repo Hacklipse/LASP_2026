@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Mapping
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from .errors import DomainInvariantError
 
@@ -90,6 +90,13 @@ class AccessPrincipalRole(str, Enum):
 
     ACTOR = "actor"
     OWNER = "owner"
+
+
+class AccessIdentifierLocation(str, Enum):
+    """객체 식별자가 HTTP 요청의 어느 부분에 있는지 나타낸다."""
+
+    QUERY = "query"
+    PATH = "path"
 
 
 _HTTP_METHOD = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -215,6 +222,9 @@ class HttpRequestSpec:
     # ACCESS_CONTROL_PROBE에서 값이 바뀌는 유일한 파라미터. 나머지 query는 Recon이 관측한
     # 원본을 그대로 보존해야 하므로 어느 것이 식별자인지 명시적으로 지정한다.
     identifier_parameter: str | None = None
+    identifier_location: AccessIdentifierLocation | None = None
+    path_identifier_index: int | None = None
+    path_identifier_value: str | None = None
 
     def __post_init__(self) -> None:
         if not self.method or _HTTP_METHOD.fullmatch(self.method) is None:
@@ -275,6 +285,29 @@ class HttpRequestSpec:
             raise DomainInvariantError("access control probe cannot carry a body")
         if not self.identifier_parameter:
             raise DomainInvariantError("access control probe must name its identifier parameter")
+
+        location = self.identifier_location or AccessIdentifierLocation.QUERY
+        if not isinstance(location, AccessIdentifierLocation):
+            raise DomainInvariantError("access control identifier location must be structured")
+
+        if location is AccessIdentifierLocation.PATH:
+            if self.path_identifier_index is None or self.path_identifier_index < 1:
+                raise DomainInvariantError(
+                    "path access control probe must identify a path segment"
+                )
+            if (
+                self.path_identifier_value is None
+                or _OBJECT_IDENTIFIER.fullmatch(self.path_identifier_value) is None
+            ):
+                raise DomainInvariantError(
+                    f"access control object id must be numeric: {self.path_identifier_value!r}"
+                )
+            return
+
+        if self.path_identifier_index is not None or self.path_identifier_value is not None:
+            raise DomainInvariantError(
+                "query access control probe cannot carry a path identifier"
+            )
 
         names = [name for name, _ in self.query_parameters]
         if names.count(self.identifier_parameter) != 1:
@@ -341,6 +374,13 @@ class EvidenceRequest:
                 ),
                 "query_names": [name for name, _ in request.query_parameters],
                 "request_kind": request.request_kind.value,
+                "identifier_location": (
+                    request.identifier_location.value
+                    if request.identifier_location is not None
+                    else None
+                ),
+                "path_identifier_index": request.path_identifier_index,
+                "path_identifier_present": request.path_identifier_value is not None,
                 "surface_id": self.surface_id,
                 "target": [
                     parsed.scheme.casefold(),
@@ -441,6 +481,35 @@ class Surface:
     # (예: action=View Profile, token=...). 식별자만 바꾸고 나머지를 원본 그대로 실으려면
     # 관측 시점의 값이 필요하다.
     observed_query: tuple[tuple[str, str], ...] = ()
+    # `/users/17`처럼 식별자가 query가 아니라 경로 세그먼트에 있는 REST 표면.
+    # index는 `urlsplit(url).path.split("/")` 기준이며 `/users/17`의 17은 2다.
+    path_identifier: str | None = None
+    path_identifier_index: int | None = None
+    observed_path_identifier: str | None = None
+
+    def __post_init__(self) -> None:
+        values = (
+            self.path_identifier,
+            self.path_identifier_index,
+            self.observed_path_identifier,
+        )
+        if all(value is None for value in values):
+            return
+        if any(value is None for value in values):
+            raise DomainInvariantError(
+                "path identifier name, index, and observed value must be provided together"
+            )
+        assert self.path_identifier_index is not None
+        assert self.observed_path_identifier is not None
+        segments = urlsplit(self.url).path.split("/")
+        if not (1 <= self.path_identifier_index < len(segments)):
+            raise DomainInvariantError("path identifier index is outside the surface path")
+        if _OBJECT_IDENTIFIER.fullmatch(self.observed_path_identifier) is None:
+            raise DomainInvariantError("observed path object id must be numeric")
+        if segments[self.path_identifier_index] != self.observed_path_identifier:
+            raise DomainInvariantError(
+                "observed path object id must match the indexed URL segment"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -622,6 +691,9 @@ class ExecutionRequest:
     body: str | None = None
     request_kind: HttpRequestKind = HttpRequestKind.CONTROL
     identifier_parameter: str | None = None
+    identifier_location: AccessIdentifierLocation | None = None
+    path_identifier_index: int | None = None
+    path_identifier_value: str | None = None
     validation_id: str | None = None
     timeout_seconds: float = 120.0
     credential_ref: str | None = None
@@ -637,6 +709,9 @@ class ExecutionRequest:
             body=self.body,
             request_kind=self.request_kind,
             identifier_parameter=self.identifier_parameter,
+            identifier_location=self.identifier_location,
+            path_identifier_index=self.path_identifier_index,
+            path_identifier_value=self.path_identifier_value,
         )
         if self.timeout_seconds <= 0:
             raise DomainInvariantError("execution timeout must be positive")
@@ -650,12 +725,21 @@ class ExecutionRequest:
         """기존 query를 보존하면서 구조화 파라미터를 인코딩한 실제 요청 URL."""
 
         parsed = urlsplit(self.target_url)
+        path = parsed.path
+        if self.identifier_location is AccessIdentifierLocation.PATH:
+            segments = path.split("/")
+            index = self.path_identifier_index
+            if index is None or not (1 <= index < len(segments)):
+                raise DomainInvariantError("path identifier index is outside the target URL")
+            assert self.path_identifier_value is not None
+            segments[index] = quote(self.path_identifier_value, safe="")
+            path = "/".join(segments)
         encoded = urlencode(self.query_parameters)
         query = parsed.query
         if encoded:
             query = f"{query}&{encoded}" if query else encoded
         # URL fragment는 HTTP 요청 대상에 포함되지 않는다.
-        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
+        return urlunsplit((parsed.scheme, parsed.netloc, path, query, ""))
 
 @dataclass(frozen=True, slots=True)
 class ExecutionResult:

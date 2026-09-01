@@ -19,16 +19,18 @@ URL은 애초에 고를 자리가 없다.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from uuid import uuid4
 
 from hacklipse.application.errors import AgentContractError
-from hacklipse.domain import AgentResult, AgentResultStatus, TaskEnvelope
+from hacklipse.domain import AgentResult, Evidence, TaskEnvelope
 from hacklipse.ports import CandidateStore, EvidenceStore, LlmClient, SurfaceStore
 from hacklipse.ports.llm import LlmMessage, LlmRequest
 
 from .access_control_analysis import (
     ACCESS_CONTROL_TOOL,
     HeuristicAccessControlAnalyzer,
+    access_identifier_options,
 )
 from .probing import resolve_analysis_task
 from .request_safety import is_object_identifier_parameter
@@ -46,9 +48,11 @@ _SELECTION_SCHEMA = {
 }
 
 _SELECTION_SYSTEM = (
-    "You pick which query parameter of a single authorized test surface identifies the "
+    "You pick which identifier candidate of a single authorized test surface identifies the "
     "object being requested, so that an object-level authorization check can be tested. "
-    "Return only parameter names that appear in the provided list. Prefer parameters that "
+    "A candidate prefixed with path: represents a numeric URL path segment; other candidates "
+    "are query parameters. Return only exact candidates that appear in the provided list. "
+    "Prefer candidates that "
     "name a record or account identifier. Never pick parameters that carry actions, CSRF "
     "tokens, submit buttons, or session identifiers. You do not choose identifier values, "
     "credentials, URLs, or payloads; the caller supplies those. Return an empty list if no "
@@ -76,7 +80,8 @@ class LlmAccessControlAnalyzer:
         self._evidence = evidence_store
         self._task: TaskEnvelope | None = None
         self._surface = None
-        self._selected: dict[str, str] = {}
+        self._selected: dict[str, str | None] = {}
+        self._id_factory = id_factory or (lambda: str(uuid4()))
         # 판정과 요청 조립은 결정적 구현을 그대로 쓴다. 두 구성이 갈라지는 지점은
         # "어떤 파라미터를 볼 것인가" 하나여야 결과 차이를 그 선택 탓으로 돌릴 수 있다.
         self._baseline = HeuristicAccessControlAnalyzer(
@@ -86,40 +91,75 @@ class LlmAccessControlAnalyzer:
             actor_object_id=actor_object_id,
             owner_object_id=owner_object_id,
             identifier_selector=self._identifier_for,
-            id_factory=id_factory or (lambda: str(uuid4())),
+            id_factory=self._id_factory,
         )
 
     def handle(self, task: TaskEnvelope) -> AgentResult:
         """LLM이 고른 식별자로 결정적 분석 절차를 수행한다."""
 
-        candidate, surface, _ = resolve_analysis_task(
+        candidate, surface, parameters = resolve_analysis_task(
             task,
             vulnerability_type="Access Control",
             candidate_store=self._candidates,
             surface_store=self._surfaces,
             required_tool=ACCESS_CONTROL_TOOL,
+            allow_parameterless_get=True,
         )
-        # 선택자가 호출될 때 필요한 문맥을 넘긴다. 선택 결과는 Candidate별로 캐시해
-        # 두 번째 호출이 다른 파라미터를 골라 증적을 못 찾는 일이 없게 한다.
+        offered = access_identifier_options(surface, parameters)
+        evidence = tuple(self._evidence.get_many(task.run_id, task.evidence_ids))
+        if candidate.candidate_id in self._selected:
+            found, stored = True, self._selected[candidate.candidate_id]
+        else:
+            found, stored = _stored_selection(evidence, surface.surface_id, offered)
+        plan_id: str | None = None
+        if not found:
+            selected, reason = self._select_identifier(task, surface, offered)
+            plan_id = f"evi-{self._id_factory()}"
+            self._evidence.append(
+                Evidence(
+                    evidence_id=plan_id,
+                    run_id=task.run_id,
+                    surface_id=surface.surface_id,
+                    created_by=LLM_ACCESS_CONTROL_ANALYZER,
+                    evidence_type="analysis_plan",
+                    observation={
+                        "type": "llm_access_control_plan",
+                        "selected_identifier": selected,
+                        "selection_reason": reason,
+                    },
+                )
+            )
+        else:
+            selected = stored
+
+        self._selected[candidate.candidate_id] = selected
+        # 선택자가 호출될 때 필요한 문맥을 넘긴다. 선택 결과는 Evidence에 보존하므로
+        # 프로세스 재시작 뒤에도 같은 파라미터로 독립 검증까지 이어진다.
         self._task, self._surface = task, surface
-        return self._baseline.handle(task)
+        result = self._baseline.handle(task)
+        if plan_id is None:
+            return result
+        return replace(
+            result,
+            new_evidence_ids=tuple(dict.fromkeys((plan_id, *result.new_evidence_ids))),
+        )
 
     def _identifier_for(self, parameters) -> str | None:
         task, surface = self._task, self._surface
         if task is None or surface is None:  # handle() 밖에서 호출될 수 없다.
             raise AgentContractError("identifier selection ran outside a task")
-        cached = self._selected.get(task.candidate_id or "")
-        if cached is not None:
-            return cached
-        identifier = self._select_identifier(task, surface, tuple(parameters))
+        key = task.candidate_id or ""
+        if key in self._selected:
+            return self._selected[key]
+        identifier, _ = self._select_identifier(task, surface, tuple(parameters))
         if identifier is not None:
             self._selected[task.candidate_id or ""] = identifier
         return identifier
 
     def _select_identifier(
         self, task: TaskEnvelope, surface, parameters: tuple[str, ...]
-    ) -> str | None:
-        """LLM에 파라미터 이름만 보여주고 하나를 고르게 한다."""
+    ) -> tuple[str | None, str]:
+        """LLM에 식별자 좌표만 보여주고 하나를 고르게 한다."""
 
         response = self._llm.complete(
             LlmRequest(
@@ -127,11 +167,11 @@ class LlmAccessControlAnalyzer:
                     LlmMessage(
                         role="user",
                         content=(
-                            f"Surface path: {_path_of(surface.url)}\n"
+                            f"Surface path: {_path_of(surface)}\n"
                             f"Method: {surface.method.upper()}\n"
-                            f"Parameters: {', '.join(parameters)}\n"
+                            f"Identifier candidates: {', '.join(parameters)}\n"
                             f"Request budget for this analysis: {task.request_budget}\n"
-                            "Select the parameter that identifies the requested object."
+                            "Select the candidate that identifies the requested object."
                         ),
                     ),
                 ),
@@ -140,7 +180,9 @@ class LlmAccessControlAnalyzer:
                 timeout_seconds=task.timeout_seconds,
             )
         )
-        return _validate_selection(response.payload.get("parameters"), parameters)
+        selected = _validate_selection(response.payload.get("parameters"), parameters)
+        reason = response.payload.get("reason")
+        return selected, reason if isinstance(reason, str) else ""
 
 
 def _validate_selection(raw: object, offered: tuple[str, ...]) -> str | None:
@@ -156,7 +198,10 @@ def _validate_selection(raw: object, offered: tuple[str, ...]) -> str | None:
             raise AgentContractError(
                 f"llm named a parameter that is not on the surface: {name}"
             )
-        if not is_object_identifier_parameter(name):
+        if not (
+            name.startswith("path:")
+            and is_object_identifier_parameter(name.removeprefix("path:"))
+        ) and not is_object_identifier_parameter(name):
             # action·token·submit을 객체 식별자로 취급하면 엉뚱한 값을 바꿔가며 찌른다.
             raise AgentContractError(
                 f"llm selected a parameter that does not identify an object: {name}"
@@ -165,7 +210,34 @@ def _validate_selection(raw: object, offered: tuple[str, ...]) -> str | None:
     return None
 
 
-def _path_of(url: str) -> str:
+def _stored_selection(
+    evidence: tuple[Evidence, ...], surface_id: str, offered: tuple[str, ...]
+) -> tuple[bool, str | None]:
+    """저장된 LLM 계획을 재사용한다. 빈 선택도 재호출 없이 복원한다."""
+
+    for item in reversed(evidence):
+        if item.surface_id != surface_id:
+            continue
+        if item.observation.get("type") != "llm_access_control_plan":
+            continue
+        selected = item.observation.get("selected_identifier")
+        if selected is None:
+            return True, None
+        if isinstance(selected, str) and selected in offered:
+            return True, selected
+        raise AgentContractError("stored access control selection is invalid")
+    return False, None
+
+
+def _path_of(surface) -> str:
     from urllib.parse import urlsplit
 
-    return urlsplit(url).path or "/"
+    path = urlsplit(surface.url).path or "/"
+    index = surface.path_identifier_index
+    if index is None or surface.path_identifier is None:
+        return path
+    segments = path.split("/")
+    if not (1 <= index < len(segments)):
+        raise AgentContractError("surface path identifier index is invalid")
+    segments[index] = "{" + surface.path_identifier + "}"
+    return "/".join(segments)

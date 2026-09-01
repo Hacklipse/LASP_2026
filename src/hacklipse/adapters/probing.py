@@ -61,6 +61,7 @@ def resolve_analysis_task(
     candidate_store: CandidateStore,
     surface_store: SurfaceStore,
     required_tool: str = ANALYSIS_TOOL,
+    allow_parameterless_get: bool = False,
 ) -> tuple[Candidate, Surface, tuple[str, ...]]:
     """Analysis Task의 Candidate/Surface를 확인하고 탐침 대상 파라미터를 정리한다.
 
@@ -84,7 +85,9 @@ def resolve_analysis_task(
     surface = surface_store.get(task.run_id, task.surface_id)
     if surface.url != task.target_url:
         raise AgentContractError("analysis task target does not match its surface")
-    if surface.method.upper() != "GET" or not surface.parameters:
+    if surface.method.upper() != "GET" or (
+        not surface.parameters and not allow_parameterless_get
+    ):
         raise AgentContractError("analysis supports parameterized GET surfaces only")
 
     # 중복 파라미터명(?a=1&a=2)은 하나로 접는다. 안 그러면 같은 곳에 탐침을 두 번 보낸다.

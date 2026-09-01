@@ -450,10 +450,6 @@ class Phase8TaskBoundaryTests(unittest.TestCase):
         self.assertEqual(record.attempts, 1)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class PhoneMaskingPrecisionTests(unittest.TestCase):
     """마스킹은 개인정보만 지워야 한다. 관측을 훼손하면 탐지 누락으로 이어진다."""
 
@@ -517,3 +513,29 @@ class SanitizerStructurePreservationTests(unittest.TestCase):
 
         self.assertEqual(parsed.path, "/search")
         self.assertEqual(parse_qs(parsed.query), {"csrf_token": ["<redacted>"]})
+
+
+class InMemoryCredentialResolverRegistrationTests(unittest.TestCase):
+    """자동 인증 Worker가 발급한 단기 자격증명은 중복 없이 메모리에만 등록한다."""
+
+    def test_adds_a_provisioned_credential(self) -> None:
+        resolver = InMemoryCredentialResolver({})
+        credential = ResolvedHttpCredential(authorization="Bearer temporary-token")
+
+        resolver.add("temporary-actor", credential)
+
+        self.assertEqual(resolver.resolve("temporary-actor"), credential)
+
+    def test_rejects_blank_or_duplicate_references(self) -> None:
+        resolver = InMemoryCredentialResolver({})
+        credential = ResolvedHttpCredential(authorization="Bearer temporary-token")
+
+        with self.assertRaises(ValueError):
+            resolver.add("", credential)
+        resolver.add("temporary-actor", credential)
+        with self.assertRaises(ValueError):
+            resolver.add("temporary-actor", credential)
+
+
+if __name__ == "__main__":
+    unittest.main()

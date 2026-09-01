@@ -9,6 +9,8 @@ from pathlib import Path
 
 from hacklipse.adapters import SQLiteBudgetManager, SQLiteStoreBundle
 from hacklipse.domain import (
+    AccessIdentifierLocation,
+    AccessPrincipalRole,
     Candidate,
     Evidence,
     EvidenceRequest,
@@ -190,6 +192,47 @@ class SQLiteStoreTests(unittest.TestCase):
         )
         self.assertEqual(self.stores.findings.get("run-1", "finding-1"), finding)
         self.assertEqual(self.stores.reports.list_by_run("run-1"), (report,))
+
+    def test_access_control_path_request_and_role_survive_task_resume(self) -> None:
+        task = TaskRecord(
+            envelope=TaskEnvelope(
+                task_id="task-access-path",
+                run_id="run-1",
+                agent_type="evidence_collector",
+                target_url="http://local.test/users/2",
+                surface_id="surface-1",
+                allowed_tools=("access_control_probe",),
+                evidence_request=EvidenceRequest(
+                    evidence_type="http_response",
+                    surface_id="surface-1",
+                    reason="owner control",
+                    suggested_tool="access_control_probe",
+                    principal_role=AccessPrincipalRole.OWNER,
+                    http_request=HttpRequestSpec(
+                        request_kind=HttpRequestKind.ACCESS_CONTROL_PROBE,
+                        identifier_parameter="user_id",
+                        identifier_location=AccessIdentifierLocation.PATH,
+                        path_identifier_index=2,
+                        path_identifier_value="1",
+                    ),
+                ),
+            )
+        )
+        self.stores.tasks.add(task)
+        self.stores.close()
+
+        self.stores = SQLiteStoreBundle(self.database_path)
+        restored = self.stores.tasks.get("task-access-path")
+
+        self.assertEqual(restored, task)
+        self.assertIs(
+            restored.envelope.evidence_request.principal_role,
+            AccessPrincipalRole.OWNER,
+        )
+        self.assertIs(
+            restored.envelope.evidence_request.http_request.identifier_location,
+            AccessIdentifierLocation.PATH,
+        )
 
     def test_add_rejects_duplicate_and_save_requires_existing_record(self) -> None:
         run = self._run()

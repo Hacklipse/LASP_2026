@@ -442,8 +442,10 @@ class ValidationAgent:
                 ).validation,
             )
 
-        assert owner_control is not None and probe is not None
-        if not unauthorized_object_exposed(owner_control, probe, owner_id):
+        assert actor_control is not None and owner_control is not None and probe is not None
+        if not unauthorized_object_exposed(
+            actor_control, owner_control, probe, actor_id, owner_id
+        ):
             # owner 객체가 actor 세션에서 보이지 않는다. 권한 검사가 동작한 것이다.
             return AgentResult(
                 task_id=task.task_id,
@@ -461,7 +463,7 @@ class ValidationAgent:
             evidence_ids=tuple(item.evidence_id for item in session_evidence),
             summary=(
                 f"actor session read object {owner_id} owned by another principal "
-                f"through parameter {identifier}"
+                f"through identifier {identifier}"
             ),
         )
         return AgentResult(
@@ -756,8 +758,10 @@ def _access_control_plan(
         if observation.get("type") != "object_id_auth":
             continue
         identifier = observation.get("identifier_parameter")
+        location = observation.get("identifier_location", "query")
         actor_id = observation.get("actor_object_id")
         owner_id = observation.get("owner_object_id")
         if all(isinstance(value, str) and value for value in (identifier, actor_id, owner_id)):
-            return str(identifier), str(actor_id), str(owner_id)
+            token = f"path:{identifier}" if location == "path" else str(identifier)
+            return token, str(actor_id), str(owner_id)
     return None

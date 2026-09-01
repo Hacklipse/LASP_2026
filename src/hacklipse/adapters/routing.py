@@ -71,7 +71,10 @@ class IdentifierSurfaceRoutingRule:
         # 비밀번호 변경·삭제처럼 상태를 바꾸는 GET 폼은 자동 탐침 대상에서 제외한다.
         if has_state_changing_parameters(surface.parameters):
             return False
-        return bool(object_identifier_parameters(surface.parameters))
+        return bool(
+            object_identifier_parameters(surface.parameters)
+            or surface.path_identifier is not None
+        )
 
 
 # 첫 버전은 설명 가능하고 재현하기 쉬운 명시적 규칙으로 라우팅한다.
