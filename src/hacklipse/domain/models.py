@@ -76,6 +76,8 @@ class HttpRequestKind(str, Enum):
     PROBE = "probe"
     PATH_TRAVERSAL_PROBE = "path_traversal_probe"
     ACCESS_CONTROL_PROBE = "access_control_probe"
+    SSTI_PROBE = "ssti_probe"
+    SSTI_CLEANUP = "ssti_cleanup"
 
 
 class AccessPrincipalRole(str, Enum):
@@ -300,12 +302,17 @@ class EvidenceRequest:
     # Agent는 어떤 자격증명을 쓸지 고를 수 없고 역할만 지정한다. 역할 → credential_ref
     # 해석은 중앙 Collector가 Run에 등록된 매핑으로만 수행한다.
     principal_role: AccessPrincipalRole | None = None
+    # 상태 변경 요청의 승인 참조는 비밀이 아니라 사용자가 부여한 권한의 식별자다.
+    # 실제 허용 여부는 Agent가 아니라 중앙 ApprovalGate가 판단한다.
+    approval_ref: str | None = None
 
     def __post_init__(self) -> None:
         if self.principal_role is not None and not isinstance(
             self.principal_role, AccessPrincipalRole
         ):
             raise DomainInvariantError("principal role must be a structured role")
+        if self.approval_ref is not None and not self.approval_ref.strip():
+            raise DomainInvariantError("evidence request approval reference cannot be blank")
 
     def request_fingerprint(self, target_url: str) -> str:
         """비밀값 없이 동일 EvidenceRequest를 재연결하는 결정적 식별자.
@@ -324,6 +331,7 @@ class EvidenceRequest:
         canonical = json.dumps(
             {
                 "body_present": request.body is not None,
+                "approval_present": self.approval_ref is not None,
                 "evidence_type": self.evidence_type,
                 "header_names": [name.casefold() for name, _ in request.headers],
                 "method": request.method.upper(),

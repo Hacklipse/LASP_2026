@@ -32,6 +32,7 @@ class SurfaceRoutingRule:
     agent_type: str
     methods: tuple[str, ...] = ("GET",)
     requires_parameters: bool = True
+    parameter_hints: tuple[str, ...] = ()
     priority: float = 0.25
 
     def matches(self, surface: Surface) -> bool:
@@ -41,7 +42,13 @@ class SurfaceRoutingRule:
         # Candidate를 만들지 않되 Surface 자체는 Recon 결과로 보존한다.
         if has_state_changing_parameters(surface.parameters):
             return False
-        return bool(surface.parameters) if self.requires_parameters else True
+        if self.requires_parameters and not surface.parameters:
+            return False
+        if self.parameter_hints:
+            offered = {name.casefold() for name in surface.parameters}
+            if not offered.intersection(hint.casefold() for hint in self.parameter_hints):
+                return False
+        return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,16 +81,25 @@ DEFAULT_RULES = (
     RoutingRule("object_id_auth", "Access Control", "access_control_analyzer", 0.8),
     RoutingRule("url_or_file_parameter", "Path Traversal", "path_traversal_analyzer", 0.6),
     RoutingRule("template_error", "SSTI", "ssti_analyzer", 0.7),
+    RoutingRule("template_execution", "SSTI", "ssti_analyzer", 0.9),
 )
 
-# Observation이 아직 없어도 입력 가능한 GET Surface를 담당 Analyzer까지 보낸다.
+# Observation이 아직 없어도 입력 가능한 Surface를 담당 Analyzer까지 보낸다.
 # 실제 취약점 판정이 아니라 탐색 대상을 만드는 규칙이므로 기존 Evidence 규칙보다
 # 낮은 priority를 사용한다.
 DEFAULT_SURFACE_RULES = (
     SurfaceRoutingRule("XSS", "xss_analyzer", priority=0.30),
     SurfaceRoutingRule("SQLi", "sqli_analyzer", priority=0.30),
-    SurfaceRoutingRule("SSTI", "ssti_analyzer", priority=0.20),
-    IdentifierSurfaceRoutingRule("Access Control", "access_control_analyzer", priority=0.35),
+    SurfaceRoutingRule(
+        "SSTI",
+        "ssti_analyzer",
+        methods=("POST",),
+        parameter_hints=("username",),
+        priority=0.20,
+    ),
+    IdentifierSurfaceRoutingRule(
+        "Access Control", "access_control_analyzer", priority=0.35
+    ),
 )
 
 

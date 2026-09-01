@@ -15,11 +15,13 @@ from hacklipse.adapters import (
     GeminiLlmClient,
     HeuristicAccessControlAnalyzer,
     HeuristicSqliAnalyzer,
+    HeuristicSstiAnalyzer,
     HeuristicPathTraversalAnalyzer,
     HeuristicXssAnalyzer,
     InMemoryBudgetManager,
     InMemoryExecutionAuditLog,
     LlmSqliAnalyzer,
+    LlmSstiAnalyzer,
     LlmPathTraversalAnalyzer,
     LlmAccessControlAnalyzer,
     LlmXssAnalyzer,
@@ -210,6 +212,7 @@ def build_local_application(
                 "browser_xss",
                 "path_traversal_probe",
                 "access_control_probe",
+                "ssti_probe",
             ),
         )
     if credential_resolver is not None and selected_config.authentication_agent_type not in agents:
@@ -265,6 +268,7 @@ IMPLEMENTED_ANALYZERS = (
     "xss_analyzer",
     "sqli_analyzer",
     "path_traversal_analyzer",
+    "ssti_analyzer",
 )
 
 
@@ -344,6 +348,11 @@ def register_standard_agents(
             actor_object_id=actor_object_id,
             owner_object_id=owner_object_id,
         )
+        ssti_analyzer: Agent = HeuristicSstiAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
         profile = "heuristic"
     else:
         xss_analyzer = LlmXssAnalyzer(
@@ -372,6 +381,12 @@ def register_standard_agents(
             actor_object_id=actor_object_id,
             owner_object_id=owner_object_id,
         )
+        ssti_analyzer = LlmSstiAnalyzer(
+            llm_client=llm_client,
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
         profile = "llm"
     app.dispatcher.register(
         "xss_analyzer", xss_analyzer, allowed_tools=("http_get",)
@@ -392,6 +407,11 @@ def register_standard_agents(
         allowed_tools=("access_control_probe",),
     )
     app.dispatcher.register(
+        "ssti_analyzer",
+        ssti_analyzer,
+        allowed_tools=("ssti_probe",),
+    )
+    app.dispatcher.register(
         "validation",
         ValidationAgent(
             candidate_store=app.stores.candidates,
@@ -403,6 +423,7 @@ def register_standard_agents(
             "browser_xss",
             "path_traversal_probe",
             "access_control_probe",
+            "ssti_probe",
         ),
     )
     return profile

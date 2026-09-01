@@ -33,6 +33,13 @@ from .access_control_analysis import (
 )
 from .routing import DEFAULT_RULES
 from .sqli_analysis import sql_error_signal
+from .ssti_analysis import (
+    SSTI_OBSERVATION,
+    SSTI_TOOL,
+    build_ssti_requests,
+    matching_ssti_evidence,
+    ssti_execution_signal,
+)
 from .xss_execution import BROWSER_XSS_TOOL, XSS_EXECUTION_MARKER_PREFIX
 
 # Router가 Candidate를 만들 때 쓴 것과 같은 taxonomy. Candidate가 알려진 취약점
@@ -101,10 +108,15 @@ class ValidationAgent:
             candidate.vulnerability_type == "Access Control"
             and ACCESS_CONTROL_TOOL in task.allowed_tools
         )
+        specialized_ssti_validation = (
+            candidate.vulnerability_type == "SSTI" and SSTI_TOOL in task.allowed_tools
+        )
         if specialized_path_validation:
             required_tool = PATH_TRAVERSAL_TOOL
         elif specialized_access_validation:
             required_tool = ACCESS_CONTROL_TOOL
+        elif specialized_ssti_validation:
+            required_tool = SSTI_TOOL
         else:
             required_tool = _REPRODUCTION_TOOL
         if required_tool not in task.allowed_tools:
@@ -128,6 +140,8 @@ class ValidationAgent:
             )
         if specialized_access_validation:
             return self._validate_access_control(task, candidate, evidence)
+        if specialized_ssti_validation:
+            return self._validate_ssti(task, candidate, evidence, reproduction)
         if (
             candidate.vulnerability_type == "XSS"
             and BROWSER_XSS_TOOL in task.allowed_tools
@@ -552,6 +566,97 @@ class ValidationAgent:
             verdict=ValidationVerdict.REJECTED,
             evidence=reproduced,
             reason="independent probe did not reproduce the safe-file read",
+        )
+
+    def _validate_ssti(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        evidence: Sequence[Evidence],
+        reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """고정 산술식의 서버 측 평가를 현재 Validation 세션에서 다시 수행한다."""
+
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        signaled_parameters = tuple(
+            dict.fromkeys(
+                parameter
+                for item in evidence
+                if item.surface_id == candidate.surface_id
+                and item.observation.get("type") == SSTI_OBSERVATION
+                and isinstance((parameter := item.observation.get("parameter")), str)
+                and parameter in surface.parameters
+            )
+        )
+        if "username" not in signaled_parameters:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no fixed-arithmetic SSTI signal to reproduce",
+            )
+
+        requests = build_ssti_requests(
+            surface,
+            "username",
+            purpose=f"SSTI validation {task.validation_id}",
+        )
+        collected = tuple(
+            matching_ssti_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise AgentContractError(
+                    "SSTI validation lacks budget for its independent safe request sequence"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+
+        reproduced = tuple(item for item in collected if item is not None)
+        if any(item.observation.get("type") == "http_error" for item in reproduced):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=reproduced,
+                reason="independent SSTI sequence encountered an HTTP execution error",
+            )
+        cleanup_status = reproduced[-1].observation.get("status")
+        if cleanup_status not in {302, 303}:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=reproduced,
+                reason="independent SSTI sequence could not restore the safe username",
+            )
+        if not ssti_execution_signal(collected):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=reproduced,
+                reason="independent fixed arithmetic probe was not evaluated by the template",
+            )
+
+        proof = ValidationProof(
+            proof_type=ValidationProofType.SSTI_EXECUTION,
+            evidence_ids=tuple(item.evidence_id for item in reproduced),
+            summary=(
+                "independent approved profile control/probe sequence reproduced fixed "
+                "server-side arithmetic evaluation and restored a safe username"
+            ),
+        )
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.CONFIRMED,
+            evidence=reproduced,
+            reason="independent control/probe comparison reproduced the SSTI effect",
+            proof=proof,
         )
 
     @staticmethod

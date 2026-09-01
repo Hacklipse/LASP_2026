@@ -47,11 +47,11 @@ class SurfaceRoutingTests(unittest.TestCase):
 
         self.assertEqual(
             [decision.candidate.vulnerability_type for decision in decisions],
-            ["XSS", "SQLi", "SSTI"],
+            ["XSS", "SQLi"],
         )
         self.assertEqual(
             [decision.candidate.assigned_agent for decision in decisions],
-            ["xss_analyzer", "sqli_analyzer", "ssti_analyzer"],
+            ["xss_analyzer", "sqli_analyzer"],
         )
         self.assertTrue(all(not decision.candidate.evidence_ids for decision in decisions))
 
@@ -75,10 +75,10 @@ class SurfaceRoutingTests(unittest.TestCase):
         self.assertEqual(xss.priority, 0.8)
         self.assertEqual(
             [decision.candidate.vulnerability_type for decision in decisions],
-            ["XSS", "SQLi", "SSTI"],
+            ["XSS", "SQLi"],
         )
 
-    def test_surface_rule_requires_parameterized_get(self) -> None:
+    def test_surface_rules_require_their_supported_method_and_parameters(self) -> None:
         router = RuleBasedVulnerabilityRouter()
 
         post = router.route(_run(), (_surface(method="POST"),), ())
@@ -86,6 +86,21 @@ class SurfaceRoutingTests(unittest.TestCase):
 
         self.assertEqual(post, ())
         self.assertEqual(no_parameters, ())
+
+    def test_username_post_surface_routes_only_to_ssti(self) -> None:
+        router = RuleBasedVulnerabilityRouter()
+
+        decisions = router.route(
+            _run(),
+            (_surface(method="POST", parameters=("email", "role", "username")),),
+            (),
+        )
+
+        self.assertEqual(
+            [decision.candidate.vulnerability_type for decision in decisions],
+            ["SSTI"],
+        )
+        self.assertEqual(decisions[0].candidate.assigned_agent, "ssti_analyzer")
 
     def test_surface_rule_skips_state_changing_get_form(self) -> None:
         router = RuleBasedVulnerabilityRouter()
@@ -143,7 +158,7 @@ class SurfaceRoutingWorkflowTests(unittest.TestCase):
         candidates = app.stores.candidates.list_by_run(run.run_id)
         self.assertEqual(
             [candidate.vulnerability_type for candidate in candidates],
-            ["XSS", "SQLi", "SSTI"],
+            ["XSS", "SQLi"],
         )
         tasks = app.stores.tasks.list_by_run(run.run_id)
         analysis_task = tasks[-1].envelope

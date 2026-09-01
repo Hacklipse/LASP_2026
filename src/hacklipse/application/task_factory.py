@@ -9,6 +9,7 @@ from hacklipse.domain import Candidate, EvidenceRequest, Run, TaskEnvelope
 
 _PATH_TRAVERSAL_TOOL = "path_traversal_probe"
 _ACCESS_CONTROL_TOOL = "access_control_probe"
+_SSTI_TOOL = "ssti_probe"
 
 
 class TaskFactory:
@@ -46,6 +47,8 @@ class TaskFactory:
             # 권한 우회 탐침은 전용 도구로만 나간다. 일반 http_get을 허용하면 Agent가
             # 식별자 제약과 헤더 금지 규칙을 우회한 요청을 만들 수 있다.
             allowed_tools = (_ACCESS_CONTROL_TOOL,)
+        elif candidate.vulnerability_type == "SSTI":
+            allowed_tools = (_SSTI_TOOL,)
         else:
             allowed_tools = ("http_get",)
         return self._base(
@@ -77,6 +80,8 @@ class TaskFactory:
             allowed_tools = (_PATH_TRAVERSAL_TOOL,)
         elif candidate.vulnerability_type == "Access Control":
             allowed_tools = (_ACCESS_CONTROL_TOOL,)
+        elif candidate.vulnerability_type == "SSTI":
+            allowed_tools = (_SSTI_TOOL,)
         else:
             allowed_tools = ("http_get",)
         return self._base(

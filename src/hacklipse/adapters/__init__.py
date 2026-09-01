@@ -9,6 +9,7 @@ from .gemini_llm_client import GeminiLlmClient
 from .llm_client import AnthropicLlmClient
 from .llm_path_traversal_analysis import LlmPathTraversalAnalyzer
 from .llm_sqli_analysis import LlmSqliAnalyzer
+from .llm_ssti_analysis import LlmSstiAnalyzer
 from .llm_xss_analysis import LlmXssAnalyzer
 from .memory import MemoryStoreBundle
 from .policy import AllowlistPolicyGate
@@ -17,6 +18,7 @@ from .access_control_analysis import HeuristicAccessControlAnalyzer
 from .llm_access_control_analysis import LlmAccessControlAnalyzer
 from .recon import ReconAgent
 from .sqli_analysis import HeuristicSqliAnalyzer
+from .ssti_analysis import HeuristicSstiAnalyzer
 from .reporting import MarkdownReportAgent
 from .retry import BoundedRetryPolicy
 from .routing import RoutingRule, RuleBasedVulnerabilityRouter, SurfaceRoutingRule
@@ -45,12 +47,14 @@ __all__ = [
     "GeminiLlmClient",
     "HeuristicAccessControlAnalyzer",
     "HeuristicSqliAnalyzer",
+    "HeuristicSstiAnalyzer",
     "HeuristicPathTraversalAnalyzer",
     "HeuristicXssAnalyzer",
     "InMemoryBudgetManager",
     "InMemoryCredentialResolver",
     "InMemoryExecutionAuditLog",
     "LlmSqliAnalyzer",
+    "LlmSstiAnalyzer",
     "LlmPathTraversalAnalyzer",
     "LlmAccessControlAnalyzer",
     "LlmXssAnalyzer",
