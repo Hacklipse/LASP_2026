@@ -13,6 +13,7 @@ from hacklipse.adapters import (
     DisabledExecutionRuntime,
     FormLoginWorker,
     GeminiLlmClient,
+    HeuristicAccessControlAnalyzer,
     HeuristicSqliAnalyzer,
     HeuristicPathTraversalAnalyzer,
     HeuristicXssAnalyzer,
@@ -20,6 +21,7 @@ from hacklipse.adapters import (
     InMemoryExecutionAuditLog,
     LlmSqliAnalyzer,
     LlmPathTraversalAnalyzer,
+    LlmAccessControlAnalyzer,
     LlmXssAnalyzer,
     LocalTaskDispatcher,
     MarkdownReportAgent,
@@ -207,6 +209,7 @@ def build_local_application(
                 "http_post",
                 "browser_xss",
                 "path_traversal_probe",
+                "access_control_probe",
             ),
         )
     if credential_resolver is not None and selected_config.authentication_agent_type not in agents:
@@ -258,6 +261,7 @@ def build_local_application(
 # AgentUnavailable로 Run 전체를 실패시키므로, 배선과 라우팅 규칙이 같은 목록을 봐야 한다.
 # Analyzer를 추가하면 여기 한 줄만 늘리면 Router가 따라온다.
 IMPLEMENTED_ANALYZERS = (
+    "access_control_analyzer",
     "xss_analyzer",
     "sqli_analyzer",
     "path_traversal_analyzer",
@@ -297,6 +301,8 @@ def register_standard_agents(
     *,
     llm_client: LlmClient | None = None,
     recon_max_pages: int = DEFAULT_MAX_PAGES,
+    actor_object_id: str | None = None,
+    owner_object_id: str | None = None,
 ) -> str:
     """Recon/Analysis/Validation을 표준 배선으로 등록하고 구성 이름을 돌려준다.
 
@@ -331,6 +337,13 @@ def register_standard_agents(
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
+        access_control_analyzer: Agent = HeuristicAccessControlAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+            actor_object_id=actor_object_id,
+            owner_object_id=owner_object_id,
+        )
         profile = "heuristic"
     else:
         xss_analyzer = LlmXssAnalyzer(
@@ -351,6 +364,14 @@ def register_standard_agents(
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
+        access_control_analyzer = LlmAccessControlAnalyzer(
+            llm_client=llm_client,
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+            actor_object_id=actor_object_id,
+            owner_object_id=owner_object_id,
+        )
         profile = "llm"
     app.dispatcher.register(
         "xss_analyzer", xss_analyzer, allowed_tools=("http_get",)
@@ -366,12 +387,22 @@ def register_standard_agents(
         allowed_tools=("path_traversal_probe",),
     )
     app.dispatcher.register(
+        "access_control_analyzer",
+        access_control_analyzer,
+        allowed_tools=("access_control_probe",),
+    )
+    app.dispatcher.register(
         "validation",
         ValidationAgent(
             candidate_store=app.stores.candidates,
             evidence_store=app.stores.evidence,
             surface_store=app.stores.surfaces,
         ),
-        allowed_tools=("http_get", "browser_xss", "path_traversal_probe"),
+        allowed_tools=(
+            "http_get",
+            "browser_xss",
+            "path_traversal_probe",
+            "access_control_probe",
+        ),
     )
     return profile

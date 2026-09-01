@@ -29,7 +29,9 @@ from hacklipse.ports.errors import CredentialNotFound, ExternalExecutionDisabled
 
 # http(s)만 허용한다. file:·ftp: 등은 SSRF 표면이므로 Runtime 진입 전에 차단한다.
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
-_HTTP_TOOLS = frozenset({"http_get", "http_post", "path_traversal_probe"})
+_HTTP_TOOLS = frozenset(
+    {"http_get", "http_post", "path_traversal_probe", "access_control_probe"}
+)
 # 실제 리다이렉트 상태만 리다이렉트로 분류한다. 300/304/305/306은 리다이렉트가 아니다.
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _DEFAULT_TIMEOUT = 15.0

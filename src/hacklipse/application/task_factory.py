@@ -8,6 +8,7 @@ from uuid import uuid4
 from hacklipse.domain import Candidate, EvidenceRequest, Run, TaskEnvelope
 
 _PATH_TRAVERSAL_TOOL = "path_traversal_probe"
+_ACCESS_CONTROL_TOOL = "access_control_probe"
 
 
 class TaskFactory:
@@ -39,11 +40,14 @@ class TaskFactory:
     ) -> TaskEnvelope:
         """Candidate의 실제 Surface URL과 Evidence 참조를 Analysis Task에 담는다."""
 
-        allowed_tools = (
-            (_PATH_TRAVERSAL_TOOL,)
-            if candidate.vulnerability_type == "Path Traversal"
-            else ("http_get",)
-        )
+        if candidate.vulnerability_type == "Path Traversal":
+            allowed_tools = (_PATH_TRAVERSAL_TOOL,)
+        elif candidate.vulnerability_type == "Access Control":
+            # 권한 우회 탐침은 전용 도구로만 나간다. 일반 http_get을 허용하면 Agent가
+            # 식별자 제약과 헤더 금지 규칙을 우회한 요청을 만들 수 있다.
+            allowed_tools = (_ACCESS_CONTROL_TOOL,)
+        else:
+            allowed_tools = ("http_get",)
         return self._base(
             run,
             agent_type=candidate.assigned_agent,
@@ -71,6 +75,8 @@ class TaskFactory:
             allowed_tools = ("http_get", "browser_xss")
         elif candidate.vulnerability_type == "Path Traversal":
             allowed_tools = (_PATH_TRAVERSAL_TOOL,)
+        elif candidate.vulnerability_type == "Access Control":
+            allowed_tools = (_ACCESS_CONTROL_TOOL,)
         else:
             allowed_tools = ("http_get",)
         return self._base(
@@ -121,11 +127,21 @@ class TaskFactory:
         )
 
     def authentication(
-        self, run: Run, *, agent_type: str, request_budget: int
+        self,
+        run: Run,
+        *,
+        agent_type: str,
+        request_budget: int,
+        credential_ref: str | None = None,
     ) -> TaskEnvelope:
-        """비밀 원문 없이 credential_ref만 중앙 인증 Worker에 전달한다."""
+        """비밀 원문 없이 credential_ref만 중앙 인증 Worker에 전달한다.
 
-        if run.credential_ref is None:
+        Access Control처럼 주체가 둘 이상인 검사에서는 역할별로 각각 인증해야 하므로
+        어떤 참조를 인증할지 호출자가 지정할 수 있다.
+        """
+
+        selected = credential_ref or run.credential_ref
+        if selected is None:
             raise ValueError("authentication task requires a credential reference")
         return self._base(
             run,
@@ -133,6 +149,7 @@ class TaskFactory:
             request_budget=request_budget,
             target_url=run.target_url,
             allowed_tools=("http_get", "http_post"),
+            credential_ref=selected,
         )
 
     def _base(
@@ -149,6 +166,7 @@ class TaskFactory:
         allowed_tools: tuple[str, ...] = (),
         validation_id: str | None = None,
         evidence_request: EvidenceRequest | None = None,
+        credential_ref: str | None = None,
     ) -> TaskEnvelope:
         """모든 Task에 공통인 Run·정책·예산 정보를 조립한다."""
 
@@ -165,7 +183,7 @@ class TaskFactory:
             request_budget=request_budget,
             policy_profile=run.policy_profile,
             timeout_seconds=run.timeout_seconds,
-            credential_ref=run.credential_ref,
+            credential_ref=credential_ref or run.credential_ref,
             validation_id=validation_id,
             evidence_request=evidence_request,
         )

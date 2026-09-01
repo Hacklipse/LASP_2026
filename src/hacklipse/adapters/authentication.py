@@ -57,6 +57,7 @@ class FormLoginWorker:
                 ),
                 task_id=task.task_id,
                 timeout_seconds=task.timeout_seconds,
+                credential_ref=task.credential_ref,
             )
             evidence_ids.append(preflight_id)
             body = preflight.observation.get("body")
@@ -93,6 +94,7 @@ class FormLoginWorker:
             task_id=task.task_id,
             timeout_seconds=task.timeout_seconds,
             approval_ref=login.approval_ref,
+            credential_ref=task.credential_ref,
         )
         evidence_ids.append(login_id)
         _require_login_success(login, response.observation)
@@ -110,6 +112,7 @@ class FormLoginWorker:
                 ),
                 task_id=task.task_id,
                 timeout_seconds=task.timeout_seconds,
+                credential_ref=task.credential_ref,
             )
             evidence_ids.append(verification_id)
             _require_authenticated_access(login, verification.observation)

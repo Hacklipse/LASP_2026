@@ -13,6 +13,8 @@ from .llm_xss_analysis import LlmXssAnalyzer
 from .memory import MemoryStoreBundle
 from .policy import AllowlistPolicyGate
 from .path_traversal_analysis import HeuristicPathTraversalAnalyzer
+from .access_control_analysis import HeuristicAccessControlAnalyzer
+from .llm_access_control_analysis import LlmAccessControlAnalyzer
 from .recon import ReconAgent
 from .sqli_analysis import HeuristicSqliAnalyzer
 from .reporting import MarkdownReportAgent
@@ -41,6 +43,7 @@ __all__ = [
     "FormLoginWorker",
     "AnthropicLlmClient",
     "GeminiLlmClient",
+    "HeuristicAccessControlAnalyzer",
     "HeuristicSqliAnalyzer",
     "HeuristicPathTraversalAnalyzer",
     "HeuristicXssAnalyzer",
@@ -49,6 +52,7 @@ __all__ = [
     "InMemoryExecutionAuditLog",
     "LlmSqliAnalyzer",
     "LlmPathTraversalAnalyzer",
+    "LlmAccessControlAnalyzer",
     "LlmXssAnalyzer",
     "LocalTaskDispatcher",
     "MarkdownReportAgent",
