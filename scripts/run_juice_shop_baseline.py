@@ -583,7 +583,10 @@ def main(argv: list[str]) -> int:
 
     progress_view = None if debug_enabled else RunProgressView()
     resolver = InMemoryCredentialResolver(credentials)
-    runtime = HttpExecutionRuntime(credential_resolver=resolver)
+    runtime = HttpExecutionRuntime(
+        credential_resolver=resolver,
+        max_body_bytes=2 * 1024 * 1024,
+    )
     audit = _DebugAuditLog(progress) if debug_enabled else InMemoryExecutionAuditLog()
     app = build_local_application(
         {},
