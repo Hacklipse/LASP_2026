@@ -1,13 +1,21 @@
-"""로컬 OWASP Juice Shop에서 SSTI 또는 Access Control 검증을 실행한다.
+"""로컬 OWASP Juice Shop에서 SQLi·SSTI·Access Control 검증을 실행한다.
 
-SSTI 모드는 브라우저에 로그인한 전용 실습 계정의 ``token`` Cookie 값을 숨김 입력으로
-받는다. Access Control 모드는 폐기 가능한 임시 계정 두 개를 자동 생성·로그인하고 token과
-basket ID를 메모리에서만 사용한다. 비밀은 Task·Evidence·감사 로그·LLM prompt에 들어가지
-않는다. SSTI는 username을 일시적으로 변경하므로 개인 계정이 아닌 실습 계정을 사용한다.
+취약점마다 인증과 정리 요구가 다르다.
+
+    SQLi            인증 없음. 읽기 전용 GET. 정리할 상태가 없다.
+    SSTI            실습 계정 token Cookie. username을 바꾸므로 고정값으로 되돌린다.
+    Access Control  임시 계정 두 개를 만들고 검증 후 연결 데이터까지 삭제한다.
+    all             한 Run에서 여러 유형을 함께 검사한다. 유형별 자격증명은 Run에
+                    따로 등록되고, 등록하지 않은 유형은 자격증명 없이 실행된다.
+
+비밀은 Task·Evidence·감사 로그·LLM prompt에 들어가지 않는다. SSTI는 username을 일시적으로
+변경하므로 개인 계정이 아닌 실습 계정을 사용한다.
 
     py scripts/run_juice_shop_baseline.py http://127.0.0.1:3000/
-    py scripts/run_juice_shop_baseline.py http://127.0.0.1:3000/ --profile llm --debug-llm-content
+    py scripts/run_juice_shop_baseline.py http://127.0.0.1:3000/ --vuln sqli
     py scripts/run_juice_shop_baseline.py http://127.0.0.1:3000/ --vuln access_control
+    py scripts/run_juice_shop_baseline.py http://127.0.0.1:3000/ --vuln all
+    py scripts/run_juice_shop_baseline.py http://127.0.0.1:3000/ --profile llm --debug-llm-content
 """
 
 from __future__ import annotations
@@ -73,7 +81,34 @@ _ACTOR_CREDENTIAL_REF = "interactive-local-juice-shop-actor"
 _OWNER_CREDENTIAL_REF = "interactive-local-juice-shop-owner"
 _PROVISION_APPROVAL_REF = "interactive-local-juice-shop-account-provisioning"
 _DEFAULT_BUDGET = 20
+# 전체 모드는 Recon 크롤링과 여러 Candidate 분석을 한 Run에서 감당해야 한다. 정확한
+# 배분은 Task 3(Budget·스케줄링)에서 다루고, 여기서는 우선 상한만 넉넉히 잡는다.
+_ALL_MODE_BUDGET = 80
+_ALL_MODE_RECON_PAGES = 12
 _OBJECT_ID = re.compile(r"^[0-9]{1,10}$")
+
+
+@dataclass(frozen=True, slots=True)
+class _VulnTarget:
+    """취약점 유형별로 실행기가 알아야 하는 값.
+
+    유형이 늘 때마다 if/else 가지를 여기저기 늘리지 않도록 한곳에 모은다. 인증과
+    정리 절차는 유형마다 실제로 다르므로 표에 넣지 않고 명시적으로 분기한다.
+    """
+
+    label: str  # Router에 넘기는 vulnerability_type
+    seed_path: str | None  # base_url 기준 시작 Surface. Access Control은 실행 중 결정된다.
+    signal: str  # Analysis가 남기는 Observation type
+    signal_label: str  # 결과 화면에 쓰는 신호 이름
+
+
+_VULN_TARGETS = {
+    "sqli": _VulnTarget("SQLi", "rest/products/search?q=seed", "sql_error", "SQL 오류"),
+    "ssti": _VulnTarget("SSTI", "profile", SSTI_OBSERVATION, "템플릿 산술 실행"),
+    "access_control": _VulnTarget(
+        "Access Control", None, "object_id_auth", "객체 권한 우회"
+    ),
+}
 
 
 @dataclass(slots=True)
@@ -346,7 +381,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("base_url", help="localhost/127.0.0.1 Juice Shop base URL")
     parser.add_argument(
         "--vuln",
-        choices=("ssti", "access_control"),
+        choices=(*_VULN_TARGETS, "all"),
         default="ssti",
         help="취약점 유형 (default: ssti)",
     )
@@ -381,17 +416,23 @@ def main(argv: list[str]) -> int:
     if parsed.scheme not in {"http", "https"} or host not in _LOCAL_HOSTS:
         print("거부: 이 실행기는 localhost/127.0.0.1의 Juice Shop만 허용합니다.")
         return 2
+    run_all = args.vuln == "all"
+    vuln = None if run_all else _VULN_TARGETS[args.vuln]
     access_control = args.vuln == "access_control"
-    if access_control:
-        target_label = "Access Control"
+    target_label = "전체" if run_all else vuln.label
+    if run_all:
+        # 전체 모드는 Recon이 시작 페이지에서 Surface를 찾아 유형별로 라우팅한다.
+        target_url = base_url
+    elif access_control:
+        # 시작 Surface가 임시 계정의 basket ID에 달려 있어 계정 준비 후에 정해진다.
         try:
             cleanup_database = _resolve_juice_shop_db(args.juice_shop_db)
         except RuntimeError as error:
             print(f"거부: {error}")
             return 2
     else:
-        target_url = urljoin(base_url, "profile")
-        target_label = "SSTI"
+        assert vuln is not None and vuln.seed_path is not None
+        target_url = urljoin(base_url, vuln.seed_path)
 
     debug_enabled = args.debug or args.debug_llm_content
     progress = _DebugProgress(debug_enabled)
@@ -424,7 +465,46 @@ def main(argv: list[str]) -> int:
             f"model={_safe_log_value(selected_model)}"
         )
 
-    if access_control:
+    agent_credentials: tuple[tuple[str, str], ...] = ()
+    if run_all:
+        # 전체 모드가 다루는 것은 Recon이 시작 페이지에서 찾아낼 수 있는 유형뿐이다.
+        # Access Control은 /rest/basket/{id}처럼 구체적인 객체 ID가 있어야 성립하는데,
+        # 그 ID는 크롤링으로 나오지 않고 임의로 만들어내면 열거가 된다. 그래서 전용
+        # Run(--vuln access_control)으로 남긴다.
+        print(
+            "전체 모드는 한 Run에서 Recon이 찾아낸 Surface를 유형별로 라우팅합니다.\n"
+            "SQLi와 XSS는 인증 없이 실행됩니다. SSTI는 token Cookie가 있어야 /profile\n"
+            "폼을 읽을 수 있습니다.\n"
+            "Access Control은 객체 ID가 필요해 크롤링으로 찾을 수 없으므로 "
+            "--vuln access_control로 따로 실행하세요."
+        )
+        token = getpass.getpass(
+            "SSTI용 Juice Shop token Cookie (건너뛰려면 Enter, 숨김 입력): "
+        ).strip()
+        credentials = {}
+        approvals = ()
+        run_credential_ref = None
+        if token:
+            credentials[_CREDENTIAL_REF] = ResolvedHttpCredential(
+                cookies=(("token", token),)
+            )
+            approvals = (SSTI_APPROVAL_REF,)
+            # Recon은 Run 기본 세션으로 돈다. 인증되지 않으면 /profile 폼을 못 읽어
+            # SSTI Surface 자체가 만들어지지 않는다.
+            run_credential_ref = _CREDENTIAL_REF
+            # 유형별 등록. SQLi·XSS는 여기 없으므로 자격증명 없이 실행된다.
+            agent_credentials = (("SSTI", _CREDENTIAL_REF),)
+            print(
+                "  SSTI 포함: username을 control/산술식으로 바꾼 뒤 "
+                f"{SSTI_CLEANUP_VALUE!r}(으)로 정리합니다."
+            )
+        else:
+            print("  SSTI 건너뜀: token이 없어 /profile 폼을 읽을 수 없습니다.")
+        confirmation = "로컬 Juice Shop 전체 취약점 검사를 실행할까요? [y/N] "
+        principal_credentials = ()
+        actor_object_id = None
+        owner_object_id = None
+    elif access_control:
         print(
             "이 검증은 로컬 Juice Shop에 폐기 가능한 임시 계정 두 개를 생성하고 "
             "각 계정의 token과 basket ID를 메모리에서만 사용합니다.\n"
@@ -433,6 +513,20 @@ def main(argv: list[str]) -> int:
         confirmation = "임시 계정 두 개를 생성하고 Access Control 검증을 실행할까요? [y/N] "
         credentials = {}
         approvals: tuple[str, ...] = (_PROVISION_APPROVAL_REF,)
+    elif args.vuln == "sqli":
+        # 인증도 정리도 필요 없는 유일한 유형이다. 읽기 전용 GET에 메타문자 하나를
+        # 실어 control과의 오류 차이만 본다.
+        print(
+            "이 검증은 인증 없이 읽기 전용 GET만 보냅니다. "
+            "대상 상태를 바꾸지 않으므로 정리할 데이터도 없습니다."
+        )
+        confirmation = "로컬 Juice Shop SQLi 검증을 실행할까요? [y/N] "
+        credentials = {}
+        run_credential_ref = None
+        principal_credentials = ()
+        actor_object_id = None
+        owner_object_id = None
+        approvals = ()
     else:
         print("브라우저 개발자 도구에서 로컬 Juice Shop의 token Cookie 값을 확인하세요.")
         token = getpass.getpass("Juice Shop token Cookie (숨김 입력): ").strip()
@@ -462,7 +556,8 @@ def main(argv: list[str]) -> int:
     app = build_local_application(
         {},
         runtime=runtime,
-        router=standard_router(vulnerability_types=(target_label,)),
+        # 전체 모드는 유형을 제한하지 않는다. Router가 Surface별로 관련 Candidate만 만든다.
+        router=standard_router(None if run_all else (target_label,)),
         credential_resolver=resolver,
         approval_gate=StaticApprovalGate(approvals),
         audit_log=audit,
@@ -495,6 +590,7 @@ def main(argv: list[str]) -> int:
         )
         progress.log("임시 ACTOR/OWNER 계정 생성 및 로그인 완료")
 
+    request_budget = _ALL_MODE_BUDGET if run_all else _DEFAULT_BUDGET
     run = None
     workflow_error: WorkflowExecutionError | None = None
     cleanup_error: Exception | None = None
@@ -502,7 +598,7 @@ def main(argv: list[str]) -> int:
         profile = register_standard_agents(
             app,
             llm_client=llm_client,
-            recon_max_pages=1,
+            recon_max_pages=_ALL_MODE_RECON_PAGES if run_all else 1,
             actor_object_id=actor_object_id,
             owner_object_id=owner_object_id,
         )
@@ -511,7 +607,7 @@ def main(argv: list[str]) -> int:
         try:
             progress.log(
                 f"Run 시작: vuln={target_label}, profile={profile}, "
-                f"request_budget={_DEFAULT_BUDGET}"
+                f"request_budget={request_budget}"
             )
             run = app.orchestrator.start(
                 RunRequest(
@@ -520,9 +616,10 @@ def main(argv: list[str]) -> int:
                         allowed_hosts=frozenset({host}),
                         allowed_path_prefixes=(base_path or "/",),
                     ),
-                    request_budget=_DEFAULT_BUDGET,
+                    request_budget=request_budget,
                     credential_ref=run_credential_ref,
                     principal_credentials=principal_credentials,
+                    agent_credentials=agent_credentials,
                 )
             )
         except WorkflowExecutionError as error:
@@ -551,12 +648,17 @@ def main(argv: list[str]) -> int:
     findings = app.stores.findings.list_by_run(run.run_id)
     candidate_counts = Counter(item.vulnerability_type for item in candidates)
     finding_counts = Counter(item.vulnerability_type for item in findings)
-    signal_type = "object_id_auth" if access_control else SSTI_OBSERVATION
-    execution_signals = sum(
-        1 for item in evidence if item.observation.get("type") == signal_type
+    signal_counts = Counter(
+        target.signal_label
+        for item in evidence
+        for target in _VULN_TARGETS.values()
+        if item.observation.get("type") == target.signal
     )
+    execution_signals = 0 if vuln is None else signal_counts[vuln.signal_label]
     verdict = (
-        "CONFIRMED (취약점 확인)" if finding_counts[target_label] else "미확정"
+        "CONFIRMED (취약점 확인)"
+        if (findings if run_all else finding_counts[target_label])
+        else "미확정"
     )
 
     print()
@@ -574,8 +676,19 @@ def main(argv: list[str]) -> int:
     print()
     print("[분석 신호]")
     print(f"  Candidate       {_format_counts(candidate_counts)}")
-    signal_label = "객체 권한 우회" if access_control else "템플릿 산술 실행"
-    print(f"  {signal_label:<14} {execution_signals}개")
+    if run_all:
+        print(f"  Surface         {len(app.stores.surfaces.list_by_run(run.run_id))}개")
+        print(f"  탐지 신호       {_format_counts(signal_counts)}")
+    else:
+        assert vuln is not None
+        print(f"  {vuln.signal_label:<14} {execution_signals}개")
+    failed = [item for item in candidates if item.status == "failed"]
+    if failed:
+        print()
+        print("[검사하지 못한 Candidate]")
+        for item in failed:
+            # 검사했는데 없었다와 검사하지 못했다를 구분해서 보여준다.
+            print(f"  {item.vulnerability_type:<14} {item.last_error}")
     print()
     print("[최종 판정]")
     print(f"  결과            {verdict}")
@@ -588,6 +701,10 @@ def main(argv: list[str]) -> int:
                 "  참고: Candidate가 없으면 token이 만료됐거나 "
                 "/rest/basket/{id} 응답을 읽지 못했을 수 있습니다."
             )
+        elif run_all:
+            print("  참고: Candidate가 없으면 Recon이 Surface를 찾지 못했을 수 있습니다.")
+        elif args.vuln == "sqli":
+            print(f"  참고: Candidate가 없으면 {vuln.seed_path} 응답을 읽지 못했을 수 있습니다.")
         else:
             print("  참고: Candidate가 없으면 token이 만료됐거나 /profile 폼을 읽지 못했을 수 있습니다.")
     print("=" * 54)
