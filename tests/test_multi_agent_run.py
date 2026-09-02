@@ -751,5 +751,167 @@ class ProgressEventTests(unittest.TestCase):
         self.assertNotIn("sk-secret", failures[0].detail or "")
 
 
+class _FixtureRuntime:
+    """네트워크 없이 구조화 요청만 기록하는 Runtime 대역."""
+
+    def __init__(self) -> None:
+        self.requests = []
+
+    def execute(self, request):
+        from hacklipse.domain import ExecutionResult
+
+        self.requests.append(request)
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            evidence_type="http_response",
+            observation={"type": "http_response", "status": 200},
+        )
+
+
+class _EvidenceSeekingAnalyzer:
+    """첫 호출에 증적을 요청하고 두 번째 호출에 끝내는 Analysis 대역."""
+
+    def __init__(self, marker: str) -> None:
+        self._marker = marker
+        self.seen_evidence: list[tuple[str, ...]] = []
+
+    def handle(self, task):
+        from hacklipse.domain import (
+            AgentResult,
+            AgentResultStatus,
+            EvidenceRequest,
+            HttpRequestSpec,
+        )
+
+        self.seen_evidence.append(task.evidence_ids)
+        if task.evidence_ids:
+            return AgentResult(task_id=task.task_id, status=AgentResultStatus.COMPLETED)
+        return AgentResult(
+            task_id=task.task_id,
+            status=AgentResultStatus.NEEDS_EVIDENCE,
+            evidence_requests=(
+                EvidenceRequest(
+                    evidence_type="http_response",
+                    surface_id=task.surface_id,
+                    reason=f"control for {self._marker}",
+                    suggested_tool="http_get",
+                    http_request=HttpRequestSpec(method="GET"),
+                ),
+            ),
+        )
+
+
+def _evidence_application():
+    from hacklipse.bootstrap import build_local_application
+
+    runtime = _FixtureRuntime()
+    app = build_local_application({}, runtime=runtime)
+    app.dispatcher.register(
+        "recon", _SurfaceOnlyReconAgent(app.stores.surfaces), allowed_tools=("http_get",)
+    )
+    analyzers = {
+        "xss_analyzer": _EvidenceSeekingAnalyzer("xss"),
+        "sqli_analyzer": _EvidenceSeekingAnalyzer("sqli"),
+    }
+    for name, agent in analyzers.items():
+        app.dispatcher.register(name, agent, allowed_tools=("http_get",))
+    app.dispatcher.register(
+        "validation", _RejectingValidator(), allowed_tools=("http_get",)
+    )
+    return app, analyzers
+
+
+class CandidateIsolationTests(unittest.TestCase):
+    """Candidate 가 여럿이어도 증적과 검증 세션이 서로 섞이면 안 된다."""
+
+    def test_evidence_rounds_do_not_leak_between_candidates(self) -> None:
+        """한 Candidate 가 수집한 증적이 다른 Candidate 의 Task 에 실리면 안 된다."""
+
+        app, analyzers = _evidence_application()
+
+        run = _start(app)
+
+        candidates = {
+            item.vulnerability_type: item
+            for item in app.stores.candidates.list_by_run(run.run_id)
+        }
+        xss_evidence = set(candidates["XSS"].evidence_ids)
+        sqli_evidence = set(candidates["SQLi"].evidence_ids)
+
+        self.assertTrue(xss_evidence)
+        self.assertTrue(sqli_evidence)
+        # 각자 자기 것만 들고 있어야 한다.
+        self.assertEqual(xss_evidence & sqli_evidence, set())
+        # 두 번째 호출에는 자기 증적만 실려 들어온다.
+        for name, agent in analyzers.items():
+            second_round = agent.seen_evidence[-1]
+            owner = "XSS" if name == "xss_analyzer" else "SQLi"
+            self.assertTrue(set(second_round) <= set(candidates[owner].evidence_ids))
+
+    def test_validation_sessions_are_separate_per_candidate(self) -> None:
+        """검증 세션이 섞이면 다른 Candidate 의 증적으로 확정될 수 있다."""
+
+        app, _ = _evidence_application()
+
+        run = _start(app)
+
+        sessions = {
+            item.validation_id
+            for item in app.stores.evidence.list_by_run(run.run_id)
+            if item.validation_id
+        }
+        # 검증이 증적을 요청하지 않는 대역이라 세션 Evidence 는 없지만,
+        # Analysis 증적에는 어떤 validation_id 도 붙어 있으면 안 된다.
+        self.assertEqual(sessions, set())
+        analysis_evidence = [
+            item
+            for item in app.stores.evidence.list_by_run(run.run_id)
+            if item.created_by.startswith("execution_runtime:")
+        ]
+        self.assertTrue(analysis_evidence)
+        self.assertTrue(all(item.validation_id is None for item in analysis_evidence))
+
+
+class ProgressScreenSafetyTests(unittest.TestCase):
+    """진행 화면은 이벤트 계층이 거른 것만 그린다. 끝에서 확인한다."""
+
+    def test_secret_in_an_error_never_reaches_the_screen(self) -> None:
+        import io
+
+        from hacklipse.ports.errors import AuthenticationFailed
+        from scripts.progress_view import RunProgressView
+
+        stream = io.StringIO()
+        view = RunProgressView(stream=stream, tty=False)
+        from hacklipse.bootstrap import build_local_application
+
+        app = build_local_application({}, progress_sink=view)
+        app.dispatcher.register(
+            "recon",
+            _SurfaceOnlyReconAgent(app.stores.surfaces),
+            allowed_tools=("http_get",),
+        )
+        app.dispatcher.register(
+            "xss_analyzer",
+            _RaisingAnalyzer(AuthenticationFailed("token=sk-live-supersecret")),
+            allowed_tools=("http_get",),
+        )
+        app.dispatcher.register(
+            "sqli_analyzer", _CompletingAnalyzer(), allowed_tools=("http_get",)
+        )
+        app.dispatcher.register(
+            "validation", _RejectingValidator(), allowed_tools=("http_get",)
+        )
+
+        _start(app)
+        view.close()
+
+        output = stream.getvalue()
+        self.assertNotIn("sk-live-supersecret", output)
+        self.assertNotIn("token=", output)
+        # 무슨 일이 있었는지는 남는다.
+        self.assertIn("AuthenticationFailed", output)
+
+
 if __name__ == "__main__":
     unittest.main()
