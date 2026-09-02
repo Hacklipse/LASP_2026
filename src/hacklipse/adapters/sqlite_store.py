@@ -191,10 +191,9 @@ def _decode_run(data: str) -> Run:
         allowed_path_prefixes=tuple(scope["allowed_path_prefixes"]),
     )
     value["phase"] = RunPhase(value["phase"])
-    # 역할 → credential_ref 매핑은 쌍의 튜플이므로 안쪽까지 복원한다.
-    value["principal_credentials"] = tuple(
-        tuple(item) for item in value.get("principal_credentials", ())
-    )
+    # 역할·취약점 유형 → credential_ref 매핑은 쌍의 튜플이므로 안쪽까지 복원한다.
+    for name in ("principal_credentials", "agent_credentials"):
+        value[name] = tuple(tuple(item) for item in value.get(name, ()))
     for name in (
         "evidence_ids",
         "surface_ids",

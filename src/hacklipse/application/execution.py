@@ -225,6 +225,10 @@ class RuntimeEvidenceCollector:
             validation_id=task.validation_id,
             timeout_seconds=task.timeout_seconds,
             approval_ref=request_spec.approval_ref,
+            # Task에 실린 자격증명을 그대로 쓴다. 여기서 Run 기본값으로 되돌리면
+            # 여러 취약점을 함께 검사할 때 유형별 세션 분리가 이 지점에서 무너진다.
+            # principal_role이 붙은 요청은 _credential_for가 역할을 우선한다.
+            credential_ref=task.credential_ref,
         )
         return AgentResult(
             task_id=task.task_id,
@@ -258,7 +262,11 @@ def _credential_for(
             )
         return credential_ref
     if requested is not None:
-        allowed = {run.credential_ref, *(ref for _, ref in run.principal_credentials)}
+        allowed = {
+            run.credential_ref,
+            *(ref for _, ref in run.principal_credentials),
+            *(ref for _, ref in run.agent_credentials),
+        }
         if requested not in allowed:
             raise PolicyViolation(
                 "execution requested a credential that is not registered for this run"

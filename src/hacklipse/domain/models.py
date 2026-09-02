@@ -171,6 +171,10 @@ class RunRequest:
     # 역할 → credential_ref 매핑. Access Control처럼 두 주체가 필요한 검사에서만 채운다.
     # 여기에 등록되지 않은 역할은 중앙 Collector가 거부한다.
     principal_credentials: tuple[tuple[str, str], ...] = ()
+    # 취약점 유형 → credential_ref 매핑. 한 Run에서 여러 취약점을 검사할 때 유형마다
+    # 필요한 인증이 다르기 때문에 필요하다(SQLi는 인증 없음, SSTI는 실습 계정 token).
+    # 비어 있으면 기존 단일 취약점 Run으로 보고 credential_ref를 그대로 쓴다.
+    agent_credentials: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         # 실행 예산은 이후 Runtime과 Agent 호출을 통제하는 상한선이다.
@@ -196,6 +200,7 @@ class Run:
     # 역할 → credential_ref 매핑. Access Control처럼 두 주체가 필요한 검사에서만 채운다.
     # 여기에 등록되지 않은 역할은 중앙 Collector가 거부한다.
     principal_credentials: tuple[tuple[str, str], ...] = ()
+    agent_credentials: tuple[tuple[str, str], ...] = ()
     phase: RunPhase = RunPhase.INIT
     evidence_ids: tuple[str, ...] = ()
     surface_ids: tuple[str, ...] = ()
@@ -208,6 +213,22 @@ class Run:
         """불변 dataclass를 직접 수정하지 않고 변경된 복사본을 만든다."""
 
         return replace(self, **changes)
+
+
+def credential_for_vulnerability(run: Run, vulnerability_type: str) -> str | None:
+    """취약점 유형에 등록된 자격증명만 해석한다.
+
+    ``agent_credentials``가 비어 있으면 기존 단일 취약점 Run이므로 Run 기본 자격증명을
+    그대로 쓴다. 등록이 하나라도 있으면 여러 유형을 함께 검사하는 Run이고, 이때
+    등록되지 않은 유형은 자격증명 없이 실행한다.
+
+    없을 때 Run 기본값으로 흘려보내지 않는 것이 요점이다. 그렇게 두면 SSTI 실습 계정
+    세션이 SQLi 요청에 얹히는 식으로 유형 간 인증이 섞인다.
+    """
+
+    if not run.agent_credentials:
+        return run.credential_ref
+    return dict(run.agent_credentials).get(vulnerability_type)
 
 
 @dataclass(frozen=True, slots=True)
@@ -524,6 +545,9 @@ class Candidate:
     assigned_agent: str
     evidence_ids: tuple[str, ...]
     status: str = "routed"
+    # 이 Candidate만 실패했을 때의 사유. 다른 Candidate는 계속 진행하므로 실패를
+    # Run 전체가 아니라 Candidate에 남겨야 무엇이 검사되지 않았는지 알 수 있다.
+    last_error: str | None = None
 
     def add_evidence(self, evidence_ids: tuple[str, ...]) -> Candidate:
         """기존 순서를 유지하면서 중복 없이 Evidence 참조를 합친다."""
@@ -535,6 +559,15 @@ class Candidate:
         """분석·검증 진행 상태가 변경된 Candidate 복사본을 만든다."""
 
         return replace(self, status=status)
+
+    def fail(self, reason: str) -> Candidate:
+        """이 Candidate만 실패로 표시한다.
+
+        "검사했는데 없었다"와 "검사하지 못했다"를 결과에서 구분하기 위해 사유를 함께
+        남긴다. 사유가 없으면 실패한 Candidate가 안전한 Candidate처럼 보인다.
+        """
+
+        return replace(self, status="failed", last_error=reason)
 
 
 @dataclass(frozen=True, slots=True)
