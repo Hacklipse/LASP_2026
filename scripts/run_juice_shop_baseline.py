@@ -34,6 +34,9 @@ from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+# 같은 디렉터리의 공용 모듈을 직접 실행할 때와 tests 에서 import 할 때 모두
+# 같은 이름으로 찾을 수 있게 한다.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hacklipse.adapters import (  # noqa: E402
     HttpExecutionRuntime,

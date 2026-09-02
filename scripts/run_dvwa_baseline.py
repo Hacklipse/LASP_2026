@@ -26,6 +26,9 @@ from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+# 같은 디렉터리의 공용 모듈을 직접 실행할 때와 tests 에서 import 할 때 모두
+# 같은 이름으로 찾을 수 있게 한다.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hacklipse.adapters import (  # noqa: E402
     HttpExecutionRuntime,
@@ -55,6 +58,7 @@ from hacklipse.ports import (  # noqa: E402
     ResolvedHttpCredential,
 )
 from hacklipse.ports.errors import LlmCredentialsMissing  # noqa: E402
+from progress_view import RunProgressView  # noqa: E402
 
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1"})
 _CREDENTIAL_REF = "interactive-local-dvwa"
@@ -590,6 +594,7 @@ def main(argv: list[str]) -> int:
     http_runtime = HttpExecutionRuntime(credential_resolver=resolver)
     runtime = PlaywrightBrowserRuntime(http_runtime=http_runtime)
     audit = _DebugAuditLog(progress) if debug_enabled else InMemoryExecutionAuditLog()
+    progress_view = None if debug_enabled else RunProgressView()
     app = build_local_application(
         {},
         runtime=runtime,
@@ -599,6 +604,9 @@ def main(argv: list[str]) -> int:
         audit_log=audit,
         config=OrchestratorConfig(browser_xss_validation=args.vuln == "xss"),
         task_progress_callback=progress.task_event if debug_enabled else None,
+        # 진행 화면과 상세 로그 중 하나만 붙인다. 둘이 섞이면 화면을 다시 그릴 때
+        # 앞서 출력한 줄과 어긋난다.
+        progress_sink=None if debug_enabled else progress_view,
     )
     # 이 실행기는 DVWA reflected-XSS/SQLi 파이프라인의 재현 실험이다. 전 사이트를
     # 크롤링하면 비밀번호 변경 같은 상태 변경 GET 폼까지 탐색 대상에 섞이고, 결과도
@@ -636,6 +644,17 @@ def main(argv: list[str]) -> int:
         return 1
     progress.log(f"Run 완료: phase={_safe_log_value(run.phase.value)}")
 
+    if progress_view is not None:
+        progress_view.close(
+            surfaces=len(app.stores.surfaces.list_by_run(run.run_id)),
+            parameters=len(
+                {
+                    name
+                    for surface in app.stores.surfaces.list_by_run(run.run_id)
+                    for name in surface.parameters
+                }
+            ),
+        )
     candidates = app.stores.candidates.list_by_run(run.run_id)
     reflections = tuple(
         item
