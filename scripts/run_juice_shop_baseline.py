@@ -42,6 +42,7 @@ from hacklipse.adapters import (  # noqa: E402
     HttpExecutionRuntime,
     InMemoryCredentialResolver,
     InMemoryExecutionAuditLog,
+    PlaywrightBrowserRuntime,
     StaticApprovalGate,
 )
 from hacklipse.adapters.ssti_analysis import (  # noqa: E402
@@ -49,7 +50,7 @@ from hacklipse.adapters.ssti_analysis import (  # noqa: E402
     SSTI_CLEANUP_VALUE,
     SSTI_OBSERVATION,
 )
-from hacklipse.application import build_progress_snapshot  # noqa: E402
+from hacklipse.application import OrchestratorConfig, build_progress_snapshot  # noqa: E402
 from hacklipse.application.errors import WorkflowExecutionError  # noqa: E402
 from hacklipse.bootstrap import (  # noqa: E402
     DEFAULT_ANTHROPIC_LLM_MODEL,
@@ -112,10 +113,21 @@ class _VulnTarget:
 _VULN_TARGETS = {
     "sqli": _VulnTarget("SQLi", "rest/products/search?q=seed", "sql_error", "SQL 오류"),
     "ssti": _VulnTarget("SSTI", "profile", SSTI_OBSERVATION, "템플릿 산술 실행"),
+    # SPA 라우트는 서버 경로가 아니다. Recon 이 번들에서 찾아내므로 seed 는 홈이다.
+    "xss": _VulnTarget("XSS", None, "reflection", "DOM 반사"),
+    # /ftp 디렉터리는 번들의 템플릿 리터럴에서만 드러난다. seed 없이 Recon 이 찾는다.
+    "path_traversal": _VulnTarget(
+        "Path Traversal", None, "path_traversal_file_read", "확장자 필터 우회 읽기"
+    ),
     "access_control": _VulnTarget(
         "Access Control", None, "object_id_auth", "객체 권한 우회"
     ),
 }
+# 브라우저를 쓰는 유형. Playwright Runtime 과 브라우저 검증을 함께 켠다.
+_BROWSER_VULNS = frozenset({"xss", "all"})
+# 시작 URL 에 표면이 없고 JS 번들과 디렉터리 목록을 거쳐야 찾을 수 있는 유형.
+# 정찰 페이지 수와 예산을 전체 모드와 같게 준다.
+_BUNDLE_DISCOVERY_VULNS = frozenset({"xss", "path_traversal", "all"})
 
 
 @dataclass(slots=True)
@@ -454,8 +466,13 @@ def main(argv: list[str]) -> int:
             print(f"거부: {error}")
             return 2
     else:
-        assert vuln is not None and vuln.seed_path is not None
-        target_url = urljoin(base_url, vuln.seed_path)
+        assert vuln is not None
+        # seed_path 가 없는 유형은 Recon 이 번들에서 표면을 찾아낸다(SPA 라우트, /ftp).
+        target_url = (
+            base_url
+            if vuln.seed_path is None
+            else urljoin(base_url, vuln.seed_path)
+        )
 
     debug_enabled = args.debug or args.debug_llm_content
     progress = _DebugProgress(debug_enabled)
@@ -544,6 +561,24 @@ def main(argv: list[str]) -> int:
         confirmation = "임시 계정 두 개를 생성하고 Access Control 검증을 실행할까요? [y/N] "
         credentials = {}
         approvals: tuple[str, ...] = (_PROVISION_APPROVAL_REF,)
+    elif args.vuln in ("xss", "path_traversal"):
+        if args.vuln == "xss":
+            print(
+                "이 검증은 헤드리스 브라우저로 SPA 라우트를 열어 값이 DOM에 반사되는지 봅니다.\n"
+                "요청은 읽기 전용 GET이며 대상 상태를 바꾸지 않습니다."
+            )
+        else:
+            print(
+                "이 검증은 서버가 직접 거부하는 자기 파일을 고정 우회 접미사로 다시 요청합니다.\n"
+                "읽기 전용 GET이며 대상 상태를 바꾸지 않습니다."
+            )
+        confirmation = f"로컬 Juice Shop {vuln.label} 검증을 실행할까요? [y/N] "
+        credentials = {}
+        run_credential_ref = None
+        principal_credentials = ()
+        actor_object_id = None
+        owner_object_id = None
+        approvals = ()
     elif args.vuln == "sqli":
         # 인증도 정리도 필요 없는 유일한 유형이다. 읽기 전용 GET에 메타문자 하나를
         # 실어 control과의 오류 차이만 본다.
@@ -583,7 +618,15 @@ def main(argv: list[str]) -> int:
 
     progress_view = None if debug_enabled else RunProgressView()
     resolver = InMemoryCredentialResolver(credentials)
-    runtime = HttpExecutionRuntime(credential_resolver=resolver)
+    http_runtime = HttpExecutionRuntime(credential_resolver=resolver)
+    # SPA 의 DOM sink 는 브라우저로만 관측된다. 필요할 때만 감싸 다른 유형의
+    # 실행 비용을 늘리지 않는다.
+    needs_browser = args.vuln in _BROWSER_VULNS
+    runtime = (
+        PlaywrightBrowserRuntime(http_runtime=http_runtime)
+        if needs_browser
+        else http_runtime
+    )
     audit = _DebugAuditLog(progress) if debug_enabled else InMemoryExecutionAuditLog()
     app = build_local_application(
         {},
@@ -597,6 +640,7 @@ def main(argv: list[str]) -> int:
         # 진행 화면과 상세 로그 중 하나만 붙인다. 상세 로그가 중간에 끼면 화면을
         # 다시 그릴 때 앞서 출력한 줄과 어긋나 둘 다 읽을 수 없게 된다.
         progress_sink=None if debug_enabled else progress_view,
+        config=OrchestratorConfig(browser_xss_validation=needs_browser),
     )
     base_path = parsed.path if parsed.path.endswith("/") else f"{parsed.path}/"
     provision_run_id: str | None = None
@@ -625,8 +669,9 @@ def main(argv: list[str]) -> int:
         )
         progress.log("임시 ACTOR/OWNER 계정 생성 및 로그인 완료")
 
+    needs_discovery = args.vuln in _BUNDLE_DISCOVERY_VULNS
     request_budget = args.request_budget or (
-        _ALL_MODE_BUDGET if run_all else _DEFAULT_BUDGET
+        _ALL_MODE_BUDGET if needs_discovery else _DEFAULT_BUDGET
     )
     run = None
     workflow_error: WorkflowExecutionError | None = None
@@ -635,7 +680,7 @@ def main(argv: list[str]) -> int:
         profile = register_standard_agents(
             app,
             llm_client=llm_client,
-            recon_max_pages=_ALL_MODE_RECON_PAGES if run_all else 1,
+            recon_max_pages=_ALL_MODE_RECON_PAGES if needs_discovery else 1,
             recon_seed_urls=recon_seed_urls,
             actor_object_id=actor_object_id,
             owner_object_id=owner_object_id,

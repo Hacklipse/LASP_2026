@@ -18,6 +18,7 @@ from hacklipse.domain import (
     EvidenceRequest,
     HttpRequestKind,
     HttpRequestSpec,
+    PATH_TRAVERSAL_BYPASS_SUFFIX,
     PATH_TRAVERSAL_SAFE_PROBE_PATH,
     ExecutionRequest,
     Surface,
@@ -41,6 +42,10 @@ PATH_TRAVERSAL_OBSERVATION = "path_traversal_file_read"
 PATH_TRAVERSAL_PROBE_PATH = PATH_TRAVERSAL_SAFE_PROBE_PATH
 PATH_TRAVERSAL_PROOF_FILE = "/etc/os-release"
 PATH_TRAVERSAL_PROOF_MARKERS = ("PRETTY_NAME=", "VERSION_ID=")
+# 서버가 확장자 필터로 직접 거부한 자기 파일을 우회 경로로 읽어내는 형태.
+# 쿼리 파라미터가 아니라 경로 자체가 파일을 가리키는 표면에서 성립한다.
+PATH_TRAVERSAL_BYPASS_OBSERVATION = "path_traversal_filter_bypass"
+RESTRICTED_FILE_OBSERVATION = "restricted_file_path"
 
 
 def validate_path_traversal_request(request: ExecutionRequest) -> None:
@@ -50,7 +55,19 @@ def validate_path_traversal_request(request: ExecutionRequest) -> None:
         raise ValueError("path traversal request must use its dedicated tool")
     if request.method.upper() != "GET" or request.body is not None or request.headers:
         raise ValueError("path traversal safe-file probe supports plain GET requests only")
+    if request.path_suffix is not None:
+        # 우회 탐침은 표면이 이미 가리키는 파일에 고정 접미사만 덧붙인다. 다른 파일을
+        # 고를 수 없으므로 파라미터도 필요 없다. 접미사 값은 도메인이 검증했다.
+        if request.request_kind is not HttpRequestKind.PATH_TRAVERSAL_PROBE:
+            raise ValueError("path suffix requires the path traversal probe kind")
+        if request.query_parameters:
+            raise ValueError("path traversal bypass probe cannot add query parameters")
+        return
     if not request.query_parameters:
+        # 우회 흐름의 control 은 표면 URL 을 그대로 받는 평범한 GET 이다. 바꾸는 값이
+        # 없으므로 파라미터도 없다. probe 쪽은 위에서 접미사까지 검증했다.
+        if request.request_kind is HttpRequestKind.CONTROL:
+            return
         raise ValueError("path traversal safe-file probe requires query parameters")
 
     values = tuple(value for _, value in request.query_parameters)
@@ -95,8 +112,13 @@ class HeuristicPathTraversalAnalyzer:
             candidate_store=self._candidates,
             surface_store=self._surfaces,
             required_tool=PATH_TRAVERSAL_TOOL,
+            # 우회 흐름의 표면은 경로 자체가 파일이라 query 파라미터가 없다.
+            allow_parameterless_get=True,
         )
         evidence = tuple(self._evidence.get_many(task.run_id, task.evidence_ids))
+        if is_restricted_file_surface(evidence, surface):
+            return self._handle_bypass(task, candidate, surface, evidence)
+
         selected = path_parameters_from_evidence(evidence, surface, parameters)
         if not selected:
             return AgentResult(
@@ -149,6 +171,164 @@ class HeuristicPathTraversalAnalyzer:
             new_evidence_ids=tuple(new_ids),
             candidate_ids=(candidate.candidate_id,),
         )
+
+
+    def _handle_bypass(
+        self,
+        task: TaskEnvelope,
+        candidate,
+        surface: Surface,
+        evidence: Sequence[Evidence],
+    ) -> AgentResult:
+        """서버가 거부한 파일이 고정 우회 접미사로 제공되는지 비교한다."""
+
+        requests = build_path_traversal_bypass_requests(
+            surface, purpose=f"Path Traversal candidate {candidate.candidate_id}"
+        )
+        collected = tuple(
+            matching_evidence(evidence, surface.url, request) for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "path traversal bypass lacks budget for its evidence requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+                candidate_ids=(candidate.candidate_id,),
+            )
+
+        control, probe = collected
+        if control is None or probe is None:  # missing 이후에는 도달하지 않는다.
+            raise AgentContractError("path traversal bypass evidence was not collected")
+        new_ids = record_path_traversal_bypass(
+            task=task,
+            surface=surface,
+            control=control,
+            probe=probe,
+            evidence=evidence,
+            evidence_store=self._evidence,
+            created_by=HEURISTIC_PATH_TRAVERSAL_ANALYZER,
+            id_factory=self._id_factory,
+        )
+        return AgentResult(
+            task_id=task.task_id,
+            status=AgentResultStatus.COMPLETED,
+            new_evidence_ids=tuple(new_ids),
+            candidate_ids=(candidate.candidate_id,),
+        )
+
+
+def is_restricted_file_surface(
+    evidence: Sequence[Evidence], surface: Surface
+) -> bool:
+    """Recon이 접근 제한 파일 표면으로 표시했는지 확인한다."""
+
+    return any(
+        item.surface_id == surface.surface_id
+        and item.observation.get("type") == RESTRICTED_FILE_OBSERVATION
+        for item in evidence
+    )
+
+
+def build_path_traversal_bypass_requests(
+    surface: Surface, *, purpose: str
+) -> tuple[EvidenceRequest, ...]:
+    """표면 경로 그대로의 control 과 고정 접미사를 붙인 probe 를 만든다."""
+
+    return (
+        EvidenceRequest(
+            evidence_type="http_response",
+            surface_id=surface.surface_id,
+            reason=f"control request for {purpose}",
+            suggested_tool=PATH_TRAVERSAL_TOOL,
+            http_request=HttpRequestSpec(
+                method="GET", request_kind=HttpRequestKind.CONTROL
+            ),
+        ),
+        EvidenceRequest(
+            evidence_type="http_response",
+            surface_id=surface.surface_id,
+            reason=f"extension filter bypass probe for {purpose}",
+            suggested_tool=PATH_TRAVERSAL_TOOL,
+            http_request=HttpRequestSpec(
+                method="GET",
+                request_kind=HttpRequestKind.PATH_TRAVERSAL_PROBE,
+                path_suffix=PATH_TRAVERSAL_BYPASS_SUFFIX,
+            ),
+        ),
+    )
+
+
+def path_traversal_bypass_signal(control: Evidence, probe: Evidence) -> bool:
+    """서버가 거부한 파일이 우회 경로로는 제공되었는지 판정한다.
+
+    단순한 2xx 는 기준이 아니다. 같은 파일을 control 에서는 서버가 거부(4xx)했고
+    probe 에서만 내용이 제공되었다는 차이가 취약점 자체다.
+    """
+
+    control_status = control.observation.get("status")
+    probe_status = probe.observation.get("status")
+    control_body = response_body(control) or ""
+    probe_body = response_body(probe) or ""
+    return bool(
+        isinstance(control_status, int)
+        and 400 <= control_status < 500
+        and isinstance(probe_status, int)
+        and 200 <= probe_status < 300
+        and probe_body
+        and probe_body != control_body
+    )
+
+
+def record_path_traversal_bypass(
+    *,
+    task: TaskEnvelope,
+    surface: Surface,
+    control: Evidence,
+    probe: Evidence,
+    evidence: Sequence[Evidence],
+    evidence_store: EvidenceStore,
+    created_by: str,
+    id_factory: Callable[[], str],
+) -> list[str]:
+    """Python 이 확인한 우회 읽기만 Observation 으로 저장한다."""
+
+    if not path_traversal_bypass_signal(control, probe):
+        return []
+    parameter = surface.url.rsplit("/", 1)[-1]
+    if has_observation_record(
+        evidence,
+        created_by,
+        PATH_TRAVERSAL_OBSERVATION,
+        parameter,
+        control.evidence_id,
+        probe.evidence_id,
+    ):
+        return []
+    observation_id = f"evi-{id_factory()}"
+    evidence_store.append(
+        Evidence(
+            evidence_id=observation_id,
+            run_id=task.run_id,
+            surface_id=surface.surface_id,
+            created_by=created_by,
+            evidence_type="observation",
+            observation={
+                "type": PATH_TRAVERSAL_OBSERVATION,
+                "parameter": parameter,
+                "bypass": PATH_TRAVERSAL_BYPASS_OBSERVATION,
+                "control_evidence_id": control.evidence_id,
+                "probe_evidence_id": probe.evidence_id,
+            },
+        )
+    )
+    return [observation_id]
 
 
 def path_parameters_from_evidence(

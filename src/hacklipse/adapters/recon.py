@@ -38,6 +38,8 @@ from hacklipse.domain import (
 )
 from hacklipse.ports import EvidenceStore, SurfaceStore
 
+from .path_traversal_analysis import RESTRICTED_FILE_OBSERVATION
+
 # HttpExecutionRuntime이 GET 실행에 사용하는 도구 이름과 맞춘다(tests/test_http_runtime.py).
 RECON_TOOL = "http_get"
 
@@ -80,6 +82,37 @@ _FILE_OR_URL_PARAM_HINTS = (
     "target",
 )
 
+# 템플릿 보간에서 끊기는 경로는 디렉터리까지만 남긴다. `${host}/ftp/order_${id}.pdf`
+# 같은 리터럴은 파일명을 알 수 없지만 그 디렉터리는 실재하는 표면이다.
+_JS_DIRECTORY = re.compile(
+    r"""["'`](?:\$\{[^}]{0,60}\})?(/[A-Za-z0-9][A-Za-z0-9._~/-]{0,100}/)[A-Za-z0-9._~-]{0,40}\$\{"""
+)
+# SPA 클라이언트 라우트와 그 query 파라미터. 라우트 이동과 파라미터 선언이 서로
+# 앞뒤 어느 쪽에도 올 수 있어 좁은 창 안에서 함께 나타나는 짝만 취한다.
+_JS_ROUTE_NAVIGATE = re.compile(r"""navigate\(\["/([A-Za-z0-9._~-]{1,40})"\]""")
+_JS_ROUTE_QUERY_PARAM = re.compile(r"""queryParams:\{([A-Za-z_][A-Za-z0-9_]{0,30}):""")
+_ROUTE_BINDING_WINDOW = 200
+
+# 웹 서버가 그대로 내주면 안 되는 확장자. 이런 파일이 표면으로 노출되어 있으면
+# 서버가 직접 거부하는지, 우회 경로로는 제공되는지 확인할 가치가 있다.
+_RESTRICTED_FILE_EXTENSIONS = (
+    ".bak",
+    ".conf",
+    ".config",
+    ".db",
+    ".env",
+    ".gg",
+    ".ini",
+    ".kdbx",
+    ".key",
+    ".log",
+    ".pem",
+    ".pyc",
+    ".sql",
+    ".yaml",
+    ".yml",
+)
+
 _MAX_SCRIPT_BYTES = 4 * 1024 * 1024
 _PATH_OBJECT_ID = re.compile(r"^[0-9]{1,10}$")
 _PATH_RESOURCE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
@@ -101,6 +134,32 @@ _SINGULAR_OBJECT_RESOURCES = frozenset(
 def _looks_like_file_or_url_parameter(name: str) -> bool:
     lowered = name.lower()
     return any(hint in lowered for hint in _FILE_OR_URL_PARAM_HINTS)
+
+
+def _client_routes(body: str) -> dict[str, tuple[str, ...]]:
+    """SPA 라우트 이름과 그 라우트가 받는 query 파라미터를 짝지어 뽑는다.
+
+    번들은 minify 되어 있어 `navigate(["/search"], i)` 처럼 파라미터 선언이 변수로
+    분리되기도 한다. 선언과 이동이 같은 함수 안에 있다는 성질만 이용해 좁은 창
+    안에서 함께 나타나는 짝을 취한다. 창을 넓히면 무관한 라우트가 섞인다.
+    """
+
+    routes: dict[str, set[str]] = {}
+    for match in _JS_ROUTE_QUERY_PARAM.finditer(body):
+        start = max(0, match.start() - _ROUTE_BINDING_WINDOW)
+        window = body[start : match.end() + _ROUTE_BINDING_WINDOW]
+        nearby = _JS_ROUTE_NAVIGATE.search(window)
+        if nearby is None:
+            continue
+        routes.setdefault(nearby.group(1), set()).add(match.group(1))
+    return {route: tuple(sorted(names)) for route, names in routes.items()}
+
+
+def _looks_like_restricted_file(url: str) -> bool:
+    """웹으로 내주면 안 되는 확장자를 가진 파일 경로인지 본다."""
+
+    name = urlsplit(url).path.rsplit("/", 1)[-1].lower()
+    return any(name.endswith(suffix) for suffix in _RESTRICTED_FILE_EXTENSIONS)
 
 
 class ReconAgent:
@@ -179,35 +238,42 @@ class ReconAgent:
             evidence_ids.extend(
                 self._flag_suspect_parameters(task.run_id, surface_id, names)
             )
+            if _looks_like_restricted_file(clean_url):
+                evidence_ids.append(
+                    self._flag_restricted_file(task.run_id, surface_id, clean_url)
+                )
             return surface_id
 
-        while pending and len(fetched) < page_budget:
-            url = pending.pop(0)
-            if url in fetched:
-                continue
-            fetched.add(url)
-
-            surface_id = remember(url, "GET", _query_names(url), _query_pairs(url))
-            evidence_id, evidence = self._fetch(task, url, surface_id)
-            evidence_ids.append(evidence_id)
-
-            body = evidence.observation.get("body")
-            if not isinstance(body, str) or not body:
-                continue
-
-            links, forms, sources = _parse_page(body, url)
-            for form_url, method, names in forms:
-                remember(form_url, method, names)
-            for link in links:
-                if not _same_origin(link, origin):
+        def crawl() -> None:
+            while pending and len(fetched) < page_budget:
+                url = pending.pop(0)
+                if url in fetched:
                     continue
-                # 예산과 무관하게 표면으로 기록하고, 여유가 있으면 크롤링까지 한다.
-                remember(link, "GET", _query_names(link), _query_pairs(link))
-                if link not in fetched and link not in pending:
-                    pending.append(link)
-            for source in sources:
-                if source not in scripts and _same_origin(source, origin):
-                    scripts.append(source)
+                fetched.add(url)
+
+                surface_id = remember(url, "GET", _query_names(url), _query_pairs(url))
+                evidence_id, evidence = self._fetch(task, url, surface_id)
+                evidence_ids.append(evidence_id)
+
+                body = evidence.observation.get("body")
+                if not isinstance(body, str) or not body:
+                    continue
+
+                links, forms, sources = _parse_page(body, url)
+                for form_url, method, names in forms:
+                    remember(form_url, method, names)
+                for link in links:
+                    if not _same_origin(link, origin):
+                        continue
+                    # 예산과 무관하게 표면으로 기록하고, 여유가 있으면 크롤링까지 한다.
+                    remember(link, "GET", _query_names(link), _query_pairs(link))
+                    if link not in fetched and link not in pending:
+                        pending.append(link)
+                for source in sources:
+                    if source not in scripts and _same_origin(source, origin):
+                        scripts.append(source)
+
+        crawl()
 
         # 번들 분석은 크롤링 뒤에 한다. 남은 예산 안에서만 스크립트를 받는다.
         affordable = max(min(self._max_scripts, page_budget - len(fetched)), 0)
@@ -215,6 +281,12 @@ class ReconAgent:
             fetched.add(source)
             for url, names in self._discover_from_script(task, source, origin):
                 remember(url, "GET", names)
+                # 번들이 가리킨 디렉터리는 목록을 내줄 수 있다. 그 안의 파일은
+                # 번들에 이름이 없으므로 이어서 크롤링해야만 발견된다.
+                if url.endswith("/") and url not in fetched and url not in pending:
+                    pending.append(url)
+        # 번들에서 찾은 디렉터리 목록을 남은 예산 안에서 마저 본다.
+        crawl()
 
         surface_ids = list(surfaces.values())
         return AgentResult(
@@ -269,12 +341,18 @@ class ReconAgent:
             parameters.setdefault(match.group(1), set()).add(match.group(2))
         paths = {match.group(1) for match in _JS_PATH.finditer(body)}
         paths.update(parameters)
+        paths.update(match.group(1) for match in _JS_DIRECTORY.finditer(body))
 
         base = f"{origin.scheme}://{origin.netloc}"
-        return [
+        found = [
             (f"{base}{path}", tuple(sorted(parameters.get(path, ()))))
             for path in sorted(paths)
         ]
+        found.extend(
+            (f"{base}/#/{route}", names)
+            for route, names in sorted(_client_routes(body).items())
+        )
+        return found
 
     def _store_surface(
         self,
@@ -301,6 +379,25 @@ class ReconAgent:
                 observed_path_identifier=path_value,
             )
         )
+
+    def _flag_restricted_file(self, run_id: str, surface_id: str, url: str) -> str:
+        """서버가 내주면 안 되는 확장자의 파일 표면을 Router 가 볼 수 있게 남긴다."""
+
+        evidence_id = f"evi-{self._id_factory()}"
+        self._evidence.append(
+            Evidence(
+                evidence_id=evidence_id,
+                run_id=run_id,
+                surface_id=surface_id,
+                created_by="recon",
+                evidence_type="observation",
+                observation={
+                    "type": RESTRICTED_FILE_OBSERVATION,
+                    "parameter": urlsplit(url).path.rsplit("/", 1)[-1],
+                },
+            )
+        )
+        return evidence_id
 
     def _flag_suspect_parameters(
         self, run_id: str, surface_id: str, params: tuple[str, ...]

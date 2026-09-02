@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from hacklipse.domain import Candidate, Evidence, RouteDecision, Run, Surface
@@ -38,8 +39,15 @@ class SurfaceRoutingRule:
     parameter_hints: tuple[str, ...] = ()
     priority: float = 0.25
 
+    # SPA 클라이언트 라우트(`/#/search`)는 HTTP 요청 대상이 아니다. fragment 는
+    # 서버로 전송되지 않으므로 HTTP 기반 Analyzer 가 받으면 매번 같은 루트 문서만
+    # 받아 신호 없이 예산만 쓴다. 브라우저 도구를 쓰는 규칙만 opt-in 한다.
+    client_route: bool = False
+
     def matches(self, surface: Surface) -> bool:
         if surface.method.upper() not in self.methods:
+            return False
+        if bool(urlsplit(surface.url).fragment) is not self.client_route:
             return False
         # GET 폼이어도 비밀번호 변경·삭제 등은 상태를 바꿀 수 있다. 자동 Analysis
         # Candidate를 만들지 않되 Surface 자체는 Recon 결과로 보존한다.
@@ -71,6 +79,8 @@ class IdentifierSurfaceRoutingRule:
     def matches(self, surface: Surface) -> bool:
         if surface.method.upper() not in self.methods:
             return False
+        if urlsplit(surface.url).fragment:
+            return False
         # 비밀번호 변경·삭제처럼 상태를 바꾸는 GET 폼은 자동 탐침 대상에서 제외한다.
         if has_state_changing_parameters(surface.parameters):
             return False
@@ -94,6 +104,13 @@ DEFAULT_RULES = (
     ),
     RoutingRule("template_error", "SSTI", "ssti_analyzer", 0.7),
     RoutingRule("template_execution", "SSTI", "ssti_analyzer", 0.9),
+    RoutingRule(
+        "restricted_file_path",
+        "Path Traversal",
+        "path_traversal_analyzer",
+        0.7,
+        methods=("GET",),
+    ),
 )
 
 # Observation이 아직 없어도 입력 가능한 Surface를 담당 Analyzer까지 보낸다.
@@ -101,6 +118,10 @@ DEFAULT_RULES = (
 # 낮은 priority를 사용한다.
 DEFAULT_SURFACE_RULES = (
     SurfaceRoutingRule("XSS", "xss_analyzer", priority=0.30),
+    # SPA 라우트의 DOM sink 는 브라우저로만 관측된다.
+    SurfaceRoutingRule(
+        "XSS", "browser_xss_analyzer", client_route=True, priority=0.40
+    ),
     SurfaceRoutingRule("SQLi", "sqli_analyzer", priority=0.30),
     SurfaceRoutingRule(
         "SSTI",

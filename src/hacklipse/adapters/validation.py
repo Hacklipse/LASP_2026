@@ -22,9 +22,13 @@ from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 
 from .probing import build_probe_requests, matching_evidence, probe_marker
 from .path_traversal_analysis import (
+    PATH_TRAVERSAL_BYPASS_OBSERVATION,
     PATH_TRAVERSAL_OBSERVATION,
     PATH_TRAVERSAL_TOOL,
+    build_path_traversal_bypass_requests,
     build_path_traversal_requests,
+    is_restricted_file_surface,
+    path_traversal_bypass_signal,
     path_traversal_signal,
 )
 from .access_control_analysis import (
@@ -489,6 +493,10 @@ class ValidationAgent:
         """고정된 비민감 파일 읽기를 현재 Validation 세션에서 독립 재현한다."""
 
         surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        if is_restricted_file_surface(evidence, surface):
+            return self._validate_path_traversal_bypass(
+                task, candidate, surface, evidence, reproduction
+            )
         signaled_parameters = tuple(
             dict.fromkeys(
                 parameter
@@ -569,6 +577,92 @@ class ValidationAgent:
             verdict=ValidationVerdict.REJECTED,
             evidence=reproduced,
             reason="independent probe did not reproduce the safe-file read",
+        )
+
+    def _validate_path_traversal_bypass(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        surface,
+        evidence: Sequence[Evidence],
+        reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """확장자 필터 우회 읽기를 독립 세션에서 다시 만든다.
+
+        Analysis 의 판정은 읽지 않는다. 좌표(어느 표면인가)만 가져오고 control 과
+        probe 를 이 Validation 세션에서 새로 수집한다.
+        """
+
+        signaled = any(
+            item.surface_id == candidate.surface_id
+            and item.observation.get("type") == PATH_TRAVERSAL_OBSERVATION
+            and item.observation.get("bypass") == PATH_TRAVERSAL_BYPASS_OBSERVATION
+            for item in evidence
+        )
+        if not signaled:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no filter bypass signal to reproduce",
+            )
+
+        requests = build_path_traversal_bypass_requests(
+            surface, purpose=f"Path Traversal validation {task.validation_id}"
+        )
+        collected = tuple(
+            matching_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "Path Traversal validation lacks budget for independent requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+
+        control, probe = collected
+        assert control is not None and probe is not None
+        if any(
+            item.observation.get("type") in {"http_error", "http_redirect"}
+            for item in (control, probe)
+        ):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=(control, probe),
+                reason="independent bypass reproduction could not obtain comparable responses",
+            )
+        if not path_traversal_bypass_signal(control, probe):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(control, probe),
+                reason="independent probe did not reproduce the filter bypass read",
+            )
+
+        proof_evidence = (control, probe)
+        proof = ValidationProof(
+            proof_type=ValidationProofType.PATH_TRAVERSAL_FILE_READ,
+            evidence_ids=tuple(item.evidence_id for item in proof_evidence),
+            summary=(
+                "independent probe read a file the server refused to serve directly "
+                f"at {surface.url.rsplit('/', 1)[-1]} using the fixed extension filter bypass"
+            ),
+        )
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.CONFIRMED,
+            evidence=proof_evidence,
+            reason="independent control/probe comparison reproduced the filter bypass read",
+            proof=proof,
         )
 
     def _validate_ssti(
