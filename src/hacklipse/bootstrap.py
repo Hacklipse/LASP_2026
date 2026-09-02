@@ -20,6 +20,7 @@ from hacklipse.adapters import (
     HeuristicXssAnalyzer,
     InMemoryBudgetManager,
     InMemoryExecutionAuditLog,
+    InMemoryProgressLog,
     LlmSqliAnalyzer,
     LlmSstiAnalyzer,
     LlmPathTraversalAnalyzer,
@@ -45,6 +46,7 @@ from hacklipse.application import (
 )
 from hacklipse.domain import TaskEnvelope
 from hacklipse.ports import (
+    ProgressSink,
     Agent,
     BudgetManager,
     ApprovalGate,
@@ -132,6 +134,7 @@ class LocalApplication:
     dispatcher: LocalTaskDispatcher
     budget_manager: BudgetManager
     policy_gate: AllowlistPolicyGate
+    progress_log: ProgressSink
     runtime: ExecutionRuntime
     collector: RuntimeEvidenceCollector
     audit_log: ExecutionAuditLog
@@ -153,6 +156,7 @@ def build_local_application(
     agent_allowed_tools: Mapping[str, tuple[str, ...]] | None = None,
     task_progress_callback: Callable[[str, TaskEnvelope, int, float], None]
     | None = None,
+    progress_sink: ProgressSink | None = None,
 ) -> LocalApplication:
     """기본적으로 네트워크를 활성화하지 않는 로컬 시스템을 조립한다."""
 
@@ -233,6 +237,9 @@ def build_local_application(
         retry_policy=retry_policy or BoundedRetryPolicy(),
         progress_callback=task_progress_callback,
     )
+    # Sink를 주지 않아도 진행 사건을 남긴다. 실행이 끝난 뒤 무슨 일이 있었는지
+    # 되짚을 수 있어야 하고, 보관 비용은 사건 몇십 개뿐이다.
+    selected_progress = progress_sink or InMemoryProgressLog()
     orchestrator = Orchestrator(
         run_store=selected_stores.runs,
         evidence_store=selected_stores.evidence,
@@ -247,9 +254,11 @@ def build_local_application(
         state_machine=RunStateMachine(),
         task_factory=TaskFactory(),
         config=selected_config,
+        progress_sink=selected_progress,
     )
     return LocalApplication(
         orchestrator=orchestrator,
+        progress_log=selected_progress,
         stores=selected_stores,
         dispatcher=dispatcher,
         budget_manager=selected_budget,

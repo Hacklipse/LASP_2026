@@ -223,6 +223,22 @@ class _DebugProgress:
             self.log(f"Task 실패: {agent} ({elapsed_seconds:.2f}초)")
 
 
+def progress_line(event) -> str:
+    """진행 사건 한 줄. 민감정보는 이미 중앙에서 제거된 상태로 들어온다."""
+
+    parts = [f"[{event.kind.value}]"]
+    if event.vulnerability_type:
+        parts.append(event.vulnerability_type)
+    elif event.agent_type:
+        parts.append(_AGENT_LABELS.get(event.agent_type, _safe_log_value(event.agent_type)))
+    if event.surface_path:
+        parts.append(event.surface_path)
+    if event.detail:
+        parts.append(f"({_safe_log_value(event.detail)})")
+    parts.append(f"예산 {event.budget_used}/{event.budget_total}")
+    return " ".join(parts)
+
+
 class _LlmUsageMeter:
     """LLM 호출 수와 token 사용량만 세는 얇은 래퍼.
 

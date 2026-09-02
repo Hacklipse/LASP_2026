@@ -847,6 +847,61 @@ class ExecutionResult:
     content_hash: str | None = None
 
 
+class ProgressEventKind(str, Enum):
+    """Run 진행 중 밖으로 알릴 수 있는 사건.
+
+    Notion 목록의 VALIDATION_* 은 AGENT_* 에 agent_type 으로 담기고, EVIDENCE_REQUESTED 는
+    수집이 끝난 시점만 알리면 충분하므로 EVIDENCE_COLLECTED 하나로 둔다. 예산은 별도
+    사건이 아니라 모든 이벤트가 함께 싣는다. 소비자가 없는 종류를 미리 만들지 않는다.
+    """
+
+    RUN_STARTED = "run_started"
+    PHASE_CHANGED = "phase_changed"
+    CANDIDATE_QUEUED = "candidate_queued"
+    AGENT_STARTED = "agent_started"
+    AGENT_COMPLETED = "agent_completed"
+    EVIDENCE_COLLECTED = "evidence_collected"
+    FINDING_CREATED = "finding_created"
+    CANDIDATE_FAILED = "candidate_failed"
+    CANDIDATE_SKIPPED = "candidate_skipped"
+    RUN_COMPLETED = "run_completed"
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressEvent:
+    """진행 상황 하나. 무엇이 일어났는지만 담고 응답 내용은 담지 않는다.
+
+    Cookie·Authorization·API Key·비밀번호·응답 본문은 넣지 않는다. surface 는 경로만
+    남기고 query 값은 제거한다. 진행 화면은 여러 사람이 함께 보거나 로그로 남으므로
+    Evidence 보다 더 좁게 잡는다.
+
+    sequence 는 Run 안에서 단조 증가한다. 순서를 복원하고 중복을 걸러내는 기준이다.
+    """
+
+    run_id: str
+    sequence: int
+    kind: ProgressEventKind
+    phase: str
+    agent_type: str | None = None
+    candidate_id: str | None = None
+    vulnerability_type: str | None = None
+    # 경로만 남긴 대상. query 값은 제거한 뒤 넣는다.
+    surface_path: str | None = None
+    detail: str | None = None
+    budget_used: int = 0
+    budget_total: int = 0
+
+    def __post_init__(self) -> None:
+        if self.sequence < 0:
+            raise DomainInvariantError("progress event sequence cannot be negative")
+        if self.surface_path is not None and (
+            "?" in self.surface_path or "#" in self.surface_path
+        ):
+            raise DomainInvariantError(
+                "progress event surface must not carry a query or fragment"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class UncheckedCandidate:
     """검사를 끝내지 못한 Candidate 하나의 요약."""

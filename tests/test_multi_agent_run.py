@@ -669,5 +669,87 @@ class CandidateStatusTests(unittest.TestCase):
         self.assertEqual(restored.status, "skipped_budget")
 
 
+class ProgressEventTests(unittest.TestCase):
+    """진행 사건은 중앙에서만 만들고 민감정보를 담지 않는다."""
+
+    def test_run_lifecycle_is_reported_in_order(self) -> None:
+        from hacklipse.domain import ProgressEventKind
+
+        app = _application(_CompletingAnalyzer())
+        run = _start(app)
+
+        events = app.progress_log.list_by_run(run.run_id)
+        kinds = [event.kind for event in events]
+
+        self.assertEqual(kinds[0], ProgressEventKind.RUN_STARTED)
+        self.assertEqual(kinds[-1], ProgressEventKind.RUN_COMPLETED)
+        self.assertIn(ProgressEventKind.CANDIDATE_QUEUED, kinds)
+        self.assertIn(ProgressEventKind.AGENT_STARTED, kinds)
+        self.assertIn(ProgressEventKind.AGENT_COMPLETED, kinds)
+        # sequence 는 Run 안에서 단조 증가해야 순서를 복원할 수 있다.
+        self.assertEqual(
+            [event.sequence for event in events],
+            sorted(event.sequence for event in events),
+        )
+        self.assertEqual(
+            len({event.sequence for event in events}), len(events)
+        )
+
+    def test_surface_is_reported_without_its_query(self) -> None:
+        """query 에는 검색어나 토큰이 실린다. 진행 화면에는 경로만 남긴다."""
+
+        app = _application(_CompletingAnalyzer())
+        run = _start(app)
+
+        surfaces = {
+            event.surface_path
+            for event in app.progress_log.list_by_run(run.run_id)
+            if event.surface_path
+        }
+
+        self.assertEqual(surfaces, {"/search"})
+        self.assertFalse(any("?" in path for path in surfaces))
+
+    def test_duplicate_sequence_is_dropped(self) -> None:
+        """재개로 같은 구간을 다시 알려도 화면이 두 번 보여주면 안 된다."""
+
+        from hacklipse.adapters import InMemoryProgressLog
+        from hacklipse.domain import ProgressEvent, ProgressEventKind
+
+        log = InMemoryProgressLog()
+        for sequence in (2, 1, 2):
+            log.emit(
+                ProgressEvent(
+                    run_id="run-1",
+                    sequence=sequence,
+                    kind=ProgressEventKind.PHASE_CHANGED,
+                    phase="analyze",
+                )
+            )
+
+        self.assertEqual(
+            [event.sequence for event in log.list_by_run("run-1")], [1, 2]
+        )
+
+    def test_failed_candidate_is_reported_without_the_error_message(self) -> None:
+        """사유 문자열에 응답 본문이나 값이 섞일 수 있으므로 예외 종류만 싣는다."""
+
+        from hacklipse.domain import ProgressEventKind
+        from hacklipse.ports.errors import AuthenticationFailed
+
+        app = _application(_RaisingAnalyzer(AuthenticationFailed("session sk-secret")))
+        run = _start(app)
+
+        failures = [
+            event
+            for event in app.progress_log.list_by_run(run.run_id)
+            if event.kind is ProgressEventKind.CANDIDATE_FAILED
+        ]
+
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0].detail, "AuthenticationFailed")
+        self.assertNotIn("sk-secret", failures[0].detail or "")
+
+
 if __name__ == "__main__":
     unittest.main()

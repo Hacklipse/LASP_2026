@@ -11,7 +11,7 @@ from .llm_path_traversal_analysis import LlmPathTraversalAnalyzer
 from .llm_sqli_analysis import LlmSqliAnalyzer
 from .llm_ssti_analysis import LlmSstiAnalyzer
 from .llm_xss_analysis import LlmXssAnalyzer
-from .memory import MemoryStoreBundle
+from .memory import CallbackProgressLog, InMemoryProgressLog, MemoryStoreBundle
 from .policy import AllowlistPolicyGate
 from .path_traversal_analysis import HeuristicPathTraversalAnalyzer
 from .access_control_analysis import HeuristicAccessControlAnalyzer
@@ -52,7 +52,9 @@ __all__ = [
     "HeuristicXssAnalyzer",
     "InMemoryBudgetManager",
     "InMemoryCredentialResolver",
+    "CallbackProgressLog",
     "InMemoryExecutionAuditLog",
+    "InMemoryProgressLog",
     "LlmSqliAnalyzer",
     "LlmSstiAnalyzer",
     "LlmPathTraversalAnalyzer",

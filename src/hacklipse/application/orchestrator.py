@@ -8,6 +8,8 @@ from uuid import uuid4
 
 from hacklipse.domain import (
     CandidateStatus,
+    ProgressEvent,
+    ProgressEventKind,
     AgentResult,
     AgentResultStatus,
     Candidate,
@@ -24,6 +26,7 @@ from hacklipse.ports import (
     EvidenceStore,
     FindingStore,
     PolicyGate,
+    ProgressSink,
     ReportStore,
     RunStore,
     SurfaceStore,
@@ -83,6 +86,7 @@ class Orchestrator:
         task_factory: TaskFactory,
         config: OrchestratorConfig | None = None,
         id_factory: Callable[[], str] | None = None,
+        progress_sink: ProgressSink | None = None,
     ) -> None:
         self._runs = run_store
         self._evidence = evidence_store
@@ -98,6 +102,8 @@ class Orchestrator:
         self._task_factory = task_factory
         self._config = config or OrchestratorConfig()
         self._id_factory = id_factory or (lambda: str(uuid4()))
+        self._progress = progress_sink
+        self._sequence = 0
 
     def start(self, request: RunRequest) -> Run:
         """사용자 입력을 검증하고 새로운 Run을 생성한 뒤 실행한다."""
@@ -118,6 +124,7 @@ class Orchestrator:
         # Run과 예산을 먼저 등록한 뒤 첫 단계인 RECON으로 전이한다.
         self._runs.add(run)
         self._budget.open_run(run.run_id, run.request_budget)
+        self._emit(run, ProgressEventKind.RUN_STARTED, detail=run.policy_profile)
         run = self._state.transition(run, RunPhase.RECON)
         self._runs.save(run)
         return self.resume(run.run_id)
@@ -153,6 +160,7 @@ class Orchestrator:
                     self._runs.save(run)
             # 단계 순서와 분기만 판단하고 실제 작업은 하위 컴포넌트에 맡긴다.
             while run.phase not in {RunPhase.DONE, RunPhase.FAILED}:
+                self._emit(run, ProgressEventKind.PHASE_CHANGED)
                 if run.phase is RunPhase.RECON:
                     run = self._recon(run)
                     run = self._state.transition(run, RunPhase.ROUTE)
@@ -172,6 +180,7 @@ class Orchestrator:
                 else:
                     raise AgentContractError(f"unsupported active phase: {run.phase}")
                 self._runs.save(run)
+            self._emit(run, ProgressEventKind.RUN_COMPLETED)
             return run
         except Exception as error:
             # 하위 컴포넌트 실패도 Run의 FAILED 상태와 원인으로 일관되게 남긴다.
@@ -191,6 +200,46 @@ class Orchestrator:
         self._require_completed(result, "recon")
         return self._merge_agent_result(run, result)
 
+    def _emit(
+        self,
+        run: Run,
+        kind: ProgressEventKind,
+        *,
+        agent_type: str | None = None,
+        candidate: Candidate | None = None,
+        surface_url: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """진행 사건을 중앙에서 하나씩 만든다.
+
+        Agent가 직접 출력하지 않고 여기만 거치게 해야 순서가 보장되고, 민감정보를
+        제거하는 규칙을 한곳에서 지킬 수 있다. Sink가 없으면 아무 일도 하지 않는다.
+        """
+
+        if self._progress is None:
+            return
+        self._sequence += 1
+        try:
+            used = max(0, run.request_budget - self._budget.remaining(run.run_id))
+        except Exception:
+            used = 0
+        self._progress.emit(
+            ProgressEvent(
+                run_id=run.run_id,
+                sequence=self._sequence,
+                kind=kind,
+                phase=run.phase.value,
+                agent_type=agent_type,
+                candidate_id=candidate.candidate_id if candidate else None,
+                vulnerability_type=candidate.vulnerability_type if candidate else None,
+                # query 값에는 검색어·토큰이 실릴 수 있다. 경로만 남긴다.
+                surface_path=_path_only(surface_url),
+                detail=detail,
+                budget_used=used,
+                budget_total=run.request_budget,
+            )
+        )
+
     def _route(self, run: Run) -> Run:
         """저장된 Surface·Evidence를 Router에 전달하고 Candidate를 저장한다."""
 
@@ -209,6 +258,12 @@ class Orchestrator:
                 raise AgentContractError("router returned a candidate for another run")
             self._candidates.add(candidate)
             candidate_ids.append(candidate.candidate_id)
+            self._emit(
+                run,
+                ProgressEventKind.CANDIDATE_QUEUED,
+                agent_type=candidate.assigned_agent,
+                candidate=candidate,
+            )
         return run.with_updates(candidate_ids=tuple(dict.fromkeys(candidate_ids)))
 
     def _analyze(self, run: Run) -> Run:
@@ -242,6 +297,13 @@ class Orchestrator:
         current = run
         # Candidate가 참조하는 Run-scoped Surface를 실제 Analysis 대상으로 해석한다.
         surface = self._surfaces.get(run.run_id, candidate.surface_id)
+        self._emit(
+            run,
+            ProgressEventKind.AGENT_STARTED,
+            agent_type=candidate.assigned_agent,
+            candidate=candidate,
+            surface_url=surface.url,
+        )
         for evidence_round in range(self._config.max_evidence_rounds + 1):
             task = self._task_factory.analysis(
                 current,
@@ -259,6 +321,13 @@ class Orchestrator:
             if result.status is AgentResultStatus.COMPLETED:
                 candidate = candidate.set_status(CandidateStatus.ANALYZED)
                 self._candidates.save(candidate)
+                self._emit(
+                    current,
+                    ProgressEventKind.AGENT_COMPLETED,
+                    agent_type=candidate.assigned_agent,
+                    candidate=candidate,
+                    surface_url=surface.url,
+                )
                 break
             if result.status is not AgentResultStatus.NEEDS_EVIDENCE:
                 raise AgentContractError("analysis did not complete")
@@ -292,6 +361,14 @@ class Orchestrator:
                 current = self._merge_agent_result(current, collection)
                 candidate = candidate.add_evidence(collection.new_evidence_ids)
                 self._candidates.save(candidate)
+                self._emit(
+                    current,
+                    ProgressEventKind.EVIDENCE_COLLECTED,
+                    agent_type=candidate.assigned_agent,
+                    candidate=candidate,
+                    surface_url=surface.url,
+                    detail=request.suggested_tool,
+                )
         return current
 
     def _validate(self, run: Run) -> Run:
@@ -324,6 +401,12 @@ class Orchestrator:
         current = run
         validation = None
         validation_id = f"validation-{self._id_factory()}"
+        self._emit(
+            run,
+            ProgressEventKind.AGENT_STARTED,
+            agent_type=self._config.validation_agent_type,
+            candidate=candidate,
+        )
 
         for evidence_round in range(self._config.max_evidence_rounds + 1):
             # Analysis 결론 대신 Candidate와 Evidence 참조만 Validator에 전달한다.
@@ -406,8 +489,21 @@ class Orchestrator:
             )
             self._findings.add(finding)
             finding_id = finding.finding_id
+            self._emit(
+                current,
+                ProgressEventKind.FINDING_CREATED,
+                agent_type=self._config.validation_agent_type,
+                candidate=candidate,
+            )
         candidate = candidate.set_status(CandidateStatus(validation.verdict.value))
         self._candidates.save(candidate)
+        self._emit(
+            current,
+            ProgressEventKind.AGENT_COMPLETED,
+            agent_type=self._config.validation_agent_type,
+            candidate=candidate,
+            detail=validation.verdict.value,
+        )
         return current, finding_id
 
     def _fail_candidate(self, run: Run, candidate_id: str, error: Exception) -> Run:
@@ -428,6 +524,13 @@ class Orchestrator:
             return self._skip_candidate_for_budget(run, candidate_id, str(error))
         candidate = self._candidates.get(run.run_id, candidate_id)
         self._candidates.save(candidate.fail(f"{type(error).__name__}: {error}"))
+        self._emit(
+            run,
+            ProgressEventKind.CANDIDATE_FAILED,
+            agent_type=candidate.assigned_agent,
+            candidate=candidate,
+            detail=type(error).__name__,
+        )
         return run
 
     def _skip_candidate_for_budget(
@@ -438,6 +541,13 @@ class Orchestrator:
         candidate = self._candidates.get(run.run_id, candidate_id)
         reason = detail or f"request budget exhausted for {run.run_id}"
         self._candidates.save(candidate.skip_for_budget(reason))
+        self._emit(
+            run,
+            ProgressEventKind.CANDIDATE_SKIPPED,
+            agent_type=candidate.assigned_agent,
+            candidate=candidate,
+            detail="budget",
+        )
         return run
 
     def _report(self, run: Run) -> Run:
@@ -532,6 +642,16 @@ class Orchestrator:
         """ID 순서를 유지하면서 중복을 제거한다."""
 
         return tuple(dict.fromkeys((*current, *added)))
+
+
+def _path_only(url: str | None) -> str | None:
+    """진행 사건에 남길 경로만 뽑는다. query와 fragment는 버린다."""
+
+    if url is None:
+        return None
+    from urllib.parse import urlsplit
+
+    return urlsplit(url).path or "/"
 
 
 def _pending_in(candidate: Candidate, phase_status: CandidateStatus) -> bool:

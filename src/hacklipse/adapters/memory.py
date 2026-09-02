@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 
 from hacklipse.domain import (
+    ProgressEvent,
     Candidate,
     Evidence,
     Finding,
@@ -200,3 +201,39 @@ def _get(items: dict[str, object], key: str):
         return deepcopy(items[key])
     except KeyError as error:
         raise RecordNotFound(key) from error
+
+
+class InMemoryProgressLog:
+    """Run별 진행 사건을 순서대로 보관하는 메모리 Sink.
+
+    같은 sequence 가 두 번 들어오면 나중 것을 버린다. 재개 시 이미 알린 구간을 다시
+    알리더라도 화면이 같은 사건을 두 번 보여주지 않게 한다.
+    """
+
+    def __init__(self) -> None:
+        self._events: dict[str, list[ProgressEvent]] = {}
+        self._seen: dict[str, set[int]] = {}
+
+    def emit(self, event: ProgressEvent) -> None:
+        seen = self._seen.setdefault(event.run_id, set())
+        if event.sequence in seen:
+            return
+        seen.add(event.sequence)
+        self._events.setdefault(event.run_id, []).append(event)
+
+    def list_by_run(self, run_id: str) -> tuple[ProgressEvent, ...]:
+        return tuple(sorted(self._events.get(run_id, ()), key=lambda item: item.sequence))
+
+
+class CallbackProgressLog(InMemoryProgressLog):
+    """보관과 동시에 콜백으로 흘려보내는 Sink. 실시간 화면이 이걸 쓴다."""
+
+    def __init__(self, callback) -> None:
+        super().__init__()
+        self._callback = callback
+
+    def emit(self, event: ProgressEvent) -> None:
+        before = len(self.list_by_run(event.run_id))
+        super().emit(event)
+        if len(self.list_by_run(event.run_id)) > before:
+            self._callback(event)

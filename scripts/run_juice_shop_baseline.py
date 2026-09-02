@@ -36,6 +36,7 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from hacklipse.adapters import (  # noqa: E402
+    CallbackProgressLog,
     HttpExecutionRuntime,
     InMemoryCredentialResolver,
     InMemoryExecutionAuditLog,
@@ -72,6 +73,7 @@ from hacklipse.ports.errors import LlmCredentialsMissing  # noqa: E402
 # 있어 import만으로 실행되지 않는다.
 from run_dvwa_baseline import (  # noqa: E402
     _DebugAuditLog,
+    progress_line,
     _DebugProgress,
     _LlmUsageMeter,
     _ProgressLlmClient,
@@ -574,6 +576,12 @@ def main(argv: list[str]) -> int:
         approval_gate=StaticApprovalGate(approvals),
         audit_log=audit,
         task_progress_callback=progress.task_event if debug_enabled else None,
+        # 진행 사건은 항상 보관하고, --debug 일 때만 화면으로도 흘려보낸다.
+        progress_sink=(
+            CallbackProgressLog(lambda event: progress.log(progress_line(event)))
+            if debug_enabled
+            else None
+        ),
     )
     base_path = parsed.path if parsed.path.endswith("/") else f"{parsed.path}/"
     provision_run_id: str | None = None
