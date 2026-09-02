@@ -15,7 +15,11 @@ from hacklipse.ports.errors import ExternalExecutionDisabled
 
 # 리다이렉트 대상 서버가 실제로 요청을 받았는지 세는 카운터.
 REDIRECT_TARGET_HITS = 0
-BIG_BODY = b"A" * (512 * 1024 + 100)  # 512KB 초과
+# 예전 기본 상한(512KiB)은 넘고 현재 기본 상한(2MiB)에는 못 미치는 크기. 기본값이
+# 되돌아가면 이 응답이 잘리므로 회귀가 바로 드러난다.
+BIG_BODY = b"A" * (512 * 1024 + 100)
+# 현재 기본 상한을 넘는 크기. 상한이 실제로 걸리는지 확인한다.
+HUGE_BODY = b"B" * (2 * 1024 * 1024 + 100)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -44,6 +48,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._text(500, b"boom")
         elif path == "/big":
             self._text(200, BIG_BODY)
+        elif path == "/huge":
+            self._text(200, HUGE_BODY)
         elif path == "/dupcookie":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -235,10 +241,23 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
         self.assertEqual(r.observation["error_kind"], "timeout")
 
     # 7
-    def test_body_truncated_at_limit(self) -> None:
+    def test_default_limit_reads_past_512kib(self) -> None:
+        """SPA 번들 후반부의 API 경로가 상한에 잘려 사라지면 Recon이 표면을 놓친다."""
+
         r = self.runtime.execute(self._req("/big"))
+        self.assertFalse(r.observation["truncated"])
+        self.assertEqual(r.observation["body_bytes"], len(BIG_BODY))
+
+    def test_body_truncated_at_default_limit(self) -> None:
+        r = self.runtime.execute(self._req("/huge"))
         self.assertTrue(r.observation["truncated"])
-        self.assertEqual(r.observation["body_bytes"], 512 * 1024)
+        self.assertEqual(r.observation["body_bytes"], 2 * 1024 * 1024)
+
+    def test_explicit_limit_overrides_the_default(self) -> None:
+        small = HttpExecutionRuntime(timeout_seconds=5.0, max_body_bytes=1024)
+        r = small.execute(self._req("/big"))
+        self.assertTrue(r.observation["truncated"])
+        self.assertEqual(r.observation["body_bytes"], 1024)
 
     # 8
     def test_head_does_not_read_body(self) -> None:

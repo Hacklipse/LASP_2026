@@ -41,7 +41,10 @@ _HTTP_TOOLS = frozenset(
 # 실제 리다이렉트 상태만 리다이렉트로 분류한다. 300/304/305/306은 리다이렉트가 아니다.
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _DEFAULT_TIMEOUT = 15.0
-_DEFAULT_MAX_BODY_BYTES = 512 * 1024
+# 현대 SPA 번들은 1MiB를 넘는다. 상한이 번들 중간을 자르면 후반부에만 등장하는
+# API 경로가 Recon에서 통째로 사라진다. Recon의 스크립트 분석 상한(4MiB)보다는
+# 낮게 두어 무제한 수집으로 번지지 않게 한다.
+_DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024
 _DEFAULT_USER_AGENT = "hacklipse-runtime/0.1"
 
 # 본문을 텍스트로 디코딩할 Content-Type 힌트. 그 외(이미지 등)는 바이너리로 간주한다.

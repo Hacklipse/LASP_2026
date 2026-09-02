@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from hacklipse.adapters import HttpExecutionRuntime
 from hacklipse.adapters.memory import InMemoryEvidenceStore, InMemorySurfaceStore
 from hacklipse.adapters.recon import ReconAgent
 from hacklipse.adapters.routing import RuleBasedVulnerabilityRouter
@@ -449,3 +452,87 @@ class ReconCrawlTests(unittest.TestCase):
         self.assertEqual(len(collector.calls), 1)
         urls = {surface.url for surface in surfaces.list_by_run("run-c5")}
         self.assertIn("http://localhost/deep.php", urls)
+
+
+# 512KiB를 넘긴 뒤에야 검색 엔드포인트가 나오는 번들. 실제 Juice Shop의 main.js 가 이
+# 모양이라 응답 본문 상한이 낮으면 후반부 경로가 통째로 사라진다.
+_LARGE_BUNDLE_SPA = (
+    b'<html><body><div id="app"></div>'
+    b'<script src="/main.js"></script></body></html>'
+)
+_LARGE_BUNDLE = (
+    b"// " + b"x" * (512 * 1024) + b"\n"
+    b"search(e){ return this.http.get(`${this.host}/rest/products/search?q=${e}`) }\n"
+)
+
+
+class _LargeBundleHandler(BaseHTTPRequestHandler):
+    """루트 HTML과 대형 JS 번들만 돌려주는 최소 서버."""
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/main.js":
+            body, content_type = _LARGE_BUNDLE, "application/javascript"
+        else:
+            body, content_type = _LARGE_BUNDLE_SPA, "text/html"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+class ReconReadsLargeBundlesTests(unittest.TestCase):
+    """대역이 아닌 실제 HttpExecutionRuntime 으로 응답 본문 상한까지 함께 검증한다.
+
+    다른 Recon 테스트는 본문을 그대로 넘겨주는 대역을 쓰므로 상한 회귀를 잡지 못한다.
+    여기서는 기본 생성자로 만든 Runtime 을 그대로 써서 전역 기본값이 512KiB 로 되돌아가면
+    실패하게 한다.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), _LargeBundleHandler)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def test_endpoint_after_512kib_becomes_a_surface(self) -> None:
+        # 기본 생성자. 여기에 max_body_bytes 를 넘기면 회귀를 가리게 된다.
+        app = build_local_application({}, runtime=HttpExecutionRuntime(timeout_seconds=5.0))
+        app.dispatcher.register(
+            "recon",
+            ReconAgent(
+                collector=app.collector,
+                evidence_store=app.stores.evidence,
+                surface_store=app.stores.surfaces,
+            ),
+            allowed_tools=("http_get",),
+        )
+
+        # Analysis Agent를 등록하지 않았으므로 ROUTE 까지만 진행하고 ANALYZE 에서 멈춘다.
+        with self.assertRaises(WorkflowExecutionError) as ctx:
+            app.orchestrator.start(
+                RunRequest(
+                    target_url=f"http://127.0.0.1:{self.port}/",
+                    scope=RunScope(allowed_hosts=frozenset({"127.0.0.1"})),
+                    request_budget=10,
+                )
+            )
+
+        found = {
+            surface.url: surface.parameters
+            for surface in app.stores.surfaces.list_by_run(ctx.exception.run_id)
+        }
+        self.assertEqual(
+            found.get(f"http://127.0.0.1:{self.port}/rest/products/search"), ("q",)
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
