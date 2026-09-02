@@ -101,7 +101,7 @@ class KnowledgeCaseFactoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "confirmed candidate"):
             factory.from_finding(
                 self._finding(),
-                self._candidate(status="validated"),
+                self._candidate(status="analyzed"),
                 self._surface(),
             )
         with self.assertRaisesRegex(ValueError, "same run"):
