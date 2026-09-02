@@ -537,5 +537,98 @@ class SkippedCandidateResumeTests(unittest.TestCase):
         self.assertEqual(analyzer.calls, 0)
 
 
+class ProgressSnapshotTests(unittest.TestCase):
+    """진행 상태는 Store를 다시 세어 계산한다.
+
+    따로 누적하면 실제 저장 내용과 어긋나고, 어긋난 쪽이 완료를 표시하면 검사되지
+    않은 항목이 검사된 것처럼 보인다.
+    """
+
+    def test_snapshot_matches_what_the_run_actually_produced(self) -> None:
+        from hacklipse.application import build_progress_snapshot
+
+        app = _application(_CompletingAnalyzer())
+        run = _start(app)
+
+        snapshot = build_progress_snapshot(
+            run, stores=app.stores, budget=app.budget_manager
+        )
+
+        self.assertEqual(snapshot.run_id, run.run_id)
+        self.assertEqual(snapshot.phase, "done")
+        self.assertEqual(snapshot.surface_count, 1)
+        self.assertEqual(snapshot.parameter_count, 1)
+        self.assertEqual(dict(snapshot.candidates_by_type), {"XSS": 1, "SQLi": 1})
+        self.assertEqual(snapshot.candidate_count, 2)
+        # 두 Candidate 모두 판정까지 끝났다.
+        self.assertEqual(snapshot.validated_count, 2)
+        self.assertEqual(snapshot.finding_count, 0)
+        self.assertEqual(snapshot.unchecked, ())
+        self.assertEqual(snapshot.budget_total, run.request_budget)
+
+    def test_unchecked_separates_failure_from_budget_skip(self) -> None:
+        from hacklipse.application import build_progress_snapshot
+        from hacklipse.domain import CANDIDATE_SKIPPED_BUDGET
+        from hacklipse.ports.errors import AuthenticationFailed
+
+        app = _application(_RaisingAnalyzer(AuthenticationFailed("session expired")))
+        run = _start(app)
+
+        snapshot = build_progress_snapshot(run, stores=app.stores)
+
+        by_type = {item.vulnerability_type: item for item in snapshot.unchecked}
+        self.assertEqual(by_type["XSS"].status, "failed")
+        self.assertIn("AuthenticationFailed", by_type["XSS"].reason or "")
+        self.assertNotIn("SQLi", by_type)
+        self.assertNotIn(CANDIDATE_SKIPPED_BUDGET, {i.status for i in snapshot.unchecked})
+
+    def test_budget_used_is_derived_from_the_manager(self) -> None:
+        from hacklipse.application import build_progress_snapshot
+        from hacklipse.bootstrap import build_local_application
+        from hacklipse.adapters import InMemoryBudgetManager
+        from hacklipse.domain import RunRequest, RunScope
+
+        budget = InMemoryBudgetManager()
+        app = build_local_application({}, budget_manager=budget)
+        app.dispatcher.register(
+            "recon",
+            _DrainingReconAgent(app.stores.surfaces, budget, units=3),
+            allowed_tools=("http_get",),
+        )
+        for name in ("xss_analyzer", "sqli_analyzer"):
+            app.dispatcher.register(name, _CompletingAnalyzer(), allowed_tools=("http_get",))
+        app.dispatcher.register(
+            "validation", _RejectingValidator(), allowed_tools=("http_get",)
+        )
+        run = app.orchestrator.start(
+            RunRequest(
+                target_url="http://localhost/",
+                scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+                request_budget=10,
+            )
+        )
+
+        snapshot = build_progress_snapshot(run, stores=app.stores, budget=budget)
+
+        self.assertEqual(snapshot.budget_used, 3)
+        self.assertEqual(snapshot.budget_total, 10)
+
+    def test_snapshot_is_json_serializable(self) -> None:
+        """웹 UI가 같은 스냅샷을 그대로 조회할 수 있어야 한다."""
+
+        import dataclasses
+        import json
+
+        from hacklipse.application import build_progress_snapshot
+
+        app = _application(_CompletingAnalyzer())
+        run = _start(app)
+
+        snapshot = build_progress_snapshot(run, stores=app.stores)
+        encoded = json.dumps(dataclasses.asdict(snapshot))
+
+        self.assertIn(snapshot.run_id, encoded)
+
+
 if __name__ == "__main__":
     unittest.main()

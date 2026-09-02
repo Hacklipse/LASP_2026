@@ -46,6 +46,7 @@ from hacklipse.adapters.ssti_analysis import (  # noqa: E402
     SSTI_CLEANUP_VALUE,
     SSTI_OBSERVATION,
 )
+from hacklipse.application import build_progress_snapshot  # noqa: E402
 from hacklipse.application.errors import WorkflowExecutionError  # noqa: E402
 from hacklipse.bootstrap import (  # noqa: E402
     DEFAULT_ANTHROPIC_LLM_MODEL,
@@ -656,21 +657,27 @@ def main(argv: list[str]) -> int:
     assert run is not None
     progress.log(f"Run 완료: phase={_safe_log_value(run.phase.value)}")
 
-    candidates = app.stores.candidates.list_by_run(run.run_id)
-    evidence = app.stores.evidence.list_by_run(run.run_id)
-    findings = app.stores.findings.list_by_run(run.run_id)
-    candidate_counts = Counter(item.vulnerability_type for item in candidates)
-    finding_counts = Counter(item.vulnerability_type for item in findings)
+    # 진행 상태 집계는 Store를 다시 세는 공용 계산을 쓴다. 실행기마다 따로 세면
+    # 같은 Run을 두 화면이 다르게 보고할 수 있다.
+    snapshot = build_progress_snapshot(
+        run,
+        stores=app.stores,
+        budget=app.budget_manager,
+        llm_calls=llm_meter.calls if llm_meter else 0,
+        llm_input_tokens=llm_meter.input_tokens if llm_meter else 0,
+        llm_output_tokens=llm_meter.output_tokens if llm_meter else 0,
+    )
+    candidate_counts = Counter(dict(snapshot.candidates_by_type))
+    finding_counts = Counter(dict(snapshot.findings_by_type))
+    # Observation type을 실행기 표시 문구로 옮긴다. 스냅샷은 원본 type만 담는다.
+    labels = {target.signal: target.signal_label for target in _VULN_TARGETS.values()}
     signal_counts = Counter(
-        target.signal_label
-        for item in evidence
-        for target in _VULN_TARGETS.values()
-        if item.observation.get("type") == target.signal
+        {labels[name]: count for name, count in snapshot.signals_by_type if name in labels}
     )
     execution_signals = 0 if vuln is None else signal_counts[vuln.signal_label]
     verdict = (
         "CONFIRMED (취약점 확인)"
-        if (findings if run_all else finding_counts[target_label])
+        if (snapshot.finding_count if run_all else finding_counts[target_label])
         else "미확정"
     )
 
@@ -683,7 +690,10 @@ def main(argv: list[str]) -> int:
     print(f"  상태            완료 ({run.phase.value})")
     print(f"  분석 대상       {target_label}")
     print(f"  Agent 구성      {profile}")
-    print(f"  감사된 실행     {len(audit.list_by_run(run.run_id))}회 / 예산 {request_budget}회")
+    print(
+        f"  감사된 실행     {len(audit.list_by_run(run.run_id))}회 / "
+        f"예산 {snapshot.budget_used}회 사용, 상한 {snapshot.budget_total}회"
+    )
     if llm_meter is not None:
         print(f"  LLM 사용량      {llm_meter.summary()}")
     if provision_run_id is not None:
@@ -692,27 +702,31 @@ def main(argv: list[str]) -> int:
     print("[분석 신호]")
     print(f"  Candidate       {_format_counts(candidate_counts)}")
     if run_all:
-        print(f"  Surface         {len(app.stores.surfaces.list_by_run(run.run_id))}개")
+        print(
+            f"  Surface         {snapshot.surface_count}개 "
+            f"(파라미터 {snapshot.parameter_count}종)"
+        )
         print(f"  탐지 신호       {_format_counts(signal_counts)}")
+        print(
+            f"  검증 완료       {snapshot.validated_count} / {snapshot.candidate_count}"
+        )
     else:
         assert vuln is not None
         print(f"  {vuln.signal_label:<14} {execution_signals}개")
-    failed = [item for item in candidates if item.status == "failed"]
-    skipped = [item for item in candidates if item.status == CANDIDATE_SKIPPED_BUDGET]
-    if failed or skipped:
+    if snapshot.unchecked:
         print()
         print("[검사하지 못한 Candidate]")
         # 검사했는데 없었다 / 검사하다 실패했다 / 시작조차 못 했다를 구분해서 보여준다.
-        for item in failed:
-            print(f"  실패    {item.vulnerability_type:<14} {item.last_error}")
-        for item in skipped:
-            print(f"  예산부족 {item.vulnerability_type:<14} {item.last_error}")
+        marks = {"failed": "실패", CANDIDATE_SKIPPED_BUDGET: "예산부족"}
+        for item in snapshot.unchecked:
+            mark = marks.get(item.status, item.status)
+            print(f"  {mark:<8} {item.vulnerability_type:<14} {item.reason}")
     print()
     print("[최종 판정]")
     print(f"  결과            {verdict}")
-    print(f"  Finding         {len(findings)}개")
+    print(f"  Finding         {snapshot.finding_count}개")
     print(f"  취약점 유형     {_format_counts(finding_counts)}")
-    if not candidates:
+    if not snapshot.candidate_count:
         print()
         if access_control:
             print(

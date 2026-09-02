@@ -819,6 +819,55 @@ class ExecutionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class UncheckedCandidate:
+    """검사를 끝내지 못한 Candidate 하나의 요약."""
+
+    vulnerability_type: str
+    status: str
+    reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressSnapshot:
+    """Run 진행 상태의 파생 뷰.
+
+    Store가 유일한 사실 원천이고 이 객체는 그 계산 결과다. 진행 상태를 따로 누적하면
+    실제 저장 내용과 어긋나 완료되지 않은 작업을 완료로 표시할 수 있다.
+
+    표시 방식은 담지 않는다. 문구·색·기호는 CLI나 웹 UI가 정하고, 여기에는 숫자와
+    식별자만 둔다. 그래야 같은 스냅샷을 두 화면이 함께 쓸 수 있다.
+    """
+
+    run_id: str
+    phase: str
+    surface_count: int = 0
+    parameter_count: int = 0
+    # 아래 매핑들은 JSON 직렬화가 가능하도록 쌍의 튜플로 둔다.
+    candidates_by_type: tuple[tuple[str, int], ...] = ()
+    candidates_by_status: tuple[tuple[str, int], ...] = ()
+    evidence_count: int = 0
+    # Analysis가 남긴 Observation 종류별 개수. 표시 문구가 아니라 원본 type 값이다.
+    signals_by_type: tuple[tuple[str, int], ...] = ()
+    validated_count: int = 0
+    findings_by_type: tuple[tuple[str, int], ...] = ()
+    budget_used: int = 0
+    budget_total: int = 0
+    llm_calls: int = 0
+    llm_input_tokens: int = 0
+    llm_output_tokens: int = 0
+    unchecked: tuple[UncheckedCandidate, ...] = ()
+    last_error: str | None = None
+
+    @property
+    def candidate_count(self) -> int:
+        return sum(count for _, count in self.candidates_by_type)
+
+    @property
+    def finding_count(self) -> int:
+        return sum(count for _, count in self.findings_by_type)
+
+
+@dataclass(frozen=True, slots=True)
 class KnowledgeQuery:
     """별도 Knowledge Plane에 전달하는 최소 검색 조건."""
 
