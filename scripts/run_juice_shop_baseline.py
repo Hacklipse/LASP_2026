@@ -36,7 +36,6 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from hacklipse.adapters import (  # noqa: E402
-    CallbackProgressLog,
     HttpExecutionRuntime,
     InMemoryCredentialResolver,
     InMemoryExecutionAuditLog,
@@ -71,9 +70,9 @@ from hacklipse.ports.errors import LlmCredentialsMissing  # noqa: E402
 
 # 기존 DVWA 실행기와 같은 안전한 디버그 출력 구현을 재사용한다. 이 모듈은 main guard가
 # 있어 import만으로 실행되지 않는다.
+from progress_view import RunProgressView  # noqa: E402
 from run_dvwa_baseline import (  # noqa: E402
     _DebugAuditLog,
-    progress_line,
     _DebugProgress,
     _LlmUsageMeter,
     _ProgressLlmClient,
@@ -564,6 +563,7 @@ def main(argv: list[str]) -> int:
         print("취소했습니다.")
         return 2
 
+    progress_view = None if debug_enabled else RunProgressView()
     resolver = InMemoryCredentialResolver(credentials)
     runtime = HttpExecutionRuntime(credential_resolver=resolver)
     audit = _DebugAuditLog(progress) if debug_enabled else InMemoryExecutionAuditLog()
@@ -576,12 +576,9 @@ def main(argv: list[str]) -> int:
         approval_gate=StaticApprovalGate(approvals),
         audit_log=audit,
         task_progress_callback=progress.task_event if debug_enabled else None,
-        # 진행 사건은 항상 보관하고, --debug 일 때만 화면으로도 흘려보낸다.
-        progress_sink=(
-            CallbackProgressLog(lambda event: progress.log(progress_line(event)))
-            if debug_enabled
-            else None
-        ),
+        # 진행 화면과 상세 로그 중 하나만 붙인다. 상세 로그가 중간에 끼면 화면을
+        # 다시 그릴 때 앞서 출력한 줄과 어긋나 둘 다 읽을 수 없게 된다.
+        progress_sink=None if debug_enabled else progress_view,
     )
     base_path = parsed.path if parsed.path.endswith("/") else f"{parsed.path}/"
     provision_run_id: str | None = None
@@ -675,6 +672,10 @@ def main(argv: list[str]) -> int:
         llm_input_tokens=llm_meter.input_tokens if llm_meter else 0,
         llm_output_tokens=llm_meter.output_tokens if llm_meter else 0,
     )
+    if progress_view is not None:
+        progress_view.close(
+            surfaces=snapshot.surface_count, parameters=snapshot.parameter_count
+        )
     candidate_counts = Counter(dict(snapshot.candidates_by_type))
     finding_counts = Counter(dict(snapshot.findings_by_type))
     # Observation type을 실행기 표시 문구로 옮긴다. 스냅샷은 원본 type만 담는다.
