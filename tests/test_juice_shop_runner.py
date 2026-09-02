@@ -63,7 +63,9 @@ class JuiceShopTemporaryAccountCleanupTests(unittest.TestCase):
         ]
 
     def test_cleanup_removes_only_the_current_temporary_accounts(self) -> None:
-        self.assertEqual(_resolve_juice_shop_db(str(self.database)), self.database)
+        # macOS의 임시 디렉터리(/var)는 /private/var 심볼릭 링크다. resolver가 경로를
+        # 정규화하므로 기대값도 같은 기준으로 맞춘다.
+        self.assertEqual(_resolve_juice_shop_db(str(self.database)), self.database.resolve())
 
         _cleanup_provisioned_accounts(self.database, self._accounts())
 
