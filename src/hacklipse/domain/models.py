@@ -552,6 +552,10 @@ class Candidate:
     # 이 Candidate만 실패했을 때의 사유. 다른 Candidate는 계속 진행하므로 실패를
     # Run 전체가 아니라 Candidate에 남겨야 무엇이 검사되지 않았는지 알 수 있다.
     last_error: str | None = None
+    # 예산 때문에 건너뛴 Candidate가 어느 단계에서 멈췄는지. 재개할 때 이 값으로
+    # 분석부터 다시 할지 검증만 다시 할지 정한다. 이것이 없으면 검증 직전에 멈춘
+    # Candidate를 재개 시 처음부터 다시 분석하게 된다.
+    resume_status: str | None = None
 
     def add_evidence(self, evidence_ids: tuple[str, ...]) -> Candidate:
         """기존 순서를 유지하면서 중복 없이 Evidence 참조를 합친다."""
@@ -560,9 +564,13 @@ class Candidate:
         return replace(self, evidence_ids=merged)
 
     def set_status(self, status: str) -> Candidate:
-        """분석·검증 진행 상태가 변경된 Candidate 복사본을 만든다."""
+        """분석·검증 진행 상태가 변경된 Candidate 복사본을 만든다.
 
-        return replace(self, status=status)
+        정상 전이가 일어났다는 것은 이전에 남긴 실패·건너뜀 정보가 더 이상 현재를
+        설명하지 않는다는 뜻이므로 함께 지운다.
+        """
+
+        return replace(self, status=status, last_error=None, resume_status=None)
 
     def fail(self, reason: str) -> Candidate:
         """이 Candidate만 실패로 표시한다.
@@ -581,7 +589,18 @@ class Candidate:
         오해한다.
         """
 
-        return replace(self, status=CANDIDATE_SKIPPED_BUDGET, last_error=reason)
+        # 이미 건너뛴 Candidate를 다시 건너뛸 때 원래 단계 정보를 잃지 않는다.
+        origin = (
+            self.resume_status
+            if self.status == CANDIDATE_SKIPPED_BUDGET
+            else self.status
+        )
+        return replace(
+            self,
+            status=CANDIDATE_SKIPPED_BUDGET,
+            last_error=reason,
+            resume_status=origin,
+        )
 
 
 @dataclass(frozen=True, slots=True)

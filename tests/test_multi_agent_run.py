@@ -421,5 +421,121 @@ class BudgetStarvationTests(unittest.TestCase):
         self.assertEqual(by_type["SQLi"].status, "rejected")
 
 
+class _CountingAnalyzer:
+    """몇 번 호출됐는지 세는 Analysis 대역."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def handle(self, task):
+        from hacklipse.domain import AgentResult, AgentResultStatus
+
+        self.calls += 1
+        return AgentResult(task_id=task.task_id, status=AgentResultStatus.COMPLETED)
+
+
+def _interrupted_run(candidate_status: str, resume_status: str):
+    """예산 때문에 건너뛴 Candidate가 남아 있는 중단된 Run을 만든다.
+
+    실제로는 프로세스가 죽거나 Run이 실패해 영속 저장소에 이 상태로 남는다.
+    """
+
+    from hacklipse.adapters import InMemoryBudgetManager
+    from hacklipse.bootstrap import build_local_application
+    from hacklipse.domain import Run, RunPhase, Surface
+
+    budget = InMemoryBudgetManager()
+    app = build_local_application({}, budget_manager=budget)
+    analyzer = _CountingAnalyzer()
+    app.dispatcher.register("sqli_analyzer", analyzer, allowed_tools=("http_get",))
+    app.dispatcher.register(
+        "validation", _RejectingValidator(), allowed_tools=("http_get",)
+    )
+
+    app.stores.surfaces.add(
+        Surface(
+            surface_id="surface-search",
+            run_id="run-1",
+            url="http://localhost/search",
+            method="GET",
+            parameters=("q",),
+        )
+    )
+    candidate = Candidate(
+        candidate_id="cand-sqli",
+        run_id="run-1",
+        surface_id="surface-search",
+        vulnerability_type="SQLi",
+        hypothesis="h",
+        assigned_agent="sqli_analyzer",
+        evidence_ids=(),
+        status=candidate_status,
+        last_error="request budget exhausted",
+        resume_status=resume_status,
+    )
+    app.stores.candidates.add(candidate)
+    app.stores.runs.add(
+        Run(
+            run_id="run-1",
+            target_url="http://localhost/",
+            scope=_SCOPE,
+            policy_profile="safe",
+            request_budget=20,
+            phase=RunPhase.ANALYZE,
+            candidate_ids=("cand-sqli",),
+        )
+    )
+    # 재개 시점에는 예산이 다시 확보돼 있다.
+    budget.open_run("run-1", 20)
+    return app, analyzer
+
+
+class SkippedCandidateResumeTests(unittest.TestCase):
+    """예산으로 건너뛴 Candidate는 재개 대상이어야 한다.
+
+    그대로 두면 예산을 늘려 다시 실행해도 영원히 검사되지 않는다. 그러면 보고서는
+    "검사하지 못했다"를 계속 유지하는데 실제로는 검사할 수 있는 상태다.
+    """
+
+    def test_skipped_before_analysis_is_analyzed_on_resume(self) -> None:
+        from hacklipse.domain import CANDIDATE_SKIPPED_BUDGET
+
+        app, analyzer = _interrupted_run(CANDIDATE_SKIPPED_BUDGET, "routed")
+
+        run = app.orchestrator.resume("run-1")
+
+        self.assertEqual(run.phase.value, "done")
+        self.assertEqual(analyzer.calls, 1)
+        candidate = app.stores.candidates.get("run-1", "cand-sqli")
+        self.assertEqual(candidate.status, "rejected")
+        # 정상 전이가 끝났으므로 건너뜀 흔적은 남지 않는다.
+        self.assertIsNone(candidate.last_error)
+        self.assertIsNone(candidate.resume_status)
+
+    def test_skipped_before_validation_does_not_repeat_analysis(self) -> None:
+        """검증 직전에 멈춘 Candidate를 분석부터 다시 돌리면 예산을 또 쓴다."""
+
+        from hacklipse.domain import CANDIDATE_SKIPPED_BUDGET
+
+        app, analyzer = _interrupted_run(CANDIDATE_SKIPPED_BUDGET, "analyzed")
+
+        run = app.orchestrator.resume("run-1")
+
+        self.assertEqual(run.phase.value, "done")
+        self.assertEqual(analyzer.calls, 0)
+        self.assertEqual(
+            app.stores.candidates.get("run-1", "cand-sqli").status, "rejected"
+        )
+
+    def test_finished_candidate_is_not_reprocessed(self) -> None:
+        """이미 판정이 끝난 Candidate는 재개해도 다시 돌지 않는다."""
+
+        app, analyzer = _interrupted_run("rejected", None)
+
+        app.orchestrator.resume("run-1")
+
+        self.assertEqual(analyzer.calls, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from hacklipse.domain import (
+    CANDIDATE_SKIPPED_BUDGET,
     AgentResult,
     AgentResultStatus,
     Candidate,
@@ -222,7 +223,7 @@ class Orchestrator:
         for candidate_id in run.candidate_ids:
             candidate = self._candidates.get(run.run_id, candidate_id)
             # 이미 처리된 Candidate는 재개 시 중복 분석하지 않는다.
-            if candidate.status != "routed":
+            if not _pending_in(candidate, "routed"):
                 continue
             if self._budget.remaining(run.run_id) <= 0:
                 # 남은 예산이 없으면 시작하지 않는다. 일부만 요청하고 죽으면 아무것도
@@ -301,7 +302,7 @@ class Orchestrator:
         finding_ids = [item.finding_id for item in self._findings.list_by_run(run.run_id)]
         for candidate_id in run.candidate_ids:
             candidate = self._candidates.get(run.run_id, candidate_id)
-            if candidate.status != "analyzed":
+            if not _pending_in(candidate, "analyzed"):
                 continue
             if self._budget.remaining(run.run_id) <= 0:
                 current = self._skip_candidate_for_budget(current, candidate_id)
@@ -531,6 +532,26 @@ class Orchestrator:
         """ID 순서를 유지하면서 중복을 제거한다."""
 
         return tuple(dict.fromkeys((*current, *added)))
+
+
+def _pending_in(candidate: Candidate, phase_status: str) -> bool:
+    """이 단계에서 아직 처리해야 하는 Candidate인지 판단한다.
+
+    예산이 모자라 건너뛴 Candidate는 재개 대상이다. 그대로 두면 예산을 늘려 다시
+    실행해도 영원히 검사되지 않는다. 다만 어느 단계에서 멈췄는지를 지켜야 한다.
+    검증 직전에 멈춘 Candidate를 분석부터 다시 돌리면 이미 쓴 예산을 또 쓴다.
+
+    재시도 횟수를 따로 세지 않는 이유는 시작 전에 잔여 예산을 확인하기 때문이다.
+    예산이 없으면 요청을 한 번도 보내지 않고 다시 건너뛰므로 반복이 비용을 늘리지
+    않는다.
+    """
+
+    if candidate.status == phase_status:
+        return True
+    return (
+        candidate.status == CANDIDATE_SKIPPED_BUDGET
+        and candidate.resume_status == phase_status
+    )
 
 
 # Candidate 단위로 격리하지 않는 실패. 대상 쪽 문제가 아니라 시스템 쪽 문제이므로
