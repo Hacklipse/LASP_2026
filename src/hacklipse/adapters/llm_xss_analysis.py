@@ -29,6 +29,7 @@ from hacklipse.domain import (
     Surface,
     TaskEnvelope,
 )
+from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.ports import CandidateStore, EvidenceStore, LlmClient, SurfaceStore
 from hacklipse.ports.llm import LlmMessage, LlmRequest
 
@@ -175,7 +176,7 @@ class LlmXssAnalyzer:
 
         if missing:
             if task.request_budget < len(missing):
-                raise AgentContractError(
+                raise BudgetExceeded(
                     "llm xss analyzer lacks budget for its remaining evidence requests"
                 )
             return AgentResult(

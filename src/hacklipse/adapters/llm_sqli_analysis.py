@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from hacklipse.application.errors import AgentContractError
 from hacklipse.domain import AgentResult, AgentResultStatus, Evidence, Surface, TaskEnvelope
+from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.ports import CandidateStore, EvidenceStore, LlmClient, SurfaceStore
 from hacklipse.ports.llm import LlmMessage, LlmRequest
 
@@ -117,7 +118,7 @@ class LlmSqliAnalyzer:
         )
         if missing:
             if task.request_budget < len(missing):
-                raise AgentContractError(
+                raise BudgetExceeded(
                     "llm sqli analyzer lacks budget for its remaining evidence requests"
                 )
             return AgentResult(

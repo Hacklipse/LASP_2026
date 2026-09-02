@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from hacklipse.application.errors import AgentContractError
 from hacklipse.domain import AgentResult, AgentResultStatus, Evidence, Surface, TaskEnvelope
+from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.ports import CandidateStore, EvidenceStore, LlmClient, SurfaceStore
 from hacklipse.ports.llm import LlmMessage, LlmRequest
 
@@ -100,7 +101,7 @@ class LlmSstiAnalyzer:
         )
         if missing:
             if task.request_budget < len(missing):
-                raise AgentContractError("LLM SSTI analyzer lacks budget for its safe request sequence")
+                raise BudgetExceeded("LLM SSTI analyzer lacks budget for its safe request sequence")
             return AgentResult(
                 task_id=task.task_id,
                 status=AgentResultStatus.NEEDS_EVIDENCE,

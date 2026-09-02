@@ -223,6 +223,36 @@ class _DebugProgress:
             self.log(f"Task 실패: {agent} ({elapsed_seconds:.2f}초)")
 
 
+class _LlmUsageMeter:
+    """LLM 호출 수와 token 사용량만 세는 얇은 래퍼.
+
+    예산은 지금까지 HTTP 요청 수만 셌는데, LLM 구성에서는 비용이 그쪽에서도 발생한다.
+    사용량을 모르면 어느 유형이 비싼지 판단할 수 없어 스케줄링 근거가 없다.
+
+    prompt나 응답 본문은 보관하지 않는다. 숫자만 센다.
+    """
+
+    def __init__(self, delegate: LlmClient) -> None:
+        self._delegate = delegate
+        self.calls = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+
+    def complete(self, request: LlmRequest) -> LlmResponse:
+        response = self._delegate.complete(request)
+        self.calls += 1
+        usage = response.usage
+        self.input_tokens += usage.input_tokens + usage.cache_read_input_tokens
+        self.output_tokens += usage.output_tokens
+        return response
+
+    def summary(self) -> str:
+        return (
+            f"{self.calls}회, 입력 {self.input_tokens:,} token, "
+            f"출력 {self.output_tokens:,} token"
+        )
+
+
 class _ProgressLlmClient:
     """공급자 중립 LlmClient에 안전한 호출 시간 관찰만 덧씌운다."""
 

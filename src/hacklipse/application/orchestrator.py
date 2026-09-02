@@ -28,7 +28,7 @@ from hacklipse.ports import (
     SurfaceStore,
     VulnerabilityRouter,
 )
-from hacklipse.ports.errors import AgentUnavailable
+from hacklipse.ports.errors import AgentUnavailable, BudgetExceeded
 
 from .errors import AgentContractError, WorkflowExecutionError
 from .state_machine import RunStateMachine
@@ -196,6 +196,10 @@ class Orchestrator:
         surfaces = self._surfaces.list_by_run(run.run_id)
         evidence = self._evidence.get_many(run.run_id, run.evidence_ids)
         decisions = self._router.route(run, surfaces, evidence)
+        # Router가 매긴 우선순위를 실행 순서로 쓴다. 예산이 모자라면 뒤쪽이 잘리므로
+        # 어떤 Candidate가 먼저 실행되는지가 곧 무엇을 포기하는지에 대한 결정이 된다.
+        # 같은 우선순위는 Router가 만든 순서를 유지한다(안정 정렬).
+        decisions = sorted(decisions, key=lambda item: item.priority, reverse=True)
         candidate_ids = list(run.candidate_ids)
         for decision in decisions:
             candidate = decision.candidate
@@ -219,6 +223,11 @@ class Orchestrator:
             candidate = self._candidates.get(run.run_id, candidate_id)
             # 이미 처리된 Candidate는 재개 시 중복 분석하지 않는다.
             if candidate.status != "routed":
+                continue
+            if self._budget.remaining(run.run_id) <= 0:
+                # 남은 예산이 없으면 시작하지 않는다. 일부만 요청하고 죽으면 아무것도
+                # 얻지 못한 채 예산만 쓰고, 결과에는 실패로 남는다.
+                current = self._skip_candidate_for_budget(current, candidate_id)
                 continue
             try:
                 current = self._analyze_candidate(current, candidate)
@@ -293,6 +302,9 @@ class Orchestrator:
         for candidate_id in run.candidate_ids:
             candidate = self._candidates.get(run.run_id, candidate_id)
             if candidate.status != "analyzed":
+                continue
+            if self._budget.remaining(run.run_id) <= 0:
+                current = self._skip_candidate_for_budget(current, candidate_id)
                 continue
             try:
                 current, finding_id = self._validate_candidate(current, candidate)
@@ -410,8 +422,21 @@ class Orchestrator:
 
         if isinstance(error, _CANDIDATE_FATAL_ERRORS):
             raise error
+        if isinstance(error, BudgetExceeded):
+            # 예산 부족은 대상의 문제도 Agent의 결함도 아니다. 실행하지 못한 것이다.
+            return self._skip_candidate_for_budget(run, candidate_id, str(error))
         candidate = self._candidates.get(run.run_id, candidate_id)
         self._candidates.save(candidate.fail(f"{type(error).__name__}: {error}"))
+        return run
+
+    def _skip_candidate_for_budget(
+        self, run: Run, candidate_id: str, detail: str | None = None
+    ) -> Run:
+        """예산이 모자라 검사하지 못한 Candidate를 실패와 구분해 기록한다."""
+
+        candidate = self._candidates.get(run.run_id, candidate_id)
+        reason = detail or f"request budget exhausted for {run.run_id}"
+        self._candidates.save(candidate.skip_for_budget(reason))
         return run
 
     def _report(self, run: Run) -> Run:

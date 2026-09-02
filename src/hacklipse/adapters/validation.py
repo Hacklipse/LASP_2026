@@ -17,6 +17,7 @@ from hacklipse.domain import (
     ValidationResult,
     ValidationVerdict,
 )
+from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 
 from .probing import build_probe_requests, matching_evidence, probe_marker
@@ -203,7 +204,7 @@ class ValidationAgent:
         )
         if missing:
             if task.request_budget < len(missing):
-                raise AgentContractError(
+                raise BudgetExceeded(
                     "XSS validation lacks budget for independent browser control/probe requests"
                 )
             return AgentResult(
@@ -309,7 +310,7 @@ class ValidationAgent:
         )
         if missing:
             if task.request_budget < len(missing):
-                raise AgentContractError(
+                raise BudgetExceeded(
                     "SQLi validation lacks budget for independent control/probe requests"
                 )
             return AgentResult(
@@ -521,7 +522,7 @@ class ValidationAgent:
         )
         if missing:
             if task.request_budget < len(missing):
-                raise AgentContractError(
+                raise BudgetExceeded(
                     "Path Traversal validation lacks budget for independent requests"
                 )
             return AgentResult(
@@ -612,7 +613,7 @@ class ValidationAgent:
         )
         if missing:
             if task.request_budget < len(missing):
-                raise AgentContractError(
+                raise BudgetExceeded(
                     "SSTI validation lacks budget for its independent safe request sequence"
                 )
             return AgentResult(

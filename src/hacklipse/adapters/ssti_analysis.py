@@ -29,6 +29,7 @@ from hacklipse.domain import (
     Surface,
     TaskEnvelope,
 )
+from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 
 SSTI_TOOL = "ssti_probe"
@@ -315,7 +316,7 @@ class HeuristicSstiAnalyzer:
         )
         if missing:
             if task.request_budget < len(missing):
-                raise AgentContractError("SSTI baseline lacks budget for its safe request sequence")
+                raise BudgetExceeded("SSTI baseline lacks budget for its safe request sequence")
             return AgentResult(
                 task_id=task.task_id,
                 status=AgentResultStatus.NEEDS_EVIDENCE,

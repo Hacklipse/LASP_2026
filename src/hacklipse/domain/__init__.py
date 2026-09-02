@@ -32,6 +32,7 @@ from .models import (
     ValidationProof,
     ValidationProofType,
     ValidationVerdict,
+    CANDIDATE_SKIPPED_BUDGET,
     credential_for_vulnerability,
     is_path_traversal_safe_probe_value,
 )
@@ -68,6 +69,7 @@ __all__ = [
     "ValidationProof",
     "ValidationProofType",
     "ValidationVerdict",
+    "CANDIDATE_SKIPPED_BUDGET",
     "credential_for_vulnerability",
     "is_path_traversal_safe_probe_value",
 ]

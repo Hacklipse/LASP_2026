@@ -288,5 +288,138 @@ class CandidateFailureIsolationTests(unittest.TestCase):
             _start(app)
 
 
+class _PriorityRouter:
+    """우선순위를 일부러 뒤섞어 돌려주는 Router 대역."""
+
+    def __init__(self, ordered_types: tuple[tuple[str, float], ...]) -> None:
+        self._ordered = ordered_types
+
+    def route(self, run, surfaces, evidence):
+        from hacklipse.domain import RouteDecision
+
+        return tuple(
+            RouteDecision(
+                candidate=Candidate(
+                    candidate_id=f"cand-{name}",
+                    run_id=run.run_id,
+                    surface_id="surface-search",
+                    vulnerability_type=name,
+                    hypothesis="h",
+                    assigned_agent=f"{name.lower()}_analyzer",
+                    evidence_ids=(),
+                ),
+                priority=priority,
+            )
+            for name, priority in self._ordered
+        )
+
+
+class CandidatePriorityTests(unittest.TestCase):
+    """예산이 모자라면 뒤쪽이 잘리므로 실행 순서가 곧 무엇을 포기할지의 결정이다."""
+
+    def test_candidates_run_in_priority_order(self) -> None:
+        from hacklipse.bootstrap import build_local_application
+
+        # Router가 낮은 우선순위를 먼저 돌려줘도 실행 순서는 높은 쪽이 앞서야 한다.
+        app = build_local_application(
+            {}, router=_PriorityRouter((("low", 0.2), ("high", 0.9), ("mid", 0.5)))
+        )
+        app.dispatcher.register(
+            "recon",
+            _SurfaceOnlyReconAgent(app.stores.surfaces),
+            allowed_tools=("http_get",),
+        )
+        for name in ("low", "high", "mid"):
+            app.dispatcher.register(
+                f"{name}_analyzer", _CompletingAnalyzer(), allowed_tools=("http_get",)
+            )
+        app.dispatcher.register(
+            "validation", _RejectingValidator(), allowed_tools=("http_get",)
+        )
+
+        run = _start(app)
+
+        self.assertEqual(
+            list(run.candidate_ids), ["cand-high", "cand-mid", "cand-low"]
+        )
+
+
+class _DrainingReconAgent(_SurfaceOnlyReconAgent):
+    """Surface를 만들면서 Run 예산을 모두 소진하는 Recon 대역."""
+
+    def __init__(self, surface_store, budget_manager, units: int) -> None:
+        super().__init__(surface_store)
+        self._budget = budget_manager
+        self._units = units
+
+    def handle(self, task):
+        result = super().handle(task)
+        self._budget.consume(task.run_id, self._units)
+        return result
+
+
+class BudgetStarvationTests(unittest.TestCase):
+    """예산 부족은 실패와 구분해서 기록해야 한다.
+
+    실패로 뭉뚱그리면 보고서를 읽는 사람이 "검사했는데 안 나왔다"로 오해한다.
+    """
+
+    def test_drained_budget_skips_candidates_before_starting_them(self) -> None:
+        from hacklipse.bootstrap import build_local_application
+        from hacklipse.domain import CANDIDATE_SKIPPED_BUDGET, RunRequest, RunScope
+
+        app = build_local_application({})
+        app.dispatcher.register(
+            "recon",
+            _DrainingReconAgent(app.stores.surfaces, app.budget_manager, units=4),
+            allowed_tools=("http_get",),
+        )
+        app.dispatcher.register(
+            "xss_analyzer", _CompletingAnalyzer(), allowed_tools=("http_get",)
+        )
+        app.dispatcher.register(
+            "sqli_analyzer", _CompletingAnalyzer(), allowed_tools=("http_get",)
+        )
+        app.dispatcher.register(
+            "validation", _RejectingValidator(), allowed_tools=("http_get",)
+        )
+
+        run = app.orchestrator.start(
+            RunRequest(
+                target_url="http://localhost/",
+                scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+                request_budget=4,
+            )
+        )
+
+        # Run 전체가 죽지 않는다. 이것이 예산 부족을 계약 위반과 분리한 이유다.
+        self.assertEqual(run.phase.value, "done")
+        candidates = app.stores.candidates.list_by_run(run.run_id)
+        self.assertEqual(
+            {item.status for item in candidates}, {CANDIDATE_SKIPPED_BUDGET}
+        )
+        self.assertIn("budget", (candidates[0].last_error or "").casefold())
+
+    def test_analyzer_budget_shortage_is_not_treated_as_a_failure(self) -> None:
+        """Analyzer가 남은 예산으로 계획을 못 세우면 그 Candidate만 건너뛴다."""
+
+        from hacklipse.domain import CANDIDATE_SKIPPED_BUDGET
+        from hacklipse.ports.errors import BudgetExceeded
+
+        app = _application(_RaisingAnalyzer(BudgetExceeded("not enough for probes")))
+
+        run = _start(app)
+
+        self.assertEqual(run.phase.value, "done")
+        by_type = {
+            item.vulnerability_type: item
+            for item in app.stores.candidates.list_by_run(run.run_id)
+        }
+        self.assertEqual(by_type["XSS"].status, CANDIDATE_SKIPPED_BUDGET)
+        self.assertNotEqual(by_type["XSS"].status, "failed")
+        # 같은 Run의 다른 Candidate는 정상 진행된다.
+        self.assertEqual(by_type["SQLi"].status, "rejected")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -24,6 +24,7 @@ from hacklipse.domain import (
     TaskEnvelope,
     is_path_traversal_safe_probe_value,
 )
+from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 
 from .probing import (
@@ -118,7 +119,7 @@ class HeuristicPathTraversalAnalyzer:
         )
         if missing:
             if task.request_budget < len(missing):
-                raise AgentContractError(
+                raise BudgetExceeded(
                     "path traversal baseline lacks budget for its evidence requests"
                 )
             return AgentResult(

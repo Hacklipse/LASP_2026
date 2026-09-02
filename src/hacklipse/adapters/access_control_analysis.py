@@ -38,6 +38,7 @@ from hacklipse.domain import (
     Surface,
     TaskEnvelope,
 )
+from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 
 from .probing import matching_evidence, resolve_analysis_task, response_body
@@ -131,7 +132,7 @@ class HeuristicAccessControlAnalyzer:
         )
         if missing:
             if task.request_budget < len(missing):
-                raise AgentContractError(
+                raise BudgetExceeded(
                     "access control baseline lacks budget for its remaining requests"
                 )
             return AgentResult(

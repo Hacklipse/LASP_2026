@@ -57,6 +57,7 @@ from hacklipse.bootstrap import (  # noqa: E402
     standard_router,
 )
 from hacklipse.domain import (  # noqa: E402
+    CANDIDATE_SKIPPED_BUDGET,
     EvidenceRequest,
     HttpRequestSpec,
     Run,
@@ -71,6 +72,7 @@ from hacklipse.ports.errors import LlmCredentialsMissing  # noqa: E402
 from run_dvwa_baseline import (  # noqa: E402
     _DebugAuditLog,
     _DebugProgress,
+    _LlmUsageMeter,
     _ProgressLlmClient,
     _safe_log_value,
 )
@@ -402,6 +404,12 @@ def main(argv: list[str]) -> int:
         "--juice-shop-db",
         help="Access Control 임시 계정 정리에 사용할 juiceshop.sqlite 경로",
     )
+    parser.add_argument(
+        "--request-budget",
+        type=int,
+        help="Run 전체 HTTP 요청 상한 (기본: 단일 유형 %d, 전체 모드 %d)"
+        % (_DEFAULT_BUDGET, _ALL_MODE_BUDGET),
+    )
     parser.add_argument("--debug", action="store_true", help="안전한 진행 로그 출력")
     parser.add_argument(
         "--debug-llm-content",
@@ -437,6 +445,7 @@ def main(argv: list[str]) -> int:
     debug_enabled = args.debug or args.debug_llm_content
     progress = _DebugProgress(debug_enabled)
     llm_client = None
+    llm_meter: _LlmUsageMeter | None = None
     selected_model = ""
     if args.profile == "llm":
         selected_model = args.llm_model or (
@@ -460,6 +469,8 @@ def main(argv: list[str]) -> int:
                 progress=progress,
                 show_content=args.debug_llm_content,
             )
+        llm_meter = _LlmUsageMeter(llm_client)
+        llm_client = llm_meter
         progress.log(
             f"LLM 구성 완료: provider={_safe_log_value(args.llm_provider)}, "
             f"model={_safe_log_value(selected_model)}"
@@ -590,7 +601,9 @@ def main(argv: list[str]) -> int:
         )
         progress.log("임시 ACTOR/OWNER 계정 생성 및 로그인 완료")
 
-    request_budget = _ALL_MODE_BUDGET if run_all else _DEFAULT_BUDGET
+    request_budget = args.request_budget or (
+        _ALL_MODE_BUDGET if run_all else _DEFAULT_BUDGET
+    )
     run = None
     workflow_error: WorkflowExecutionError | None = None
     cleanup_error: Exception | None = None
@@ -670,7 +683,9 @@ def main(argv: list[str]) -> int:
     print(f"  상태            완료 ({run.phase.value})")
     print(f"  분석 대상       {target_label}")
     print(f"  Agent 구성      {profile}")
-    print(f"  감사된 실행     {len(audit.list_by_run(run.run_id))}회")
+    print(f"  감사된 실행     {len(audit.list_by_run(run.run_id))}회 / 예산 {request_budget}회")
+    if llm_meter is not None:
+        print(f"  LLM 사용량      {llm_meter.summary()}")
     if provision_run_id is not None:
         print(f"  계정 준비 실행  {len(audit.list_by_run(provision_run_id))}회")
     print()
@@ -683,12 +698,15 @@ def main(argv: list[str]) -> int:
         assert vuln is not None
         print(f"  {vuln.signal_label:<14} {execution_signals}개")
     failed = [item for item in candidates if item.status == "failed"]
-    if failed:
+    skipped = [item for item in candidates if item.status == CANDIDATE_SKIPPED_BUDGET]
+    if failed or skipped:
         print()
         print("[검사하지 못한 Candidate]")
+        # 검사했는데 없었다 / 검사하다 실패했다 / 시작조차 못 했다를 구분해서 보여준다.
         for item in failed:
-            # 검사했는데 없었다와 검사하지 못했다를 구분해서 보여준다.
-            print(f"  {item.vulnerability_type:<14} {item.last_error}")
+            print(f"  실패    {item.vulnerability_type:<14} {item.last_error}")
+        for item in skipped:
+            print(f"  예산부족 {item.vulnerability_type:<14} {item.last_error}")
     print()
     print("[최종 판정]")
     print(f"  결과            {verdict}")

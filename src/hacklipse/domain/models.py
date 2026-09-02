@@ -533,6 +533,10 @@ class Surface:
             )
 
 
+# 예산 부족으로 시작하지 못한 Candidate의 상태. 검사 실패(failed)와 구분한다.
+CANDIDATE_SKIPPED_BUDGET = "skipped_budget"
+
+
 @dataclass(frozen=True, slots=True)
 class Candidate:
     """아직 독립 검증을 통과하지 않은 취약점 가설."""
@@ -568,6 +572,16 @@ class Candidate:
         """
 
         return replace(self, status="failed", last_error=reason)
+
+    def skip_for_budget(self, reason: str) -> Candidate:
+        """예산이 모자라 시도조차 하지 못한 Candidate로 표시한다.
+
+        실패와 구분해야 한다. 실패는 "검사했는데 대상이 응답하지 않았다"이고 이쪽은
+        "검사를 시작조차 못 했다"이다. 둘을 뭉뚱그리면 보고서를 읽는 사람이 검사 범위를
+        오해한다.
+        """
+
+        return replace(self, status=CANDIDATE_SKIPPED_BUDGET, last_error=reason)
 
 
 @dataclass(frozen=True, slots=True)

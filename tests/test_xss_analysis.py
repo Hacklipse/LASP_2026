@@ -13,6 +13,7 @@ from hacklipse.adapters import (
     SurfaceRoutingRule,
 )
 from hacklipse.application.errors import AgentContractError
+from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.bootstrap import build_local_application
 from hacklipse.domain import (
     AgentResult,
@@ -222,7 +223,9 @@ class HeuristicXssAnalyzerTests(unittest.TestCase):
 
     def test_rejects_missing_tool_and_insufficient_task_budget_before_requests(self) -> None:
         agent, _, runtime, task = _task(parameters=("name",), request_budget=1)
-        with self.assertRaises(AgentContractError):
+        # 예산 부족은 계약 위반이 아니라 실행하지 못한 상태다. Orchestrator가 이 구분으로
+        # 해당 Candidate만 skipped_budget으로 남기고 Run은 계속 진행한다.
+        with self.assertRaises(BudgetExceeded):
             agent.handle(task)
         self.assertEqual(runtime.requests, [])
 
