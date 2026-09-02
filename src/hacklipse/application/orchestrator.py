@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from hacklipse.domain import (
-    CANDIDATE_SKIPPED_BUDGET,
+    CandidateStatus,
     AgentResult,
     AgentResultStatus,
     Candidate,
@@ -223,7 +223,7 @@ class Orchestrator:
         for candidate_id in run.candidate_ids:
             candidate = self._candidates.get(run.run_id, candidate_id)
             # 이미 처리된 Candidate는 재개 시 중복 분석하지 않는다.
-            if not _pending_in(candidate, "routed"):
+            if not _pending_in(candidate, CandidateStatus.ROUTED):
                 continue
             if self._budget.remaining(run.run_id) <= 0:
                 # 남은 예산이 없으면 시작하지 않는다. 일부만 요청하고 죽으면 아무것도
@@ -257,7 +257,7 @@ class Orchestrator:
             self._candidates.save(candidate)
 
             if result.status is AgentResultStatus.COMPLETED:
-                candidate = candidate.set_status("analyzed")
+                candidate = candidate.set_status(CandidateStatus.ANALYZED)
                 self._candidates.save(candidate)
                 break
             if result.status is not AgentResultStatus.NEEDS_EVIDENCE:
@@ -302,7 +302,7 @@ class Orchestrator:
         finding_ids = [item.finding_id for item in self._findings.list_by_run(run.run_id)]
         for candidate_id in run.candidate_ids:
             candidate = self._candidates.get(run.run_id, candidate_id)
-            if not _pending_in(candidate, "analyzed"):
+            if not _pending_in(candidate, CandidateStatus.ANALYZED):
                 continue
             if self._budget.remaining(run.run_id) <= 0:
                 current = self._skip_candidate_for_budget(current, candidate_id)
@@ -392,7 +392,7 @@ class Orchestrator:
 
         if validation is None:
             # 반복 상한 안에 판정을 얻지 못하면 Finding으로 승격하지 않는다.
-            candidate = candidate.set_status("suspected")
+            candidate = candidate.set_status(CandidateStatus.SUSPECTED)
             self._candidates.save(candidate)
             return current, None
 
@@ -406,7 +406,7 @@ class Orchestrator:
             )
             self._findings.add(finding)
             finding_id = finding.finding_id
-        candidate = candidate.set_status(validation.verdict.value)
+        candidate = candidate.set_status(CandidateStatus(validation.verdict.value))
         self._candidates.save(candidate)
         return current, finding_id
 
@@ -534,7 +534,7 @@ class Orchestrator:
         return tuple(dict.fromkeys((*current, *added)))
 
 
-def _pending_in(candidate: Candidate, phase_status: str) -> bool:
+def _pending_in(candidate: Candidate, phase_status: CandidateStatus) -> bool:
     """이 단계에서 아직 처리해야 하는 Candidate인지 판단한다.
 
     예산이 모자라 건너뛴 Candidate는 재개 대상이다. 그대로 두면 예산을 늘려 다시
@@ -546,11 +546,11 @@ def _pending_in(candidate: Candidate, phase_status: str) -> bool:
     않는다.
     """
 
-    if candidate.status == phase_status:
+    if candidate.status is phase_status:
         return True
     return (
-        candidate.status == CANDIDATE_SKIPPED_BUDGET
-        and candidate.resume_status == phase_status
+        candidate.status is CandidateStatus.SKIPPED_BUDGET
+        and candidate.resume_status is phase_status
     )
 
 

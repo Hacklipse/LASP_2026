@@ -13,8 +13,8 @@ from collections import Counter
 from collections.abc import Sequence
 
 from hacklipse.domain import (
-    CANDIDATE_SKIPPED_BUDGET,
     Candidate,
+    CandidateStatus,
     ProgressSnapshot,
     Run,
     UncheckedCandidate,
@@ -22,9 +22,18 @@ from hacklipse.domain import (
 from hacklipse.ports import BudgetManager
 
 # 판정까지 끝난 Candidate 상태. Validation이 verdict 값을 그대로 상태로 쓴다.
-_VALIDATED_STATUSES = frozenset({"confirmed", "rejected", "suspected"})
+_VALIDATED_STATUSES = frozenset(
+    {
+        CandidateStatus.CONFIRMED,
+        CandidateStatus.REJECTED,
+        CandidateStatus.SUSPECTED,
+        CandidateStatus.BLOCKED,
+    }
+)
 # 검사를 끝내지 못한 상태. "검사했는데 없었다"와 구분해서 보여줘야 한다.
-_UNCHECKED_STATUSES = frozenset({"failed", CANDIDATE_SKIPPED_BUDGET})
+_UNCHECKED_STATUSES = frozenset(
+    {CandidateStatus.FAILED, CandidateStatus.SKIPPED_BUDGET}
+)
 
 
 def build_progress_snapshot(
@@ -64,7 +73,7 @@ def build_progress_snapshot(
         surface_count=len(surfaces),
         parameter_count=len(parameters),
         candidates_by_type=_counted(item.vulnerability_type for item in candidates),
-        candidates_by_status=_counted(item.status for item in candidates),
+        candidates_by_status=_counted(item.status.value for item in candidates),
         evidence_count=len(evidence),
         signals_by_type=tuple(sorted(signals.items())),
         validated_count=sum(
@@ -102,7 +111,7 @@ def _unchecked(candidates: Sequence[Candidate]) -> tuple[UncheckedCandidate, ...
     return tuple(
         UncheckedCandidate(
             vulnerability_type=item.vulnerability_type,
-            status=item.status,
+            status=item.status.value,
             reason=item.last_error,
         )
         for item in candidates

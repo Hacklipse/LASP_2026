@@ -366,7 +366,7 @@ class BudgetStarvationTests(unittest.TestCase):
 
     def test_drained_budget_skips_candidates_before_starting_them(self) -> None:
         from hacklipse.bootstrap import build_local_application
-        from hacklipse.domain import CANDIDATE_SKIPPED_BUDGET, RunRequest, RunScope
+        from hacklipse.domain import CandidateStatus, RunRequest, RunScope
 
         app = build_local_application({})
         app.dispatcher.register(
@@ -396,14 +396,14 @@ class BudgetStarvationTests(unittest.TestCase):
         self.assertEqual(run.phase.value, "done")
         candidates = app.stores.candidates.list_by_run(run.run_id)
         self.assertEqual(
-            {item.status for item in candidates}, {CANDIDATE_SKIPPED_BUDGET}
+            {item.status for item in candidates}, {CandidateStatus.SKIPPED_BUDGET}
         )
         self.assertIn("budget", (candidates[0].last_error or "").casefold())
 
     def test_analyzer_budget_shortage_is_not_treated_as_a_failure(self) -> None:
         """Analyzer가 남은 예산으로 계획을 못 세우면 그 Candidate만 건너뛴다."""
 
-        from hacklipse.domain import CANDIDATE_SKIPPED_BUDGET
+        from hacklipse.domain import CandidateStatus
         from hacklipse.ports.errors import BudgetExceeded
 
         app = _application(_RaisingAnalyzer(BudgetExceeded("not enough for probes")))
@@ -415,7 +415,7 @@ class BudgetStarvationTests(unittest.TestCase):
             item.vulnerability_type: item
             for item in app.stores.candidates.list_by_run(run.run_id)
         }
-        self.assertEqual(by_type["XSS"].status, CANDIDATE_SKIPPED_BUDGET)
+        self.assertEqual(by_type["XSS"].status, CandidateStatus.SKIPPED_BUDGET)
         self.assertNotEqual(by_type["XSS"].status, "failed")
         # 같은 Run의 다른 Candidate는 정상 진행된다.
         self.assertEqual(by_type["SQLi"].status, "rejected")
@@ -498,9 +498,9 @@ class SkippedCandidateResumeTests(unittest.TestCase):
     """
 
     def test_skipped_before_analysis_is_analyzed_on_resume(self) -> None:
-        from hacklipse.domain import CANDIDATE_SKIPPED_BUDGET
+        from hacklipse.domain import CandidateStatus
 
-        app, analyzer = _interrupted_run(CANDIDATE_SKIPPED_BUDGET, "routed")
+        app, analyzer = _interrupted_run(CandidateStatus.SKIPPED_BUDGET, "routed")
 
         run = app.orchestrator.resume("run-1")
 
@@ -515,9 +515,9 @@ class SkippedCandidateResumeTests(unittest.TestCase):
     def test_skipped_before_validation_does_not_repeat_analysis(self) -> None:
         """검증 직전에 멈춘 Candidate를 분석부터 다시 돌리면 예산을 또 쓴다."""
 
-        from hacklipse.domain import CANDIDATE_SKIPPED_BUDGET
+        from hacklipse.domain import CandidateStatus
 
-        app, analyzer = _interrupted_run(CANDIDATE_SKIPPED_BUDGET, "analyzed")
+        app, analyzer = _interrupted_run(CandidateStatus.SKIPPED_BUDGET, "analyzed")
 
         run = app.orchestrator.resume("run-1")
 
@@ -568,7 +568,7 @@ class ProgressSnapshotTests(unittest.TestCase):
 
     def test_unchecked_separates_failure_from_budget_skip(self) -> None:
         from hacklipse.application import build_progress_snapshot
-        from hacklipse.domain import CANDIDATE_SKIPPED_BUDGET
+        from hacklipse.domain import CandidateStatus
         from hacklipse.ports.errors import AuthenticationFailed
 
         app = _application(_RaisingAnalyzer(AuthenticationFailed("session expired")))
@@ -580,7 +580,7 @@ class ProgressSnapshotTests(unittest.TestCase):
         self.assertEqual(by_type["XSS"].status, "failed")
         self.assertIn("AuthenticationFailed", by_type["XSS"].reason or "")
         self.assertNotIn("SQLi", by_type)
-        self.assertNotIn(CANDIDATE_SKIPPED_BUDGET, {i.status for i in snapshot.unchecked})
+        self.assertNotIn(CandidateStatus.SKIPPED_BUDGET, {i.status for i in snapshot.unchecked})
 
     def test_budget_used_is_derived_from_the_manager(self) -> None:
         from hacklipse.application import build_progress_snapshot
@@ -628,6 +628,45 @@ class ProgressSnapshotTests(unittest.TestCase):
         encoded = json.dumps(dataclasses.asdict(snapshot))
 
         self.assertIn(snapshot.run_id, encoded)
+
+
+class CandidateStatusTests(unittest.TestCase):
+    """상태가 자유 문자열이면 오타가 조용히 통과해 집계를 왜곡한다."""
+
+    def test_unknown_status_is_rejected(self) -> None:
+        from hacklipse.domain import CandidateStatus
+        from hacklipse.domain.errors import DomainInvariantError
+
+        with self.assertRaises(DomainInvariantError):
+            _candidate("SQLi", "sqli_analyzer").set_status("analized")
+
+        # 정상 값은 그대로 통과한다.
+        self.assertIs(
+            _candidate("SQLi", "sqli_analyzer").set_status(CandidateStatus.ANALYZED).status,
+            CandidateStatus.ANALYZED,
+        )
+
+    def test_stored_string_is_restored_as_the_enum(self) -> None:
+        """저장소에서 문자열로 복원한 Candidate도 같은 검사를 통과해야 한다."""
+
+        from hacklipse.domain import CandidateStatus
+
+        restored = Candidate(
+            candidate_id="c",
+            run_id="run-1",
+            surface_id="s",
+            vulnerability_type="SQLi",
+            hypothesis="h",
+            assigned_agent="a",
+            evidence_ids=(),
+            status="skipped_budget",
+            resume_status="analyzed",
+        )
+
+        self.assertIs(restored.status, CandidateStatus.SKIPPED_BUDGET)
+        self.assertIs(restored.resume_status, CandidateStatus.ANALYZED)
+        # str을 함께 상속하므로 기존 문자열 비교와 저장이 그대로 동작한다.
+        self.assertEqual(restored.status, "skipped_budget")
 
 
 if __name__ == "__main__":

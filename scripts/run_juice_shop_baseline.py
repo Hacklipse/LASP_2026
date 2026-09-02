@@ -58,7 +58,7 @@ from hacklipse.bootstrap import (  # noqa: E402
     standard_router,
 )
 from hacklipse.domain import (  # noqa: E402
-    CANDIDATE_SKIPPED_BUDGET,
+    CandidateStatus,
     EvidenceRequest,
     HttpRequestSpec,
     Run,
@@ -717,7 +717,10 @@ def main(argv: list[str]) -> int:
         print()
         print("[검사하지 못한 Candidate]")
         # 검사했는데 없었다 / 검사하다 실패했다 / 시작조차 못 했다를 구분해서 보여준다.
-        marks = {"failed": "실패", CANDIDATE_SKIPPED_BUDGET: "예산부족"}
+        marks = {
+            CandidateStatus.FAILED.value: "실패",
+            CandidateStatus.SKIPPED_BUDGET.value: "예산부족",
+        }
         for item in snapshot.unchecked:
             mark = marks.get(item.status, item.status)
             print(f"  {mark:<8} {item.vulnerability_type:<14} {item.reason}")

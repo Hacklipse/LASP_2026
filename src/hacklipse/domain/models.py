@@ -533,8 +533,23 @@ class Surface:
             )
 
 
-# 예산 부족으로 시작하지 못한 Candidate의 상태. 검사 실패(failed)와 구분한다.
-CANDIDATE_SKIPPED_BUDGET = "skipped_budget"
+class CandidateStatus(str, Enum):
+    """Candidate 하나가 거치는 진행 상태.
+
+    자유 문자열이면 오타가 조용히 통과해 "검사했는데 없었다"가 "검사하지 못했다"로
+    잘못 집계될 수 있다. 집계 기준을 손으로 유지하는 곳이 여러 군데라 더 그렇다.
+
+    str을 함께 상속하므로 저장·직렬화와 기존 문자열 비교가 그대로 동작한다.
+    """
+
+    ROUTED = "routed"  # Router가 만들었고 아직 분석 전
+    ANALYZED = "analyzed"  # 분석을 마쳤고 독립 검증 대기
+    CONFIRMED = "confirmed"  # 검증이 proof와 함께 확정
+    SUSPECTED = "suspected"  # 판정을 얻지 못함. Finding으로 승격하지 않는다
+    REJECTED = "rejected"  # 검증이 재현하지 못함
+    BLOCKED = "blocked"  # 정책이나 승인 때문에 검증을 진행할 수 없음
+    FAILED = "failed"  # 검사하다 실패했다
+    SKIPPED_BUDGET = "skipped_budget"  # 예산이 없어 시작조차 못 했다
 
 
 @dataclass(frozen=True, slots=True)
@@ -548,14 +563,28 @@ class Candidate:
     hypothesis: str
     assigned_agent: str
     evidence_ids: tuple[str, ...]
-    status: str = "routed"
+    status: CandidateStatus = CandidateStatus.ROUTED
     # 이 Candidate만 실패했을 때의 사유. 다른 Candidate는 계속 진행하므로 실패를
     # Run 전체가 아니라 Candidate에 남겨야 무엇이 검사되지 않았는지 알 수 있다.
     last_error: str | None = None
     # 예산 때문에 건너뛴 Candidate가 어느 단계에서 멈췄는지. 재개할 때 이 값으로
     # 분석부터 다시 할지 검증만 다시 할지 정한다. 이것이 없으면 검증 직전에 멈춘
     # Candidate를 재개 시 처음부터 다시 분석하게 된다.
-    resume_status: str | None = None
+    resume_status: CandidateStatus | None = None
+
+    def __post_init__(self) -> None:
+        # 저장소에서 문자열로 복원한 값도 같은 검사를 통과시킨다. 알 수 없는 상태는
+        # 조용히 통과시키지 않고 여기서 막는다.
+        for field_name in ("status", "resume_status"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            try:
+                object.__setattr__(self, field_name, CandidateStatus(value))
+            except ValueError as error:
+                raise DomainInvariantError(
+                    f"unknown candidate status: {value!r}"
+                ) from error
 
     def add_evidence(self, evidence_ids: tuple[str, ...]) -> Candidate:
         """기존 순서를 유지하면서 중복 없이 Evidence 참조를 합친다."""
@@ -563,7 +592,7 @@ class Candidate:
         merged = tuple(dict.fromkeys((*self.evidence_ids, *evidence_ids)))
         return replace(self, evidence_ids=merged)
 
-    def set_status(self, status: str) -> Candidate:
+    def set_status(self, status: CandidateStatus) -> Candidate:
         """분석·검증 진행 상태가 변경된 Candidate 복사본을 만든다.
 
         정상 전이가 일어났다는 것은 이전에 남긴 실패·건너뜀 정보가 더 이상 현재를
@@ -579,7 +608,7 @@ class Candidate:
         남긴다. 사유가 없으면 실패한 Candidate가 안전한 Candidate처럼 보인다.
         """
 
-        return replace(self, status="failed", last_error=reason)
+        return replace(self, status=CandidateStatus.FAILED, last_error=reason)
 
     def skip_for_budget(self, reason: str) -> Candidate:
         """예산이 모자라 시도조차 하지 못한 Candidate로 표시한다.
@@ -592,12 +621,12 @@ class Candidate:
         # 이미 건너뛴 Candidate를 다시 건너뛸 때 원래 단계 정보를 잃지 않는다.
         origin = (
             self.resume_status
-            if self.status == CANDIDATE_SKIPPED_BUDGET
+            if self.status is CandidateStatus.SKIPPED_BUDGET
             else self.status
         )
         return replace(
             self,
-            status=CANDIDATE_SKIPPED_BUDGET,
+            status=CandidateStatus.SKIPPED_BUDGET,
             last_error=reason,
             resume_status=origin,
         )
