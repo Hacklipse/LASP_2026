@@ -272,4 +272,10 @@ def _credential_for(
                 "execution requested a credential that is not registered for this run"
             )
         return requested
+    # agent_credentials가 존재하면 유형별 인증을 명시적으로 분리한 다중 취약점
+    # Run이다. 이때 requested=None은 "기본값 사용"이 아니라 "이 유형은 무인증"을
+    # 뜻한다. Recon은 TaskFactory가 기본 credential_ref를 명시해서 이 분기의 영향을
+    # 받지 않고, 기존 단일 취약점 Run은 아래 기본값 호환 경로를 그대로 쓴다.
+    if run.agent_credentials:
+        return None
     return run.credential_ref

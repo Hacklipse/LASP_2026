@@ -18,7 +18,7 @@ from hacklipse.domain import (
 from hacklipse.ports import BudgetManager, RetryPolicy, TaskDispatcher, TaskStore
 from hacklipse.ports.errors import TaskTimeout
 
-from .errors import AgentContractError
+from .errors import AgentContractError, safe_error_reason
 
 
 class TaskExecutor:
@@ -69,7 +69,9 @@ class TaskExecutor:
             except Exception as error:
                 # 실패를 기록한 후 RetryPolicy에 다음 시도 여부를 위임한다.
                 record = record.with_status(
-                    TaskStatus.FAILED, attempts=attempt, error=str(error)
+                    TaskStatus.FAILED,
+                    attempts=attempt,
+                    error=safe_error_reason(error),
                 )
                 self._tasks.save(record)
                 self._notify("failed", envelope, attempt, time.monotonic() - started)

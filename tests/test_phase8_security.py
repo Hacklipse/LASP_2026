@@ -278,7 +278,10 @@ class Phase8AuthenticatedWorkflowTests(unittest.TestCase):
         with self.assertRaises(WorkflowExecutionError) as context:
             app.orchestrator.start(self._request())
 
-        self.assertIn("protected resource verification", str(context.exception))
+        self.assertEqual(context.exception.reason, "AuthenticationFailed")
+        self.assertIn(
+            "protected resource verification", str(context.exception.__cause__)
+        )
         self.assertEqual(_DvwaLikeHandler.authenticated_gets, 0)
 
     def test_login_post_is_blocked_without_explicit_approval(self) -> None:

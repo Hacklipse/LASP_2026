@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from hacklipse.domain import DomainInvariantError, Run, RunPhase
 
+from .errors import safe_error_reason
+
 
 class RunStateMachine:
     """상태 전이 규칙만 담당하며 Agent 호출이나 저장은 수행하지 않는다."""
@@ -36,4 +38,4 @@ class RunStateMachine:
         if run.phase in {RunPhase.DONE, RunPhase.FAILED}:
             return run
         failed = self.transition(run, RunPhase.FAILED)
-        return failed.with_updates(last_error=str(error))
+        return failed.with_updates(last_error=safe_error_reason(error))

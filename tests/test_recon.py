@@ -39,10 +39,21 @@ class _FakeCollector:
         self._evidence = evidence_store
         self._body = body
         self.calls: list[tuple[str, str]] = []
+        self.credential_refs: list[str | None] = []
 
-    def collect(self, run_id, target_url, spec, *, task_id, timeout_seconds=120.0):
+    def collect(
+        self,
+        run_id,
+        target_url,
+        spec,
+        *,
+        task_id,
+        timeout_seconds=120.0,
+        credential_ref=None,
+    ):
         del timeout_seconds
         self.calls.append((run_id, target_url))
+        self.credential_refs.append(credential_ref)
         evidence_id = f"evi-fetch-{task_id}-{len(self.calls)}"
         self._evidence.append(
             Evidence(
@@ -71,7 +82,13 @@ def _make_agent(*, body: str | None = _SAMPLE_HTML):
     return agent, evidence_store, surface_store
 
 
-def _task(run_id: str, target_url: str, *, allowed_tools=("http_get",)) -> TaskEnvelope:
+def _task(
+    run_id: str,
+    target_url: str,
+    *,
+    allowed_tools=("http_get",),
+    credential_ref: str | None = None,
+) -> TaskEnvelope:
     return TaskEnvelope(
         task_id=f"task-{run_id}",
         run_id=run_id,
@@ -79,6 +96,7 @@ def _task(run_id: str, target_url: str, *, allowed_tools=("http_get",)) -> TaskE
         target_url=target_url,
         allowed_tools=allowed_tools,
         request_budget=5,
+        credential_ref=credential_ref,
     )
 
 
@@ -273,10 +291,21 @@ class _RoutingCollector:
         self._evidence = evidence_store
         self._bodies = bodies
         self.calls: list[str] = []
+        self.credential_refs: list[str | None] = []
 
-    def collect(self, run_id, target_url, spec, *, task_id, timeout_seconds=120.0):
+    def collect(
+        self,
+        run_id,
+        target_url,
+        spec,
+        *,
+        task_id,
+        timeout_seconds=120.0,
+        credential_ref=None,
+    ):
         del timeout_seconds
         self.calls.append(target_url)
+        self.credential_refs.append(credential_ref)
         evidence_id = f"evi-page-{len(self.calls)}"
         self._evidence.append(
             Evidence(
@@ -311,6 +340,44 @@ def _crawling_agent(bodies: dict[str, str], **kwargs):
 
 
 class ReconCrawlTests(unittest.TestCase):
+    def test_fetches_an_authenticated_additional_seed_with_the_recon_credential(
+        self,
+    ) -> None:
+        agent, collector, surfaces = _crawling_agent(
+            {
+                "http://localhost/": "<html><body>spa</body></html>",
+                "http://localhost/profile": (
+                    '<form action="/profile" method="post">'
+                    '<input name="username"></form>'
+                ),
+            },
+            max_pages=2,
+            seed_urls=("http://localhost/profile",),
+        )
+
+        agent.handle(
+            _task(
+                "run-seeds",
+                "http://localhost/",
+                credential_ref="juice-ssti-session",
+            )
+        )
+
+        self.assertEqual(
+            collector.calls,
+            ["http://localhost/", "http://localhost/profile"],
+        )
+        self.assertEqual(
+            collector.credential_refs,
+            ["juice-ssti-session", "juice-ssti-session"],
+        )
+        profile = next(
+            item
+            for item in surfaces.list_by_run("run-seeds")
+            if item.url == "http://localhost/profile" and item.method == "POST"
+        )
+        self.assertEqual(profile.parameters, ("username",))
+
     def test_follows_links_and_finds_surfaces_on_later_pages(self) -> None:
         agent, collector, surfaces = _crawling_agent(
             {

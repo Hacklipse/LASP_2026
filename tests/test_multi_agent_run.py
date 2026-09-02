@@ -142,6 +142,71 @@ class TaskCredentialSeparationTests(unittest.TestCase):
 
         self.assertEqual(task.credential_ref, "juice-default")
 
+    def test_unauthenticated_type_reaches_runtime_without_the_default_session(
+        self,
+    ) -> None:
+        """Task의 None이 실제 실행 직전에 기본 세션으로 되돌아가면 안 된다."""
+
+        from hacklipse.bootstrap import build_local_application
+        from hacklipse.domain import EvidenceRequest, HttpRequestSpec
+
+        runtime = _FixtureRuntime()
+        app = build_local_application({}, runtime=runtime)
+        run = _run(
+            credential_ref="ssti-token",
+            agent_credentials=(("SSTI", "ssti-token"),),
+        )
+        app.stores.runs.add(run)
+        app.budget_manager.open_run(run.run_id, run.request_budget)
+        task = self.factory.evidence_collection(
+            run,
+            _candidate("SQLi", "sqli_analyzer"),
+            EvidenceRequest(
+                evidence_type="http_response",
+                surface_id="surface-1",
+                reason="SQLi control",
+                suggested_tool="http_get",
+                http_request=HttpRequestSpec(method="GET"),
+            ),
+            target_url="http://127.0.0.1:3000/rest/products/search",
+            agent_type="evidence_collector",
+            request_budget=5,
+        )
+
+        app.collector.handle(task)
+
+        self.assertEqual(len(runtime.requests), 1)
+        self.assertIsNone(task.credential_ref)
+        self.assertIsNone(runtime.requests[0].credential_ref)
+
+    def test_single_type_runtime_keeps_the_legacy_default_session(self) -> None:
+        """유형별 매핑이 없는 기존 Run의 호환 동작은 유지한다."""
+
+        from hacklipse.bootstrap import build_local_application
+        from hacklipse.domain import EvidenceRequest, HttpRequestSpec
+
+        runtime = _FixtureRuntime()
+        app = build_local_application({}, runtime=runtime)
+        run = _run(credential_ref="dvwa-session")
+        app.stores.runs.add(run)
+        app.budget_manager.open_run(run.run_id, run.request_budget)
+
+        app.collector.collect(
+            run.run_id,
+            "http://127.0.0.1:3000/search",
+            EvidenceRequest(
+                evidence_type="http_response",
+                surface_id="surface-1",
+                reason="legacy control",
+                suggested_tool="http_get",
+                http_request=HttpRequestSpec(method="GET"),
+            ),
+            task_id="task-legacy-runtime",
+            credential_ref=None,
+        )
+
+        self.assertEqual(runtime.requests[0].credential_ref, "dvwa-session")
+
 
 class _SurfaceOnlyReconAgent:
     """Observation 없이 입력 가능한 Surface 하나만 반환하는 Recon 대역.
@@ -209,7 +274,29 @@ class _RejectingValidator:
         )
 
 
-def _application(xss_analyzer):
+class _BlockingValidator:
+    def handle(self, task):
+        from hacklipse.domain import (
+            AgentResult,
+            AgentResultStatus,
+            ValidationResult,
+            ValidationVerdict,
+        )
+
+        return AgentResult(
+            task_id=task.task_id,
+            status=AgentResultStatus.COMPLETED,
+            validation=ValidationResult(
+                validation_id=task.validation_id or "",
+                run_id=task.run_id,
+                candidate_id=task.candidate_id,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence_ids=(),
+                reason="target response may contain token=do-not-store",
+            ),
+        )
+
+def _application(xss_analyzer, *, validation_agent=None):
     from hacklipse.bootstrap import build_local_application
 
     app = build_local_application({})
@@ -220,7 +307,11 @@ def _application(xss_analyzer):
     app.dispatcher.register(
         "sqli_analyzer", _CompletingAnalyzer(), allowed_tools=("http_get",)
     )
-    app.dispatcher.register("validation", _RejectingValidator(), allowed_tools=("http_get",))
+    app.dispatcher.register(
+        "validation",
+        validation_agent or _RejectingValidator(),
+        allowed_tools=("http_get",),
+    )
     return app
 
 
@@ -270,6 +361,31 @@ class CandidateFailureIsolationTests(unittest.TestCase):
             _start(app)
 
         self.assertEqual(caught.exception.phase, "analyze")
+
+    def test_error_payload_is_not_persisted_or_exposed_by_the_workflow(self) -> None:
+        """Agent 예외의 원문은 Task, Run, 최종 예외 어디에도 복사하지 않는다."""
+
+        from hacklipse.application.errors import (
+            AgentContractError,
+            WorkflowExecutionError,
+        )
+
+        secret = "token=sk-do-not-persist"
+        app = _application(_RaisingAnalyzer(AgentContractError(secret)))
+
+        with self.assertRaises(WorkflowExecutionError) as caught:
+            _start(app)
+
+        run = app.stores.runs.get(caught.exception.run_id)
+        failed_tasks = [
+            item for item in app.stores.tasks.list_by_run(run.run_id) if item.error
+        ]
+        stored = [run.last_error, *(item.error for item in failed_tasks)]
+        self.assertTrue(failed_tasks)
+        self.assertTrue(all(secret not in (item or "") for item in stored))
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertEqual(run.last_error, "AgentContractError")
+        self.assertEqual(caught.exception.reason, "AgentContractError")
 
     def test_missing_analyzer_still_fails_the_whole_run(self) -> None:
         """미등록 Agent는 설정 오류이므로 조용히 건너뛰지 않는다."""
@@ -582,6 +698,26 @@ class ProgressSnapshotTests(unittest.TestCase):
         self.assertNotIn("SQLi", by_type)
         self.assertNotIn(CandidateStatus.SKIPPED_BUDGET, {i.status for i in snapshot.unchecked})
 
+    def test_blocked_validation_is_visible_as_unchecked_with_a_safe_reason(self) -> None:
+        """BLOCKED를 완료로만 집계하면 검증하지 못한 Candidate가 숨는다."""
+
+        from hacklipse.application import build_progress_snapshot
+
+        app = _application(
+            _CompletingAnalyzer(), validation_agent=_BlockingValidator()
+        )
+        run = _start(app)
+
+        snapshot = build_progress_snapshot(run, stores=app.stores)
+        blocked = [item for item in snapshot.unchecked if item.status == "blocked"]
+
+        self.assertEqual(snapshot.validated_count, 2)
+        self.assertEqual(len(blocked), 2)
+        self.assertTrue(all(item.reason == "validation blocked" for item in blocked))
+        self.assertTrue(
+            all("do-not-store" not in (item.reason or "") for item in blocked)
+        )
+
     def test_budget_used_is_derived_from_the_manager(self) -> None:
         from hacklipse.application import build_progress_snapshot
         from hacklipse.bootstrap import build_local_application
@@ -801,6 +937,75 @@ class _EvidenceSeekingAnalyzer:
         )
 
 
+class _EvidenceSeekingConfirmingValidator:
+    """Candidate마다 자기 validation_id의 Evidence로만 Proof를 만드는 대역."""
+
+    def __init__(self, candidate_store, evidence_store) -> None:
+        self._candidates = candidate_store
+        self._evidence = evidence_store
+        self.results = {}
+
+    def handle(self, task):
+        from hacklipse.domain import (
+            AgentResult,
+            AgentResultStatus,
+            EvidenceRequest,
+            HttpRequestSpec,
+            ValidationProof,
+            ValidationProofType,
+            ValidationResult,
+            ValidationVerdict,
+        )
+
+        evidence = self._evidence.get_many(task.run_id, task.evidence_ids)
+        current_session = tuple(
+            item
+            for item in evidence
+            if item.validation_id == task.validation_id
+        )
+        if not current_session:
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=(
+                    EvidenceRequest(
+                        evidence_type="http_response",
+                        surface_id=task.surface_id,
+                        reason="independent validation control",
+                        suggested_tool="http_get",
+                        http_request=HttpRequestSpec(method="GET"),
+                    ),
+                ),
+            )
+
+        candidate = self._candidates.get(task.run_id, task.candidate_id or "")
+        proof_types = {
+            "XSS": ValidationProofType.XSS_EXECUTION,
+            "SQLi": ValidationProofType.SQLI_EFFECT,
+        }
+        evidence_ids = tuple(item.evidence_id for item in current_session)
+        result = ValidationResult(
+            validation_id=task.validation_id or "",
+            run_id=task.run_id,
+            candidate_id=candidate.candidate_id,
+            verdict=ValidationVerdict.CONFIRMED,
+            evidence_ids=evidence_ids,
+            reason="fixture reproduced the candidate",
+            reproduction_count=len(evidence_ids),
+            proof=ValidationProof(
+                proof_type=proof_types[candidate.vulnerability_type],
+                evidence_ids=evidence_ids,
+                summary="fixture proof from this validation session",
+            ),
+        )
+        self.results[candidate.candidate_id] = result
+        return AgentResult(
+            task_id=task.task_id,
+            status=AgentResultStatus.COMPLETED,
+            validation=result,
+        )
+
+
 def _evidence_application():
     from hacklipse.bootstrap import build_local_application
 
@@ -851,25 +1056,63 @@ class CandidateIsolationTests(unittest.TestCase):
     def test_validation_sessions_are_separate_per_candidate(self) -> None:
         """검증 세션이 섞이면 다른 Candidate 의 증적으로 확정될 수 있다."""
 
-        app, _ = _evidence_application()
+        from hacklipse.bootstrap import build_local_application
+
+        runtime = _FixtureRuntime()
+        app = build_local_application({}, runtime=runtime)
+        app.dispatcher.register(
+            "recon",
+            _SurfaceOnlyReconAgent(app.stores.surfaces),
+            allowed_tools=("http_get",),
+        )
+        for name, marker in (("xss_analyzer", "xss"), ("sqli_analyzer", "sqli")):
+            app.dispatcher.register(
+                name,
+                _EvidenceSeekingAnalyzer(marker),
+                allowed_tools=("http_get",),
+            )
+        validator = _EvidenceSeekingConfirmingValidator(
+            app.stores.candidates, app.stores.evidence
+        )
+        app.dispatcher.register(
+            "validation", validator, allowed_tools=("http_get",)
+        )
 
         run = _start(app)
 
-        sessions = {
-            item.validation_id
-            for item in app.stores.evidence.list_by_run(run.run_id)
-            if item.validation_id
-        }
-        # 검증이 증적을 요청하지 않는 대역이라 세션 Evidence 는 없지만,
-        # Analysis 증적에는 어떤 validation_id 도 붙어 있으면 안 된다.
-        self.assertEqual(sessions, set())
+        all_evidence = app.stores.evidence.list_by_run(run.run_id)
         analysis_evidence = [
             item
-            for item in app.stores.evidence.list_by_run(run.run_id)
-            if item.created_by.startswith("execution_runtime:")
+            for item in all_evidence
+            if item.validation_id is None
         ]
         self.assertTrue(analysis_evidence)
         self.assertTrue(all(item.validation_id is None for item in analysis_evidence))
+
+        validation_evidence = [
+            item for item in all_evidence if item.validation_id is not None
+        ]
+        sessions = {item.validation_id for item in validation_evidence}
+        findings = app.stores.findings.list_by_run(run.run_id)
+
+        self.assertEqual(len(sessions), 2)
+        self.assertEqual(len(findings), 2)
+        self.assertEqual({item.validation_id for item in findings}, sessions)
+        self.assertEqual(len(validator.results), 2)
+
+        finding_evidence = [set(item.evidence_ids) for item in findings]
+        self.assertFalse(finding_evidence[0] & finding_evidence[1])
+        for finding in findings:
+            result = validator.results[finding.candidate_id]
+            self.assertEqual(set(finding.evidence_ids), set(result.evidence_ids))
+            self.assertEqual(set(result.proof.evidence_ids), set(result.evidence_ids))
+            self.assertTrue(
+                all(
+                    item.validation_id == finding.validation_id
+                    for item in validation_evidence
+                    if item.evidence_id in finding.evidence_ids
+                )
+            )
 
 
 class ProgressScreenSafetyTests(unittest.TestCase):
@@ -964,6 +1207,56 @@ class ProgressTimingTests(unittest.TestCase):
             and event.sequence > started.sequence
         )
         self.assertGreater(completed.elapsed_ms - started.elapsed_ms, 0)
+
+    def test_each_new_run_restarts_sequence_and_elapsed_time(self) -> None:
+        """같은 Orchestrator를 재사용해도 Run별 시간축은 서로 독립적이어야 한다."""
+
+        from hacklipse.adapters import InMemoryProgressLog
+        from hacklipse.bootstrap import build_local_application
+        from hacklipse.domain import AgentResult, AgentResultStatus, Surface
+
+        class UniqueSurfaceReconAgent:
+            def __init__(self, surface_store) -> None:
+                self._surfaces = surface_store
+
+            def handle(self, task):
+                surface = Surface(
+                    surface_id=f"surface-{task.run_id}",
+                    run_id=task.run_id,
+                    url="http://localhost/search",
+                    method="GET",
+                    parameters=("q",),
+                )
+                self._surfaces.add(surface)
+                return AgentResult(
+                    task_id=task.task_id,
+                    status=AgentResultStatus.COMPLETED,
+                    surface_ids=(surface.surface_id,),
+                )
+
+        ticks = iter(n / 10 for n in range(500))
+        log = InMemoryProgressLog()
+        app = build_local_application({}, progress_sink=log, clock=lambda: next(ticks))
+        app.dispatcher.register(
+            "recon",
+            UniqueSurfaceReconAgent(app.stores.surfaces),
+            allowed_tools=("http_get",),
+        )
+        for name in ("xss_analyzer", "sqli_analyzer"):
+            app.dispatcher.register(
+                name, _CompletingAnalyzer(), allowed_tools=("http_get",)
+            )
+        app.dispatcher.register(
+            "validation", _RejectingValidator(), allowed_tools=("http_get",)
+        )
+
+        first = _start(app)
+        second = _start(app)
+
+        for run in (first, second):
+            events = log.list_by_run(run.run_id)
+            self.assertEqual(events[0].sequence, 1)
+            self.assertEqual(events[0].elapsed_ms, 0)
 
 
 if __name__ == "__main__":

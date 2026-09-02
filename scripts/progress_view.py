@@ -48,6 +48,7 @@ class _TypeState:
     analyzed: int = 0
     validated: int = 0
     findings: int = 0
+    blocked: int = 0
     unchecked: int = 0
     surface: str | None = None
     note: str | None = None
@@ -55,6 +56,8 @@ class _TypeState:
     spent_ms: int = 0
 
     def mark(self) -> str:
+        if self.blocked:
+            return _BROKEN
         if self.validated and self.validated >= self.candidates:
             return _DONE
         if self.unchecked:
@@ -70,6 +73,9 @@ class _TypeState:
         요청을 보내고 신호까지 남긴 뒤 독립 검증을 기다리는 중이다.
         """
 
+        if self.blocked:
+            suffix = f" {self.spent_ms / 1000:.1f}초" if self.spent_ms else ""
+            return f"차단 (검증 미완료){suffix}"
         if self.validated and self.validated >= self.candidates:
             spent = f" {self.spent_ms / 1000:.1f}초" if self.spent_ms else ""
             base = "완료" if not self.findings else f"완료 (Finding {self.findings})"
@@ -158,6 +164,8 @@ class RunProgressView:
             # 분석과 검증이 각각 완료를 알린다. 검증 완료에는 verdict가 실린다.
             if event.detail:
                 state.validated += 1
+                if event.detail == "blocked":
+                    state.blocked += 1
             else:
                 state.analyzed += 1
         elif kind is ProgressEventKind.FINDING_CREATED:

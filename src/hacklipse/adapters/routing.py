@@ -22,6 +22,9 @@ class RoutingRule:
     vulnerability_type: str
     agent_type: str
     priority: float = 0.5
+    # Observation 자체만으로는 부족한 Agent 계약(예: Path Traversal은 GET만)을
+    # 라우팅 단계에서 함께 표현한다. None이면 기존처럼 모든 메서드를 허용한다.
+    methods: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +85,13 @@ DEFAULT_RULES = (
     RoutingRule("reflection", "XSS", "xss_analyzer", 0.8),
     RoutingRule("sql_error", "SQLi", "sqli_analyzer", 0.8),
     RoutingRule("object_id_auth", "Access Control", "access_control_analyzer", 0.8),
-    RoutingRule("url_or_file_parameter", "Path Traversal", "path_traversal_analyzer", 0.6),
+    RoutingRule(
+        "url_or_file_parameter",
+        "Path Traversal",
+        "path_traversal_analyzer",
+        0.6,
+        methods=("GET",),
+    ),
     RoutingRule("template_error", "SSTI", "ssti_analyzer", 0.7),
     RoutingRule("template_execution", "SSTI", "ssti_analyzer", 0.9),
 )
@@ -133,6 +142,18 @@ class RuleBasedVulnerabilityRouter:
             rule = self._rules.get(observation_type)
             if rule is None or item.surface_id is None:
                 continue
+            if rule.methods is not None:
+                surface = next(
+                    (
+                        candidate_surface
+                        for candidate_surface in surfaces
+                        if candidate_surface.surface_id == item.surface_id
+                        and candidate_surface.run_id == run.run_id
+                    ),
+                    None,
+                )
+                if surface is None or surface.method.upper() not in rule.methods:
+                    continue
             key = (item.surface_id, rule.vulnerability_type)
             # 동일 Surface와 취약점 유형 조합은 하나의 Candidate만 생성한다.
             if key in decisions:

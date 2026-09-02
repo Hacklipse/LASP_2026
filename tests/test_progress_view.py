@@ -99,6 +99,27 @@ class ProgressFoldingTests(unittest.TestCase):
         self.assertIn("중단 (예산 부족)", output)
         self.assertNotIn("XSS       완료", output)
 
+    def test_blocked_verdict_is_not_shown_as_completed(self) -> None:
+        """검증 호출이 끝난 것과 검증에 성공한 것은 다른 상태다."""
+
+        view, stream = _view(tty=False)
+        emit = _Emitter(view)
+        emit(ProgressEventKind.CANDIDATE_QUEUED, phase="route", vulnerability_type="XSS")
+        emit(ProgressEventKind.AGENT_STARTED, vulnerability_type="XSS")
+        emit(ProgressEventKind.AGENT_COMPLETED, vulnerability_type="XSS")
+        emit(ProgressEventKind.AGENT_STARTED, phase="validate", vulnerability_type="XSS")
+        emit(
+            ProgressEventKind.AGENT_COMPLETED,
+            phase="validate",
+            vulnerability_type="XSS",
+            detail="blocked",
+        )
+        view.close()
+
+        output = stream.getvalue()
+        self.assertIn("차단 (검증 미완료)", output)
+        self.assertNotIn("XSS       완료", output)
+
 
 class TerminalCompatibilityTests(unittest.TestCase):
     """TTY 와 non-TTY 에서 출력이 서로 다르게, 그러나 둘 다 온전해야 한다."""

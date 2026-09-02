@@ -316,6 +316,7 @@ def register_standard_agents(
     *,
     llm_client: LlmClient | None = None,
     recon_max_pages: int = DEFAULT_MAX_PAGES,
+    recon_seed_urls: tuple[str, ...] = (),
     actor_object_id: str | None = None,
     owner_object_id: str | None = None,
 ) -> str:
@@ -333,6 +334,7 @@ def register_standard_agents(
             evidence_store=app.stores.evidence,
             surface_store=app.stores.surfaces,
             max_pages=recon_max_pages,
+            seed_urls=recon_seed_urls,
         ),
         allowed_tools=("http_get",),
     )

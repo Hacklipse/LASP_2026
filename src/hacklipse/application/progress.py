@@ -32,7 +32,11 @@ _VALIDATED_STATUSES = frozenset(
 )
 # 검사를 끝내지 못한 상태. "검사했는데 없었다"와 구분해서 보여줘야 한다.
 _UNCHECKED_STATUSES = frozenset(
-    {CandidateStatus.FAILED, CandidateStatus.SKIPPED_BUDGET}
+    {
+        CandidateStatus.FAILED,
+        CandidateStatus.SKIPPED_BUDGET,
+        CandidateStatus.BLOCKED,
+    }
 )
 
 

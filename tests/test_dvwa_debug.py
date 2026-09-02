@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import unittest
+from collections import Counter
 
 from scripts.run_dvwa_baseline import (
     _DebugAuditLog,
     _DebugProgress,
     _ProgressLlmClient,
+    _print_summary,
     _safe_llm_content,
     _safe_log_value,
 )
@@ -32,6 +36,25 @@ class _FakeLlmClient:
 
 
 class DvwaDebugTests(unittest.TestCase):
+    def test_summary_aligns_the_path_traversal_count_with_other_signals(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            _print_summary(
+                profile="llm/gemini",
+                vuln="path_traversal",
+                phase="done",
+                candidate_counts=Counter({"Path Traversal": 1}),
+                reflection_count=0,
+                sql_error_count=0,
+                object_id_auth_count=0,
+                path_traversal_count=1,
+                browser_execution_count=0,
+                audited_execution_count=3,
+                finding_counts=Counter(),
+            )
+
+        self.assertIn("  OS 파일 읽기    1개", output.getvalue())
+
     def test_llm_progress_reports_timing_and_usage_without_request_content(self) -> None:
         messages: list[str] = []
         progress = _DebugProgress(True, writer=messages.append)

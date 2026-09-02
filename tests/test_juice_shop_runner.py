@@ -13,9 +13,26 @@ sys.path.insert(0, str(_SCRIPTS))
 
 from run_juice_shop_baseline import (  # noqa: E402
     _ProvisionedAccount,
+    _all_mode_recon_seeds,
     _cleanup_provisioned_accounts,
     _resolve_juice_shop_db,
 )
+
+
+class JuiceShopAllModeTests(unittest.TestCase):
+    def test_authenticated_all_mode_adds_the_profile_as_a_recon_seed(self) -> None:
+        self.assertEqual(
+            _all_mode_recon_seeds(
+                "http://127.0.0.1:3000/", include_ssti=True
+            ),
+            ("http://127.0.0.1:3000/profile",),
+        )
+        self.assertEqual(
+            _all_mode_recon_seeds(
+                "http://127.0.0.1:3000/", include_ssti=False
+            ),
+            (),
+        )
 
 
 class JuiceShopTemporaryAccountCleanupTests(unittest.TestCase):

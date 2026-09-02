@@ -409,7 +409,7 @@ def _print_summary(
     print(f"  Reflection      {reflection_count}개")
     print(f"  SQL 오류        {sql_error_count}개")
     print(f"  객체 권한 우회  {object_id_auth_count}개")
-    print(f"  OS 파일 읽기 {path_traversal_count}개")
+    print(f"  OS 파일 읽기    {path_traversal_count}개")
     print(f"  XSS 실행        {browser_execution_count}개")
     print()
     print("[최종 판정]")

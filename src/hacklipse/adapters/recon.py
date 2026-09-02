@@ -20,7 +20,7 @@ LLM을 쓰지 않는다: 크롤링과 폼 추출은 결정적 작업이라 판�
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from urllib.parse import parse_qsl, urljoin, urlsplit
 from uuid import uuid4
 
@@ -114,6 +114,7 @@ class ReconAgent:
         surface_store: SurfaceStore,
         max_pages: int = DEFAULT_MAX_PAGES,
         max_scripts: int = DEFAULT_MAX_SCRIPTS,
+        seed_urls: Sequence[str] = (),
         id_factory: Callable[[], str] | None = None,
     ) -> None:
         if max_pages < 1:
@@ -123,6 +124,7 @@ class ReconAgent:
         self._surfaces = surface_store
         self._max_pages = max_pages
         self._max_scripts = max_scripts
+        self._seed_urls = tuple(dict.fromkeys(seed_urls))
         self._id_factory = id_factory or (lambda: str(uuid4()))
 
     def handle(self, task: TaskEnvelope) -> AgentResult:
@@ -136,7 +138,13 @@ class ReconAgent:
         origin = urlsplit(task.target_url)
         page_budget = self._page_budget(task)
 
-        pending: list[str] = [task.target_url]
+        for seed_url in self._seed_urls:
+            if not _same_origin(seed_url, origin):
+                raise AgentContractError("recon seed URL belongs to another origin")
+        # SPA 홈페이지와 별도 서버 렌더링 페이지처럼 서로 링크되지 않은 진입점을
+        # 한 Recon 세션에서 함께 탐색할 수 있다. Juice Shop의 인증된 /profile이
+        # 대표적이다.
+        pending = list(dict.fromkeys((task.target_url, *self._seed_urls)))
         fetched: set[str] = set()
         scripts: list[str] = []
         evidence_ids: list[str] = []
@@ -240,6 +248,9 @@ class ReconAgent:
             ),
             task_id=task.task_id,
             timeout_seconds=task.timeout_seconds,
+            # Recon은 특정 취약점 Agent가 아니므로 Run 기본 세션을 쓴다. TaskFactory가
+            # 선택한 참조를 전달하지 않으면 다중 취약점 Run에서 무인증으로 바뀐다.
+            credential_ref=task.credential_ref,
         )
         return evidence_id, self._evidence.get(task.run_id, evidence_id)
 

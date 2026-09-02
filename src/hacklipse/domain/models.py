@@ -592,14 +592,17 @@ class Candidate:
         merged = tuple(dict.fromkeys((*self.evidence_ids, *evidence_ids)))
         return replace(self, evidence_ids=merged)
 
-    def set_status(self, status: CandidateStatus) -> Candidate:
+    def set_status(
+        self, status: CandidateStatus, *, reason: str | None = None
+    ) -> Candidate:
         """분석·검증 진행 상태가 변경된 Candidate 복사본을 만든다.
 
         정상 전이가 일어났다는 것은 이전에 남긴 실패·건너뜀 정보가 더 이상 현재를
-        설명하지 않는다는 뜻이므로 함께 지운다.
+        설명하지 않는다는 뜻이므로 함께 지운다. 다만 BLOCKED처럼 판정은 끝났지만
+        검증을 완료하지 못한 상태는 일반화된 사유를 명시적으로 보존할 수 있다.
         """
 
-        return replace(self, status=status, last_error=None, resume_status=None)
+        return replace(self, status=status, last_error=reason, resume_status=None)
 
     def fail(self, reason: str) -> Candidate:
         """이 Candidate만 실패로 표시한다.

@@ -35,7 +35,7 @@ from hacklipse.ports import (
 )
 from hacklipse.ports.errors import AgentUnavailable, BudgetExceeded
 
-from .errors import AgentContractError, WorkflowExecutionError
+from .errors import AgentContractError, WorkflowExecutionError, safe_error_reason
 from .state_machine import RunStateMachine
 from .task_executor import TaskExecutor
 from .task_factory import TaskFactory
@@ -130,6 +130,10 @@ class Orchestrator:
         # Run과 예산을 먼저 등록한 뒤 첫 단계인 RECON으로 전이한다.
         self._runs.add(run)
         self._budget.open_run(run.run_id, run.request_budget)
+        # Orchestrator 인스턴스를 재사용해도 진행 순번과 경과 시간은 Run마다 새로
+        # 시작해야 한다. 그렇지 않으면 두 번째 Run의 단계 비용이 첫 Run까지 포함한다.
+        self._sequence = 0
+        self._started_at = None
         self._emit(run, ProgressEventKind.RUN_STARTED, detail=run.policy_profile)
         run = self._state.transition(run, RunPhase.RECON)
         self._runs.save(run)
@@ -192,7 +196,9 @@ class Orchestrator:
             # 하위 컴포넌트 실패도 Run의 FAILED 상태와 원인으로 일관되게 남긴다.
             failed = self._state.fail(run, error)
             self._runs.save(failed)
-            raise WorkflowExecutionError(run.run_id, run.phase.value, str(error)) from error
+            raise WorkflowExecutionError(
+                run.run_id, run.phase.value, safe_error_reason(error)
+            ) from error
 
     def _recon(self, run: Run) -> Run:
         """Recon Task를 실행하고 새 Evidence·Surface 참조를 Run에 병합한다."""
@@ -505,7 +511,11 @@ class Orchestrator:
                 agent_type=self._config.validation_agent_type,
                 candidate=candidate,
             )
-        candidate = candidate.set_status(CandidateStatus(validation.verdict.value))
+        status = CandidateStatus(validation.verdict.value)
+        # Validator의 reason은 외부 응답을 포함할 수 있어 그대로 저장하지 않는다.
+        # BLOCKED는 판정은 났지만 검증을 완료하지 못했다는 사실만 일반화해 남긴다.
+        reason = "validation blocked" if status is CandidateStatus.BLOCKED else None
+        candidate = candidate.set_status(status, reason=reason)
         self._candidates.save(candidate)
         self._emit(
             current,
@@ -531,9 +541,11 @@ class Orchestrator:
             raise error
         if isinstance(error, BudgetExceeded):
             # 예산 부족은 대상의 문제도 Agent의 결함도 아니다. 실행하지 못한 것이다.
-            return self._skip_candidate_for_budget(run, candidate_id, str(error))
+            return self._skip_candidate_for_budget(
+                run, candidate_id, "BudgetExceeded: request budget exhausted"
+            )
         candidate = self._candidates.get(run.run_id, candidate_id)
-        self._candidates.save(candidate.fail(f"{type(error).__name__}: {error}"))
+        self._candidates.save(candidate.fail(safe_error_reason(error)))
         self._emit(
             run,
             ProgressEventKind.CANDIDATE_FAILED,

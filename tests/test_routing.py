@@ -113,6 +113,30 @@ class SurfaceRoutingTests(unittest.TestCase):
 
         self.assertEqual(decisions, ())
 
+    def test_path_traversal_observation_does_not_route_a_post_upload_surface(self) -> None:
+        """파일명 파라미터가 있어도 POST 업로드는 GET 전용 Agent로 보내지 않는다."""
+
+        router = RuleBasedVulnerabilityRouter()
+        evidence = Evidence(
+            evidence_id="evi-file-upload",
+            run_id="run-1",
+            surface_id="surface-search",
+            created_by="recon",
+            evidence_type="observation",
+            observation={
+                "type": "url_or_file_parameter",
+                "parameter": "file",
+            },
+        )
+
+        decisions = router.route(
+            _run(),
+            (_surface(method="POST", parameters=("file",)),),
+            (evidence,),
+        )
+
+        self.assertEqual(decisions, ())
+
 
 class _SurfaceOnlyReconAgent:
     """Observation 없이 입력 가능한 Surface 하나만 반환하는 Recon 대역."""

@@ -133,6 +133,16 @@ def _format_counts(counts: Counter[str]) -> str:
     return ", ".join(f"{name} {count}개" for name, count in counts.items())
 
 
+def _all_mode_recon_seeds(base_url: str, *, include_ssti: bool) -> tuple[str, ...]:
+    """전체 모드에서 SPA와 별도로 방문해야 하는 인증 Surface를 반환한다."""
+
+    if not include_ssti:
+        return ()
+    profile_path = _VULN_TARGETS["ssti"].seed_path
+    assert profile_path is not None
+    return (urljoin(base_url, profile_path),)
+
+
 def _response_json(result, *, operation: str, statuses: tuple[int, ...]) -> dict:
     status = result.observation.get("status")
     body = result.observation.get("body")
@@ -482,6 +492,7 @@ def main(argv: list[str]) -> int:
         )
 
     agent_credentials: tuple[tuple[str, str], ...] = ()
+    recon_seed_urls: tuple[str, ...] = ()
     if run_all:
         # 전체 모드가 다루는 것은 Recon이 시작 페이지에서 찾아낼 수 있는 유형뿐이다.
         # Access Control은 /rest/basket/{id}처럼 구체적인 객체 ID가 있어야 성립하는데,
@@ -510,6 +521,10 @@ def main(argv: list[str]) -> int:
             run_credential_ref = _CREDENTIAL_REF
             # 유형별 등록. SQLi·XSS는 여기 없으므로 자격증명 없이 실행된다.
             agent_credentials = (("SSTI", _CREDENTIAL_REF),)
+            # SPA 홈페이지에는 서버 렌더링 /profile 폼으로 가는 일반 링크가 없다.
+            # 홈페이지의 공개 API Surface와 인증된 SSTI Surface를 모두 명시적으로
+            # Recon seed로 사용한다.
+            recon_seed_urls = _all_mode_recon_seeds(base_url, include_ssti=True)
             print(
                 "  SSTI 포함: username을 control/산술식으로 바꾼 뒤 "
                 f"{SSTI_CLEANUP_VALUE!r}(으)로 정리합니다."
@@ -621,6 +636,7 @@ def main(argv: list[str]) -> int:
             app,
             llm_client=llm_client,
             recon_max_pages=_ALL_MODE_RECON_PAGES if run_all else 1,
+            recon_seed_urls=recon_seed_urls,
             actor_object_id=actor_object_id,
             owner_object_id=owner_object_id,
         )
