@@ -241,7 +241,13 @@ def build_local_application(
     )
     # Sink를 주지 않아도 진행 사건을 남긴다. 실행이 끝난 뒤 무슨 일이 있었는지
     # 되짚을 수 있어야 하고, 보관 비용은 사건 몇십 개뿐이다.
-    selected_progress = progress_sink or InMemoryProgressLog()
+    # 저장소가 영속이면 진행 사건도 같은 파일에 남긴다. 작업은 복원되는데 진행
+    # 상태만 사라지면 재개 화면이 "아무 일도 없었다"로 보인다.
+    selected_progress = (
+        progress_sink
+        or getattr(selected_stores, "progress", None)
+        or InMemoryProgressLog()
+    )
     orchestrator = Orchestrator(
         run_store=selected_stores.runs,
         evidence_store=selected_stores.evidence,

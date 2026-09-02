@@ -224,6 +224,11 @@ class InMemoryProgressLog:
     def list_by_run(self, run_id: str) -> tuple[ProgressEvent, ...]:
         return tuple(sorted(self._events.get(run_id, ()), key=lambda item: item.sequence))
 
+    def last_sequence(self, run_id: str) -> int:
+        """저장된 마지막 순번. 사건이 없으면 0."""
+
+        return max(self._seen.get(run_id, ()), default=0)
+
 
 class CallbackProgressLog(InMemoryProgressLog):
     """보관과 동시에 콜백으로 흘려보내는 Sink. 실시간 화면이 이걸 쓴다."""

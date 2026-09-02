@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol
 
 from hacklipse.domain import (
@@ -47,3 +48,16 @@ class ProgressSink(Protocol):
     """
 
     def emit(self, event: ProgressEvent) -> None: ...
+
+
+class ProgressLog(ProgressSink, Protocol):
+    """받은 사건을 되짚을 수 있는 Sink.
+
+    중단된 Run을 다시 읽을 때 두 가지가 필요하다. 이미 알린 사건을 화면이 복원할 수
+    있어야 하고, 새 사건의 순번이 저장된 순번과 겹치지 않아야 한다. 겹치면 중복으로
+    걸러져 재개 구간이 통째로 사라진다.
+    """
+
+    def list_by_run(self, run_id: str) -> Sequence[ProgressEvent]: ...
+
+    def last_sequence(self, run_id: str) -> int: ...

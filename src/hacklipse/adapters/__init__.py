@@ -35,7 +35,7 @@ from .security import (
 from .validation import ValidationAgent
 from .xss_analysis import HeuristicXssAnalyzer
 from .sqlite_budget import SQLiteBudgetManager
-from .sqlite_store import SQLiteStoreBundle
+from .sqlite_store import SQLiteProgressLog, SQLiteStoreBundle
 
 __all__ = [
     "AllowlistPolicyGate",
@@ -74,6 +74,7 @@ __all__ = [
     "ValidationAgent",
     "SQLiteBudgetManager",
     "SQLiteExecutionAuditLog",
+    "SQLiteProgressLog",
     "SQLiteStoreBundle",
     "StaticApprovalGate",
 ]
