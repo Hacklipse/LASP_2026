@@ -890,10 +890,16 @@ class ProgressEvent:
     detail: str | None = None
     budget_used: int = 0
     budget_total: int = 0
+    # Run 시작 이후 경과 시간. 벽시계 시각이 아니라 경과값이라 재현 실행 사이에 비교할
+    # 수 있고, 두 이벤트를 빼면 그 구간에 걸린 시간이 나온다. 브라우저 검증처럼 비싼
+    # 단계의 비용을 재는 근거가 된다.
+    elapsed_ms: int = 0
 
     def __post_init__(self) -> None:
         if self.sequence < 0:
             raise DomainInvariantError("progress event sequence cannot be negative")
+        if self.elapsed_ms < 0:
+            raise DomainInvariantError("progress event elapsed time cannot be negative")
         if self.surface_path is not None and (
             "?" in self.surface_path or "#" in self.surface_path
         ):

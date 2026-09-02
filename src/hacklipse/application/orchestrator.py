@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from uuid import uuid4
@@ -87,6 +88,7 @@ class Orchestrator:
         config: OrchestratorConfig | None = None,
         id_factory: Callable[[], str] | None = None,
         progress_sink: ProgressSink | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._runs = run_store
         self._evidence = evidence_store
@@ -104,6 +106,10 @@ class Orchestrator:
         self._id_factory = id_factory or (lambda: str(uuid4()))
         self._progress = progress_sink
         self._sequence = 0
+        # 경과 시간만 쓰므로 단조 시계를 쓴다. 시스템 시각이 바뀌어도 구간 길이가
+        # 음수가 되지 않는다. 테스트는 결정적 시계를 주입한다.
+        self._clock = clock or time.monotonic
+        self._started_at: float | None = None
 
     def start(self, request: RunRequest) -> Run:
         """사용자 입력을 검증하고 새로운 Run을 생성한 뒤 실행한다."""
@@ -218,6 +224,9 @@ class Orchestrator:
 
         if self._progress is None:
             return
+        now = self._clock()
+        if self._started_at is None:
+            self._started_at = now
         self._sequence += 1
         try:
             used = max(0, run.request_budget - self._budget.remaining(run.run_id))
@@ -237,6 +246,7 @@ class Orchestrator:
                 detail=detail,
                 budget_used=used,
                 budget_total=run.request_budget,
+                elapsed_ms=max(0, int((now - self._started_at) * 1000)),
             )
         )
 

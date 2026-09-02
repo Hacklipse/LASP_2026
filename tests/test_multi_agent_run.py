@@ -913,5 +913,58 @@ class ProgressScreenSafetyTests(unittest.TestCase):
         self.assertIn("AuthenticationFailed", output)
 
 
+class ProgressTimingTests(unittest.TestCase):
+    """이벤트 사이의 시간 차이가 그 구간에 걸린 비용이다.
+
+    비싼 검증을 우선순위에 반영하려면 어느 단계가 얼마나 걸리는지 알아야 한다.
+    """
+
+    def test_elapsed_time_is_monotonic_and_measures_steps(self) -> None:
+        from hacklipse.adapters import InMemoryProgressLog
+        from hacklipse.bootstrap import build_local_application
+        from hacklipse.domain import ProgressEventKind
+
+        ticks = iter([0.0] + [n / 10 for n in range(1, 200)])
+        log = InMemoryProgressLog()
+        app = build_local_application({}, progress_sink=log, clock=lambda: next(ticks))
+        app.dispatcher.register(
+            "recon",
+            _SurfaceOnlyReconAgent(app.stores.surfaces),
+            allowed_tools=("http_get",),
+        )
+        for name in ("xss_analyzer", "sqli_analyzer"):
+            app.dispatcher.register(
+                name, _CompletingAnalyzer(), allowed_tools=("http_get",)
+            )
+        app.dispatcher.register(
+            "validation", _RejectingValidator(), allowed_tools=("http_get",)
+        )
+
+        run = _start(app)
+        events = log.list_by_run(run.run_id)
+
+        # 경과 시간은 줄지 않는다. 시스템 시각이 바뀌어도 구간이 음수가 되면 안 된다.
+        elapsed = [event.elapsed_ms for event in events]
+        self.assertEqual(elapsed, sorted(elapsed))
+        self.assertEqual(elapsed[0], 0)
+        self.assertGreater(elapsed[-1], 0)
+
+        # 한 Candidate의 분석 구간을 두 이벤트의 차이로 잴 수 있다.
+        started = next(
+            event
+            for event in events
+            if event.kind is ProgressEventKind.AGENT_STARTED
+            and event.vulnerability_type == "XSS"
+        )
+        completed = next(
+            event
+            for event in events
+            if event.kind is ProgressEventKind.AGENT_COMPLETED
+            and event.vulnerability_type == "XSS"
+            and event.sequence > started.sequence
+        )
+        self.assertGreater(completed.elapsed_ms - started.elapsed_ms, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

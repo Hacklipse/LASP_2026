@@ -51,6 +51,8 @@ class _TypeState:
     unchecked: int = 0
     surface: str | None = None
     note: str | None = None
+    started_ms: int = 0
+    spent_ms: int = 0
 
     def mark(self) -> str:
         if self.validated and self.validated >= self.candidates:
@@ -69,7 +71,9 @@ class _TypeState:
         """
 
         if self.validated and self.validated >= self.candidates:
-            return "완료" if not self.findings else f"완료 (Finding {self.findings})"
+            spent = f" {self.spent_ms / 1000:.1f}초" if self.spent_ms else ""
+            base = "완료" if not self.findings else f"완료 (Finding {self.findings})"
+            return base + spent
         if self.unchecked:
             return f"중단 ({self.note})" if self.note else "중단"
         if self.running:
@@ -142,11 +146,15 @@ class RunProgressView:
             state.candidates += 1
         elif kind is ProgressEventKind.AGENT_STARTED:
             state.running += 1
+            state.started_ms = event.elapsed_ms
             state.surface = event.surface_path or state.surface
         elif kind is ProgressEventKind.EVIDENCE_COLLECTED:
             state.surface = event.surface_path or state.surface
         elif kind is ProgressEventKind.AGENT_COMPLETED:
             state.running = max(0, state.running - 1)
+            # 시작과 완료의 차이가 그 단계에 걸린 시간이다. 비싼 검증을 우선순위에
+            # 반영하려면 이 값이 필요하다.
+            state.spent_ms += max(0, event.elapsed_ms - state.started_ms)
             # 분석과 검증이 각각 완료를 알린다. 검증 완료에는 verdict가 실린다.
             if event.detail:
                 state.validated += 1

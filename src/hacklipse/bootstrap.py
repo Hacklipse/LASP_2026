@@ -157,6 +157,7 @@ def build_local_application(
     task_progress_callback: Callable[[str, TaskEnvelope, int, float], None]
     | None = None,
     progress_sink: ProgressSink | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> LocalApplication:
     """기본적으로 네트워크를 활성화하지 않는 로컬 시스템을 조립한다."""
 
@@ -255,6 +256,7 @@ def build_local_application(
         task_factory=TaskFactory(),
         config=selected_config,
         progress_sink=selected_progress,
+        clock=clock,
     )
     return LocalApplication(
         orchestrator=orchestrator,
