@@ -38,7 +38,10 @@ from hacklipse.domain import (
 )
 from hacklipse.ports import EvidenceStore, SurfaceStore
 
-from .path_traversal_analysis import RESTRICTED_FILE_OBSERVATION
+from .path_traversal_analysis import (
+    RESTRICTED_FILE_OBSERVATION,
+    UNLINKED_RENDER_PARAMETER_OBSERVATION,
+)
 
 # HttpExecutionRuntime이 GET 실행에 사용하는 도구 이름과 맞춘다(tests/test_http_runtime.py).
 RECON_TOOL = "http_get"
@@ -58,6 +61,12 @@ _JS_PATH = re.compile(
 # URL의 일부이므로 제외한다 — 이 필터가 없으면 소셜 공유 링크가 전부 섞여 들어온다.
 _JS_PATH_PARAM = re.compile(
     r"""(?<![/A-Za-z0-9._~-])(/[A-Za-z0-9][A-Za-z0-9._~/-]{0,100})\?([A-Za-z0-9_]{1,40})="""
+)
+# SPA가 서버 렌더링 문서로 빠져나갈 때 쓰는 navigation sink. 단순 경로 리터럴과
+# 달리 실제 HTML 문서일 가능성이 높으므로, 번들에서 발견한 뒤 예산 안에서 방문한다.
+# 특정 제품의 경로 이름이 아니라 브라우저 API와 상대경로의 결합만 본다.
+_JS_DOCUMENT_NAVIGATION = re.compile(
+    r"""(?:window\.)?location\.(?:assign|replace)\([^)]{0,160}?["'`](/[A-Za-z0-9][A-Za-z0-9._~/-]{0,100})["'`]"""
 )
 
 # 결정적 Recon 단계에서 실제 요청 없이도 판단할 수 있는 유일한 신호: 파라미터 "이름"이
@@ -112,6 +121,11 @@ _RESTRICTED_FILE_EXTENSIONS = (
     ".yaml",
     ".yml",
 )
+
+# HTML 폼에 노출되지 않아도 서버 템플릿 엔진이 공통적으로 해석하는 렌더 옵션.
+# Recon은 이를 관측값으로 가장하지 않고 ``source``가 붙은 추론 Evidence로 남긴다.
+# 능동 POST는 Analysis의 승인·고정 safe-file 경계 뒤에서만 일어난다.
+_UNLINKED_RENDER_PARAMETERS = ("layout",)
 
 _MAX_SCRIPT_BYTES = 4 * 1024 * 1024
 _PATH_OBJECT_ID = re.compile(r"^[0-9]{1,10}$")
@@ -206,6 +220,7 @@ class ReconAgent:
         pending = list(dict.fromkeys((task.target_url, *self._seed_urls)))
         fetched: set[str] = set()
         scripts: list[str] = []
+        document_pages: set[str] = set()
         evidence_ids: list[str] = []
         # 발견과 수집은 다르다 — 크롤링 예산이 모자라도 발견한 URL은 Surface로 남긴다.
         # (url, method, parameters) 조합으로 중복을 막는다.
@@ -261,7 +276,13 @@ class ReconAgent:
 
                 links, forms, sources = _parse_page(body, url)
                 for form_url, method, names in forms:
-                    remember(form_url, method, names)
+                    form_surface_id = remember(form_url, method, names)
+                    if method == "POST" and url in document_pages:
+                        evidence_ids.extend(
+                            self._flag_unlinked_render_parameters(
+                                task.run_id, form_surface_id
+                            )
+                        )
                 for link in links:
                     if not _same_origin(link, origin):
                         continue
@@ -279,11 +300,15 @@ class ReconAgent:
         affordable = max(min(self._max_scripts, page_budget - len(fetched)), 0)
         for source in scripts[:affordable]:
             fetched.add(source)
-            for url, names in self._discover_from_script(task, source, origin):
+            for url, names, should_crawl in self._discover_from_script(
+                task, source, origin
+            ):
                 remember(url, "GET", names)
-                # 번들이 가리킨 디렉터리는 목록을 내줄 수 있다. 그 안의 파일은
-                # 번들에 이름이 없으므로 이어서 크롤링해야만 발견된다.
-                if url.endswith("/") and url not in fetched and url not in pending:
+                # 번들이 가리킨 디렉터리와 서버 문서 navigation은 실제 응답을 봐야
+                # 내부 파일이나 HTML 폼을 발견할 수 있다.
+                if should_crawl:
+                    document_pages.add(url)
+                if should_crawl and url not in fetched and url not in pending:
                     pending.append(url)
         # 번들에서 찾은 디렉터리 목록을 남은 예산 안에서 마저 본다.
         crawl()
@@ -328,7 +353,7 @@ class ReconAgent:
 
     def _discover_from_script(
         self, task: TaskEnvelope, source: str, origin
-    ) -> list[tuple[str, tuple[str, ...]]]:
+    ) -> list[tuple[str, tuple[str, ...], bool]]:
         """JS 번들을 받아 경로 리터럴에서 Surface 후보를 만든다."""
 
         _, evidence = self._fetch(task, source, None)
@@ -339,17 +364,27 @@ class ReconAgent:
         parameters: dict[str, set[str]] = {}
         for match in _JS_PATH_PARAM.finditer(body):
             parameters.setdefault(match.group(1), set()).add(match.group(2))
+        document_paths = {
+            match.group(1) for match in _JS_DOCUMENT_NAVIGATION.finditer(body)
+        }
         paths = {match.group(1) for match in _JS_PATH.finditer(body)}
         paths.update(parameters)
         paths.update(match.group(1) for match in _JS_DIRECTORY.finditer(body))
 
         base = f"{origin.scheme}://{origin.netloc}"
+        # 실제 문서 이동을 먼저 방문한다. 일반 경로 수십 개를 정렬한 뒤 예산이
+        # 소진되어 중요한 서버 렌더링 폼을 놓치는 일을 막는다.
+        ordered_paths = (*sorted(document_paths), *sorted(paths - document_paths))
         found = [
-            (f"{base}{path}", tuple(sorted(parameters.get(path, ()))))
-            for path in sorted(paths)
+            (
+                f"{base}{path}",
+                tuple(sorted(parameters.get(path, ()))),
+                path in document_paths or path.endswith("/"),
+            )
+            for path in ordered_paths
         ]
         found.extend(
-            (f"{base}/#/{route}", names)
+            (f"{base}/#/{route}", names, False)
             for route, names in sorted(_client_routes(body).items())
         )
         return found
@@ -417,6 +452,31 @@ class ReconAgent:
                     created_by="recon",
                     evidence_type="observation",
                     observation={"type": "url_or_file_parameter", "parameter": name},
+                )
+            )
+            evidence_ids.append(evidence_id)
+        return evidence_ids
+
+    def _flag_unlinked_render_parameters(
+        self, run_id: str, surface_id: str
+    ) -> list[str]:
+        """서버 렌더링 POST 폼에 제한된 비노출 옵션 후보를 남긴다."""
+
+        evidence_ids: list[str] = []
+        for name in _UNLINKED_RENDER_PARAMETERS:
+            evidence_id = f"evi-{self._id_factory()}"
+            self._evidence.append(
+                Evidence(
+                    evidence_id=evidence_id,
+                    run_id=run_id,
+                    surface_id=surface_id,
+                    created_by="recon",
+                    evidence_type="observation",
+                    observation={
+                        "type": UNLINKED_RENDER_PARAMETER_OBSERVATION,
+                        "parameter": name,
+                        "source": "bounded_unlinked_render_parameter",
+                    },
                 )
             )
             evidence_ids.append(evidence_id)

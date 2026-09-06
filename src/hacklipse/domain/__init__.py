@@ -13,6 +13,7 @@ from .models import (
     PROBE_METACHARACTERS,
     PATH_TRAVERSAL_BYPASS_SUFFIX,
     PATH_TRAVERSAL_SAFE_PROBE_PATH,
+    PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH,
     AccessPrincipalRole,
     AccessIdentifierLocation,
     HttpRequestKind,
@@ -41,6 +42,7 @@ from .models import (
     credential_for_vulnerability,
     is_path_traversal_bypass_suffix,
     is_path_traversal_safe_probe_value,
+    is_path_traversal_safe_form_probe_value,
 )
 
 __all__ = [
@@ -55,6 +57,7 @@ __all__ = [
     "Finding",
     "PROBE_METACHARACTERS",
     "PATH_TRAVERSAL_SAFE_PROBE_PATH",
+    "PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH",
     "AccessPrincipalRole",
     "AccessIdentifierLocation",
     "HttpRequestKind",
@@ -82,4 +85,5 @@ __all__ = [
     "UncheckedCandidate",
     "credential_for_vulnerability",
     "is_path_traversal_safe_probe_value",
+    "is_path_traversal_safe_form_probe_value",
 ]

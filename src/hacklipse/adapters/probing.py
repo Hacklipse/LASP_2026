@@ -62,6 +62,7 @@ def resolve_analysis_task(
     surface_store: SurfaceStore,
     required_tool: str = ANALYSIS_TOOL,
     allow_parameterless_get: bool = False,
+    allowed_methods: tuple[str, ...] = ("GET",),
 ) -> tuple[Candidate, Surface, tuple[str, ...]]:
     """Analysis Task의 Candidate/Surface를 확인하고 탐침 대상 파라미터를 정리한다.
 
@@ -85,10 +86,13 @@ def resolve_analysis_task(
     surface = surface_store.get(task.run_id, task.surface_id)
     if surface.url != task.target_url:
         raise AgentContractError("analysis task target does not match its surface")
-    if surface.method.upper() != "GET" or (
+    if surface.method.upper() not in allowed_methods or (
         not surface.parameters and not allow_parameterless_get
     ):
-        raise AgentContractError("analysis supports parameterized GET surfaces only")
+        methods = "/".join(allowed_methods)
+        raise AgentContractError(
+            f"analysis supports parameterized {methods} surfaces only"
+        )
 
     # 중복 파라미터명(?a=1&a=2)은 하나로 접는다. 안 그러면 같은 곳에 탐침을 두 번 보낸다.
     return candidate, surface, tuple(dict.fromkeys(surface.parameters))
@@ -213,6 +217,7 @@ def matching_evidence(
         return None
     expected_url = resolved_url(target_url, request.http_request.query_parameters)
     expected_kind = request.http_request.request_kind.value
+    expected_method = request.http_request.method.upper()
     expected_fingerprint = request.request_fingerprint(target_url)
     for item in reversed(evidence):
         observation = item.observation
@@ -229,7 +234,7 @@ def matching_evidence(
                 )
             )
             and observation.get("request_kind") == expected_kind
-            and str(observation.get("method", "GET")).upper() == "GET"
+            and str(observation.get("method", "GET")).upper() == expected_method
         ):
             return item
     return None

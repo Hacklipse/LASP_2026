@@ -28,6 +28,7 @@ from .path_traversal_analysis import (
     build_path_traversal_bypass_requests,
     build_path_traversal_requests,
     is_restricted_file_surface,
+    path_parameter_candidates,
     path_traversal_bypass_signal,
     path_traversal_signal,
 )
@@ -504,7 +505,8 @@ class ValidationAgent:
                 if item.surface_id == candidate.surface_id
                 and item.observation.get("type") == PATH_TRAVERSAL_OBSERVATION
                 and isinstance((parameter := item.observation.get("parameter")), str)
-                and parameter in surface.parameters
+                and parameter
+                in path_parameter_candidates(evidence, surface, surface.parameters)
             )
         )
         if not signaled_parameters:

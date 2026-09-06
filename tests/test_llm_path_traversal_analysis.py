@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import hashlib
 import unittest
 from dataclasses import replace
+from urllib.parse import parse_qsl
 
-from hacklipse.adapters import LlmPathTraversalAnalyzer
+from hacklipse.adapters import LlmPathTraversalAnalyzer, StaticApprovalGate
 from hacklipse.adapters.llm_path_traversal_analysis import (
     LLM_PATH_TRAVERSAL_ANALYZER,
 )
 from hacklipse.adapters.path_traversal_analysis import (
+    PATH_TRAVERSAL_BYPASS_OBSERVATION,
+    PATH_TRAVERSAL_FORM_PROBE_PATH,
+    PATH_TRAVERSAL_FORM_PROOF_MARKERS,
+    PATH_TRAVERSAL_OBSERVATION,
+    PATH_TRAVERSAL_POST_APPROVAL_REF,
     PATH_TRAVERSAL_PROBE_PATH,
     PATH_TRAVERSAL_PROOF_MARKERS,
     PATH_TRAVERSAL_TOOL,
+    RESTRICTED_FILE_OBSERVATION,
+    UNLINKED_RENDER_PARAMETER_OBSERVATION,
 )
 from hacklipse.application.errors import AgentContractError
 from hacklipse.bootstrap import build_local_application
@@ -22,6 +31,7 @@ from hacklipse.domain import (
     Evidence,
     ExecutionRequest,
     ExecutionResult,
+    PATH_TRAVERSAL_BYPASS_SUFFIX,
     Run,
     RunScope,
     Surface,
@@ -57,6 +67,49 @@ class _Runtime:
             "\n".join(PATH_TRAVERSAL_PROOF_MARKERS)
             if self.vulnerable and PATH_TRAVERSAL_PROBE_PATH in values
             else "normal"
+        )
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            evidence_type="http_response",
+            observation={"type": "http_response", "status": 200, "body": body},
+        )
+
+
+class _RestrictedFileRuntime:
+    def __init__(self) -> None:
+        self.requests: list[ExecutionRequest] = []
+
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        self.requests.append(request)
+        bypassed = request.resolved_url.endswith(PATH_TRAVERSAL_BYPASS_SUFFIX)
+        status = 200 if bypassed else 403
+        body = b'{"name":"juice-shop"}' if bypassed else b"denied"
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            evidence_type="http_response",
+            observation={
+                "type": "http_response",
+                "status": status,
+                "body": None if bypassed else body.decode(),
+                "body_bytes": len(body),
+                "requested_url": request.resolved_url,
+            },
+            content_hash=hashlib.sha256(body).hexdigest(),
+        )
+
+
+class _PostFormRuntime:
+    def __init__(self) -> None:
+        self.requests: list[ExecutionRequest] = []
+
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        self.requests.append(request)
+        values = dict(parse_qsl(request.body or "")).values()
+        body = (
+            "\n".join(PATH_TRAVERSAL_FORM_PROOF_MARKERS)
+            if request.method.upper() == "POST"
+            and PATH_TRAVERSAL_FORM_PROBE_PATH in values
+            else "normal form"
         )
         return ExecutionResult(
             execution_id=request.execution_id,
@@ -130,12 +183,160 @@ def _fixture(payload: dict[str, object], *, vulnerable: bool = True):
     return agent, app, llm, runtime, task
 
 
+def _restricted_file_fixture():
+    target = "http://local.test/ftp/package.json.bak"
+    llm = _FakeLlmClient({"parameters": [], "reason": "must not be called"})
+    runtime = _RestrictedFileRuntime()
+    app = build_local_application({}, runtime=runtime)
+    app.stores.runs.add(
+        Run(
+            run_id=_RUN_ID,
+            target_url=target,
+            scope=RunScope(allowed_hosts=frozenset({"local.test"})),
+            policy_profile="safe",
+            request_budget=20,
+        )
+    )
+    app.stores.surfaces.add(
+        Surface(
+            surface_id=_SURFACE_ID,
+            run_id=_RUN_ID,
+            url=target,
+            method="GET",
+        )
+    )
+    app.stores.evidence.append(
+        Evidence(
+            evidence_id="evi-restricted",
+            run_id=_RUN_ID,
+            surface_id=_SURFACE_ID,
+            created_by="recon",
+            evidence_type="observation",
+            observation={
+                "type": RESTRICTED_FILE_OBSERVATION,
+                "parameter": "package.json.bak",
+            },
+        )
+    )
+    app.stores.candidates.add(
+        Candidate(
+            candidate_id=_CANDIDATE_ID,
+            run_id=_RUN_ID,
+            surface_id=_SURFACE_ID,
+            vulnerability_type="Path Traversal",
+            hypothesis="restricted file",
+            assigned_agent="path_traversal_analyzer",
+            evidence_ids=("evi-restricted",),
+        )
+    )
+    app.budget_manager.open_run(_RUN_ID, 20)
+    agent = LlmPathTraversalAnalyzer(
+        llm_client=llm,
+        candidate_store=app.stores.candidates,
+        surface_store=app.stores.surfaces,
+        evidence_store=app.stores.evidence,
+        id_factory=iter(str(index) for index in range(100)).__next__,
+    )
+    task = TaskEnvelope(
+        task_id="task-llm-path",
+        run_id=_RUN_ID,
+        agent_type="path_traversal_analyzer",
+        target_url=target,
+        surface_id=_SURFACE_ID,
+        candidate_id=_CANDIDATE_ID,
+        evidence_ids=("evi-restricted",),
+        allowed_tools=(PATH_TRAVERSAL_TOOL,),
+        request_budget=10,
+    )
+    return agent, app, llm, runtime, task
+
+
+def _post_form_fixture():
+    target = "http://local.test/account/export"
+    llm = _FakeLlmClient(
+        {"parameters": ["layout"], "reason": "server render option"}
+    )
+    runtime = _PostFormRuntime()
+    app = build_local_application(
+        {},
+        runtime=runtime,
+        approval_gate=StaticApprovalGate((PATH_TRAVERSAL_POST_APPROVAL_REF,)),
+    )
+    app.stores.runs.add(
+        Run(
+            run_id=_RUN_ID,
+            target_url=target,
+            scope=RunScope(allowed_hosts=frozenset({"local.test"})),
+            policy_profile="safe",
+            request_budget=20,
+        )
+    )
+    app.stores.surfaces.add(
+        Surface(
+            surface_id=_SURFACE_ID,
+            run_id=_RUN_ID,
+            url=target,
+            method="POST",
+            parameters=("email", "securityAnswer"),
+        )
+    )
+    app.stores.evidence.append(
+        Evidence(
+            evidence_id="evi-layout-candidate",
+            run_id=_RUN_ID,
+            surface_id=_SURFACE_ID,
+            created_by="recon",
+            evidence_type="observation",
+            observation={
+                "type": UNLINKED_RENDER_PARAMETER_OBSERVATION,
+                "parameter": "layout",
+                "source": "bounded_unlinked_render_parameter",
+            },
+        )
+    )
+    app.stores.candidates.add(
+        Candidate(
+            candidate_id=_CANDIDATE_ID,
+            run_id=_RUN_ID,
+            surface_id=_SURFACE_ID,
+            vulnerability_type="Path Traversal",
+            hypothesis="unlinked render parameter",
+            assigned_agent="path_traversal_analyzer",
+            evidence_ids=("evi-layout-candidate",),
+        )
+    )
+    app.budget_manager.open_run(_RUN_ID, 20)
+    agent = LlmPathTraversalAnalyzer(
+        llm_client=llm,
+        candidate_store=app.stores.candidates,
+        surface_store=app.stores.surfaces,
+        evidence_store=app.stores.evidence,
+        id_factory=iter(str(index) for index in range(100)).__next__,
+    )
+    task = TaskEnvelope(
+        task_id="task-llm-path-form",
+        run_id=_RUN_ID,
+        agent_type="path_traversal_analyzer",
+        target_url=target,
+        surface_id=_SURFACE_ID,
+        candidate_id=_CANDIDATE_ID,
+        evidence_ids=("evi-layout-candidate",),
+        allowed_tools=(PATH_TRAVERSAL_TOOL,),
+        request_budget=10,
+    )
+    return agent, app, llm, runtime, task
+
+
 def _collect(result, app, task: TaskEnvelope) -> TaskEnvelope:
     ids = list(task.evidence_ids) + list(result.new_evidence_ids)
     for request in result.evidence_requests:
         ids.append(
             app.collector.collect(
-                task.run_id, task.target_url or "", request, task_id=task.task_id
+                task.run_id,
+                task.target_url or "",
+                request,
+                task_id=task.task_id,
+                approval_ref=request.approval_ref,
             )
         )
     return replace(
@@ -229,6 +430,53 @@ class LlmPathTraversalAnalyzerTests(unittest.TestCase):
         self.assertIs(result.status, AgentResultStatus.COMPLETED)
         self.assertEqual(len(llm.requests), 1)
         self.assertEqual(runtime.requests, [])
+
+    def test_restricted_file_uses_fixed_bypass_without_llm_plan(self) -> None:
+        agent, app, llm, runtime, task = _restricted_file_fixture()
+
+        requested = agent.handle(task)
+        result = agent.handle(_collect(requested, app, task))
+
+        self.assertIs(requested.status, AgentResultStatus.NEEDS_EVIDENCE)
+        self.assertIs(result.status, AgentResultStatus.COMPLETED)
+        self.assertEqual(llm.requests, [])
+        self.assertEqual(len(runtime.requests), 2)
+        self.assertFalse(
+            runtime.requests[0].resolved_url.endswith(PATH_TRAVERSAL_BYPASS_SUFFIX)
+        )
+        self.assertTrue(
+            runtime.requests[1].resolved_url.endswith(PATH_TRAVERSAL_BYPASS_SUFFIX)
+        )
+        signal = next(
+            item
+            for item in app.stores.evidence.list_by_run(_RUN_ID)
+            if item.observation.get("type") == PATH_TRAVERSAL_OBSERVATION
+        )
+        self.assertEqual(signal.created_by, LLM_PATH_TRAVERSAL_ANALYZER)
+        self.assertEqual(
+            signal.observation["bypass"], PATH_TRAVERSAL_BYPASS_OBSERVATION
+        )
+
+    def test_llm_can_select_bounded_unlinked_post_form_parameter(self) -> None:
+        agent, app, llm, runtime, task = _post_form_fixture()
+
+        requested = agent.handle(task)
+        result = agent.handle(_collect(requested, app, task))
+
+        self.assertIs(result.status, AgentResultStatus.COMPLETED)
+        self.assertEqual(len(llm.requests), 1)
+        self.assertIn("layout", llm.requests[0].messages[0].content)
+        self.assertEqual(
+            [request.method.upper() for request in runtime.requests],
+            ["GET", "POST"],
+        )
+        signal = next(
+            item
+            for item in app.stores.evidence.list_by_run(_RUN_ID)
+            if item.observation.get("type") == PATH_TRAVERSAL_OBSERVATION
+        )
+        self.assertEqual(signal.observation["parameter"], "layout")
+        self.assertEqual(signal.observation["selection_source"], "llm")
 
 
 if __name__ == "__main__":

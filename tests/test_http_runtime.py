@@ -162,6 +162,7 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
         headers: tuple[tuple[str, str], ...] = (),
         body: str | None = None,
         request_kind: HttpRequestKind = HttpRequestKind.CONTROL,
+        validation_id: str | None = None,
     ) -> ExecutionRequest:
         base = host or f"http://127.0.0.1:{self.port}"
         return ExecutionRequest(
@@ -177,6 +178,7 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
             headers=headers,
             body=body,
             request_kind=request_kind,
+            validation_id=validation_id,
         )
 
     # 1
@@ -288,6 +290,17 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
 
         self.assertIn("sid=after-login", sent)
         self.assertNotIn("before-login", sent)
+
+    def test_validation_session_is_isolated_from_analysis_cookies(self) -> None:
+        self.runtime.execute(self._req("/session-open"))
+
+        analysis = self.runtime.execute(self._req("/echo-cookie")).observation["body"]
+        validation = self.runtime.execute(
+            self._req("/echo-cookie", validation_id="validation-1")
+        ).observation["body"]
+
+        self.assertIn("sid=before-login", analysis)
+        self.assertEqual(validation, "COOKIE=(none)")
 
     def test_binary_not_forced_to_string(self) -> None:
         r = self.runtime.execute(self._req("/binary"))

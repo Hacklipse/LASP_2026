@@ -13,9 +13,13 @@ from hacklipse.ports import CandidateStore, EvidenceStore, LlmClient, SurfaceSto
 from hacklipse.ports.llm import LlmMessage, LlmRequest
 
 from .path_traversal_analysis import (
+    PATH_TRAVERSAL_FORM_PROBE_PATH,
     PATH_TRAVERSAL_PROBE_PATH,
     PATH_TRAVERSAL_TOOL,
     build_path_traversal_requests,
+    handle_path_traversal_bypass,
+    is_restricted_file_surface,
+    path_parameter_candidates,
     record_path_traversal_observations,
 )
 from .probing import matching_evidence, resolve_analysis_task, validate_probe_selection
@@ -69,8 +73,23 @@ class LlmPathTraversalAnalyzer:
             candidate_store=self._candidates,
             surface_store=self._surfaces,
             required_tool=PATH_TRAVERSAL_TOOL,
+            # 확장자 필터 우회 표면은 경로 자체가 파일이라 query 파라미터가 없다.
+            allow_parameterless_get=True,
+            allowed_methods=("GET", "POST"),
         )
         evidence = tuple(self._evidence.get_many(task.run_id, task.evidence_ids))
+        if is_restricted_file_surface(evidence, surface):
+            # 선택할 파라미터가 없는 결정적 검증이므로 LLM 호출 없이 고정 접미사만 쓴다.
+            return handle_path_traversal_bypass(
+                task=task,
+                candidate=candidate,
+                surface=surface,
+                evidence=evidence,
+                evidence_store=self._evidence,
+                created_by=LLM_PATH_TRAVERSAL_ANALYZER,
+                id_factory=self._id_factory,
+            )
+        parameters = path_parameter_candidates(evidence, surface, parameters)
         stored = _stored_plan(evidence, surface.surface_id)
         new_ids: list[str] = []
         if stored is None:
@@ -179,7 +198,11 @@ class LlmPathTraversalAnalyzer:
             "offered_parameters": list(parameters),
             "dropped_for_budget": list(dropped),
             # 감사용 메타데이터일 뿐, LLM 응답에서 가져오지 않는다.
-            "proof_path": PATH_TRAVERSAL_PROBE_PATH,
+            "proof_path": (
+                PATH_TRAVERSAL_FORM_PROBE_PATH
+                if surface.method.upper() == "POST"
+                else PATH_TRAVERSAL_PROBE_PATH
+            ),
         }
         evidence_id = f"evi-{self._id_factory()}"
         self._evidence.append(

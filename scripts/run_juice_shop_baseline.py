@@ -1,9 +1,10 @@
-"""로컬 OWASP Juice Shop에서 SQLi·SSTI·Access Control 검증을 실행한다.
+"""로컬 OWASP Juice Shop에서 다중 취약점 baseline 검증을 실행한다.
 
 취약점마다 인증과 정리 요구가 다르다.
 
     SQLi            인증 없음. 읽기 전용 GET. 정리할 상태가 없다.
     SSTI            실습 계정 token Cookie. username을 바꾸므로 고정값으로 되돌린다.
+    Path Traversal  임시 계정으로 서버 렌더링 폼의 고정 safe-file 읽기를 검증한다.
     Access Control  임시 계정 두 개를 만들고 검증 후 연결 데이터까지 삭제한다.
     all             한 Run에서 여러 유형을 함께 검사한다. 유형별 자격증명은 Run에
                     따로 등록되고, 등록하지 않은 유형은 자격증명 없이 실행된다.
@@ -50,6 +51,9 @@ from hacklipse.adapters.ssti_analysis import (  # noqa: E402
     SSTI_CLEANUP_VALUE,
     SSTI_OBSERVATION,
 )
+from hacklipse.adapters.path_traversal_analysis import (  # noqa: E402
+    PATH_TRAVERSAL_POST_APPROVAL_REF,
+)
 from hacklipse.application import OrchestratorConfig, build_progress_snapshot  # noqa: E402
 from hacklipse.application.errors import WorkflowExecutionError  # noqa: E402
 from hacklipse.bootstrap import (  # noqa: E402
@@ -87,6 +91,10 @@ _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1"})
 _CREDENTIAL_REF = "interactive-local-juice-shop"
 _ACTOR_CREDENTIAL_REF = "interactive-local-juice-shop-actor"
 _OWNER_CREDENTIAL_REF = "interactive-local-juice-shop-owner"
+_RECON_CREDENTIAL_REF = "temporary-local-juice-shop-recon"
+_PATH_TRAVERSAL_CREDENTIAL_REF = "temporary-local-juice-shop-path-traversal"
+_TEMP_SSTI_CREDENTIAL_REF = "temporary-local-juice-shop-ssti"
+_PROVISION_SESSION_REF = "temporary-local-juice-shop-provisioning-session"
 _PROVISION_APPROVAL_REF = "interactive-local-juice-shop-account-provisioning"
 _DEFAULT_BUDGET = 20
 # 전체 모드는 Recon 크롤링과 여러 Candidate 분석을 한 Run에서 감당해야 한다. 정확한
@@ -117,7 +125,7 @@ _VULN_TARGETS = {
     "xss": _VulnTarget("XSS", None, "reflection", "DOM 반사"),
     # /ftp 디렉터리는 번들의 템플릿 리터럴에서만 드러난다. seed 없이 Recon 이 찾는다.
     "path_traversal": _VulnTarget(
-        "Path Traversal", None, "path_traversal_file_read", "확장자 필터 우회 읽기"
+        "Path Traversal", None, "path_traversal_file_read", "로컬 파일 읽기"
     ),
     "access_control": _VulnTarget(
         "Access Control", None, "object_id_auth", "객체 권한 우회"
@@ -159,7 +167,12 @@ def _response_json(result, *, operation: str, statuses: tuple[int, ...]) -> dict
     status = result.observation.get("status")
     body = result.observation.get("body")
     if status not in statuses or not isinstance(body, str):
-        raise RuntimeError(f"임시 계정 {operation} 응답이 예상한 형식이 아닙니다.")
+        raise RuntimeError(
+            f"임시 계정 {operation} 응답이 예상한 형식이 아닙니다. "
+            f"(type={result.evidence_type!r}, status={status!r}, "
+            f"error_kind={result.observation.get('error_kind')!r}, "
+            f"body_type={type(body).__name__})"
+        )
     try:
         payload = json.loads(body)
     except (TypeError, ValueError) as error:
@@ -405,6 +418,165 @@ def _provision_access_control_accounts(
     return accounts, provision_run_id
 
 
+def _provision_path_traversal_account(
+    app,
+    resolver: InMemoryCredentialResolver,
+    *,
+    base_url: str,
+    host: str,
+    allowed_path_prefix: str,
+    cleanup_database: Path,
+) -> tuple[_ProvisionedAccount, str]:
+    """서버 렌더링 폼을 탐색·검증할 폐기용 계정과 보안 답변을 만든다."""
+
+    provision_run_id = f"run-provision-{uuid4()}"
+    app.stores.runs.add(
+        Run(
+            run_id=provision_run_id,
+            target_url=urljoin(base_url, "api/Users"),
+            scope=RunScope(
+                allowed_hosts=frozenset({host}),
+                allowed_path_prefixes=(allowed_path_prefix,),
+            ),
+            policy_profile="safe",
+            request_budget=3,
+        )
+    )
+    app.budget_manager.open_run(provision_run_id, 3)
+
+    suffix = uuid4().hex
+    email = f"hacklipse-path-{suffix}@example.invalid"
+    password = secrets.token_urlsafe(18)
+    account: _ProvisionedAccount | None = None
+    try:
+        _, registration = app.collector.collect_with_result(
+            provision_run_id,
+            urljoin(base_url, "api/Users"),
+            EvidenceRequest(
+                evidence_type="account_provisioning",
+                surface_id="juice-shop-account-provisioning",
+                reason="create disposable local Juice Shop path traversal account",
+                suggested_tool="http_post",
+                http_request=HttpRequestSpec(
+                    method="POST",
+                    headers=(("Content-Type", "application/json"),),
+                    body=json.dumps(
+                        {"email": email, "password": password},
+                        separators=(",", ":"),
+                    ),
+                ),
+                approval_ref=_PROVISION_APPROVAL_REF,
+            ),
+            task_id="provision-path-register",
+            approval_ref=_PROVISION_APPROVAL_REF,
+        )
+        registration_payload = _response_json(
+            registration, operation="생성", statuses=(201,)
+        )
+        registration_data = registration_payload.get("data")
+        user_id = (
+            registration_data.get("id")
+            if isinstance(registration_data, dict)
+            else registration_payload.get("id")
+        )
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise RuntimeError("임시 계정 생성 응답에 user ID가 없습니다.")
+        account = _ProvisionedAccount(
+            "path_traversal",
+            _PATH_TRAVERSAL_CREDENTIAL_REF,
+            user_id,
+            email,
+        )
+
+        _, login = app.collector.collect_with_result(
+            provision_run_id,
+            urljoin(base_url, "rest/user/login"),
+            EvidenceRequest(
+                evidence_type="account_authentication",
+                surface_id="juice-shop-account-provisioning",
+                reason="log in disposable local Juice Shop path traversal account",
+                suggested_tool="http_post",
+                http_request=HttpRequestSpec(
+                    method="POST",
+                    headers=(("Content-Type", "application/json"),),
+                    body=json.dumps(
+                        {"email": email, "password": password},
+                        separators=(",", ":"),
+                    ),
+                ),
+                approval_ref=_PROVISION_APPROVAL_REF,
+            ),
+            task_id="provision-path-login",
+            approval_ref=_PROVISION_APPROVAL_REF,
+        )
+        payload = _response_json(login, operation="로그인", statuses=(200,))
+        authentication = payload.get("authentication")
+        token = (
+            authentication.get("token")
+            if isinstance(authentication, dict)
+            else None
+        )
+        basket_id = str(
+            authentication.get("bid", "")
+            if isinstance(authentication, dict)
+            else ""
+        )
+        if not isinstance(token, str) or not token:
+            raise RuntimeError("임시 계정 로그인 응답에 token이 없습니다.")
+        account.basket_id = basket_id if _OBJECT_ID.fullmatch(basket_id) else None
+
+        credential = ResolvedHttpCredential(
+            authorization=f"Bearer {token}", cookies=(("token", token),)
+        )
+        resolver.add(_PROVISION_SESSION_REF, credential)
+        app.stores.runs.save(
+            app.stores.runs.get(provision_run_id).with_updates(
+                credential_ref=_PROVISION_SESSION_REF
+            )
+        )
+        _, answer = app.collector.collect_with_result(
+            provision_run_id,
+            urljoin(base_url, "api/SecurityAnswers"),
+            EvidenceRequest(
+                evidence_type="account_provisioning",
+                surface_id="juice-shop-account-provisioning",
+                reason="add a security answer to the disposable local account",
+                suggested_tool="http_post",
+                http_request=HttpRequestSpec(
+                    method="POST",
+                    headers=(("Content-Type", "application/json"),),
+                    body=json.dumps(
+                        {
+                            "UserId": user_id,
+                            "SecurityQuestionId": 1,
+                            "answer": secrets.token_urlsafe(12),
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
+                approval_ref=_PROVISION_APPROVAL_REF,
+            ),
+            task_id="provision-path-security-answer",
+            approval_ref=_PROVISION_APPROVAL_REF,
+            credential_ref=_PROVISION_SESSION_REF,
+        )
+        _response_json(answer, operation="보안 답변 생성", statuses=(201,))
+
+        # 같은 token을 서로 다른 참조로 등록해 Recon/Analysis 유형별 CookieJar를
+        # 격리한다. data-erasure 응답의 로그아웃 Cookie가 SSTI 세션을 지우지 않는다.
+        for credential_ref in (
+            _RECON_CREDENTIAL_REF,
+            _PATH_TRAVERSAL_CREDENTIAL_REF,
+            _TEMP_SSTI_CREDENTIAL_REF,
+        ):
+            resolver.add(credential_ref, credential)
+        return account, provision_run_id
+    except Exception:
+        if account is not None:
+            _cleanup_provisioned_accounts(cleanup_database, [account])
+        raise
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base_url", help="localhost/127.0.0.1 Juice Shop base URL")
@@ -429,7 +601,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--llm-model", help="provider model id")
     parser.add_argument(
         "--juice-shop-db",
-        help="Access Control 임시 계정 정리에 사용할 juiceshop.sqlite 경로",
+        help="임시 계정 정리에 사용할 Juice Shop juiceshop.sqlite 경로",
     )
     parser.add_argument(
         "--request-budget",
@@ -454,17 +626,21 @@ def main(argv: list[str]) -> int:
     run_all = args.vuln == "all"
     vuln = None if run_all else _VULN_TARGETS[args.vuln]
     access_control = args.vuln == "access_control"
+    needs_path_account = args.vuln in {"path_traversal", "all"}
     target_label = "전체" if run_all else vuln.label
-    if run_all:
-        # 전체 모드는 Recon이 시작 페이지에서 Surface를 찾아 유형별로 라우팅한다.
-        target_url = base_url
-    elif access_control:
-        # 시작 Surface가 임시 계정의 basket ID에 달려 있어 계정 준비 후에 정해진다.
+    cleanup_database: Path | None = None
+    if access_control or needs_path_account:
         try:
             cleanup_database = _resolve_juice_shop_db(args.juice_shop_db)
         except RuntimeError as error:
             print(f"거부: {error}")
             return 2
+    if run_all:
+        # 전체 모드는 Recon이 시작 페이지에서 Surface를 찾아 유형별로 라우팅한다.
+        target_url = base_url
+    elif access_control:
+        # 시작 Surface가 임시 계정의 basket ID에 달려 있어 계정 준비 후에 정해진다.
+        pass
     else:
         assert vuln is not None
         # seed_path 가 없는 유형은 Recon 이 번들에서 표면을 찾아낸다(SPA 라우트, /ftp).
@@ -517,37 +693,23 @@ def main(argv: list[str]) -> int:
         # Run(--vuln access_control)으로 남긴다.
         print(
             "전체 모드는 한 Run에서 Recon이 찾아낸 Surface를 유형별로 라우팅합니다.\n"
-            "SQLi와 XSS는 인증 없이 실행됩니다. SSTI는 token Cookie가 있어야 /profile\n"
-            "폼을 읽을 수 있습니다.\n"
+            "SQLi와 XSS는 인증 없이 실행합니다. SSTI와 Path Traversal은 폐기 가능한\n"
+            "임시 계정의 분리된 세션으로 검증하고 종료 시 연결 데이터를 삭제합니다.\n"
             "Access Control은 객체 ID가 필요해 크롤링으로 찾을 수 없으므로 "
             "--vuln access_control로 따로 실행하세요."
         )
-        token = getpass.getpass(
-            "SSTI용 Juice Shop token Cookie (건너뛰려면 Enter, 숨김 입력): "
-        ).strip()
         credentials = {}
-        approvals = ()
+        approvals = (
+            _PROVISION_APPROVAL_REF,
+            PATH_TRAVERSAL_POST_APPROVAL_REF,
+            SSTI_APPROVAL_REF,
+        )
         run_credential_ref = None
-        if token:
-            credentials[_CREDENTIAL_REF] = ResolvedHttpCredential(
-                cookies=(("token", token),)
-            )
-            approvals = (SSTI_APPROVAL_REF,)
-            # Recon은 Run 기본 세션으로 돈다. 인증되지 않으면 /profile 폼을 못 읽어
-            # SSTI Surface 자체가 만들어지지 않는다.
-            run_credential_ref = _CREDENTIAL_REF
-            # 유형별 등록. SQLi·XSS는 여기 없으므로 자격증명 없이 실행된다.
-            agent_credentials = (("SSTI", _CREDENTIAL_REF),)
-            # SPA 홈페이지에는 서버 렌더링 /profile 폼으로 가는 일반 링크가 없다.
-            # 홈페이지의 공개 API Surface와 인증된 SSTI Surface를 모두 명시적으로
-            # Recon seed로 사용한다.
-            recon_seed_urls = _all_mode_recon_seeds(base_url, include_ssti=True)
-            print(
-                "  SSTI 포함: username을 control/산술식으로 바꾼 뒤 "
-                f"{SSTI_CLEANUP_VALUE!r}(으)로 정리합니다."
-            )
-        else:
-            print("  SSTI 건너뜀: token이 없어 /profile 폼을 읽을 수 없습니다.")
+        recon_seed_urls = _all_mode_recon_seeds(base_url, include_ssti=True)
+        print(
+            "  SSTI 포함: username을 control/산술식으로 바꾼 뒤 "
+            f"{SSTI_CLEANUP_VALUE!r}(으)로 정리합니다."
+        )
         confirmation = "로컬 Juice Shop 전체 취약점 검사를 실행할까요? [y/N] "
         principal_credentials = ()
         actor_object_id = None
@@ -569,8 +731,10 @@ def main(argv: list[str]) -> int:
             )
         else:
             print(
-                "이 검증은 서버가 직접 거부하는 자기 파일을 고정 우회 접미사로 다시 요청합니다.\n"
-                "읽기 전용 GET이며 대상 상태를 바꾸지 않습니다."
+                "이 검증은 폐기 가능한 임시 계정을 만들고 Recon이 SPA 번들에서 발견한\n"
+                "서버 렌더링 폼에 고정된 비민감 파일 경로만 전송합니다.\n"
+                "POST는 개인정보 삭제 요청 행을 만들지만 실제 계정은 삭제하지 않으며,\n"
+                "검증 종료 시 임시 계정과 연결 데이터를 직접 정리합니다."
             )
         confirmation = f"로컬 Juice Shop {vuln.label} 검증을 실행할까요? [y/N] "
         credentials = {}
@@ -578,7 +742,11 @@ def main(argv: list[str]) -> int:
         principal_credentials = ()
         actor_object_id = None
         owner_object_id = None
-        approvals = ()
+        approvals = (
+            (_PROVISION_APPROVAL_REF, PATH_TRAVERSAL_POST_APPROVAL_REF)
+            if args.vuln == "path_traversal"
+            else ()
+        )
     elif args.vuln == "sqli":
         # 인증도 정리도 필요 없는 유일한 유형이다. 읽기 전용 GET에 메타문자 하나를
         # 실어 control과의 오류 차이만 본다.
@@ -645,7 +813,28 @@ def main(argv: list[str]) -> int:
     base_path = parsed.path if parsed.path.endswith("/") else f"{parsed.path}/"
     provision_run_id: str | None = None
     provisioned_accounts: list[_ProvisionedAccount] = []
-    if access_control:
+    if needs_path_account:
+        assert cleanup_database is not None
+        try:
+            path_account, provision_run_id = _provision_path_traversal_account(
+                app,
+                resolver,
+                base_url=base_url,
+                host=host,
+                allowed_path_prefix=base_path or "/",
+                cleanup_database=cleanup_database,
+            )
+        except (RuntimeError, ValueError) as error:
+            print(f"임시 계정 준비 실패: {error}")
+            return 1
+        provisioned_accounts = [path_account]
+        run_credential_ref = _RECON_CREDENTIAL_REF
+        agent_credentials = (("Path Traversal", _PATH_TRAVERSAL_CREDENTIAL_REF),)
+        if run_all:
+            agent_credentials += (("SSTI", _TEMP_SSTI_CREDENTIAL_REF),)
+        progress.log("Path Traversal용 임시 계정 생성 및 보안 답변 등록 완료")
+    elif access_control:
+        assert cleanup_database is not None
         try:
             provisioned_accounts, provision_run_id = _provision_access_control_accounts(
                 app,
@@ -708,10 +897,10 @@ def main(argv: list[str]) -> int:
         except WorkflowExecutionError as error:
             workflow_error = error
     finally:
-        if access_control and provisioned_accounts:
+        if provisioned_accounts and cleanup_database is not None:
             try:
                 _cleanup_provisioned_accounts(cleanup_database, provisioned_accounts)
-                progress.log("임시 ACTOR/OWNER 계정 및 연결 데이터 삭제 완료")
+                progress.log("임시 계정 및 연결 데이터 삭제 완료")
             except Exception as error:
                 cleanup_error = error
 

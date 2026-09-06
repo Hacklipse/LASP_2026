@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
+from urllib.parse import parse_qsl
 
-from hacklipse.adapters import HeuristicPathTraversalAnalyzer
+from hacklipse.adapters import HeuristicPathTraversalAnalyzer, StaticApprovalGate
 from hacklipse.adapters.path_traversal_analysis import (
     HEURISTIC_PATH_TRAVERSAL_ANALYZER,
+    PATH_TRAVERSAL_FORM_PROBE_PATH,
+    PATH_TRAVERSAL_FORM_PROOF_MARKERS,
+    PATH_TRAVERSAL_POST_APPROVAL_REF,
     PATH_TRAVERSAL_PROBE_PATH,
     PATH_TRAVERSAL_PROOF_MARKERS,
     PATH_TRAVERSAL_TOOL,
+    UNLINKED_RENDER_PARAMETER_OBSERVATION,
 )
 from hacklipse.adapters.policy import AllowlistPolicyGate
 from hacklipse.bootstrap import (
@@ -295,6 +300,99 @@ class PathTraversalFindingEndToEndTests(unittest.TestCase):
         self.assertEqual(
             ValidationProofType.PATH_TRAVERSAL_FILE_READ.value,
             "path_traversal_file_read",
+        )
+
+
+class _ServerRenderedFormRuntime:
+    """SPA 문서 이동 뒤의 서버 렌더링 폼과 safe-file 읽기를 재현한다."""
+
+    def __init__(self) -> None:
+        self.requests: list[ExecutionRequest] = []
+
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        self.requests.append(request)
+        path = request.resolved_url.split("?", 1)[0]
+        if path.endswith("/main.js"):
+            body = (
+                "go(){window.location.replace(env.hostServer+`/account/export`)}"
+            )
+        elif path.endswith("/account/export") and request.method.upper() == "GET":
+            body = (
+                '<form action="/account/export" method="POST">'
+                '<input name="email"><input name="securityAnswer"></form>'
+            )
+        elif path.endswith("/account/export") and request.method.upper() == "POST":
+            values = dict(parse_qsl(request.body or "")).values()
+            body = (
+                "\n".join(PATH_TRAVERSAL_FORM_PROOF_MARKERS)
+                if PATH_TRAVERSAL_FORM_PROBE_PATH in values
+                else "normal"
+            )
+        else:
+            body = '<html><script src="/main.js"></script></html>'
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            evidence_type="http_response",
+            observation={
+                "type": "http_response",
+                "status": 200,
+                "body": body,
+                "requested_url": request.resolved_url,
+            },
+        )
+
+
+class ServerRenderedFormPathTraversalEndToEndTests(unittest.TestCase):
+    def test_recon_to_finding_without_a_product_specific_seed(self) -> None:
+        runtime = _ServerRenderedFormRuntime()
+        app = build_local_application(
+            {},
+            runtime=runtime,
+            router=standard_router(vulnerability_types=("Path Traversal",)),
+            approval_gate=StaticApprovalGate(
+                (PATH_TRAVERSAL_POST_APPROVAL_REF,)
+            ),
+        )
+        register_standard_agents(app, recon_max_pages=4)
+
+        run = app.orchestrator.start(
+            RunRequest(
+                target_url="http://local.test/",
+                scope=RunScope(allowed_hosts=frozenset({"local.test"})),
+                request_budget=20,
+            )
+        )
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        form = next(
+            surface
+            for surface in app.stores.surfaces.list_by_run(run.run_id)
+            if surface.url == "http://local.test/account/export"
+            and surface.method == "POST"
+        )
+        inferred = [
+            item
+            for item in app.stores.evidence.list_by_run(run.run_id)
+            if item.surface_id == form.surface_id
+            and item.observation.get("type")
+            == UNLINKED_RENDER_PARAMETER_OBSERVATION
+        ]
+        self.assertEqual([item.observation["parameter"] for item in inferred], ["layout"])
+        findings = app.stores.findings.list_by_run(run.run_id)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].vulnerability_type, "Path Traversal")
+        probes = [
+            request
+            for request in runtime.requests
+            if request.method.upper() == "POST"
+        ]
+        self.assertEqual(len(probes), 2)
+        self.assertTrue(
+            all(
+                PATH_TRAVERSAL_FORM_PROBE_PATH
+                in dict(parse_qsl(request.body or "")).values()
+                for request in probes
+            )
         )
 
 

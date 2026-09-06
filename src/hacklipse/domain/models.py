@@ -118,6 +118,10 @@ _PROBE_VALUE = re.compile(r"^[A-Za-z0-9_-]+['\"<>]{0,4}$")
 # 비민감 OS 식별 파일을 정확한 상대 경로 하나로 고정해 LLM이나 Agent가 다른 파일
 # (예: /etc/passwd)을 선택하지 못하게 한다.
 PATH_TRAVERSAL_SAFE_PROBE_PATH = "../../../../../etc/os-release"
+# 서버 템플릿의 layout/view 경로가 뷰 디렉터리 밖으로 나가는지 확인할 때만 쓰는
+# 별도 저민감 파일. 패키지 메타데이터는 비밀 파일이 아니며 Juice Shop을 포함한
+# Node 애플리케이션 루트에 일반적으로 존재한다.
+PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH = "../package.json"
 # 확장자 필터를 우회해 서버가 직접 거부한 자기 파일을 읽게 하는 고정 접미사.
 # 이미 URL 인코딩된 문자열이므로 재인코딩하지 않고 경로 뒤에 그대로 붙인다.
 # Agent나 LLM은 "우회를 적용한다"만 지정할 수 있고 접미사 내용은 고를 수 없다.
@@ -145,6 +149,12 @@ def is_path_traversal_safe_probe_value(value: str) -> bool:
     """고정된 비민감 증명 파일 상대 경로와 정확히 같은지 확인한다."""
 
     return value == PATH_TRAVERSAL_SAFE_PROBE_PATH
+
+
+def is_path_traversal_safe_form_probe_value(value: str) -> bool:
+    """서버 렌더링 폼 전용 고정 패키지 메타데이터 경로인지 확인한다."""
+
+    return value == PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH
 
 
 def is_path_traversal_bypass_suffix(value: str) -> bool:

@@ -102,6 +102,13 @@ DEFAULT_RULES = (
         0.6,
         methods=("GET",),
     ),
+    RoutingRule(
+        "unlinked_render_parameter_candidate",
+        "Path Traversal",
+        "path_traversal_analyzer",
+        0.55,
+        methods=("POST",),
+    ),
     RoutingRule("template_error", "SSTI", "ssti_analyzer", 0.7),
     RoutingRule("template_execution", "SSTI", "ssti_analyzer", 0.9),
     RoutingRule(

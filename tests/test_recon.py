@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import unittest
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from hacklipse.adapters import HttpExecutionRuntime
@@ -279,6 +280,20 @@ class Api{
 }
 """
 
+_DOCUMENT_NAVIGATION_BUNDLE = """
+class AccountMenu {
+  openExport(){ window.location.replace(environment.hostServer + `/account/export`) }
+}
+"""
+
+_SERVER_RENDERED_FORM = """
+<html><body>
+<form action="/account/export" method="POST">
+  <input name="email"><input name="securityAnswer">
+</form>
+</body></html>
+"""
+
 _PAGE_TWO = """
 <html><body>
 <a href="/deep.php?file=secret.txt">deep</a>
@@ -428,6 +443,51 @@ class ReconCrawlTests(unittest.TestCase):
         self.assertIn("http://localhost/api/Products", found)
         # 외부 URL의 경로 조각이 표면으로 새어 들어오면 안 된다.
         self.assertTrue(all("twitter.com" not in url for url in found))
+
+    def test_crawls_document_navigation_and_flags_unlinked_render_option(self) -> None:
+        """제품별 URL seed 없이 SPA 밖의 서버 렌더링 POST 폼까지 이어간다."""
+
+        agent, collector, surfaces = _crawling_agent(
+            {
+                "http://localhost/": _SPA_HTML,
+                "http://localhost/main.js": _DOCUMENT_NAVIGATION_BUNDLE,
+                "http://localhost/account/export": _SERVER_RENDERED_FORM,
+            },
+            max_pages=4,
+        )
+
+        agent.handle(
+            replace(
+                _task("run-document-navigation", "http://localhost/"),
+                request_budget=10,
+            )
+        )
+
+        self.assertIn("http://localhost/account/export", collector.calls)
+        form = next(
+            surface
+            for surface in surfaces.list_by_run("run-document-navigation")
+            if surface.url == "http://localhost/account/export"
+            and surface.method == "POST"
+        )
+        self.assertEqual(form.parameters, ("email", "securityAnswer"))
+        inferred = [
+            item.observation
+            for item in collector._evidence.list_by_run("run-document-navigation")
+            if item.surface_id == form.surface_id
+            and item.observation.get("type")
+            == "unlinked_render_parameter_candidate"
+        ]
+        self.assertEqual(
+            inferred,
+            [
+                {
+                    "type": "unlinked_render_parameter_candidate",
+                    "parameter": "layout",
+                    "source": "bounded_unlinked_render_parameter",
+                }
+            ],
+        )
 
     def test_leaves_request_budget_for_later_phases(self) -> None:
         chain = {

@@ -140,9 +140,13 @@ class HttpExecutionRuntime:
         self._credentials = credential_resolver
         # CookieJar와 opener는 Run별로 격리한다. 다른 Run의 세션이 섞이면 인증 경계와
         # 검증 provenance가 동시에 깨진다.
-        self._sessions: dict[tuple[str, str | None], urllib.request.OpenerDirector] = {}
-        self._session_jars: dict[tuple[str, str | None], http.cookiejar.CookieJar] = {}
-        self._seeded_sessions: set[tuple[str, str | None]] = set()
+        self._sessions: dict[
+            tuple[str, str | None, str | None], urllib.request.OpenerDirector
+        ] = {}
+        self._session_jars: dict[
+            tuple[str, str | None, str | None], http.cookiejar.CookieJar
+        ] = {}
+        self._seeded_sessions: set[tuple[str, str | None, str | None]] = set()
 
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
         """정책 검사를 통과한 요청을 실제로 전송하고 응답을 Evidence로 변환한다."""
@@ -229,7 +233,7 @@ class HttpExecutionRuntime:
         """
 
         self._opener_for(request)
-        jar = self._session_jars[(request.run_id, request.credential_ref)]
+        jar = self._session_jars[self._session_key(request)]
         cookie_request = urllib.request.Request(request.resolved_url)
         jar.add_cookie_header(cookie_request)
         header = cookie_request.get_header("Cookie")
@@ -240,9 +244,9 @@ class HttpExecutionRuntime:
         return tuple((name, morsel.value) for name, morsel in parsed.items())
 
     def _opener_for(self, request: ExecutionRequest) -> urllib.request.OpenerDirector:
-        """Run/credential 조합별 CookieJar를 만들고 초기 쿠키를 한 번만 주입한다."""
+        """Run/credential/validation 조합별 세션을 만들고 쿠키를 한 번 주입한다."""
 
-        key = (request.run_id, request.credential_ref)
+        key = self._session_key(request)
         opener = self._sessions.get(key)
         if opener is None:
             jar = _RotatingSessionCookieJar(policy=_LocalhostCookiePolicy())
@@ -267,6 +271,12 @@ class HttpExecutionRuntime:
                 jar.set_cookie(_session_cookie(name, value, hostname, parsed.scheme == "https"))
             self._seeded_sessions.add(key)
         return opener
+
+    @staticmethod
+    def _session_key(request: ExecutionRequest) -> tuple[str, str | None, str | None]:
+        """독립 Validation 재현이 Analysis의 로그아웃 Cookie에 오염되지 않게 한다."""
+
+        return request.run_id, request.credential_ref, request.validation_id
 
     def _response_result(
         self,
