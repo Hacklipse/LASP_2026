@@ -7,30 +7,59 @@
 
 ## 1. 현재 상태
 
-> 갱신 기준: 2026-09-03, `dev/dmswls`의 `bb03441`
+> 갱신 기준: 2026-09-06, `dev/dmswls`의 `bc5a54f`
 
 Phase 1~8의 공통 실행 기반과 **5종(XSS·SQLi·Path Traversal·Access Control·SSTI)
 Analysis/Validation Agent의 휴리스틱·LLM 구현**이 완료됐다. 모든 외부 실행은 중앙 수집
 경계에서 Scope·도구 권한·예산·감사·민감정보 제거를 적용하고, Finding은 취약점별 독립
-Validation proof가 만들어진 경우에만 승격된다. 전체 테스트는 현재 303개가 통과한다.
+Validation proof가 만들어진 경우에만 승격된다. 전체 테스트는 현재 334개가 통과한다.
 
 Phase 9-A에서는 확정 Finding을 민감정보가 제거된 `KnowledgeCase`로 일반화하는 Factory와
 append-only InMemory·SQLite KnowledgeBase를 구현했다. 다만 KnowledgeBase를 실제 Run의
 검색·발행 흐름에 연결하는 Orchestrator 배선은 아직 하지 않았다.
 
+### 대상 결정 — Juice Shop 단일화, DVWA 폐기
+
+Agent와 시나리오가 계속 추가되므로 대상이 둘이면 표면 계약도 둘로 갈라진다.
+**실험 대상을 Juice Shop 하나로 고정하고 DVWA는 폐기한다.**
+
+직전 판정은 "XSS·Path Traversal은 Juice Shop에서 불가"였다. 그 조사는 **당시 구현을
+그대로 둔 채 돌려본 결과**였고, 구현을 대상 표면에 맞추니 둘 다 재현됐다.
+
+- XSS: Analysis를 HTTP 본문 반사에서 브라우저 DOM 반사로 옮김
+- Path Traversal: 디렉터리 탈출 → 확장자 필터 우회로 취약점 종류를 재정의
+
+Proof 조건은 약화하지 않았다. 일반 2xx를 성공 기준으로 쓰지 않고, 거부(4xx) → 제공(2xx)
+차이를 직접 요구한다.
+
+DVWA 실행기(`scripts/run_dvwa_baseline.py`)와 쿼리 파라미터 탈출 흐름은 코드에 남아
+있다. 폐기 결정은 "대상 고정"이지 "코드 삭제"가 아니다. 삭제는 별도 결정이 필요하다.
+
 현재 최우선 통합 상태는 다음과 같다.
 
-- DVWA는 XSS·SQLi·Path Traversal 회귀 실행기로 유지한다.
-- Juice Shop 단일 Run의 `all` 모드는 현재 Recon이 발견한 XSS·SQLi와 인증된 `/profile`
-  SSTI를 함께 라우팅한다. 실제 실행에서 SQLi와 SSTI는 Finding까지 확인됐다.
+- Juice Shop 단일 Run의 `all` 모드가 XSS·SQLi·Path Traversal을 함께 라우팅하고
+  세 유형 모두 Finding까지 만든다. 인증이 필요한 SSTI는 token Cookie가 있을 때 포함된다.
 - Access Control은 임시 ACTOR/OWNER 계정 생성·검증·삭제 E2E가 구현됐지만 아직
-  `--vuln access_control` 전용 Run으로만 실행된다.
-- Juice Shop XSS는 Candidate까지 생성되지만 현재 HTTP query reflection 계약만으로는
-  SPA의 DOM XSS를 증명하지 못한다.
-- Juice Shop Path Traversal은 현재 Agent의 GET query + 고정 safe-file 계약과 대상의
-  POST body 기반 Local File Read 표면이 달라 `all` Run에 아직 합쳐지지 않았다.
+  `--vuln access_control` 전용 Run으로만 실행된다. 객체 ID는 크롤링으로 나오지 않고
+  임의로 만들면 열거가 되므로 `all` 모드에서 의도적으로 제외한다.
 - HTTP Runtime의 기본 응답 본문 상한은 2 MiB로 올라가 Juice Shop의 큰 `main.js`를
   읽을 수 있으며, 그 결과 `/rest/products/search?q=` Surface와 SQLi Finding이 복구됐다.
+
+#### 실측 (2026-09-06, `--vuln all --profile heuristic`)
+
+```plain text
+  Surface    95개 (파라미터 4종)
+  Candidate  Path Traversal 8개, XSS 5개, SQLi 2개
+  탐지 신호  확장자 필터 우회 읽기 6개, DOM 반사 2개, SQL 오류 1개
+  검증 완료  15 / 15
+  결과       CONFIRMED — Finding 8개 (Path Traversal 6, SQLi 1, XSS 1)
+  실행       57회 / 상한 80회
+```
+
+Path Traversal Finding 6개는 독립 curl 기준과 대조해 확인했다. `/ftp`의 제한 확장자
+파일 7개 중 6개가 plain 403 → bypass 200이고, 평문으로도 제공되는
+`incident-support.kdbx`는 우회가 아니므로 올바르게 rejected 된다. 오탐 0개이며 Finding
+6개 모두 증적 2개(control 4xx + probe 2xx)를 갖고 분석 증적은 하나도 섞이지 않았다.
 
 | 계층 | 상태 |
 |---|---|
@@ -41,7 +70,7 @@ append-only InMemory·SQLite KnowledgeBase를 구현했다. 다만 KnowledgeBase
 | Analysis Agent | ✅ 5종 모두 휴리스틱·Gemini/Anthropic 공용 LLM 경로 구현 |
 | Validation Agent | ✅ 5종 독립 proof와 Finding 승격 구현 |
 | Pipeline LLM | ⚠️ Analysis에만 연결됨. Recon·Router·Orchestrator·Validation·Report는 결정적 구현 |
-| Juice Shop 단일 Run | ⚠️ XSS·SQLi·SSTI 동시 라우팅. Access Control·Path Traversal 통합 전 |
+| Juice Shop 단일 Run | ✅ XSS·SQLi·Path Traversal 동시 라우팅, SSTI는 인증 시 포함. Access Control은 전용 Run |
 | KnowledgeBase | ⚠️ Core Adapter 완료, Run 검색·발행 배선 전 |
 | 안전 통제 | ✅ Phase 8 baseline 구현 완료 |
 
@@ -51,8 +80,9 @@ append-only InMemory·SQLite KnowledgeBase를 구현했다. 다만 KnowledgeBase
 report              → adapters/reporting.py          ✅
 evidence_collector  → application/execution.py       ✅
 session_authenticator → adapters/authentication.py   ✅
-recon               → 결정적 HTML·JS Surface 수집       ✅
-xss_analyzer        → heuristic / LLM 구현              ✅
+recon               → 결정적 HTML·JS·SPA 라우트 수집     ✅
+xss_analyzer        → heuristic / LLM 구현 (서버 반사)     ✅
+browser_xss_analyzer → heuristic 만 (SPA DOM 반사)        ⚠️ LLM 판 없음
 sqli_analyzer       → heuristic / LLM 구현              ✅
 path_traversal_analyzer → heuristic / LLM 구현           ✅
 access_control_analyzer → heuristic / LLM 구현           ✅
@@ -62,8 +92,9 @@ knowledge           → InMemory / SQLite Adapter 구현    ✅ Core
 ```
 
 `bootstrap.build_local_application()`은 공통 Worker를 조립하고,
-`register_standard_agents()`가 Recon·5종 Analysis·Validation 구현을 등록한다. LLM Client를
+`register_standard_agents()`가 Recon·Analysis·Validation 구현을 등록한다. LLM Client를
 주입하지 않으면 휴리스틱 대조군, 주입하면 같은 등록 키의 LLM Analysis Agent를 사용한다.
+`browser_xss_analyzer`는 예외로 두 프로필이 같은 휴리스틱 구현을 공유한다.
 Router는 선택된 취약점 유형과 등록된 Analyzer를 기준으로 Candidate를 만든다.
 
 ---
@@ -130,10 +161,10 @@ flowchart LR
     style REPORT fill:#e0ffe0,stroke:#0a0
 ```
 
-전체 단계는 5종 모두 단위·Fake Runtime E2E로 완주한다. 실제 로컬 대상에서는 DVWA와
-Juice Shop 실행기가 취약점별 baseline을 제공한다. 다만 Juice Shop 한 Run에서 5종을 모두
-Finding까지 완주하는 통합 목표는 아직 미완료이므로, Agent 구현 완료와 대상 통합 완료를
-구분해서 본다.
+전체 단계는 5종 모두 단위·Fake Runtime E2E로 완주한다. 실제 로컬 대상은 Juice Shop
+하나로 고정했다. 한 Run에서 XSS·SQLi·Path Traversal이 Finding까지 완주하고 SSTI는 인증
+시 합류한다. Access Control만 전용 Run으로 남아 있어, Agent 구현 완료와 대상 통합 완료를
+아직 구분해서 본다.
 
 ---
 
@@ -326,11 +357,19 @@ Validation이 별도 재현을 수행해 `XSS_EXECUTION`, `SQLI_EFFECT`,
 
 | Agent | 휴리스틱 | LLM | 실제 E2E |
 |---|---:|---:|---:|
-| XSS | ✅ | ✅ | ✅ DVWA Finding / ⚠️ Juice Shop DOM 계약 전 |
-| SQLi | ✅ | ✅ | ✅ DVWA·Juice Shop Finding |
+| XSS | ✅ 서버 반사 / ✅ 브라우저 DOM 반사 | ✅ 서버 반사만 | ✅ Juice Shop `#/search?q=` Finding |
+| SQLi | ✅ | ✅ | ✅ Juice Shop `/rest/products/search` Finding |
 | Access Control | ✅ | ✅ | ✅ Fake E2E·Juice Shop 전용 Run Finding |
-| Path Traversal | ✅ 고정 `/etc/os-release` | ✅ | ✅ 독립 E2E / ⚠️ Juice Shop POST body 계약 전 |
+| Path Traversal | ✅ 확장자 필터 우회 | ⚠️ 쿼리 탈출 계약만 | ✅ Juice Shop `/ftp/{파일}` Finding 6개 |
 | SSTI | ✅ | ✅ | ✅ Fake E2E·Juice Shop Finding |
+
+XSS는 담당 Analyzer가 둘이다. 서버가 본문에 값을 돌려주는 반사는 `xss_analyzer`,
+SPA의 DOM sink는 `browser_xss_analyzer`가 맡는다. Router가 Surface 모양(fragment 라우트
+여부)으로 갈라 보낸다. **브라우저 쪽은 아직 휴리스틱 구현만 있어 두 프로필이 이를
+공유하므로, XSS는 heuristic/LLM 비교가 성립하지 않는다.**
+
+Path Traversal LLM Agent는 쿼리 파라미터 탈출 계약만 알고 있어 새 우회 흐름을 타지
+않는다. 휴리스틱 경로만 Juice Shop 표면을 다룬다.
 
 **왜 마지막인가** **연구의 본체이자 가장 비싼 부분이다.** Phase 1~5가 없으면 LLM에게 줄 입력(구조화된 Surface, 실제 응답 Evidence)이 없어서 프롬프트를 설계할 수 없다. 그리고 대조군이 먼저 있어야 "LLM이 실제로 나은가"를 측정할 수 있다.
 
@@ -435,20 +474,37 @@ Evidence는 "이번 대상에서 직접 관찰한 사실", Knowledge는 "민감�
 
 ### 현재 통합 마일스톤 — Juice Shop 5종 단일 Run
 
-최종 프레임워크의 입력 단위는 **서비스 URL 하나, Run 하나**다. DVWA와 Juice Shop을 묶은
-상위 Run은 최종 구조가 아니며, DVWA 실행기는 취약점별 회귀 검사용으로만 유지한다.
+최종 프레임워크의 입력 단위는 **서비스 URL 하나, Run 하나**다. 대상은 Juice Shop으로
+고정했고 DVWA는 폐기했다.
 
 | 항목 | 현재 상태 |
 |---|---|
 | SQLi | ✅ `all`에서 `/rest/products/search?q=` 발견, 독립 검증 후 Finding |
+| XSS | ✅ `all`에서 SPA 라우트 `#/search?q=` DOM 반사 → 브라우저 실행 proof |
+| Path Traversal | ✅ `all`에서 `/ftp/{파일}` 확장자 필터 우회 → Finding 6개 |
 | SSTI | ✅ token이 있으면 `/profile` seed·유형별 credential 사용, 정리 후 Finding |
-| XSS | ⚠️ Candidate 생성까지. SPA DOM sink용 브라우저 분석·검증 계약 필요 |
-| Path Traversal | ⚠️ Agent는 구현됨. Juice Shop의 POST body Local File Read 표면 계약 필요 |
-| Access Control | ⚠️ 전용 Run의 임시 2계정 E2E는 완료. 같은 `all` Run fixture로 통합 필요 |
-| 단일 Run 완료 기준 | ⏳ 한 URL에서 5종 Candidate→Analysis→Validation→Finding 흐름과 정리 검증 |
+| Access Control | ⚠️ 전용 Run의 임시 2계정 E2E는 완료. `all` 통합은 의도적으로 보류 |
+| 단일 Run 완료 기준 | ⏳ Access Control까지 한 Run에 넣으면 완료 |
 
-추가로 확인된 성능·비교 실험 과제는 브라우저 XSS의 고정 렌더 대기 축소,
-Path Traversal 후보 우선순위 개선, 브라우저 XSS의 휴리스틱/LLM 판단 경로 분리다.
+Access Control만 `all`에서 빠져 있다. Recon이 만드는 것은 `/basket`(Angular 라우트)이지
+`/rest/basket/{id}`가 아니고, **객체 ID는 크롤링으로 나오지 않으며 임의로 만들면 열거가
+된다.** 계정만 만들고 Candidate는 생기지 않는 상황을 피하려고 전용 Run으로 남겼다.
+표면 발견 방법을 먼저 정해야 통합할 수 있다.
+
+#### 남은 성능·비교 과제
+
+- **브라우저 XSS의 고정 렌더 대기 축소** — 지금은 요청마다 2초 고정 대기다. 실측상
+  브라우저 실행 자체는 0.08~0.3초로 싸고 대기가 비용의 전부다. 조건 충족까지만 기다리면
+  성공 경로는 0.28~0.33초로 줄지만 실패 경로는 상한까지 기다린다. `body`에 텍스트가
+  생겼는지로 렌더 완료를 판정하는 방법은 **쓸 수 없다** — 0.03초에 참이 되는데 marker는
+  500ms에 나타나 오탐이 난다.
+- **도구별 예산 가중치** — 브라우저가 검증뿐 아니라 분석에도 들어와 요청 1회의 비용이
+  도구마다 크게 다르다. 요청 수만 세는 현재 예산 모델로는 우선순위 조정에 근거가 없다.
+- **Path Traversal 후보 축소** — `/ftp`의 제한 확장자 파일을 전부 후보로 만든다. 필터는
+  서버 전체에 걸리므로 한 파일이면 증명에 충분하지만, 어느 파일이 우회되는지는 요청해야
+  알 수 있어 사전에 줄이기 어렵다.
+- **브라우저 XSS의 LLM 판단 경로** — `LlmBrowserXssAnalyzer`가 없어 두 프로필이 휴리스틱
+  구현을 공유한다. XSS만 heuristic/LLM 비교가 성립하지 않는다.
 
 ---
 
