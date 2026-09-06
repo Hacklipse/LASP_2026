@@ -10,6 +10,7 @@ from hacklipse.adapters import (
     AllowlistPolicyGate,
     AnthropicLlmClient,
     BoundedRetryPolicy,
+    BrowserXssAnalyzer,
     DisabledExecutionRuntime,
     FormLoginWorker,
     GeminiLlmClient,
@@ -240,7 +241,13 @@ def build_local_application(
     )
     # Sink를 주지 않아도 진행 사건을 남긴다. 실행이 끝난 뒤 무슨 일이 있었는지
     # 되짚을 수 있어야 하고, 보관 비용은 사건 몇십 개뿐이다.
-    selected_progress = progress_sink or InMemoryProgressLog()
+    # 저장소가 영속이면 진행 사건도 같은 파일에 남긴다. 작업은 복원되는데 진행
+    # 상태만 사라지면 재개 화면이 "아무 일도 없었다"로 보인다.
+    selected_progress = (
+        progress_sink
+        or getattr(selected_stores, "progress", None)
+        or InMemoryProgressLog()
+    )
     orchestrator = Orchestrator(
         run_store=selected_stores.runs,
         evidence_store=selected_stores.evidence,
@@ -277,6 +284,7 @@ def build_local_application(
 IMPLEMENTED_ANALYZERS = (
     "access_control_analyzer",
     "xss_analyzer",
+    "browser_xss_analyzer",
     "sqli_analyzer",
     "path_traversal_analyzer",
     "ssti_analyzer",
@@ -403,6 +411,17 @@ def register_standard_agents(
         profile = "llm"
     app.dispatcher.register(
         "xss_analyzer", xss_analyzer, allowed_tools=("http_get",)
+    )
+    # SPA 라우트의 DOM 반사는 브라우저로만 관측된다. LLM 구성에서도 같은 관측을
+    # 쓰므로 두 프로필이 이 Analyzer 를 공유한다.
+    app.dispatcher.register(
+        "browser_xss_analyzer",
+        BrowserXssAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        ),
+        allowed_tools=("browser_xss",),
     )
     app.dispatcher.register(
         "sqli_analyzer",

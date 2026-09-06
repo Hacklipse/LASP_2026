@@ -1,7 +1,13 @@
 """Application 계층이 사용하는 교체 가능한 컴포넌트 계약을 공개한다."""
 
 from .agents import Agent, TaskDispatcher, VulnerabilityRouter
-from .control import BudgetManager, PolicyGate, ProgressSink, RetryPolicy
+from .control import (
+    BudgetManager,
+    PolicyGate,
+    ProgressLog,
+    ProgressSink,
+    RetryPolicy,
+)
 from .knowledge import KnowledgeBase
 from .llm import LlmClient, LlmMessage, LlmRequest, LlmResponse, LlmUsage
 from .repositories import (
@@ -44,6 +50,7 @@ __all__ = [
     "LlmResponse",
     "LlmUsage",
     "PolicyGate",
+    "ProgressLog",
     "ProgressSink",
     "ReportStore",
     "RetryPolicy",

@@ -118,6 +118,10 @@ _PROBE_VALUE = re.compile(r"^[A-Za-z0-9_-]+['\"<>]{0,4}$")
 # 비민감 OS 식별 파일을 정확한 상대 경로 하나로 고정해 LLM이나 Agent가 다른 파일
 # (예: /etc/passwd)을 선택하지 못하게 한다.
 PATH_TRAVERSAL_SAFE_PROBE_PATH = "../../../../../etc/os-release"
+# 확장자 필터를 우회해 서버가 직접 거부한 자기 파일을 읽게 하는 고정 접미사.
+# 이미 URL 인코딩된 문자열이므로 재인코딩하지 않고 경로 뒤에 그대로 붙인다.
+# Agent나 LLM은 "우회를 적용한다"만 지정할 수 있고 접미사 내용은 고를 수 없다.
+PATH_TRAVERSAL_BYPASS_SUFFIX = "%2500.md"
 # Access Control 탐침이 식별자 파라미터에 실을 수 있는 값. 숫자만 허용해 LLM이나 Agent가
 # 경로·따옴표·와일드카드를 객체 ID 자리에 넣지 못하게 한다.
 _OBJECT_IDENTIFIER = re.compile(r"^[0-9]{1,10}$")
@@ -141,6 +145,12 @@ def is_path_traversal_safe_probe_value(value: str) -> bool:
     """고정된 비민감 증명 파일 상대 경로와 정확히 같은지 확인한다."""
 
     return value == PATH_TRAVERSAL_SAFE_PROBE_PATH
+
+
+def is_path_traversal_bypass_suffix(value: str) -> bool:
+    """도메인이 고정한 확장자 필터 우회 접미사와 정확히 같은지 확인한다."""
+
+    return value == PATH_TRAVERSAL_BYPASS_SUFFIX
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +256,9 @@ class HttpRequestSpec:
     identifier_location: AccessIdentifierLocation | None = None
     path_identifier_index: int | None = None
     path_identifier_value: str | None = None
+    # 경로 끝에 그대로 붙는 도메인 고정 접미사. 값 형태를 도메인이 강제하므로
+    # Agent가 임의 경로나 임의 인코딩을 여기로 실을 수 없다.
+    path_suffix: str | None = None
 
     def __post_init__(self) -> None:
         if not self.method or _HTTP_METHOD.fullmatch(self.method) is None:
@@ -274,6 +287,15 @@ class HttpRequestSpec:
             ):
                 raise DomainInvariantError(
                     "path traversal probe may only use markers and the fixed safe path"
+                )
+        if self.path_suffix is not None:
+            if self.request_kind is not HttpRequestKind.PATH_TRAVERSAL_PROBE:
+                raise DomainInvariantError(
+                    "path suffix belongs to the path traversal probe kind only"
+                )
+            if not is_path_traversal_bypass_suffix(self.path_suffix):
+                raise DomainInvariantError(
+                    f"path suffix must be the fixed bypass suffix: {self.path_suffix!r}"
                 )
         if self.request_kind is HttpRequestKind.ACCESS_CONTROL_PROBE:
             self._validate_access_control_probe()
@@ -792,6 +814,7 @@ class ExecutionRequest:
     identifier_location: AccessIdentifierLocation | None = None
     path_identifier_index: int | None = None
     path_identifier_value: str | None = None
+    path_suffix: str | None = None
     validation_id: str | None = None
     timeout_seconds: float = 120.0
     credential_ref: str | None = None
@@ -810,6 +833,7 @@ class ExecutionRequest:
             identifier_location=self.identifier_location,
             path_identifier_index=self.path_identifier_index,
             path_identifier_value=self.path_identifier_value,
+            path_suffix=self.path_suffix,
         )
         if self.timeout_seconds <= 0:
             raise DomainInvariantError("execution timeout must be positive")
@@ -832,6 +856,10 @@ class ExecutionRequest:
             assert self.path_identifier_value is not None
             segments[index] = quote(self.path_identifier_value, safe="")
             path = "/".join(segments)
+        if self.path_suffix is not None:
+            # 도메인이 고정한 접미사이며 이미 인코딩된 문자열이다. 다시 quote하면
+            # `%25`가 `%2525`가 되어 우회가 성립하지 않는다.
+            path = f"{path}{self.path_suffix}"
         encoded = urlencode(self.query_parameters)
         query = parsed.query
         if encoded:

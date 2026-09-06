@@ -16,6 +16,10 @@ from hacklipse.domain import (
 _PATH_TRAVERSAL_TOOL = "path_traversal_probe"
 _ACCESS_CONTROL_TOOL = "access_control_probe"
 _SSTI_TOOL = "ssti_probe"
+_BROWSER_XSS_TOOL = "browser_xss"
+# XSS 는 담당 Agent 가 둘이다. 서버 반사는 http_get, SPA 의 DOM 반사는 브라우저로만
+# 관측된다. 도구는 취약점 유형이 아니라 그 Agent 가 무엇으로 요청하는지에 달려 있다.
+_BROWSER_XSS_ANALYZER = "browser_xss_analyzer"
 
 
 class TaskFactory:
@@ -49,7 +53,9 @@ class TaskFactory:
     ) -> TaskEnvelope:
         """Candidate의 실제 Surface URL과 Evidence 참조를 Analysis Task에 담는다."""
 
-        if candidate.vulnerability_type == "Path Traversal":
+        if candidate.assigned_agent == _BROWSER_XSS_ANALYZER:
+            allowed_tools = (_BROWSER_XSS_TOOL,)
+        elif candidate.vulnerability_type == "Path Traversal":
             allowed_tools = (_PATH_TRAVERSAL_TOOL,)
         elif candidate.vulnerability_type == "Access Control":
             # 권한 우회 탐침은 전용 도구로만 나간다. 일반 http_get을 허용하면 Agent가

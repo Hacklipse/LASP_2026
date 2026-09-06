@@ -145,6 +145,7 @@ class Orchestrator:
         run = self._runs.get(run_id)
         if run.phase in {RunPhase.DONE, RunPhase.FAILED}:
             return run
+        self._continue_progress(run_id)
 
         try:
             if run.phase in {
@@ -211,6 +212,34 @@ class Orchestrator:
         result = self._tasks.execute(task)
         self._require_completed(result, "recon")
         return self._merge_agent_result(run, result)
+
+    def _continue_progress(self, run_id: str) -> None:
+        """저장된 진행 사건 뒤에서 순번과 경과 시간을 이어받는다.
+
+        새 프로세스에서 재개하면 순번이 0부터 다시 시작한다. 저장된 사건과 겹치면
+        중복으로 걸러져 재개 구간이 통째로 사라진다. 경과 시간도 마찬가지로 0부터
+        다시 세면 하나의 Run 안에서 시간이 뒤로 흐른다.
+
+        Sink가 되짚기를 지원하지 않으면(화면만 그리는 Sink) 아무 일도 하지 않는다.
+        """
+
+        if self._progress is None or self._sequence:
+            return
+        last_sequence = getattr(self._progress, "last_sequence", None)
+        if last_sequence is None:
+            return
+        self._sequence = last_sequence(run_id)
+        if not self._sequence:
+            return
+        stored = getattr(self._progress, "list_by_run", None)
+        if stored is None:
+            return
+        events = stored(run_id)
+        if not events:
+            return
+        # 중단 시각이 아니라 마지막 사건의 경과값을 원점으로 삼는다. 멈춰 있던
+        # 시간은 단계 비용이 아니므로 세지 않는다.
+        self._started_at = self._clock() - events[-1].elapsed_ms / 1000
 
     def _emit(
         self,

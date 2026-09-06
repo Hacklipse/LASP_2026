@@ -87,13 +87,19 @@ class BrowserProbeContractTests(unittest.TestCase):
         )
 
     def test_runtime_replaces_only_the_marker_with_a_fixed_script(self) -> None:
+        """innerHTML 로 삽입된 `<script>` 는 브라우저가 실행하지 않는다.
+
+        SPA 의 DOM sink 를 검증하려면 삽입만으로 이벤트가 발생하는 형태여야 한다.
+        형태는 도메인 쪽에 고정되어 있고 marker 만 바뀐다.
+        """
+
         url, marker = browser_navigation_url(_request())
 
         self.assertEqual(marker, _MARKER)
         parameters = dict(parse_qsl(urlsplit(url).query, keep_blank_values=True))
         self.assertEqual(
             parameters["name"],
-            f"<script>window.__hacklipse_xss_probe__='{_MARKER}'</script>",
+            f'<img src=x onerror="window.__hacklipse_xss_probe__=\'{_MARKER}\'">',
         )
 
     def test_control_request_never_receives_an_execution_script(self) -> None:

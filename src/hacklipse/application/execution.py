@@ -117,6 +117,7 @@ class RuntimeEvidenceCollector:
             identifier_location=http_request.identifier_location,
             path_identifier_index=http_request.path_identifier_index,
             path_identifier_value=http_request.path_identifier_value,
+            path_suffix=http_request.path_suffix,
             validation_id=validation_id,
             timeout_seconds=min(timeout_seconds, run.timeout_seconds),
             credential_ref=_credential_for(run, spec.principal_role, credential_ref),

@@ -11,6 +11,7 @@ from .models import (
     ExecutionResult,
     Finding,
     PROBE_METACHARACTERS,
+    PATH_TRAVERSAL_BYPASS_SUFFIX,
     PATH_TRAVERSAL_SAFE_PROBE_PATH,
     AccessPrincipalRole,
     AccessIdentifierLocation,
@@ -38,6 +39,7 @@ from .models import (
     ProgressSnapshot,
     UncheckedCandidate,
     credential_for_vulnerability,
+    is_path_traversal_bypass_suffix,
     is_path_traversal_safe_probe_value,
 )
 

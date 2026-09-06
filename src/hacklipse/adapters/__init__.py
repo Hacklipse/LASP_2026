@@ -10,6 +10,7 @@ from .llm_client import AnthropicLlmClient
 from .llm_path_traversal_analysis import LlmPathTraversalAnalyzer
 from .llm_sqli_analysis import LlmSqliAnalyzer
 from .llm_ssti_analysis import LlmSstiAnalyzer
+from .browser_xss_analysis import BrowserXssAnalyzer
 from .llm_xss_analysis import LlmXssAnalyzer
 from .memory import CallbackProgressLog, InMemoryProgressLog, MemoryStoreBundle
 from .policy import AllowlistPolicyGate
@@ -34,7 +35,7 @@ from .security import (
 from .validation import ValidationAgent
 from .xss_analysis import HeuristicXssAnalyzer
 from .sqlite_budget import SQLiteBudgetManager
-from .sqlite_store import SQLiteStoreBundle
+from .sqlite_store import SQLiteProgressLog, SQLiteStoreBundle
 
 __all__ = [
     "AllowlistPolicyGate",
@@ -49,6 +50,7 @@ __all__ = [
     "HeuristicSqliAnalyzer",
     "HeuristicSstiAnalyzer",
     "HeuristicPathTraversalAnalyzer",
+    "BrowserXssAnalyzer",
     "HeuristicXssAnalyzer",
     "InMemoryBudgetManager",
     "InMemoryCredentialResolver",
@@ -72,6 +74,7 @@ __all__ = [
     "ValidationAgent",
     "SQLiteBudgetManager",
     "SQLiteExecutionAuditLog",
+    "SQLiteProgressLog",
     "SQLiteStoreBundle",
     "StaticApprovalGate",
 ]
