@@ -265,6 +265,30 @@ def build_path_traversal_bypass_requests(
     )
 
 
+def _received_bytes(evidence: Evidence) -> int:
+    """실제로 받은 본문 크기. 바이너리도 세야 한다."""
+
+    size = evidence.observation.get("body_bytes")
+    if isinstance(size, int):
+        return max(0, size)
+    return len(response_body(evidence) or "")
+
+
+def _content_key(evidence: Evidence) -> tuple[object, ...]:
+    """두 응답이 같은 내용인지 비교할 키.
+
+    디코딩된 본문에 기대지 않는다. 서버가 우회 경로로 내주는 파일은 대부분
+    application/octet-stream 이라 Runtime 이 텍스트로 풀지 않고 body 를 None 으로
+    남긴다. content_hash 와 크기는 종류와 무관하게 항상 기록된다.
+    """
+
+    return (
+        evidence.content_hash,
+        evidence.observation.get("body_bytes"),
+        response_body(evidence),
+    )
+
+
 def path_traversal_bypass_signal(control: Evidence, probe: Evidence) -> bool:
     """서버가 거부한 파일이 우회 경로로는 제공되었는지 판정한다.
 
@@ -274,15 +298,13 @@ def path_traversal_bypass_signal(control: Evidence, probe: Evidence) -> bool:
 
     control_status = control.observation.get("status")
     probe_status = probe.observation.get("status")
-    control_body = response_body(control) or ""
-    probe_body = response_body(probe) or ""
     return bool(
         isinstance(control_status, int)
         and 400 <= control_status < 500
         and isinstance(probe_status, int)
         and 200 <= probe_status < 300
-        and probe_body
-        and probe_body != control_body
+        and _received_bytes(probe)
+        and _content_key(control) != _content_key(probe)
     )
 
 

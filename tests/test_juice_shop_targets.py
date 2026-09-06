@@ -11,6 +11,7 @@ DVWA 를 폐기하면서 XSS 와 Path Traversal 의 표면 모양이 바뀌었�
 
 from __future__ import annotations
 
+import hashlib
 import unittest
 
 from hacklipse.adapters import BrowserXssAnalyzer, HeuristicPathTraversalAnalyzer
@@ -402,14 +403,29 @@ class BypassSuffixContractTests(unittest.TestCase):
             validate_path_traversal_request(request)
 
 
-def _evidence(evidence_id: str, status: int, body: str) -> Evidence:
+def _evidence(
+    evidence_id: str, status: int, body: str, *, textual: bool = True
+) -> Evidence:
+    """실제 Runtime 이 남기는 모양으로 만든다.
+
+    Runtime 은 비텍스트 응답의 본문을 문자열로 풀지 않고 크기와 해시만 남긴다.
+    대역이 항상 텍스트를 돌려주면 그 경로가 테스트되지 않는다.
+    """
+
+    raw = body.encode()
     return Evidence(
         evidence_id=evidence_id,
         run_id=_RUN_ID,
         surface_id="surface-file",
         created_by="runtime",
         evidence_type="http_response",
-        observation={"type": "http_response", "status": status, "body": body},
+        observation={
+            "type": "http_response",
+            "status": status,
+            "body": body if textual else None,
+            "body_bytes": len(raw),
+        },
+        content_hash=hashlib.sha256(raw).hexdigest(),
     )
 
 
@@ -448,6 +464,20 @@ class BypassSignalTests(unittest.TestCase):
             )
         )
 
+    def test_a_binary_probe_body_is_still_a_read(self) -> None:
+        """서버가 우회로 내주는 파일은 대부분 application/octet-stream 이다.
+
+        Runtime 은 그런 응답을 텍스트로 풀지 않고 body 를 None 으로 남긴다. 판정이
+        디코딩된 본문에 기대면 백업·키·DB 처럼 정작 중요한 파일을 통째로 놓친다.
+        """
+
+        self.assertTrue(
+            path_traversal_bypass_signal(
+                _evidence("c", 403, "Only .md and .pdf files are allowed!"),
+                _evidence("p", 200, '{"name":"juice-shop"}', textual=False),
+            )
+        )
+
 
 class RestrictedFileDetectionTests(unittest.TestCase):
     def test_web_servable_extensions_are_not_flagged(self) -> None:
@@ -476,15 +506,20 @@ class _BypassRuntime:
             status, body = 200, '{"name":"juice-shop"}'
         else:
             status, body = 403, "Only .md and .pdf files are allowed!"
+        raw = body.encode()
         return ExecutionResult(
             execution_id=request.execution_id,
             evidence_type="http_response",
             observation={
                 "type": "http_response",
                 "status": status,
-                "body": body,
+                # 우회로 받은 파일은 application/octet-stream 이라 Runtime 이
+                # 텍스트로 풀지 않는다. 대역도 같은 모양으로 돌려준다.
+                "body": None if status == 200 else body,
+                "body_bytes": len(raw),
                 "requested_url": request.resolved_url,
             },
+            content_hash=hashlib.sha256(raw).hexdigest(),
         )
 
 
