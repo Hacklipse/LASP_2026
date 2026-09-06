@@ -37,15 +37,17 @@ DVWA 실행기(`scripts/run_dvwa_baseline.py`)와 쿼리 파라미터 탈출 흐
 
 현재 최우선 통합 상태는 다음과 같다.
 
-- Juice Shop 단일 Run의 `all` 모드가 XSS·SQLi·Path Traversal을 함께 라우팅하고
-  세 유형 모두 Finding까지 만든다. 인증이 필요한 SSTI는 token Cookie가 있을 때 포함된다.
+- Juice Shop 단일 Run의 `all` 모드가 XSS·SQLi·Path Traversal을 함께 라우팅한다.
+  인증이 필요한 SSTI는 token Cookie가 있을 때 포함된다.
+  **세 유형이 Finding까지 가는 것은 휴리스틱 프로필에서만 확인했다.** LLM 프로필은
+  아래 「LLM 프로필 미완주」 때문에 `all`이 완주하지 못한다.
 - Access Control은 임시 ACTOR/OWNER 계정 생성·검증·삭제 E2E가 구현됐지만 아직
   `--vuln access_control` 전용 Run으로만 실행된다. 객체 ID는 크롤링으로 나오지 않고
   임의로 만들면 열거가 되므로 `all` 모드에서 의도적으로 제외한다.
 - HTTP Runtime의 기본 응답 본문 상한은 2 MiB로 올라가 Juice Shop의 큰 `main.js`를
   읽을 수 있으며, 그 결과 `/rest/products/search?q=` Surface와 SQLi Finding이 복구됐다.
 
-#### 실측 (2026-09-06, `--vuln all --profile heuristic`)
+#### 실측 (2026-09-06, **`--profile heuristic`**)
 
 ```plain text
   Surface    95개 (파라미터 4종)
@@ -357,10 +359,10 @@ Validation이 별도 재현을 수행해 `XSS_EXECUTION`, `SQLI_EFFECT`,
 
 | Agent | 휴리스틱 | LLM | 실제 E2E |
 |---|---:|---:|---:|
-| XSS | ✅ 서버 반사 / ✅ 브라우저 DOM 반사 | ✅ 서버 반사만 | ✅ Juice Shop `#/search?q=` Finding |
+| XSS | ✅ 서버 반사 / ✅ 브라우저 DOM 반사 | ⚠️ 서버 반사만. 브라우저 판 없음 | ✅ 휴리스틱만 확인 |
 | SQLi | ✅ | ✅ | ✅ Juice Shop `/rest/products/search` Finding |
 | Access Control | ✅ | ✅ | ✅ Fake E2E·Juice Shop 전용 Run Finding |
-| Path Traversal | ✅ 확장자 필터 우회 | ⚠️ 쿼리 탈출 계약만 | ✅ Juice Shop `/ftp/{파일}` Finding 6개 |
+| Path Traversal | ✅ 확장자 필터 우회 | ❌ 새 표면에서 Run 중단 | ✅ 휴리스틱만 확인 (Finding 6개) |
 | SSTI | ✅ | ✅ | ✅ Fake E2E·Juice Shop Finding |
 
 XSS는 담당 Analyzer가 둘이다. 서버가 본문에 값을 돌려주는 반사는 `xss_analyzer`,
@@ -368,8 +370,25 @@ SPA의 DOM sink는 `browser_xss_analyzer`가 맡는다. Router가 Surface 모양
 여부)으로 갈라 보낸다. **브라우저 쪽은 아직 휴리스틱 구현만 있어 두 프로필이 이를
 공유하므로, XSS는 heuristic/LLM 비교가 성립하지 않는다.**
 
-Path Traversal LLM Agent는 쿼리 파라미터 탈출 계약만 알고 있어 새 우회 흐름을 타지
-않는다. 휴리스틱 경로만 Juice Shop 표면을 다룬다.
+#### LLM 프로필 미완주 — 미해결
+
+`LlmPathTraversalAnalyzer.handle()` 이 `resolve_analysis_task(...)` 에
+`allow_parameterless_get=True` 를 넘기지 않는다. 새 Path Traversal 표면은 경로 자체가
+파일이라 query 파라미터가 없으므로 `AgentContractError` 가 난다. 계약 위반은 격리하지
+않는 정책(Task 2)이라 **Run 전체가 죽는다.**
+
+```plain text
+LLM 프로필 --vuln all
+  Run 실패: phase=analyze / AgentContractError
+  Candidate 15  Finding 0     <- 전부 routed 상태로 남음
+```
+
+`resolve_analysis_task` 가 `handle()` 첫 줄이라 **LLM 호출 이전에 실패한다.** 실제 API
+키가 있어도 결과는 같다. XSS·SQLi 는 차례가 오기 전에 Run 이 끝난다.
+
+고치는 방법은 둘 중 하나다.
+1. `LlmPathTraversalAnalyzer` 에도 우회 흐름을 구현한다 (권장)
+2. 최소 조치로 `allow_parameterless_get=True` 를 넘기고 우회 표면은 신호 없이 COMPLETED 로 넘긴다
 
 **왜 마지막인가** **연구의 본체이자 가장 비싼 부분이다.** Phase 1~5가 없으면 LLM에게 줄 입력(구조화된 Surface, 실제 응답 Evidence)이 없어서 프롬프트를 설계할 수 없다. 그리고 대조군이 먼저 있어야 "LLM이 실제로 나은가"를 측정할 수 있다.
 
@@ -479,9 +498,9 @@ Evidence는 "이번 대상에서 직접 관찰한 사실", Knowledge는 "민감�
 
 | 항목 | 현재 상태 |
 |---|---|
-| SQLi | ✅ `all`에서 `/rest/products/search?q=` 발견, 독립 검증 후 Finding |
-| XSS | ✅ `all`에서 SPA 라우트 `#/search?q=` DOM 반사 → 브라우저 실행 proof |
-| Path Traversal | ✅ `all`에서 `/ftp/{파일}` 확장자 필터 우회 → Finding 6개 |
+| SQLi | ✅ 휴리스틱 `all`에서 Finding. LLM 은 팀 보고로 확인 |
+| XSS | ✅ 휴리스틱 `all`에서 DOM 반사 → 브라우저 실행 proof. LLM `all` 은 미완주 |
+| Path Traversal | ✅ 휴리스틱 `all`에서 Finding 6개. ❌ LLM 은 계약 누락으로 Run 중단 |
 | SSTI | ✅ token이 있으면 `/profile` seed·유형별 credential 사용, 정리 후 Finding |
 | Access Control | ⚠️ 전용 Run의 임시 2계정 E2E는 완료. `all` 통합은 의도적으로 보류 |
 | 단일 Run 완료 기준 | ⏳ Access Control까지 한 Run에 넣으면 완료 |
