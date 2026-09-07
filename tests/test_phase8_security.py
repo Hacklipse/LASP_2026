@@ -278,7 +278,10 @@ class Phase8AuthenticatedWorkflowTests(unittest.TestCase):
         with self.assertRaises(WorkflowExecutionError) as context:
             app.orchestrator.start(self._request())
 
-        self.assertIn("protected resource verification", str(context.exception))
+        self.assertEqual(context.exception.reason, "AuthenticationFailed")
+        self.assertIn(
+            "protected resource verification", str(context.exception.__cause__)
+        )
         self.assertEqual(_DvwaLikeHandler.authenticated_gets, 0)
 
     def test_login_post_is_blocked_without_explicit_approval(self) -> None:
@@ -348,6 +351,65 @@ class _SlowAgent:
 
 
 class Phase8TaskBoundaryTests(unittest.TestCase):
+    def test_task_progress_callback_observes_start_and_completion(self) -> None:
+        stores = MemoryStoreBundle()
+        budget = InMemoryBudgetManager()
+        budget.open_run("run-progress", 1)
+        dispatcher = LocalTaskDispatcher()
+        dispatcher.register("worker", _CompletingAgent(), allowed_tools=())
+        events: list[tuple[str, str, int, float]] = []
+        executor = TaskExecutor(
+            dispatcher=dispatcher,
+            task_store=stores.tasks,
+            budget_manager=budget,
+            retry_policy=BoundedRetryPolicy(),
+            progress_callback=lambda event, task, attempt, elapsed: events.append(
+                (event, task.task_id, attempt, elapsed)
+            ),
+        )
+
+        executor.execute(
+            TaskEnvelope(
+                task_id="task-progress",
+                run_id="run-progress",
+                agent_type="worker",
+            )
+        )
+
+        self.assertEqual([event[0] for event in events], ["started", "succeeded"])
+        self.assertTrue(all(event[1] == "task-progress" for event in events))
+        self.assertTrue(all(event[2] == 1 for event in events))
+        self.assertGreaterEqual(events[-1][3], 0.0)
+
+    def test_task_progress_callback_failure_does_not_change_task_result(self) -> None:
+        stores = MemoryStoreBundle()
+        budget = InMemoryBudgetManager()
+        budget.open_run("run-progress-error", 1)
+        dispatcher = LocalTaskDispatcher()
+        dispatcher.register("worker", _CompletingAgent(), allowed_tools=())
+
+        def broken_callback(*args) -> None:
+            del args
+            raise RuntimeError("debug output unavailable")
+
+        executor = TaskExecutor(
+            dispatcher=dispatcher,
+            task_store=stores.tasks,
+            budget_manager=budget,
+            retry_policy=BoundedRetryPolicy(),
+            progress_callback=broken_callback,
+        )
+
+        result = executor.execute(
+            TaskEnvelope(
+                task_id="task-progress-error",
+                run_id="run-progress-error",
+                agent_type="worker",
+            )
+        )
+
+        self.assertIs(result.status, AgentResultStatus.COMPLETED)
+
     def test_dispatcher_rejects_tools_not_granted_at_registration(self) -> None:
         dispatcher = LocalTaskDispatcher()
         dispatcher.register("restricted", _CompletingAgent(), allowed_tools=())
@@ -389,10 +451,6 @@ class Phase8TaskBoundaryTests(unittest.TestCase):
         record = stores.tasks.get("task-timeout")
         self.assertIs(record.status, TaskStatus.FAILED)
         self.assertEqual(record.attempts, 1)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class PhoneMaskingPrecisionTests(unittest.TestCase):
@@ -458,3 +516,29 @@ class SanitizerStructurePreservationTests(unittest.TestCase):
 
         self.assertEqual(parsed.path, "/search")
         self.assertEqual(parse_qs(parsed.query), {"csrf_token": ["<redacted>"]})
+
+
+class InMemoryCredentialResolverRegistrationTests(unittest.TestCase):
+    """자동 인증 Worker가 발급한 단기 자격증명은 중복 없이 메모리에만 등록한다."""
+
+    def test_adds_a_provisioned_credential(self) -> None:
+        resolver = InMemoryCredentialResolver({})
+        credential = ResolvedHttpCredential(authorization="Bearer temporary-token")
+
+        resolver.add("temporary-actor", credential)
+
+        self.assertEqual(resolver.resolve("temporary-actor"), credential)
+
+    def test_rejects_blank_or_duplicate_references(self) -> None:
+        resolver = InMemoryCredentialResolver({})
+        credential = ResolvedHttpCredential(authorization="Bearer temporary-token")
+
+        with self.assertRaises(ValueError):
+            resolver.add("", credential)
+        resolver.add("temporary-actor", credential)
+        with self.assertRaises(ValueError):
+            resolver.add("temporary-actor", credential)
+
+
+if __name__ == "__main__":
+    unittest.main()

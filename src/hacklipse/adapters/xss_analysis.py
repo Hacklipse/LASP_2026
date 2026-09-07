@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from hacklipse.application.errors import AgentContractError
 from hacklipse.domain import AgentResult, AgentResultStatus, Evidence, TaskEnvelope
+from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 
 from .probing import (
@@ -76,7 +77,7 @@ class HeuristicXssAnalyzer:
 
         if missing:
             if task.request_budget < len(missing):
-                raise AgentContractError(
+                raise BudgetExceeded(
                     "xss baseline lacks budget for its remaining evidence requests"
                 )
             return AgentResult(

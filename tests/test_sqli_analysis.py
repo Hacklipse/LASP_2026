@@ -15,6 +15,7 @@ from dataclasses import replace
 from hacklipse.adapters import HeuristicSqliAnalyzer
 from hacklipse.adapters.sqli_analysis import HEURISTIC_SQLI_ANALYZER
 from hacklipse.application.errors import AgentContractError
+from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.bootstrap import build_local_application
 from hacklipse.domain import (
     AgentResultStatus,
@@ -247,7 +248,8 @@ class HeuristicSqliAnalyzerTests(unittest.TestCase):
     def test_insufficient_budget_stops_before_any_request(self) -> None:
         agent, _, runtime, task = _fixture(mode="error_message", request_budget=1)
 
-        with self.assertRaises(AgentContractError):
+        # 예산 부족은 계약 위반이 아니다. Orchestrator가 skipped_budget으로 구분한다.
+        with self.assertRaises(BudgetExceeded):
             agent.handle(task)
         self.assertEqual(runtime.requests, [])
 

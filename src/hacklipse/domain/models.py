@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Mapping
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from .errors import DomainInvariantError
 
@@ -74,6 +74,29 @@ class HttpRequestKind(str, Enum):
 
     CONTROL = "control"
     PROBE = "probe"
+    PATH_TRAVERSAL_PROBE = "path_traversal_probe"
+    ACCESS_CONTROL_PROBE = "access_control_probe"
+    SSTI_PROBE = "ssti_probe"
+    SSTI_CLEANUP = "ssti_cleanup"
+
+
+class AccessPrincipalRole(str, Enum):
+    """Access Control 탐침이 지정할 수 있는 인증 주체 역할.
+
+    Agent와 LLM은 credential_ref를 직접 고를 수 없고 역할만 지정한다. 역할에서
+    자격증명으로의 해석은 중앙 Collector가 Run에 등록된 매핑으로만 수행하므로,
+    Agent는 username·password·Cookie·Authorization을 알 수도 고를 수도 없다.
+    """
+
+    ACTOR = "actor"
+    OWNER = "owner"
+
+
+class AccessIdentifierLocation(str, Enum):
+    """객체 식별자가 HTTP 요청의 어느 부분에 있는지 나타낸다."""
+
+    QUERY = "query"
+    PATH = "path"
 
 
 _HTTP_METHOD = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -91,6 +114,21 @@ _HTTP_METHOD = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 # 새 탐침 기법이 다른 문자를 필요로 하면 여기를 늘리는 것이 명시적 결정이 된다.
 PROBE_METACHARACTERS = "'\"<>"
 _PROBE_VALUE = re.compile(r"^[A-Za-z0-9_-]+['\"<>]{0,4}$")
+# Path Traversal 자동 검증이 읽을 수 있는 유일한 값이다. 컨테이너에 기본 존재하는
+# 비민감 OS 식별 파일을 정확한 상대 경로 하나로 고정해 LLM이나 Agent가 다른 파일
+# (예: /etc/passwd)을 선택하지 못하게 한다.
+PATH_TRAVERSAL_SAFE_PROBE_PATH = "../../../../../etc/os-release"
+# 서버 템플릿의 layout/view 경로가 뷰 디렉터리 밖으로 나가는지 확인할 때만 쓰는
+# 별도 저민감 파일. 패키지 메타데이터는 비밀 파일이 아니며 Juice Shop을 포함한
+# Node 애플리케이션 루트에 일반적으로 존재한다.
+PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH = "../package.json"
+# 확장자 필터를 우회해 서버가 직접 거부한 자기 파일을 읽게 하는 고정 접미사.
+# 이미 URL 인코딩된 문자열이므로 재인코딩하지 않고 경로 뒤에 그대로 붙인다.
+# Agent나 LLM은 "우회를 적용한다"만 지정할 수 있고 접미사 내용은 고를 수 없다.
+PATH_TRAVERSAL_BYPASS_SUFFIX = "%2500.md"
+# Access Control 탐침이 식별자 파라미터에 실을 수 있는 값. 숫자만 허용해 LLM이나 Agent가
+# 경로·따옴표·와일드카드를 객체 ID 자리에 넣지 못하게 한다.
+_OBJECT_IDENTIFIER = re.compile(r"^[0-9]{1,10}$")
 _FORBIDDEN_REQUEST_HEADERS = frozenset(
     {
         "accept-encoding",
@@ -105,6 +143,24 @@ _FORBIDDEN_REQUEST_HEADERS = frozenset(
         "user-agent",
     }
 )
+
+
+def is_path_traversal_safe_probe_value(value: str) -> bool:
+    """고정된 비민감 증명 파일 상대 경로와 정확히 같은지 확인한다."""
+
+    return value == PATH_TRAVERSAL_SAFE_PROBE_PATH
+
+
+def is_path_traversal_safe_form_probe_value(value: str) -> bool:
+    """서버 렌더링 폼 전용 고정 패키지 메타데이터 경로인지 확인한다."""
+
+    return value == PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH
+
+
+def is_path_traversal_bypass_suffix(value: str) -> bool:
+    """도메인이 고정한 확장자 필터 우회 접미사와 정확히 같은지 확인한다."""
+
+    return value == PATH_TRAVERSAL_BYPASS_SUFFIX
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +188,13 @@ class RunRequest:
     request_budget: int = 100
     timeout_seconds: int = 120
     credential_ref: str | None = None
+    # 역할 → credential_ref 매핑. Access Control처럼 두 주체가 필요한 검사에서만 채운다.
+    # 여기에 등록되지 않은 역할은 중앙 Collector가 거부한다.
+    principal_credentials: tuple[tuple[str, str], ...] = ()
+    # 취약점 유형 → credential_ref 매핑. 한 Run에서 여러 취약점을 검사할 때 유형마다
+    # 필요한 인증이 다르기 때문에 필요하다(SQLi는 인증 없음, SSTI는 실습 계정 token).
+    # 비어 있으면 기존 단일 취약점 Run으로 보고 credential_ref를 그대로 쓴다.
+    agent_credentials: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         # 실행 예산은 이후 Runtime과 Agent 호출을 통제하는 상한선이다.
@@ -154,6 +217,10 @@ class Run:
     request_budget: int
     timeout_seconds: int = 120
     credential_ref: str | None = None
+    # 역할 → credential_ref 매핑. Access Control처럼 두 주체가 필요한 검사에서만 채운다.
+    # 여기에 등록되지 않은 역할은 중앙 Collector가 거부한다.
+    principal_credentials: tuple[tuple[str, str], ...] = ()
+    agent_credentials: tuple[tuple[str, str], ...] = ()
     phase: RunPhase = RunPhase.INIT
     evidence_ids: tuple[str, ...] = ()
     surface_ids: tuple[str, ...] = ()
@@ -168,6 +235,22 @@ class Run:
         return replace(self, **changes)
 
 
+def credential_for_vulnerability(run: Run, vulnerability_type: str) -> str | None:
+    """취약점 유형에 등록된 자격증명만 해석한다.
+
+    ``agent_credentials``가 비어 있으면 기존 단일 취약점 Run이므로 Run 기본 자격증명을
+    그대로 쓴다. 등록이 하나라도 있으면 여러 유형을 함께 검사하는 Run이고, 이때
+    등록되지 않은 유형은 자격증명 없이 실행한다.
+
+    없을 때 Run 기본값으로 흘려보내지 않는 것이 요점이다. 그렇게 두면 SSTI 실습 계정
+    세션이 SQLi 요청에 얹히는 식으로 유형 간 인증이 섞인다.
+    """
+
+    if not run.agent_credentials:
+        return run.credential_ref
+    return dict(run.agent_credentials).get(vulnerability_type)
+
+
 @dataclass(frozen=True, slots=True)
 class HttpRequestSpec:
     """Agent가 공통 HTTP Runtime에 전달하는 구조화된 요청 명세."""
@@ -177,6 +260,15 @@ class HttpRequestSpec:
     headers: tuple[tuple[str, str], ...] = ()
     body: str | None = None
     request_kind: HttpRequestKind = HttpRequestKind.CONTROL
+    # ACCESS_CONTROL_PROBE에서 값이 바뀌는 유일한 파라미터. 나머지 query는 Recon이 관측한
+    # 원본을 그대로 보존해야 하므로 어느 것이 식별자인지 명시적으로 지정한다.
+    identifier_parameter: str | None = None
+    identifier_location: AccessIdentifierLocation | None = None
+    path_identifier_index: int | None = None
+    path_identifier_value: str | None = None
+    # 경로 끝에 그대로 붙는 도메인 고정 접미사. 값 형태를 도메인이 강제하므로
+    # Agent가 임의 경로나 임의 인코딩을 여기로 실을 수 없다.
+    path_suffix: str | None = None
 
     def __post_init__(self) -> None:
         if not self.method or _HTTP_METHOD.fullmatch(self.method) is None:
@@ -191,14 +283,33 @@ class HttpRequestSpec:
                 raise DomainInvariantError("HTTP query parameters must be string pairs")
             # 탐침 요청만 값 형태를 강제한다. CONTROL 요청은 대상이 원래 갖고 있던
             # 값(Recon이 수집한 쿼리)을 그대로 실어야 하므로 제한하지 않는다.
-            if (
-                self.request_kind is HttpRequestKind.PROBE
-                and _PROBE_VALUE.fullmatch(value) is None
-            ):
+            if self.request_kind is HttpRequestKind.PROBE and _PROBE_VALUE.fullmatch(
+                value
+            ) is None:
                 raise DomainInvariantError(
                     "probe query value must be a marker with allowed metacharacters "
                     f"({PROBE_METACHARACTERS}): {value!r}"
                 )
+            if (
+                self.request_kind is HttpRequestKind.PATH_TRAVERSAL_PROBE
+                and _PROBE_VALUE.fullmatch(value) is None
+                and not is_path_traversal_safe_probe_value(value)
+            ):
+                raise DomainInvariantError(
+                    "path traversal probe may only use markers and the fixed safe path"
+                )
+        if self.path_suffix is not None:
+            if self.request_kind is not HttpRequestKind.PATH_TRAVERSAL_PROBE:
+                raise DomainInvariantError(
+                    "path suffix belongs to the path traversal probe kind only"
+                )
+            if not is_path_traversal_bypass_suffix(self.path_suffix):
+                raise DomainInvariantError(
+                    f"path suffix must be the fixed bypass suffix: {self.path_suffix!r}"
+                )
+        if self.request_kind is HttpRequestKind.ACCESS_CONTROL_PROBE:
+            self._validate_access_control_probe()
+
         for name, value in self.headers:
             if not isinstance(name, str) or not isinstance(value, str):
                 raise DomainInvariantError("HTTP headers must be string pairs")
@@ -210,6 +321,60 @@ class HttpRequestSpec:
             if "\r" in value or "\n" in value:
                 raise DomainInvariantError("HTTP header value cannot contain line breaks")
 
+    def _validate_access_control_probe(self) -> None:
+        """객체 권한 탐침이 식별자 값 하나만 바꾸도록 강제한다.
+
+        다른 사용자의 객체를 읽어보는 요청이므로 표면을 최대한 좁힌다. 헤더·본문을
+        금지해 Cookie나 Authorization을 명세로 주입할 수 없게 하고, 값이 바뀌는 자리를
+        식별자 파라미터 하나로 한정한다. 나머지 query(action·token 등)는 Recon이 관측한
+        원본을 그대로 실어야 대상 페이지가 정상 동작한다.
+        """
+
+        if self.method.upper() != "GET":
+            raise DomainInvariantError("access control probe must be a GET request")
+        if self.headers:
+            raise DomainInvariantError("access control probe cannot set request headers")
+        if self.body is not None:
+            raise DomainInvariantError("access control probe cannot carry a body")
+        if not self.identifier_parameter:
+            raise DomainInvariantError("access control probe must name its identifier parameter")
+
+        location = self.identifier_location or AccessIdentifierLocation.QUERY
+        if not isinstance(location, AccessIdentifierLocation):
+            raise DomainInvariantError("access control identifier location must be structured")
+
+        if location is AccessIdentifierLocation.PATH:
+            if self.path_identifier_index is None or self.path_identifier_index < 1:
+                raise DomainInvariantError(
+                    "path access control probe must identify a path segment"
+                )
+            if (
+                self.path_identifier_value is None
+                or _OBJECT_IDENTIFIER.fullmatch(self.path_identifier_value) is None
+            ):
+                raise DomainInvariantError(
+                    f"access control object id must be numeric: {self.path_identifier_value!r}"
+                )
+            return
+
+        if self.path_identifier_index is not None or self.path_identifier_value is not None:
+            raise DomainInvariantError(
+                "query access control probe cannot carry a path identifier"
+            )
+
+        names = [name for name, _ in self.query_parameters]
+        if names.count(self.identifier_parameter) != 1:
+            raise DomainInvariantError(
+                "access control probe identifier must appear exactly once in the query"
+            )
+        for name, value in self.query_parameters:
+            if name != self.identifier_parameter:
+                continue
+            if _OBJECT_IDENTIFIER.fullmatch(value) is None:
+                raise DomainInvariantError(
+                    f"access control object id must be numeric: {value!r}"
+                )
+
 
 @dataclass(frozen=True, slots=True)
 class EvidenceRequest:
@@ -220,6 +385,20 @@ class EvidenceRequest:
     reason: str
     suggested_tool: str
     http_request: HttpRequestSpec | None = None
+    # Agent는 어떤 자격증명을 쓸지 고를 수 없고 역할만 지정한다. 역할 → credential_ref
+    # 해석은 중앙 Collector가 Run에 등록된 매핑으로만 수행한다.
+    principal_role: AccessPrincipalRole | None = None
+    # 상태 변경 요청의 승인 참조는 비밀이 아니라 사용자가 부여한 권한의 식별자다.
+    # 실제 허용 여부는 Agent가 아니라 중앙 ApprovalGate가 판단한다.
+    approval_ref: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.principal_role is not None and not isinstance(
+            self.principal_role, AccessPrincipalRole
+        ):
+            raise DomainInvariantError("principal role must be a structured role")
+        if self.approval_ref is not None and not self.approval_ref.strip():
+            raise DomainInvariantError("evidence request approval reference cannot be blank")
 
     def request_fingerprint(self, target_url: str) -> str:
         """비밀값 없이 동일 EvidenceRequest를 재연결하는 결정적 식별자.
@@ -238,12 +417,23 @@ class EvidenceRequest:
         canonical = json.dumps(
             {
                 "body_present": request.body is not None,
+                "approval_present": self.approval_ref is not None,
                 "evidence_type": self.evidence_type,
                 "header_names": [name.casefold() for name, _ in request.headers],
                 "method": request.method.upper(),
                 "purpose": self.reason,
+                "principal_role": (
+                    self.principal_role.value if self.principal_role is not None else None
+                ),
                 "query_names": [name for name, _ in request.query_parameters],
                 "request_kind": request.request_kind.value,
+                "identifier_location": (
+                    request.identifier_location.value
+                    if request.identifier_location is not None
+                    else None
+                ),
+                "path_identifier_index": request.path_identifier_index,
+                "path_identifier_present": request.path_identifier_value is not None,
                 "surface_id": self.surface_id,
                 "target": [
                     parsed.scheme.casefold(),
@@ -340,6 +530,58 @@ class Surface:
     method: str
     parameters: tuple[str, ...] = ()
     requires_auth: bool = False
+    # Recon이 실제로 관측한 query 값. 이름만으로는 재요청이 성립하지 않는 페이지가 있다
+    # (예: action=View Profile, token=...). 식별자만 바꾸고 나머지를 원본 그대로 실으려면
+    # 관측 시점의 값이 필요하다.
+    observed_query: tuple[tuple[str, str], ...] = ()
+    # `/users/17`처럼 식별자가 query가 아니라 경로 세그먼트에 있는 REST 표면.
+    # index는 `urlsplit(url).path.split("/")` 기준이며 `/users/17`의 17은 2다.
+    path_identifier: str | None = None
+    path_identifier_index: int | None = None
+    observed_path_identifier: str | None = None
+
+    def __post_init__(self) -> None:
+        values = (
+            self.path_identifier,
+            self.path_identifier_index,
+            self.observed_path_identifier,
+        )
+        if all(value is None for value in values):
+            return
+        if any(value is None for value in values):
+            raise DomainInvariantError(
+                "path identifier name, index, and observed value must be provided together"
+            )
+        assert self.path_identifier_index is not None
+        assert self.observed_path_identifier is not None
+        segments = urlsplit(self.url).path.split("/")
+        if not (1 <= self.path_identifier_index < len(segments)):
+            raise DomainInvariantError("path identifier index is outside the surface path")
+        if _OBJECT_IDENTIFIER.fullmatch(self.observed_path_identifier) is None:
+            raise DomainInvariantError("observed path object id must be numeric")
+        if segments[self.path_identifier_index] != self.observed_path_identifier:
+            raise DomainInvariantError(
+                "observed path object id must match the indexed URL segment"
+            )
+
+
+class CandidateStatus(str, Enum):
+    """Candidate 하나가 거치는 진행 상태.
+
+    자유 문자열이면 오타가 조용히 통과해 "검사했는데 없었다"가 "검사하지 못했다"로
+    잘못 집계될 수 있다. 집계 기준을 손으로 유지하는 곳이 여러 군데라 더 그렇다.
+
+    str을 함께 상속하므로 저장·직렬화와 기존 문자열 비교가 그대로 동작한다.
+    """
+
+    ROUTED = "routed"  # Router가 만들었고 아직 분석 전
+    ANALYZED = "analyzed"  # 분석을 마쳤고 독립 검증 대기
+    CONFIRMED = "confirmed"  # 검증이 proof와 함께 확정
+    SUSPECTED = "suspected"  # 판정을 얻지 못함. Finding으로 승격하지 않는다
+    REJECTED = "rejected"  # 검증이 재현하지 못함
+    BLOCKED = "blocked"  # 정책이나 승인 때문에 검증을 진행할 수 없음
+    FAILED = "failed"  # 검사하다 실패했다
+    SKIPPED_BUDGET = "skipped_budget"  # 예산이 없어 시작조차 못 했다
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,7 +595,28 @@ class Candidate:
     hypothesis: str
     assigned_agent: str
     evidence_ids: tuple[str, ...]
-    status: str = "routed"
+    status: CandidateStatus = CandidateStatus.ROUTED
+    # 이 Candidate만 실패했을 때의 사유. 다른 Candidate는 계속 진행하므로 실패를
+    # Run 전체가 아니라 Candidate에 남겨야 무엇이 검사되지 않았는지 알 수 있다.
+    last_error: str | None = None
+    # 예산 때문에 건너뛴 Candidate가 어느 단계에서 멈췄는지. 재개할 때 이 값으로
+    # 분석부터 다시 할지 검증만 다시 할지 정한다. 이것이 없으면 검증 직전에 멈춘
+    # Candidate를 재개 시 처음부터 다시 분석하게 된다.
+    resume_status: CandidateStatus | None = None
+
+    def __post_init__(self) -> None:
+        # 저장소에서 문자열로 복원한 값도 같은 검사를 통과시킨다. 알 수 없는 상태는
+        # 조용히 통과시키지 않고 여기서 막는다.
+        for field_name in ("status", "resume_status"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            try:
+                object.__setattr__(self, field_name, CandidateStatus(value))
+            except ValueError as error:
+                raise DomainInvariantError(
+                    f"unknown candidate status: {value!r}"
+                ) from error
 
     def add_evidence(self, evidence_ids: tuple[str, ...]) -> Candidate:
         """기존 순서를 유지하면서 중복 없이 Evidence 참조를 합친다."""
@@ -361,10 +624,47 @@ class Candidate:
         merged = tuple(dict.fromkeys((*self.evidence_ids, *evidence_ids)))
         return replace(self, evidence_ids=merged)
 
-    def set_status(self, status: str) -> Candidate:
-        """분석·검증 진행 상태가 변경된 Candidate 복사본을 만든다."""
+    def set_status(
+        self, status: CandidateStatus, *, reason: str | None = None
+    ) -> Candidate:
+        """분석·검증 진행 상태가 변경된 Candidate 복사본을 만든다.
 
-        return replace(self, status=status)
+        정상 전이가 일어났다는 것은 이전에 남긴 실패·건너뜀 정보가 더 이상 현재를
+        설명하지 않는다는 뜻이므로 함께 지운다. 다만 BLOCKED처럼 판정은 끝났지만
+        검증을 완료하지 못한 상태는 일반화된 사유를 명시적으로 보존할 수 있다.
+        """
+
+        return replace(self, status=status, last_error=reason, resume_status=None)
+
+    def fail(self, reason: str) -> Candidate:
+        """이 Candidate만 실패로 표시한다.
+
+        "검사했는데 없었다"와 "검사하지 못했다"를 결과에서 구분하기 위해 사유를 함께
+        남긴다. 사유가 없으면 실패한 Candidate가 안전한 Candidate처럼 보인다.
+        """
+
+        return replace(self, status=CandidateStatus.FAILED, last_error=reason)
+
+    def skip_for_budget(self, reason: str) -> Candidate:
+        """예산이 모자라 시도조차 하지 못한 Candidate로 표시한다.
+
+        실패와 구분해야 한다. 실패는 "검사했는데 대상이 응답하지 않았다"이고 이쪽은
+        "검사를 시작조차 못 했다"이다. 둘을 뭉뚱그리면 보고서를 읽는 사람이 검사 범위를
+        오해한다.
+        """
+
+        # 이미 건너뛴 Candidate를 다시 건너뛸 때 원래 단계 정보를 잃지 않는다.
+        origin = (
+            self.resume_status
+            if self.status is CandidateStatus.SKIPPED_BUDGET
+            else self.status
+        )
+        return replace(
+            self,
+            status=CandidateStatus.SKIPPED_BUDGET,
+            last_error=reason,
+            resume_status=origin,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -520,6 +820,11 @@ class ExecutionRequest:
     headers: tuple[tuple[str, str], ...] = ()
     body: str | None = None
     request_kind: HttpRequestKind = HttpRequestKind.CONTROL
+    identifier_parameter: str | None = None
+    identifier_location: AccessIdentifierLocation | None = None
+    path_identifier_index: int | None = None
+    path_identifier_value: str | None = None
+    path_suffix: str | None = None
     validation_id: str | None = None
     timeout_seconds: float = 120.0
     credential_ref: str | None = None
@@ -534,6 +839,11 @@ class ExecutionRequest:
             headers=self.headers,
             body=self.body,
             request_kind=self.request_kind,
+            identifier_parameter=self.identifier_parameter,
+            identifier_location=self.identifier_location,
+            path_identifier_index=self.path_identifier_index,
+            path_identifier_value=self.path_identifier_value,
+            path_suffix=self.path_suffix,
         )
         if self.timeout_seconds <= 0:
             raise DomainInvariantError("execution timeout must be positive")
@@ -547,12 +857,25 @@ class ExecutionRequest:
         """기존 query를 보존하면서 구조화 파라미터를 인코딩한 실제 요청 URL."""
 
         parsed = urlsplit(self.target_url)
+        path = parsed.path
+        if self.identifier_location is AccessIdentifierLocation.PATH:
+            segments = path.split("/")
+            index = self.path_identifier_index
+            if index is None or not (1 <= index < len(segments)):
+                raise DomainInvariantError("path identifier index is outside the target URL")
+            assert self.path_identifier_value is not None
+            segments[index] = quote(self.path_identifier_value, safe="")
+            path = "/".join(segments)
+        if self.path_suffix is not None:
+            # 도메인이 고정한 접미사이며 이미 인코딩된 문자열이다. 다시 quote하면
+            # `%25`가 `%2525`가 되어 우회가 성립하지 않는다.
+            path = f"{path}{self.path_suffix}"
         encoded = urlencode(self.query_parameters)
         query = parsed.query
         if encoded:
             query = f"{query}&{encoded}" if query else encoded
         # URL fragment는 HTTP 요청 대상에 포함되지 않는다.
-        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
+        return urlunsplit((parsed.scheme, parsed.netloc, path, query, ""))
 
 @dataclass(frozen=True, slots=True)
 class ExecutionResult:
@@ -563,6 +886,116 @@ class ExecutionResult:
     observation: Mapping[str, object]
     artifact_refs: Mapping[str, str] = field(default_factory=dict)
     content_hash: str | None = None
+
+
+class ProgressEventKind(str, Enum):
+    """Run 진행 중 밖으로 알릴 수 있는 사건.
+
+    Notion 목록의 VALIDATION_* 은 AGENT_* 에 agent_type 으로 담기고, EVIDENCE_REQUESTED 는
+    수집이 끝난 시점만 알리면 충분하므로 EVIDENCE_COLLECTED 하나로 둔다. 예산은 별도
+    사건이 아니라 모든 이벤트가 함께 싣는다. 소비자가 없는 종류를 미리 만들지 않는다.
+    """
+
+    RUN_STARTED = "run_started"
+    PHASE_CHANGED = "phase_changed"
+    CANDIDATE_QUEUED = "candidate_queued"
+    AGENT_STARTED = "agent_started"
+    AGENT_COMPLETED = "agent_completed"
+    EVIDENCE_COLLECTED = "evidence_collected"
+    FINDING_CREATED = "finding_created"
+    CANDIDATE_FAILED = "candidate_failed"
+    CANDIDATE_SKIPPED = "candidate_skipped"
+    RUN_COMPLETED = "run_completed"
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressEvent:
+    """진행 상황 하나. 무엇이 일어났는지만 담고 응답 내용은 담지 않는다.
+
+    Cookie·Authorization·API Key·비밀번호·응답 본문은 넣지 않는다. surface 는 경로만
+    남기고 query 값은 제거한다. 진행 화면은 여러 사람이 함께 보거나 로그로 남으므로
+    Evidence 보다 더 좁게 잡는다.
+
+    sequence 는 Run 안에서 단조 증가한다. 순서를 복원하고 중복을 걸러내는 기준이다.
+    """
+
+    run_id: str
+    sequence: int
+    kind: ProgressEventKind
+    phase: str
+    agent_type: str | None = None
+    candidate_id: str | None = None
+    vulnerability_type: str | None = None
+    # 경로만 남긴 대상. query 값은 제거한 뒤 넣는다.
+    surface_path: str | None = None
+    detail: str | None = None
+    budget_used: int = 0
+    budget_total: int = 0
+    # Run 시작 이후 경과 시간. 벽시계 시각이 아니라 경과값이라 재현 실행 사이에 비교할
+    # 수 있고, 두 이벤트를 빼면 그 구간에 걸린 시간이 나온다. 브라우저 검증처럼 비싼
+    # 단계의 비용을 재는 근거가 된다.
+    elapsed_ms: int = 0
+
+    def __post_init__(self) -> None:
+        if self.sequence < 0:
+            raise DomainInvariantError("progress event sequence cannot be negative")
+        if self.elapsed_ms < 0:
+            raise DomainInvariantError("progress event elapsed time cannot be negative")
+        if self.surface_path is not None and (
+            "?" in self.surface_path or "#" in self.surface_path
+        ):
+            raise DomainInvariantError(
+                "progress event surface must not carry a query or fragment"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class UncheckedCandidate:
+    """검사를 끝내지 못한 Candidate 하나의 요약."""
+
+    vulnerability_type: str
+    status: str
+    reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressSnapshot:
+    """Run 진행 상태의 파생 뷰.
+
+    Store가 유일한 사실 원천이고 이 객체는 그 계산 결과다. 진행 상태를 따로 누적하면
+    실제 저장 내용과 어긋나 완료되지 않은 작업을 완료로 표시할 수 있다.
+
+    표시 방식은 담지 않는다. 문구·색·기호는 CLI나 웹 UI가 정하고, 여기에는 숫자와
+    식별자만 둔다. 그래야 같은 스냅샷을 두 화면이 함께 쓸 수 있다.
+    """
+
+    run_id: str
+    phase: str
+    surface_count: int = 0
+    parameter_count: int = 0
+    # 아래 매핑들은 JSON 직렬화가 가능하도록 쌍의 튜플로 둔다.
+    candidates_by_type: tuple[tuple[str, int], ...] = ()
+    candidates_by_status: tuple[tuple[str, int], ...] = ()
+    evidence_count: int = 0
+    # Analysis가 남긴 Observation 종류별 개수. 표시 문구가 아니라 원본 type 값이다.
+    signals_by_type: tuple[tuple[str, int], ...] = ()
+    validated_count: int = 0
+    findings_by_type: tuple[tuple[str, int], ...] = ()
+    budget_used: int = 0
+    budget_total: int = 0
+    llm_calls: int = 0
+    llm_input_tokens: int = 0
+    llm_output_tokens: int = 0
+    unchecked: tuple[UncheckedCandidate, ...] = ()
+    last_error: str | None = None
+
+    @property
+    def candidate_count(self) -> int:
+        return sum(count for _, count in self.candidates_by_type)
+
+    @property
+    def finding_count(self) -> int:
+        return sum(count for _, count in self.findings_by_type)
 
 
 @dataclass(frozen=True, slots=True)

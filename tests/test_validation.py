@@ -10,7 +10,7 @@ from hacklipse.adapters.memory import (
     InMemorySurfaceStore,
 )
 from hacklipse.adapters.recon import ReconAgent
-from hacklipse.adapters.routing import RuleBasedVulnerabilityRouter
+from hacklipse.adapters.routing import RoutingRule, RuleBasedVulnerabilityRouter
 from hacklipse.adapters.validation import ValidationAgent
 from hacklipse.application.errors import AgentContractError
 from hacklipse.application import OrchestratorConfig
@@ -579,11 +579,20 @@ class ValidationDrivesEvidenceLoopTests(unittest.TestCase):
     """중앙 수집 Evidence가 현재 Validation 세션 provenance를 갖는지 검증한다."""
 
     def test_generic_reproduction_stays_suspected_and_reaches_report(self) -> None:
-        # 취약점별 proof가 없는 Path Traversal baseline은 Finding을 만들지 않는다.
+        # 취약점별 proof가 아직 없는 Access Control은 Finding을 만들지 않는다.
         app = build_local_application(
             agents={},
             runtime=_RouteThenReproduceRuntime(),
-            router=RuleBasedVulnerabilityRouter(surface_rules=()),
+            router=RuleBasedVulnerabilityRouter(
+                rules=(
+                    RoutingRule(
+                        "url_or_file_parameter",
+                        "Access Control",
+                        "access_control_analyzer",
+                    ),
+                ),
+                surface_rules=(),
+            ),
         )
         app.dispatcher.register(
             "recon",
@@ -594,10 +603,12 @@ class ValidationDrivesEvidenceLoopTests(unittest.TestCase):
             ),
             allowed_tools=("http_get",),
         )
+        # Access Control Task는 전용 도구로만 나간다. 대역도 같은 권한을 받아야
+        # Dispatcher를 통과한다.
         app.dispatcher.register(
-            "path_traversal_analyzer",
+            "access_control_analyzer",
             _PassthroughAnalysisAgent(),
-            allowed_tools=("http_get",),
+            allowed_tools=("access_control_probe",),
         )
         app.dispatcher.register(
             "validation",
@@ -606,7 +617,7 @@ class ValidationDrivesEvidenceLoopTests(unittest.TestCase):
                 evidence_store=app.stores.evidence,
                 surface_store=app.stores.surfaces,
             ),
-            allowed_tools=("http_get",),
+            allowed_tools=("http_get", "access_control_probe"),
         )
 
         run = app.orchestrator.start(
@@ -626,19 +637,14 @@ class ValidationDrivesEvidenceLoopTests(unittest.TestCase):
             for item in app.stores.evidence.list_by_run(run.run_id)
             if item.validation_id is not None
         ]
-        self.assertEqual(len(validation_evidence), 1)
-        self.assertIsNotNone(validation_evidence[0].source_task_id)
+        # Access Control은 무엇을 재현할지 알려주는 Analysis Observation이 없으면
+        # 요청을 쓰지 않는다. 무엇과 비교할지 모르는 채로 한 번 더 받아오는 것은
+        # 예산만 쓰고 판정에 기여하지 못한다.
+        self.assertEqual(validation_evidence, [])
         tasks = app.stores.tasks.list_by_run(run.run_id)
         self.assertEqual(
             [item.envelope.agent_type for item in tasks],
-            [
-                "recon",
-                "path_traversal_analyzer",
-                "validation",
-                "evidence_collector",
-                "validation",
-                "report",
-            ],
+            ["recon", "access_control_analyzer", "validation", "report"],
         )
         reports = app.stores.reports.list_by_run(run.run_id)
         self.assertEqual(len(reports), 1)

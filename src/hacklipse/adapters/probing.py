@@ -60,6 +60,9 @@ def resolve_analysis_task(
     vulnerability_type: str,
     candidate_store: CandidateStore,
     surface_store: SurfaceStore,
+    required_tool: str = ANALYSIS_TOOL,
+    allow_parameterless_get: bool = False,
+    allowed_methods: tuple[str, ...] = ("GET",),
 ) -> tuple[Candidate, Surface, tuple[str, ...]]:
     """Analysis Task의 Candidate/Surface를 확인하고 탐침 대상 파라미터를 정리한다.
 
@@ -69,8 +72,8 @@ def resolve_analysis_task(
 
     if task.candidate_id is None or task.surface_id is None or task.target_url is None:
         raise AgentContractError("analysis task is missing candidate or surface context")
-    if ANALYSIS_TOOL not in task.allowed_tools:
-        raise AgentContractError("analysis HTTP tool is not allowed by the task")
+    if required_tool not in task.allowed_tools:
+        raise AgentContractError("analysis execution tool is not allowed by the task")
 
     candidate = candidate_store.get(task.run_id, task.candidate_id)
     if candidate.vulnerability_type != vulnerability_type:
@@ -83,11 +86,51 @@ def resolve_analysis_task(
     surface = surface_store.get(task.run_id, task.surface_id)
     if surface.url != task.target_url:
         raise AgentContractError("analysis task target does not match its surface")
-    if surface.method.upper() != "GET" or not surface.parameters:
-        raise AgentContractError("analysis supports parameterized GET surfaces only")
+    if surface.method.upper() not in allowed_methods or (
+        not surface.parameters and not allow_parameterless_get
+    ):
+        methods = "/".join(allowed_methods)
+        raise AgentContractError(
+            f"analysis supports parameterized {methods} surfaces only"
+        )
 
     # 중복 파라미터명(?a=1&a=2)은 하나로 접는다. 안 그러면 같은 곳에 탐침을 두 번 보낸다.
     return candidate, surface, tuple(dict.fromkeys(surface.parameters))
+
+
+def validate_probe_selection(
+    raw: object,
+    offered: tuple[str, ...],
+    request_budget: int,
+    *,
+    analyzer_name: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """LLM 선택을 실제 Surface와 요청 예산 안으로 제한한다.
+
+    control 한 건이 항상 필요하므로 선택 가능한 probe 수는 남은 예산보다 하나 적다.
+    존재하지 않는 파라미터는 조용히 버리지 않고 Agent 계약 위반으로 처리한다.
+    """
+
+    if not isinstance(raw, list):
+        raise AgentContractError(f"{analyzer_name} plan did not return a parameter list")
+    selected: list[str] = []
+    for name in raw:
+        if not isinstance(name, str):
+            raise AgentContractError(
+                f"{analyzer_name} plan returned a non-string parameter"
+            )
+        if name not in offered:
+            raise AgentContractError(
+                f"{analyzer_name} plan named a parameter that is not on the surface: "
+                f"{name}"
+            )
+        if name not in selected:
+            selected.append(name)
+
+    affordable = max(request_budget - 1, 0)
+    if len(selected) <= affordable:
+        return tuple(selected), ()
+    return tuple(selected[:affordable]), tuple(selected[affordable:])
 
 
 def build_probe_requests(
@@ -174,6 +217,7 @@ def matching_evidence(
         return None
     expected_url = resolved_url(target_url, request.http_request.query_parameters)
     expected_kind = request.http_request.request_kind.value
+    expected_method = request.http_request.method.upper()
     expected_fingerprint = request.request_fingerprint(target_url)
     for item in reversed(evidence):
         observation = item.observation
@@ -190,7 +234,7 @@ def matching_evidence(
                 )
             )
             and observation.get("request_kind") == expected_kind
-            and str(observation.get("method", "GET")).upper() == "GET"
+            and str(observation.get("method", "GET")).upper() == expected_method
         ):
             return item
     return None

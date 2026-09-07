@@ -15,7 +15,11 @@ from hacklipse.ports.errors import ExternalExecutionDisabled
 
 # 리다이렉트 대상 서버가 실제로 요청을 받았는지 세는 카운터.
 REDIRECT_TARGET_HITS = 0
-BIG_BODY = b"A" * (512 * 1024 + 100)  # 512KB 초과
+# 예전 기본 상한(512KiB)은 넘고 현재 기본 상한(2MiB)에는 못 미치는 크기. 기본값이
+# 되돌아가면 이 응답이 잘리므로 회귀가 바로 드러난다.
+BIG_BODY = b"A" * (512 * 1024 + 100)
+# 현재 기본 상한을 넘는 크기. 상한이 실제로 걸리는지 확인한다.
+HUGE_BODY = b"B" * (2 * 1024 * 1024 + 100)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -44,6 +48,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._text(500, b"boom")
         elif path == "/big":
             self._text(200, BIG_BODY)
+        elif path == "/huge":
+            self._text(200, HUGE_BODY)
         elif path == "/dupcookie":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -51,6 +57,24 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Set-Cookie", "b=2")
             self.end_headers()
             self.wfile.write(b"ok")
+        elif path == "/session-open":
+            # 로그인 이전 세션: Domain 속성 없는 host-only Cookie.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Set-Cookie", "sid=before-login; path=/")
+            self.end_headers()
+            self.wfile.write(b"opened")
+        elif path == "/session-rotate":
+            # 로그인 직후 세션 재발급: 같은 이름에 Domain 속성만 새로 붙는다.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header(
+                "Set-Cookie", "sid=after-login; path=/; domain=127.0.0.1"
+            )
+            self.end_headers()
+            self.wfile.write(b"rotated")
+        elif path == "/echo-cookie":
+            self._text(200, f"COOKIE={self.headers.get('Cookie', '(none)')}".encode())
         elif path == "/binary":
             self.send_response(200)
             self.send_header("Content-Type", "image/png")
@@ -131,19 +155,21 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
         self,
         path: str,
         *,
+        tool: str = "http_get",
         method: str = "GET",
         host: str | None = None,
         query_parameters: tuple[tuple[str, str], ...] = (),
         headers: tuple[tuple[str, str], ...] = (),
         body: str | None = None,
         request_kind: HttpRequestKind = HttpRequestKind.CONTROL,
+        validation_id: str | None = None,
     ) -> ExecutionRequest:
         base = host or f"http://127.0.0.1:{self.port}"
         return ExecutionRequest(
             execution_id="exec-1",
             run_id="run-1",
             task_id="task-1",
-            tool="http_get",
+            tool=tool,
             target_url=f"{base}{path}",
             surface_id=None,
             purpose="test",
@@ -152,6 +178,7 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
             headers=headers,
             body=body,
             request_kind=request_kind,
+            validation_id=validation_id,
         )
 
     # 1
@@ -162,6 +189,18 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
         self.assertIn("REFLECTED_MARKER", r.observation["body"])
         self.assertTrue(r.observation["headers"])
         self.assertIsNotNone(r.content_hash)
+
+    def test_path_traversal_probe_tool_uses_the_shared_http_runtime(self) -> None:
+        r = self.runtime.execute(
+            self._req(
+                "/echo-query",
+                tool="path_traversal_probe",
+                query_parameters=(("page", "../../../../../etc/os-release"),),
+                request_kind=HttpRequestKind.PATH_TRAVERSAL_PROBE,
+            )
+        )
+        self.assertEqual(r.observation["status"], 200)
+        self.assertIn("etc/os-release", r.observation["body"])
 
     # 2 + 3
     def test_302_not_followed_and_target_untouched(self) -> None:
@@ -204,10 +243,23 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
         self.assertEqual(r.observation["error_kind"], "timeout")
 
     # 7
-    def test_body_truncated_at_limit(self) -> None:
+    def test_default_limit_reads_past_512kib(self) -> None:
+        """SPA 번들 후반부의 API 경로가 상한에 잘려 사라지면 Recon이 표면을 놓친다."""
+
         r = self.runtime.execute(self._req("/big"))
+        self.assertFalse(r.observation["truncated"])
+        self.assertEqual(r.observation["body_bytes"], len(BIG_BODY))
+
+    def test_body_truncated_at_default_limit(self) -> None:
+        r = self.runtime.execute(self._req("/huge"))
         self.assertTrue(r.observation["truncated"])
-        self.assertEqual(r.observation["body_bytes"], 512 * 1024)
+        self.assertEqual(r.observation["body_bytes"], 2 * 1024 * 1024)
+
+    def test_explicit_limit_overrides_the_default(self) -> None:
+        small = HttpExecutionRuntime(timeout_seconds=5.0, max_body_bytes=1024)
+        r = small.execute(self._req("/big"))
+        self.assertTrue(r.observation["truncated"])
+        self.assertEqual(r.observation["body_bytes"], 1024)
 
     # 8
     def test_head_does_not_read_body(self) -> None:
@@ -223,6 +275,33 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
         self.assertEqual(sorted(cookies), ["a=1", "b=2"])
 
     # 10
+    def test_rotated_session_cookie_replaces_the_stale_one(self) -> None:
+        """Domain 속성만 바뀐 재발급 Cookie가 이전 값을 남기지 않아야 한다.
+
+        RFC 6265는 (name, domain, path)로 Cookie를 구분하므로, 로그인 직후 서버가
+        Domain을 붙여 세션을 재발급하면 인증 이전 Cookie가 함께 남아 두 값이 같이
+        전송된다. 서버가 낡은 쪽을 집으면 방금 성공한 로그인이 사라진다.
+        """
+
+        runtime = HttpExecutionRuntime(timeout_seconds=5.0)
+        runtime.execute(self._req("/session-open"))
+        runtime.execute(self._req("/session-rotate"))
+        sent = runtime.execute(self._req("/echo-cookie")).observation["body"]
+
+        self.assertIn("sid=after-login", sent)
+        self.assertNotIn("before-login", sent)
+
+    def test_validation_session_is_isolated_from_analysis_cookies(self) -> None:
+        self.runtime.execute(self._req("/session-open"))
+
+        analysis = self.runtime.execute(self._req("/echo-cookie")).observation["body"]
+        validation = self.runtime.execute(
+            self._req("/echo-cookie", validation_id="validation-1")
+        ).observation["body"]
+
+        self.assertIn("sid=before-login", analysis)
+        self.assertEqual(validation, "COOKIE=(none)")
+
     def test_binary_not_forced_to_string(self) -> None:
         r = self.runtime.execute(self._req("/binary"))
         self.assertIsNone(r.observation["body"])  # 강제 디코딩하지 않음

@@ -20,7 +20,7 @@ LLM을 쓰지 않는다: 크롤링과 폼 추출은 결정적 작업이라 판�
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from urllib.parse import parse_qsl, urljoin, urlsplit
 from uuid import uuid4
 
@@ -37,6 +37,11 @@ from hacklipse.domain import (
     TaskEnvelope,
 )
 from hacklipse.ports import EvidenceStore, SurfaceStore
+
+from .path_traversal_analysis import (
+    RESTRICTED_FILE_OBSERVATION,
+    UNLINKED_RENDER_PARAMETER_OBSERVATION,
+)
 
 # HttpExecutionRuntime이 GET 실행에 사용하는 도구 이름과 맞춘다(tests/test_http_runtime.py).
 RECON_TOOL = "http_get"
@@ -56,6 +61,12 @@ _JS_PATH = re.compile(
 # URL의 일부이므로 제외한다 — 이 필터가 없으면 소셜 공유 링크가 전부 섞여 들어온다.
 _JS_PATH_PARAM = re.compile(
     r"""(?<![/A-Za-z0-9._~-])(/[A-Za-z0-9][A-Za-z0-9._~/-]{0,100})\?([A-Za-z0-9_]{1,40})="""
+)
+# SPA가 서버 렌더링 문서로 빠져나갈 때 쓰는 navigation sink. 단순 경로 리터럴과
+# 달리 실제 HTML 문서일 가능성이 높으므로, 번들에서 발견한 뒤 예산 안에서 방문한다.
+# 특정 제품의 경로 이름이 아니라 브라우저 API와 상대경로의 결합만 본다.
+_JS_DOCUMENT_NAVIGATION = re.compile(
+    r"""(?:window\.)?location\.(?:assign|replace)\([^)]{0,160}?["'`](/[A-Za-z0-9][A-Za-z0-9._~/-]{0,100})["'`]"""
 )
 
 # 결정적 Recon 단계에서 실제 요청 없이도 판단할 수 있는 유일한 신호: 파라미터 "이름"이
@@ -80,12 +91,89 @@ _FILE_OR_URL_PARAM_HINTS = (
     "target",
 )
 
+# 템플릿 보간에서 끊기는 경로는 디렉터리까지만 남긴다. `${host}/ftp/order_${id}.pdf`
+# 같은 리터럴은 파일명을 알 수 없지만 그 디렉터리는 실재하는 표면이다.
+_JS_DIRECTORY = re.compile(
+    r"""["'`](?:\$\{[^}]{0,60}\})?(/[A-Za-z0-9][A-Za-z0-9._~/-]{0,100}/)[A-Za-z0-9._~-]{0,40}\$\{"""
+)
+# SPA 클라이언트 라우트와 그 query 파라미터. 라우트 이동과 파라미터 선언이 서로
+# 앞뒤 어느 쪽에도 올 수 있어 좁은 창 안에서 함께 나타나는 짝만 취한다.
+_JS_ROUTE_NAVIGATE = re.compile(r"""navigate\(\["/([A-Za-z0-9._~-]{1,40})"\]""")
+_JS_ROUTE_QUERY_PARAM = re.compile(r"""queryParams:\{([A-Za-z_][A-Za-z0-9_]{0,30}):""")
+_ROUTE_BINDING_WINDOW = 200
+
+# 웹 서버가 그대로 내주면 안 되는 확장자. 이런 파일이 표면으로 노출되어 있으면
+# 서버가 직접 거부하는지, 우회 경로로는 제공되는지 확인할 가치가 있다.
+_RESTRICTED_FILE_EXTENSIONS = (
+    ".bak",
+    ".conf",
+    ".config",
+    ".db",
+    ".env",
+    ".gg",
+    ".ini",
+    ".kdbx",
+    ".key",
+    ".log",
+    ".pem",
+    ".pyc",
+    ".sql",
+    ".yaml",
+    ".yml",
+)
+
+# HTML 폼에 노출되지 않아도 서버 템플릿 엔진이 공통적으로 해석하는 렌더 옵션.
+# Recon은 이를 관측값으로 가장하지 않고 ``source``가 붙은 추론 Evidence로 남긴다.
+# 능동 POST는 Analysis의 승인·고정 safe-file 경계 뒤에서만 일어난다.
+_UNLINKED_RENDER_PARAMETERS = ("layout",)
+
 _MAX_SCRIPT_BYTES = 4 * 1024 * 1024
+_PATH_OBJECT_ID = re.compile(r"^[0-9]{1,10}$")
+_PATH_RESOURCE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
+_SINGULAR_OBJECT_RESOURCES = frozenset(
+    {
+        "account",
+        "address",
+        "basket",
+        "cart",
+        "invoice",
+        "order",
+        "profile",
+        "record",
+        "user",
+    }
+)
 
 
 def _looks_like_file_or_url_parameter(name: str) -> bool:
     lowered = name.lower()
     return any(hint in lowered for hint in _FILE_OR_URL_PARAM_HINTS)
+
+
+def _client_routes(body: str) -> dict[str, tuple[str, ...]]:
+    """SPA 라우트 이름과 그 라우트가 받는 query 파라미터를 짝지어 뽑는다.
+
+    번들은 minify 되어 있어 `navigate(["/search"], i)` 처럼 파라미터 선언이 변수로
+    분리되기도 한다. 선언과 이동이 같은 함수 안에 있다는 성질만 이용해 좁은 창
+    안에서 함께 나타나는 짝을 취한다. 창을 넓히면 무관한 라우트가 섞인다.
+    """
+
+    routes: dict[str, set[str]] = {}
+    for match in _JS_ROUTE_QUERY_PARAM.finditer(body):
+        start = max(0, match.start() - _ROUTE_BINDING_WINDOW)
+        window = body[start : match.end() + _ROUTE_BINDING_WINDOW]
+        nearby = _JS_ROUTE_NAVIGATE.search(window)
+        if nearby is None:
+            continue
+        routes.setdefault(nearby.group(1), set()).add(match.group(1))
+    return {route: tuple(sorted(names)) for route, names in routes.items()}
+
+
+def _looks_like_restricted_file(url: str) -> bool:
+    """웹으로 내주면 안 되는 확장자를 가진 파일 경로인지 본다."""
+
+    name = urlsplit(url).path.rsplit("/", 1)[-1].lower()
+    return any(name.endswith(suffix) for suffix in _RESTRICTED_FILE_EXTENSIONS)
 
 
 class ReconAgent:
@@ -99,6 +187,7 @@ class ReconAgent:
         surface_store: SurfaceStore,
         max_pages: int = DEFAULT_MAX_PAGES,
         max_scripts: int = DEFAULT_MAX_SCRIPTS,
+        seed_urls: Sequence[str] = (),
         id_factory: Callable[[], str] | None = None,
     ) -> None:
         if max_pages < 1:
@@ -108,6 +197,7 @@ class ReconAgent:
         self._surfaces = surface_store
         self._max_pages = max_pages
         self._max_scripts = max_scripts
+        self._seed_urls = tuple(dict.fromkeys(seed_urls))
         self._id_factory = id_factory or (lambda: str(uuid4()))
 
     def handle(self, task: TaskEnvelope) -> AgentResult:
@@ -121,61 +211,107 @@ class ReconAgent:
         origin = urlsplit(task.target_url)
         page_budget = self._page_budget(task)
 
-        pending: list[str] = [task.target_url]
+        for seed_url in self._seed_urls:
+            if not _same_origin(seed_url, origin):
+                raise AgentContractError("recon seed URL belongs to another origin")
+        # SPA 홈페이지와 별도 서버 렌더링 페이지처럼 서로 링크되지 않은 진입점을
+        # 한 Recon 세션에서 함께 탐색할 수 있다. Juice Shop의 인증된 /profile이
+        # 대표적이다.
+        pending = list(dict.fromkeys((task.target_url, *self._seed_urls)))
         fetched: set[str] = set()
         scripts: list[str] = []
+        document_pages: set[str] = set()
         evidence_ids: list[str] = []
         # 발견과 수집은 다르다 — 크롤링 예산이 모자라도 발견한 URL은 Surface로 남긴다.
         # (url, method, parameters) 조합으로 중복을 막는다.
         surfaces: dict[tuple[str, str, tuple[str, ...]], str] = {}
 
-        def remember(url: str, method: str, names: tuple[str, ...]) -> str:
-            key = (url.split("?", 1)[0], method, names)
+        def remember(
+            url: str,
+            method: str,
+            names: tuple[str, ...],
+            observed: tuple[tuple[str, str], ...] = (),
+        ) -> str:
+            clean_url = url.split("?", 1)[0]
+            path_identifier = _path_identifier(clean_url)
+            key_url = _canonical_surface_url(clean_url, path_identifier)
+            key = (key_url, method, names)
             existing = surfaces.get(key)
             if existing is not None:
                 return existing
             surface_id = f"surface-{self._id_factory()}"
             surfaces[key] = surface_id
-            self._store_surface(task.run_id, surface_id, key[0], method, names)
+            self._store_surface(
+                task.run_id,
+                surface_id,
+                clean_url,
+                method,
+                names,
+                observed=observed,
+                path_identifier=path_identifier,
+            )
             evidence_ids.extend(
                 self._flag_suspect_parameters(task.run_id, surface_id, names)
             )
+            if _looks_like_restricted_file(clean_url):
+                evidence_ids.append(
+                    self._flag_restricted_file(task.run_id, surface_id, clean_url)
+                )
             return surface_id
 
-        while pending and len(fetched) < page_budget:
-            url = pending.pop(0)
-            if url in fetched:
-                continue
-            fetched.add(url)
-
-            surface_id = remember(url, "GET", _query_names(url))
-            evidence_id, evidence = self._fetch(task, url, surface_id)
-            evidence_ids.append(evidence_id)
-
-            body = evidence.observation.get("body")
-            if not isinstance(body, str) or not body:
-                continue
-
-            links, forms, sources = _parse_page(body, url)
-            for form_url, method, names in forms:
-                remember(form_url, method, names)
-            for link in links:
-                if not _same_origin(link, origin):
+        def crawl() -> None:
+            while pending and len(fetched) < page_budget:
+                url = pending.pop(0)
+                if url in fetched:
                     continue
-                # 예산과 무관하게 표면으로 기록하고, 여유가 있으면 크롤링까지 한다.
-                remember(link, "GET", _query_names(link))
-                if link not in fetched and link not in pending:
-                    pending.append(link)
-            for source in sources:
-                if source not in scripts and _same_origin(source, origin):
-                    scripts.append(source)
+                fetched.add(url)
+
+                surface_id = remember(url, "GET", _query_names(url), _query_pairs(url))
+                evidence_id, evidence = self._fetch(task, url, surface_id)
+                evidence_ids.append(evidence_id)
+
+                body = evidence.observation.get("body")
+                if not isinstance(body, str) or not body:
+                    continue
+
+                links, forms, sources = _parse_page(body, url)
+                for form_url, method, names in forms:
+                    form_surface_id = remember(form_url, method, names)
+                    if method == "POST" and url in document_pages:
+                        evidence_ids.extend(
+                            self._flag_unlinked_render_parameters(
+                                task.run_id, form_surface_id
+                            )
+                        )
+                for link in links:
+                    if not _same_origin(link, origin):
+                        continue
+                    # 예산과 무관하게 표면으로 기록하고, 여유가 있으면 크롤링까지 한다.
+                    remember(link, "GET", _query_names(link), _query_pairs(link))
+                    if link not in fetched and link not in pending:
+                        pending.append(link)
+                for source in sources:
+                    if source not in scripts and _same_origin(source, origin):
+                        scripts.append(source)
+
+        crawl()
 
         # 번들 분석은 크롤링 뒤에 한다. 남은 예산 안에서만 스크립트를 받는다.
         affordable = max(min(self._max_scripts, page_budget - len(fetched)), 0)
         for source in scripts[:affordable]:
             fetched.add(source)
-            for url, names in self._discover_from_script(task, source, origin):
+            for url, names, should_crawl in self._discover_from_script(
+                task, source, origin
+            ):
                 remember(url, "GET", names)
+                # 번들이 가리킨 디렉터리와 서버 문서 navigation은 실제 응답을 봐야
+                # 내부 파일이나 HTML 폼을 발견할 수 있다.
+                if should_crawl:
+                    document_pages.add(url)
+                if should_crawl and url not in fetched and url not in pending:
+                    pending.append(url)
+        # 번들에서 찾은 디렉터리 목록을 남은 예산 안에서 마저 본다.
+        crawl()
 
         surface_ids = list(surfaces.values())
         return AgentResult(
@@ -209,12 +345,15 @@ class ReconAgent:
             ),
             task_id=task.task_id,
             timeout_seconds=task.timeout_seconds,
+            # Recon은 특정 취약점 Agent가 아니므로 Run 기본 세션을 쓴다. TaskFactory가
+            # 선택한 참조를 전달하지 않으면 다중 취약점 Run에서 무인증으로 바뀐다.
+            credential_ref=task.credential_ref,
         )
         return evidence_id, self._evidence.get(task.run_id, evidence_id)
 
     def _discover_from_script(
         self, task: TaskEnvelope, source: str, origin
-    ) -> list[tuple[str, tuple[str, ...]]]:
+    ) -> list[tuple[str, tuple[str, ...], bool]]:
         """JS 번들을 받아 경로 리터럴에서 Surface 후보를 만든다."""
 
         _, evidence = self._fetch(task, source, None)
@@ -225,18 +364,43 @@ class ReconAgent:
         parameters: dict[str, set[str]] = {}
         for match in _JS_PATH_PARAM.finditer(body):
             parameters.setdefault(match.group(1), set()).add(match.group(2))
+        document_paths = {
+            match.group(1) for match in _JS_DOCUMENT_NAVIGATION.finditer(body)
+        }
         paths = {match.group(1) for match in _JS_PATH.finditer(body)}
         paths.update(parameters)
+        paths.update(match.group(1) for match in _JS_DIRECTORY.finditer(body))
 
         base = f"{origin.scheme}://{origin.netloc}"
-        return [
-            (f"{base}{path}", tuple(sorted(parameters.get(path, ()))))
-            for path in sorted(paths)
+        # 실제 문서 이동을 먼저 방문한다. 일반 경로 수십 개를 정렬한 뒤 예산이
+        # 소진되어 중요한 서버 렌더링 폼을 놓치는 일을 막는다.
+        ordered_paths = (*sorted(document_paths), *sorted(paths - document_paths))
+        found = [
+            (
+                f"{base}{path}",
+                tuple(sorted(parameters.get(path, ()))),
+                path in document_paths or path.endswith("/"),
+            )
+            for path in ordered_paths
         ]
+        found.extend(
+            (f"{base}/#/{route}", names, False)
+            for route, names in sorted(_client_routes(body).items())
+        )
+        return found
 
     def _store_surface(
-        self, run_id: str, surface_id: str, url: str, method: str, params: tuple[str, ...]
+        self,
+        run_id: str,
+        surface_id: str,
+        url: str,
+        method: str,
+        params: tuple[str, ...],
+        *,
+        observed: tuple[tuple[str, str], ...] = (),
+        path_identifier: tuple[str, int, str] | None = None,
     ) -> None:
+        path_name, path_index, path_value = path_identifier or (None, None, None)
         self._surfaces.add(
             Surface(
                 surface_id=surface_id,
@@ -244,8 +408,31 @@ class ReconAgent:
                 url=url,
                 method=method,
                 parameters=params,
+                observed_query=observed,
+                path_identifier=path_name,
+                path_identifier_index=path_index,
+                observed_path_identifier=path_value,
             )
         )
+
+    def _flag_restricted_file(self, run_id: str, surface_id: str, url: str) -> str:
+        """서버가 내주면 안 되는 확장자의 파일 표면을 Router 가 볼 수 있게 남긴다."""
+
+        evidence_id = f"evi-{self._id_factory()}"
+        self._evidence.append(
+            Evidence(
+                evidence_id=evidence_id,
+                run_id=run_id,
+                surface_id=surface_id,
+                created_by="recon",
+                evidence_type="observation",
+                observation={
+                    "type": RESTRICTED_FILE_OBSERVATION,
+                    "parameter": urlsplit(url).path.rsplit("/", 1)[-1],
+                },
+            )
+        )
+        return evidence_id
 
     def _flag_suspect_parameters(
         self, run_id: str, surface_id: str, params: tuple[str, ...]
@@ -265,6 +452,31 @@ class ReconAgent:
                     created_by="recon",
                     evidence_type="observation",
                     observation={"type": "url_or_file_parameter", "parameter": name},
+                )
+            )
+            evidence_ids.append(evidence_id)
+        return evidence_ids
+
+    def _flag_unlinked_render_parameters(
+        self, run_id: str, surface_id: str
+    ) -> list[str]:
+        """서버 렌더링 POST 폼에 제한된 비노출 옵션 후보를 남긴다."""
+
+        evidence_ids: list[str] = []
+        for name in _UNLINKED_RENDER_PARAMETERS:
+            evidence_id = f"evi-{self._id_factory()}"
+            self._evidence.append(
+                Evidence(
+                    evidence_id=evidence_id,
+                    run_id=run_id,
+                    surface_id=surface_id,
+                    created_by="recon",
+                    evidence_type="observation",
+                    observation={
+                        "type": UNLINKED_RENDER_PARAMETER_OBSERVATION,
+                        "parameter": name,
+                        "source": "bounded_unlinked_render_parameter",
+                    },
                 )
             )
             evidence_ids.append(evidence_id)
@@ -316,6 +528,56 @@ def _parse_page(
 
 def _query_names(url: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(name for name, _ in parse_qsl(urlsplit(url).query)))
+
+
+def _query_pairs(url: str) -> tuple[tuple[str, str], ...]:
+    """관측된 query 값을 이름별로 한 번씩 보존한다."""
+
+    pairs: dict[str, str] = {}
+    for name, value in parse_qsl(urlsplit(url).query, keep_blank_values=True):
+        pairs.setdefault(name, value)
+    return tuple(pairs.items())
+
+
+def _path_identifier(url: str) -> tuple[str, int, str] | None:
+    """`/users/17` 형태에서 논리 식별자명·세그먼트 위치·관측값을 얻는다.
+
+    모든 숫자 경로를 객체로 보면 버전(`/v1/`)이나 연도까지 후보가 된다. 따라서 숫자
+    바로 앞이 복수형 리소스명인 경우만 결정적으로 인정한다.
+    """
+
+    segments = urlsplit(url).path.split("/")
+    for index in range(len(segments) - 1, 1, -1):
+        value = segments[index]
+        resource = segments[index - 1]
+        if _PATH_OBJECT_ID.fullmatch(value) is None:
+            continue
+        lowered = resource.casefold()
+        if _PATH_RESOURCE.fullmatch(resource) is None:
+            continue
+        if lowered.endswith("s") and len(resource) > 1:
+            singular = resource[:-1]
+        elif lowered in _SINGULAR_OBJECT_RESOURCES:
+            singular = resource
+        else:
+            continue
+        return f"{singular.casefold()}_id", index, value
+    return None
+
+
+def _canonical_surface_url(
+    url: str, path_identifier: tuple[str, int, str] | None
+) -> str:
+    """서로 다른 concrete ID 링크를 동일 REST Surface 하나로 중복 제거한다."""
+
+    if path_identifier is None:
+        return url
+    name, index, _ = path_identifier
+    parsed = urlsplit(url)
+    segments = parsed.path.split("/")
+    segments[index] = "{" + name + "}"
+    path = "/".join(segments)
+    return parsed._replace(path=path).geturl()
 
 
 def _same_origin(url: str, origin) -> bool:

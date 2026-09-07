@@ -17,11 +17,35 @@ from hacklipse.domain import (
     ValidationResult,
     ValidationVerdict,
 )
+from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 
 from .probing import build_probe_requests, matching_evidence, probe_marker
+from .path_traversal_analysis import (
+    PATH_TRAVERSAL_BYPASS_OBSERVATION,
+    PATH_TRAVERSAL_OBSERVATION,
+    PATH_TRAVERSAL_TOOL,
+    build_path_traversal_bypass_requests,
+    build_path_traversal_requests,
+    is_restricted_file_surface,
+    path_parameter_candidates,
+    path_traversal_bypass_signal,
+    path_traversal_signal,
+)
+from .access_control_analysis import (
+    ACCESS_CONTROL_TOOL,
+    build_access_control_requests,
+    unauthorized_object_exposed,
+)
 from .routing import DEFAULT_RULES
 from .sqli_analysis import sql_error_signal
+from .ssti_analysis import (
+    SSTI_OBSERVATION,
+    SSTI_TOOL,
+    build_ssti_requests,
+    matching_ssti_evidence,
+    ssti_execution_signal,
+)
 from .xss_execution import BROWSER_XSS_TOOL, XSS_EXECUTION_MARKER_PREFIX
 
 # Router가 Candidate를 만들 때 쓴 것과 같은 taxonomy. Candidate가 알려진 취약점
@@ -82,9 +106,28 @@ class ValidationAgent:
                 "validation agent has no reproduction rule for "
                 f"vulnerability type: {candidate.vulnerability_type}"
             )
-        if _REPRODUCTION_TOOL not in task.allowed_tools:
+        specialized_path_validation = (
+            candidate.vulnerability_type == "Path Traversal"
+            and PATH_TRAVERSAL_TOOL in task.allowed_tools
+        )
+        specialized_access_validation = (
+            candidate.vulnerability_type == "Access Control"
+            and ACCESS_CONTROL_TOOL in task.allowed_tools
+        )
+        specialized_ssti_validation = (
+            candidate.vulnerability_type == "SSTI" and SSTI_TOOL in task.allowed_tools
+        )
+        if specialized_path_validation:
+            required_tool = PATH_TRAVERSAL_TOOL
+        elif specialized_access_validation:
+            required_tool = ACCESS_CONTROL_TOOL
+        elif specialized_ssti_validation:
+            required_tool = SSTI_TOOL
+        else:
+            required_tool = _REPRODUCTION_TOOL
+        if required_tool not in task.allowed_tools:
             raise AgentContractError(
-                f"validation tool is not allowed by the task: {_REPRODUCTION_TOOL}"
+                f"validation tool is not allowed by the task: {required_tool}"
             )
 
         evidence_ids = tuple(dict.fromkeys(task.evidence_ids))
@@ -97,6 +140,14 @@ class ValidationAgent:
 
         if candidate.vulnerability_type == "SQLi":
             return self._validate_sqli(task, candidate, evidence, reproduction)
+        if specialized_path_validation:
+            return self._validate_path_traversal(
+                task, candidate, evidence, reproduction
+            )
+        if specialized_access_validation:
+            return self._validate_access_control(task, candidate, evidence)
+        if specialized_ssti_validation:
+            return self._validate_ssti(task, candidate, evidence, reproduction)
         if (
             candidate.vulnerability_type == "XSS"
             and BROWSER_XSS_TOOL in task.allowed_tools
@@ -158,7 +209,7 @@ class ValidationAgent:
         )
         if missing:
             if task.request_budget < len(missing):
-                raise AgentContractError(
+                raise BudgetExceeded(
                     "XSS validation lacks budget for independent browser control/probe requests"
                 )
             return AgentResult(
@@ -264,7 +315,7 @@ class ValidationAgent:
         )
         if missing:
             if task.request_budget < len(missing):
-                raise AgentContractError(
+                raise BudgetExceeded(
                     "SQLi validation lacks budget for independent control/probe requests"
                 )
             return AgentResult(
@@ -313,6 +364,398 @@ class ValidationAgent:
             verdict=ValidationVerdict.REJECTED,
             evidence=reproduced,
             reason="independent quote probe did not reproduce the SQL error differential",
+        )
+
+    def _validate_access_control(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        evidence: Sequence[Evidence],
+    ) -> AgentResult:
+        """Analysis 결론을 쓰지 않고 자기 세션에서 세 요청을 다시 수행해 판정한다.
+
+        Analysis가 만든 object_id_auth Observation은 "어디를 어떤 객체 ID로 볼지"를 알려주는
+        지시일 뿐 확정 근거가 아니다. 실제 판정은 이 validation_id로 새로 수집한 Evidence
+        세 개로만 한다.
+        """
+
+        plan = _access_control_plan(evidence)
+        if plan is None:
+            # Analysis 신호가 없으면 무엇을 재현해야 하는지 알 수 없다. 조용히 통과시키지
+            # 않고 미확정으로 남긴다.
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.COMPLETED,
+                validation=self._validation_result(
+                    task,
+                    verdict=ValidationVerdict.SUSPECTED,
+                    evidence=(),
+                    reason="no object_id_auth observation to reproduce independently",
+                ).validation,
+            )
+
+        identifier, actor_id, owner_id = plan
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        requests = build_access_control_requests(
+            surface,
+            identifier,
+            actor_object_id=actor_id,
+            owner_object_id=owner_id,
+            purpose=f"independent access control validation {task.validation_id}",
+        )
+        collected = [
+            matching_evidence(evidence, surface.url, request) for request in requests
+        ]
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                return AgentResult(
+                    task_id=task.task_id,
+                    status=AgentResultStatus.COMPLETED,
+                    validation=self._validation_result(
+                        task,
+                        verdict=ValidationVerdict.SUSPECTED,
+                        evidence=(),
+                        reason="independent access control reproduction exceeded the request budget",
+                    ).validation,
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+
+        actor_control, owner_control, probe = collected
+        session_evidence = tuple(
+            item for item in (actor_control, owner_control, probe) if item is not None
+        )
+        # 세 요청 모두 이번 validation 세션의 중앙 수집 Evidence여야 한다.
+        if len(session_evidence) != 3 or any(
+            not _is_reproduction_evidence(item, task.validation_id)
+            for item in (actor_control, owner_control, probe)
+            if item is not None
+        ):
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.COMPLETED,
+                validation=self._validation_result(
+                    task,
+                    verdict=ValidationVerdict.SUSPECTED,
+                    evidence=(),
+                    reason="access control reproduction did not belong to this validation session",
+                ).validation,
+            )
+
+        assert actor_control is not None and owner_control is not None and probe is not None
+        if not unauthorized_object_exposed(
+            actor_control, owner_control, probe, actor_id, owner_id
+        ):
+            # owner 객체가 actor 세션에서 보이지 않는다. 권한 검사가 동작한 것이다.
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.COMPLETED,
+                validation=self._validation_result(
+                    task,
+                    verdict=ValidationVerdict.REJECTED,
+                    evidence=session_evidence,
+                    reason="actor session did not expose the owner object",
+                ).validation,
+            )
+
+        proof = ValidationProof(
+            proof_type=ValidationProofType.UNAUTHORIZED_OBJECT_ACCESS,
+            evidence_ids=tuple(item.evidence_id for item in session_evidence),
+            summary=(
+                f"actor session read object {owner_id} owned by another principal "
+                f"through identifier {identifier}"
+            ),
+        )
+        return AgentResult(
+            task_id=task.task_id,
+            status=AgentResultStatus.COMPLETED,
+            validation=self._validation_result(
+                task,
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence=session_evidence,
+                reason="independent reproduction exposed another principal's object",
+                proof=proof,
+            ).validation,
+        )
+
+    def _validate_path_traversal(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        evidence: Sequence[Evidence],
+        reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """고정된 비민감 파일 읽기를 현재 Validation 세션에서 독립 재현한다."""
+
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        if is_restricted_file_surface(evidence, surface):
+            return self._validate_path_traversal_bypass(
+                task, candidate, surface, evidence, reproduction
+            )
+        signaled_parameters = tuple(
+            dict.fromkeys(
+                parameter
+                for item in evidence
+                if item.surface_id == candidate.surface_id
+                and item.observation.get("type") == PATH_TRAVERSAL_OBSERVATION
+                and isinstance((parameter := item.observation.get("parameter")), str)
+                and parameter
+                in path_parameter_candidates(evidence, surface, surface.parameters)
+            )
+        )
+        if not signaled_parameters:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no safe-file read signal to reproduce",
+            )
+
+        requests = build_path_traversal_requests(
+            surface,
+            surface.parameters,
+            signaled_parameters,
+            purpose=f"Path Traversal validation {task.validation_id}",
+        )
+        collected = tuple(
+            matching_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "Path Traversal validation lacks budget for independent requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+
+        reproduced = tuple(item for item in collected if item is not None)
+        if any(
+            item.observation.get("type") in {"http_error", "http_redirect"}
+            for item in reproduced
+        ):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=reproduced,
+                reason="independent safe-file reproduction could not obtain comparable responses",
+            )
+
+        control = reproduced[0]
+        for parameter, probe in zip(signaled_parameters, reproduced[1:]):
+            if not path_traversal_signal(control, probe):
+                continue
+            proof_evidence = (control, probe)
+            proof = ValidationProof(
+                proof_type=ValidationProofType.PATH_TRAVERSAL_FILE_READ,
+                evidence_ids=tuple(item.evidence_id for item in proof_evidence),
+                summary=(
+                    "independent fixed safe-file probe reproduced an out-of-directory "
+                    f"file read for parameter {parameter}"
+                ),
+            )
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence=proof_evidence,
+                reason="independent control/probe comparison reproduced the safe-file read",
+                proof=proof,
+            )
+
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.REJECTED,
+            evidence=reproduced,
+            reason="independent probe did not reproduce the safe-file read",
+        )
+
+    def _validate_path_traversal_bypass(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        surface,
+        evidence: Sequence[Evidence],
+        reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """확장자 필터 우회 읽기를 독립 세션에서 다시 만든다.
+
+        Analysis 의 판정은 읽지 않는다. 좌표(어느 표면인가)만 가져오고 control 과
+        probe 를 이 Validation 세션에서 새로 수집한다.
+        """
+
+        signaled = any(
+            item.surface_id == candidate.surface_id
+            and item.observation.get("type") == PATH_TRAVERSAL_OBSERVATION
+            and item.observation.get("bypass") == PATH_TRAVERSAL_BYPASS_OBSERVATION
+            for item in evidence
+        )
+        if not signaled:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no filter bypass signal to reproduce",
+            )
+
+        requests = build_path_traversal_bypass_requests(
+            surface, purpose=f"Path Traversal validation {task.validation_id}"
+        )
+        collected = tuple(
+            matching_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "Path Traversal validation lacks budget for independent requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+
+        control, probe = collected
+        assert control is not None and probe is not None
+        if any(
+            item.observation.get("type") in {"http_error", "http_redirect"}
+            for item in (control, probe)
+        ):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=(control, probe),
+                reason="independent bypass reproduction could not obtain comparable responses",
+            )
+        if not path_traversal_bypass_signal(control, probe):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(control, probe),
+                reason="independent probe did not reproduce the filter bypass read",
+            )
+
+        proof_evidence = (control, probe)
+        proof = ValidationProof(
+            proof_type=ValidationProofType.PATH_TRAVERSAL_FILE_READ,
+            evidence_ids=tuple(item.evidence_id for item in proof_evidence),
+            summary=(
+                "independent probe read a file the server refused to serve directly "
+                f"at {surface.url.rsplit('/', 1)[-1]} using the fixed extension filter bypass"
+            ),
+        )
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.CONFIRMED,
+            evidence=proof_evidence,
+            reason="independent control/probe comparison reproduced the filter bypass read",
+            proof=proof,
+        )
+
+    def _validate_ssti(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        evidence: Sequence[Evidence],
+        reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """고정 산술식의 서버 측 평가를 현재 Validation 세션에서 다시 수행한다."""
+
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        signaled_parameters = tuple(
+            dict.fromkeys(
+                parameter
+                for item in evidence
+                if item.surface_id == candidate.surface_id
+                and item.observation.get("type") == SSTI_OBSERVATION
+                and isinstance((parameter := item.observation.get("parameter")), str)
+                and parameter in surface.parameters
+            )
+        )
+        if "username" not in signaled_parameters:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no fixed-arithmetic SSTI signal to reproduce",
+            )
+
+        requests = build_ssti_requests(
+            surface,
+            "username",
+            purpose=f"SSTI validation {task.validation_id}",
+        )
+        collected = tuple(
+            matching_ssti_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "SSTI validation lacks budget for its independent safe request sequence"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+
+        reproduced = tuple(item for item in collected if item is not None)
+        if any(item.observation.get("type") == "http_error" for item in reproduced):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=reproduced,
+                reason="independent SSTI sequence encountered an HTTP execution error",
+            )
+        cleanup_status = reproduced[-1].observation.get("status")
+        if cleanup_status not in {302, 303}:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=reproduced,
+                reason="independent SSTI sequence could not restore the safe username",
+            )
+        if not ssti_execution_signal(collected):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=reproduced,
+                reason="independent fixed arithmetic probe was not evaluated by the template",
+            )
+
+        proof = ValidationProof(
+            proof_type=ValidationProofType.SSTI_EXECUTION,
+            evidence_ids=tuple(item.evidence_id for item in reproduced),
+            summary=(
+                "independent approved profile control/probe sequence reproduced fixed "
+                "server-side arithmetic evaluation and restored a safe username"
+            ),
+        )
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.CONFIRMED,
+            evidence=reproduced,
+            reason="independent control/probe comparison reproduced the SSTI effect",
+            proof=proof,
         )
 
     @staticmethod
@@ -400,3 +843,22 @@ def _is_reproduction_evidence(evidence: Evidence, validation_id: str) -> bool:
         and evidence.created_by.startswith("execution_runtime:")
         and str(evidence.observation.get("type")) in _REPRODUCTION_EVIDENCE_TYPES
     )
+
+
+def _access_control_plan(
+    evidence: Sequence[Evidence],
+) -> tuple[str, str, str] | None:
+    """Analysis Observation에서 재현에 필요한 좌표만 읽는다(판정은 읽지 않는다)."""
+
+    for item in reversed(list(evidence)):
+        observation = item.observation
+        if observation.get("type") != "object_id_auth":
+            continue
+        identifier = observation.get("identifier_parameter")
+        location = observation.get("identifier_location", "query")
+        actor_id = observation.get("actor_object_id")
+        owner_id = observation.get("owner_object_id")
+        if all(isinstance(value, str) and value for value in (identifier, actor_id, owner_id)):
+            token = f"path:{identifier}" if location == "path" else str(identifier)
+            return token, str(actor_id), str(owner_id)
+    return None

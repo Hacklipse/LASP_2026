@@ -4,18 +4,28 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Collection, Mapping, Protocol
+from typing import Callable, Collection, Mapping, Protocol
 
 from hacklipse.adapters import (
     AllowlistPolicyGate,
     AnthropicLlmClient,
     BoundedRetryPolicy,
+    BrowserXssAnalyzer,
     DisabledExecutionRuntime,
     FormLoginWorker,
+    GeminiLlmClient,
+    HeuristicAccessControlAnalyzer,
     HeuristicSqliAnalyzer,
+    HeuristicSstiAnalyzer,
+    HeuristicPathTraversalAnalyzer,
     HeuristicXssAnalyzer,
     InMemoryBudgetManager,
     InMemoryExecutionAuditLog,
+    InMemoryProgressLog,
+    LlmSqliAnalyzer,
+    LlmSstiAnalyzer,
+    LlmPathTraversalAnalyzer,
+    LlmAccessControlAnalyzer,
     LlmXssAnalyzer,
     LocalTaskDispatcher,
     MarkdownReportAgent,
@@ -35,7 +45,9 @@ from hacklipse.application import (
     TaskExecutor,
     TaskFactory,
 )
+from hacklipse.domain import TaskEnvelope
 from hacklipse.ports import (
+    ProgressSink,
     Agent,
     BudgetManager,
     ApprovalGate,
@@ -58,11 +70,17 @@ from hacklipse.ports.errors import LlmCredentialsMissing
 
 # 자격증명은 환경변수로만 받는다. 파일에 두면 커밋에 딸려 들어갈 수 있고, Task에 실으면
 # 감사 로그·프롬프트로 새어 나간다(TaskEnvelope에는 원문 필드 자체가 없다).
-API_KEY_ENV = "ANTHROPIC_API_KEY"
+ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+# 기존 호출자와 테스트의 공개 이름을 유지한다.
+API_KEY_ENV = ANTHROPIC_API_KEY_ENV
 
 # 주 실험은 단일 모델로 고정한다. 역할별로 모델을 섞으면 성능 차이가 아키텍처 덕인지
 # 모델 덕인지 분리되지 않는다. 더 강한 모델은 같은 배선에서 model만 바꿔 2차 실험으로 돌린다.
-DEFAULT_LLM_MODEL = "claude-sonnet-5"
+DEFAULT_ANTHROPIC_LLM_MODEL = "claude-sonnet-5"
+DEFAULT_GEMINI_LLM_MODEL = "gemini-3.5-flash-lite"
+# 기존 Anthropic builder의 기본값 이름을 호환성 목적으로 유지한다.
+DEFAULT_LLM_MODEL = DEFAULT_ANTHROPIC_LLM_MODEL
 
 
 def build_llm_client_from_env(*, model: str = DEFAULT_LLM_MODEL) -> AnthropicLlmClient:
@@ -73,12 +91,27 @@ def build_llm_client_from_env(*, model: str = DEFAULT_LLM_MODEL) -> AnthropicLlm
     않고 여기서 실패한다.
     """
 
-    api_key = os.environ.get(API_KEY_ENV, "").strip()
+    api_key = os.environ.get(ANTHROPIC_API_KEY_ENV, "").strip()
     if not api_key:
         raise LlmCredentialsMissing(
-            f"{API_KEY_ENV} is not set; export it or pass an explicit LlmClient"
+            f"{ANTHROPIC_API_KEY_ENV} is not set; "
+            "export it or pass an explicit LlmClient"
         )
     return AnthropicLlmClient(api_key=api_key, model=model)
+
+
+def build_gemini_llm_client_from_env(
+    *, model: str = DEFAULT_GEMINI_LLM_MODEL
+) -> GeminiLlmClient:
+    """환경변수의 Gemini API Key로 공급자 중립 LlmClient를 만든다."""
+
+    api_key = os.environ.get(GEMINI_API_KEY_ENV, "").strip()
+    if not api_key:
+        raise LlmCredentialsMissing(
+            f"{GEMINI_API_KEY_ENV} is not set; "
+            "export it or pass an explicit LlmClient"
+        )
+    return GeminiLlmClient(api_key=api_key, model=model)
 
 
 class StoreBundle(Protocol):
@@ -102,6 +135,7 @@ class LocalApplication:
     dispatcher: LocalTaskDispatcher
     budget_manager: BudgetManager
     policy_gate: AllowlistPolicyGate
+    progress_log: ProgressSink
     runtime: ExecutionRuntime
     collector: RuntimeEvidenceCollector
     audit_log: ExecutionAuditLog
@@ -121,6 +155,10 @@ def build_local_application(
     audit_log: ExecutionAuditLog | None = None,
     approval_gate: ApprovalGate | None = None,
     agent_allowed_tools: Mapping[str, tuple[str, ...]] | None = None,
+    task_progress_callback: Callable[[str, TaskEnvelope, int, float], None]
+    | None = None,
+    progress_sink: ProgressSink | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> LocalApplication:
     """기본적으로 네트워크를 활성화하지 않는 로컬 시스템을 조립한다."""
 
@@ -174,7 +212,14 @@ def build_local_application(
         dispatcher.register(
             selected_config.evidence_collector_agent_type,
             collector,
-            allowed_tools=("http_get", "http_post", "browser_xss"),
+            allowed_tools=(
+                "http_get",
+                "http_post",
+                "browser_xss",
+                "path_traversal_probe",
+                "access_control_probe",
+                "ssti_probe",
+            ),
         )
     if credential_resolver is not None and selected_config.authentication_agent_type not in agents:
         dispatcher.register(
@@ -192,6 +237,16 @@ def build_local_application(
         task_store=selected_stores.tasks,
         budget_manager=selected_budget,
         retry_policy=retry_policy or BoundedRetryPolicy(),
+        progress_callback=task_progress_callback,
+    )
+    # Sink를 주지 않아도 진행 사건을 남긴다. 실행이 끝난 뒤 무슨 일이 있었는지
+    # 되짚을 수 있어야 하고, 보관 비용은 사건 몇십 개뿐이다.
+    # 저장소가 영속이면 진행 사건도 같은 파일에 남긴다. 작업은 복원되는데 진행
+    # 상태만 사라지면 재개 화면이 "아무 일도 없었다"로 보인다.
+    selected_progress = (
+        progress_sink
+        or getattr(selected_stores, "progress", None)
+        or InMemoryProgressLog()
     )
     orchestrator = Orchestrator(
         run_store=selected_stores.runs,
@@ -207,9 +262,12 @@ def build_local_application(
         state_machine=RunStateMachine(),
         task_factory=TaskFactory(),
         config=selected_config,
+        progress_sink=selected_progress,
+        clock=clock,
     )
     return LocalApplication(
         orchestrator=orchestrator,
+        progress_log=selected_progress,
         stores=selected_stores,
         dispatcher=dispatcher,
         budget_manager=selected_budget,
@@ -223,7 +281,14 @@ def build_local_application(
 # 실제로 구현된 Analysis Agent. Router가 이 목록 밖 Candidate를 만들면 Dispatcher가
 # AgentUnavailable로 Run 전체를 실패시키므로, 배선과 라우팅 규칙이 같은 목록을 봐야 한다.
 # Analyzer를 추가하면 여기 한 줄만 늘리면 Router가 따라온다.
-IMPLEMENTED_ANALYZERS = ("xss_analyzer", "sqli_analyzer")
+IMPLEMENTED_ANALYZERS = (
+    "access_control_analyzer",
+    "xss_analyzer",
+    "browser_xss_analyzer",
+    "sqli_analyzer",
+    "path_traversal_analyzer",
+    "ssti_analyzer",
+)
 
 
 def standard_router(
@@ -259,6 +324,9 @@ def register_standard_agents(
     *,
     llm_client: LlmClient | None = None,
     recon_max_pages: int = DEFAULT_MAX_PAGES,
+    recon_seed_urls: tuple[str, ...] = (),
+    actor_object_id: str | None = None,
+    owner_object_id: str | None = None,
 ) -> str:
     """Recon/Analysis/Validation을 표준 배선으로 등록하고 구성 이름을 돌려준다.
 
@@ -274,34 +342,106 @@ def register_standard_agents(
             evidence_store=app.stores.evidence,
             surface_store=app.stores.surfaces,
             max_pages=recon_max_pages,
+            seed_urls=recon_seed_urls,
         ),
         allowed_tools=("http_get",),
     )
     if llm_client is None:
-        analyzer: Agent = HeuristicXssAnalyzer(
+        xss_analyzer: Agent = HeuristicXssAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
+        sqli_analyzer: Agent = HeuristicSqliAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
+        path_traversal_analyzer: Agent = HeuristicPathTraversalAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
+        access_control_analyzer: Agent = HeuristicAccessControlAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+            actor_object_id=actor_object_id,
+            owner_object_id=owner_object_id,
+        )
+        ssti_analyzer: Agent = HeuristicSstiAnalyzer(
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
         profile = "heuristic"
     else:
-        analyzer = LlmXssAnalyzer(
+        xss_analyzer = LlmXssAnalyzer(
+            llm_client=llm_client,
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
+        sqli_analyzer = LlmSqliAnalyzer(
+            llm_client=llm_client,
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
+        path_traversal_analyzer = LlmPathTraversalAnalyzer(
+            llm_client=llm_client,
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
+        access_control_analyzer = LlmAccessControlAnalyzer(
+            llm_client=llm_client,
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+            actor_object_id=actor_object_id,
+            owner_object_id=owner_object_id,
+        )
+        ssti_analyzer = LlmSstiAnalyzer(
             llm_client=llm_client,
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
         profile = "llm"
-    app.dispatcher.register("xss_analyzer", analyzer, allowed_tools=("http_get",))
-    # SQLi는 아직 결정적 구현만 있다. LLM 구성에서도 같은 baseline을 쓴다.
     app.dispatcher.register(
-        "sqli_analyzer",
-        HeuristicSqliAnalyzer(
+        "xss_analyzer", xss_analyzer, allowed_tools=("http_get",)
+    )
+    # SPA 라우트의 DOM 반사는 브라우저로만 관측된다. LLM 구성에서도 같은 관측을
+    # 쓰므로 두 프로필이 이 Analyzer 를 공유한다.
+    app.dispatcher.register(
+        "browser_xss_analyzer",
+        BrowserXssAnalyzer(
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         ),
+        allowed_tools=("browser_xss",),
+    )
+    app.dispatcher.register(
+        "sqli_analyzer",
+        sqli_analyzer,
         allowed_tools=("http_get",),
+    )
+    app.dispatcher.register(
+        "path_traversal_analyzer",
+        path_traversal_analyzer,
+        allowed_tools=("path_traversal_probe",),
+    )
+    app.dispatcher.register(
+        "access_control_analyzer",
+        access_control_analyzer,
+        allowed_tools=("access_control_probe",),
+    )
+    app.dispatcher.register(
+        "ssti_analyzer",
+        ssti_analyzer,
+        allowed_tools=("ssti_probe",),
     )
     app.dispatcher.register(
         "validation",
@@ -310,6 +450,12 @@ def register_standard_agents(
             evidence_store=app.stores.evidence,
             surface_store=app.stores.surfaces,
         ),
-        allowed_tools=("http_get", "browser_xss"),
+        allowed_tools=(
+            "http_get",
+            "browser_xss",
+            "path_traversal_probe",
+            "access_control_probe",
+            "ssti_probe",
+        ),
     )
     return profile

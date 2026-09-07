@@ -5,12 +5,21 @@ from .authentication import FormLoginWorker
 from .browser_runtime import PlaywrightBrowserRuntime
 from .dispatcher import LocalTaskDispatcher
 from .http_runtime import HttpExecutionRuntime
+from .gemini_llm_client import GeminiLlmClient
 from .llm_client import AnthropicLlmClient
+from .llm_path_traversal_analysis import LlmPathTraversalAnalyzer
+from .llm_sqli_analysis import LlmSqliAnalyzer
+from .llm_ssti_analysis import LlmSstiAnalyzer
+from .browser_xss_analysis import BrowserXssAnalyzer
 from .llm_xss_analysis import LlmXssAnalyzer
-from .memory import MemoryStoreBundle
+from .memory import CallbackProgressLog, InMemoryProgressLog, MemoryStoreBundle
 from .policy import AllowlistPolicyGate
+from .path_traversal_analysis import HeuristicPathTraversalAnalyzer
+from .access_control_analysis import HeuristicAccessControlAnalyzer
+from .llm_access_control_analysis import LlmAccessControlAnalyzer
 from .recon import ReconAgent
 from .sqli_analysis import HeuristicSqliAnalyzer
+from .ssti_analysis import HeuristicSstiAnalyzer
 from .reporting import MarkdownReportAgent
 from .retry import BoundedRetryPolicy
 from .routing import RoutingRule, RuleBasedVulnerabilityRouter, SurfaceRoutingRule
@@ -26,7 +35,7 @@ from .security import (
 from .validation import ValidationAgent
 from .xss_analysis import HeuristicXssAnalyzer
 from .sqlite_budget import SQLiteBudgetManager
-from .sqlite_store import SQLiteStoreBundle
+from .sqlite_store import SQLiteProgressLog, SQLiteStoreBundle
 
 __all__ = [
     "AllowlistPolicyGate",
@@ -36,11 +45,22 @@ __all__ = [
     "HttpExecutionRuntime",
     "FormLoginWorker",
     "AnthropicLlmClient",
+    "GeminiLlmClient",
+    "HeuristicAccessControlAnalyzer",
     "HeuristicSqliAnalyzer",
+    "HeuristicSstiAnalyzer",
+    "HeuristicPathTraversalAnalyzer",
+    "BrowserXssAnalyzer",
     "HeuristicXssAnalyzer",
     "InMemoryBudgetManager",
     "InMemoryCredentialResolver",
+    "CallbackProgressLog",
     "InMemoryExecutionAuditLog",
+    "InMemoryProgressLog",
+    "LlmSqliAnalyzer",
+    "LlmSstiAnalyzer",
+    "LlmPathTraversalAnalyzer",
+    "LlmAccessControlAnalyzer",
     "LlmXssAnalyzer",
     "LocalTaskDispatcher",
     "MarkdownReportAgent",
@@ -54,6 +74,7 @@ __all__ = [
     "ValidationAgent",
     "SQLiteBudgetManager",
     "SQLiteExecutionAuditLog",
+    "SQLiteProgressLog",
     "SQLiteStoreBundle",
     "StaticApprovalGate",
 ]

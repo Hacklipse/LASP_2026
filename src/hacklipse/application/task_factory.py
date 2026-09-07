@@ -5,7 +5,21 @@ from __future__ import annotations
 from collections.abc import Callable
 from uuid import uuid4
 
-from hacklipse.domain import Candidate, EvidenceRequest, Run, TaskEnvelope
+from hacklipse.domain import (
+    Candidate,
+    EvidenceRequest,
+    Run,
+    TaskEnvelope,
+    credential_for_vulnerability,
+)
+
+_PATH_TRAVERSAL_TOOL = "path_traversal_probe"
+_ACCESS_CONTROL_TOOL = "access_control_probe"
+_SSTI_TOOL = "ssti_probe"
+_BROWSER_XSS_TOOL = "browser_xss"
+# XSS 는 담당 Agent 가 둘이다. 서버 반사는 http_get, SPA 의 DOM 반사는 브라우저로만
+# 관측된다. 도구는 취약점 유형이 아니라 그 Agent 가 무엇으로 요청하는지에 달려 있다.
+_BROWSER_XSS_ANALYZER = "browser_xss_analyzer"
 
 
 class TaskFactory:
@@ -25,6 +39,8 @@ class TaskFactory:
             target_url=run.target_url,
             # HttpExecutionRuntime의 GET 실행 도구 이름과 맞춰야 collect()가 통과한다.
             allowed_tools=("http_get",),
+            # Recon은 특정 취약점에 속하지 않는 탐색이므로 Run 기본 세션으로 돈다.
+            credential_ref=run.credential_ref,
         )
 
     def analysis(
@@ -37,6 +53,18 @@ class TaskFactory:
     ) -> TaskEnvelope:
         """Candidate의 실제 Surface URL과 Evidence 참조를 Analysis Task에 담는다."""
 
+        if candidate.assigned_agent == _BROWSER_XSS_ANALYZER:
+            allowed_tools = (_BROWSER_XSS_TOOL,)
+        elif candidate.vulnerability_type == "Path Traversal":
+            allowed_tools = (_PATH_TRAVERSAL_TOOL,)
+        elif candidate.vulnerability_type == "Access Control":
+            # 권한 우회 탐침은 전용 도구로만 나간다. 일반 http_get을 허용하면 Agent가
+            # 식별자 제약과 헤더 금지 규칙을 우회한 요청을 만들 수 있다.
+            allowed_tools = (_ACCESS_CONTROL_TOOL,)
+        elif candidate.vulnerability_type == "SSTI":
+            allowed_tools = (_SSTI_TOOL,)
+        else:
+            allowed_tools = ("http_get",)
         return self._base(
             run,
             agent_type=candidate.assigned_agent,
@@ -45,7 +73,10 @@ class TaskFactory:
             surface_id=candidate.surface_id,
             candidate_id=candidate.candidate_id,
             evidence_ids=candidate.evidence_ids,
-            allowed_tools=("http_get",),
+            allowed_tools=allowed_tools,
+            credential_ref=credential_for_vulnerability(
+                run, candidate.vulnerability_type
+            ),
         )
 
     def validation(
@@ -60,11 +91,16 @@ class TaskFactory:
     ) -> TaskEnvelope:
         """Candidate/Evidence 참조만 전달하는 Validation Task를 생성한다."""
 
-        allowed_tools = (
-            ("http_get", "browser_xss")
-            if candidate.vulnerability_type == "XSS" and browser_xss_enabled
-            else ("http_get",)
-        )
+        if candidate.vulnerability_type == "XSS" and browser_xss_enabled:
+            allowed_tools = ("http_get", "browser_xss")
+        elif candidate.vulnerability_type == "Path Traversal":
+            allowed_tools = (_PATH_TRAVERSAL_TOOL,)
+        elif candidate.vulnerability_type == "Access Control":
+            allowed_tools = (_ACCESS_CONTROL_TOOL,)
+        elif candidate.vulnerability_type == "SSTI":
+            allowed_tools = (_SSTI_TOOL,)
+        else:
+            allowed_tools = ("http_get",)
         return self._base(
             run,
             agent_type=agent_type,
@@ -74,6 +110,9 @@ class TaskFactory:
             evidence_ids=candidate.evidence_ids,
             allowed_tools=allowed_tools,
             validation_id=validation_id,
+            credential_ref=credential_for_vulnerability(
+                run, candidate.vulnerability_type
+            ),
         )
 
     def evidence_collection(
@@ -100,6 +139,11 @@ class TaskFactory:
             allowed_tools=(request.suggested_tool,),
             validation_id=validation_id,
             evidence_request=request,
+            # 증적 수집도 Candidate가 속한 취약점 유형의 세션으로 나가야 한다.
+            # Run 기본값을 쓰면 유형별 인증 분리가 이 지점에서 무너진다.
+            credential_ref=credential_for_vulnerability(
+                run, candidate.vulnerability_type
+            ),
         )
 
     def report(self, run: Run, *, agent_type: str) -> TaskEnvelope:
@@ -113,11 +157,21 @@ class TaskFactory:
         )
 
     def authentication(
-        self, run: Run, *, agent_type: str, request_budget: int
+        self,
+        run: Run,
+        *,
+        agent_type: str,
+        request_budget: int,
+        credential_ref: str | None = None,
     ) -> TaskEnvelope:
-        """비밀 원문 없이 credential_ref만 중앙 인증 Worker에 전달한다."""
+        """비밀 원문 없이 credential_ref만 중앙 인증 Worker에 전달한다.
 
-        if run.credential_ref is None:
+        Access Control처럼 주체가 둘 이상인 검사에서는 역할별로 각각 인증해야 하므로
+        어떤 참조를 인증할지 호출자가 지정할 수 있다.
+        """
+
+        selected = credential_ref or run.credential_ref
+        if selected is None:
             raise ValueError("authentication task requires a credential reference")
         return self._base(
             run,
@@ -125,6 +179,7 @@ class TaskFactory:
             request_budget=request_budget,
             target_url=run.target_url,
             allowed_tools=("http_get", "http_post"),
+            credential_ref=selected,
         )
 
     def _base(
@@ -141,8 +196,13 @@ class TaskFactory:
         allowed_tools: tuple[str, ...] = (),
         validation_id: str | None = None,
         evidence_request: EvidenceRequest | None = None,
+        credential_ref: str | None = None,
     ) -> TaskEnvelope:
-        """모든 Task에 공통인 Run·정책·예산 정보를 조립한다."""
+        """모든 Task에 공통인 Run·정책·예산 정보를 조립한다.
+
+        credential_ref는 호출자가 해석해서 넘긴다. 여기서 Run 기본값으로 되돌리면
+        "이 유형에는 자격증명을 주지 않는다"는 결정을 표현할 수 없다.
+        """
 
         return TaskEnvelope(
             task_id=self._id_factory(),
@@ -157,7 +217,7 @@ class TaskFactory:
             request_budget=request_budget,
             policy_profile=run.policy_profile,
             timeout_seconds=run.timeout_seconds,
-            credential_ref=run.credential_ref,
+            credential_ref=credential_ref,
             validation_id=validation_id,
             evidence_request=evidence_request,
         )

@@ -76,6 +76,17 @@ class InMemoryCredentialResolver:
                 f"credential reference is not configured: {credential_ref}"
             ) from error
 
+    def add(
+        self, credential_ref: str, credential: ResolvedHttpCredential
+    ) -> None:
+        """중앙 인증 Worker가 발급받은 단기 자격증명을 메모리에만 등록한다."""
+
+        if not credential_ref.strip():
+            raise ValueError("credential reference cannot be blank")
+        if credential_ref in self._credentials:
+            raise ValueError(f"credential reference is already configured: {credential_ref}")
+        self._credentials[credential_ref] = credential
+
 
 class SensitiveDataSanitizer:
     """Cookie·Authorization·토큰·주입된 비밀을 Evidence 저장 전에 제거한다."""

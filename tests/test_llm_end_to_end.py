@@ -14,6 +14,10 @@ from hacklipse.bootstrap import (
     register_standard_agents,
     standard_router,
 )
+from hacklipse.adapters.path_traversal_analysis import (
+    PATH_TRAVERSAL_PROBE_PATH,
+    PATH_TRAVERSAL_PROOF_MARKERS,
+)
 from hacklipse.domain import ExecutionRequest, ExecutionResult, RunPhase, RunRequest, RunScope
 from hacklipse.ports.llm import LlmRequest, LlmResponse
 
@@ -42,6 +46,45 @@ class _ReflectingRuntime:
         )
 
 
+class _SqliDifferentialRuntime:
+    """id probe의 작은따옴표에만 SQL 오류를 반환한다."""
+
+    def __init__(self) -> None:
+        self.requests: list[ExecutionRequest] = []
+
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        self.requests.append(request)
+        parameters = dict(request.query_parameters)
+        body = "normal database result"
+        if "Submit" in parameters and parameters.get("id", "").endswith("'"):
+            body = "You have an error in your SQL syntax"
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            evidence_type="http_response",
+            observation={
+                "type": "http_response",
+                "status": 200,
+                "body": body,
+                "requested_url": request.resolved_url,
+            },
+        )
+
+
+class _PathTraversalSafeFileRuntime:
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        values = dict(request.query_parameters).values()
+        body = (
+            "\n".join(PATH_TRAVERSAL_PROOF_MARKERS)
+            if PATH_TRAVERSAL_PROBE_PATH in values
+            else "normal include response"
+        )
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            evidence_type="http_response",
+            observation={"type": "http_response", "status": 200, "body": body},
+        )
+
+
 class _FakeLlmClient:
     def __init__(self) -> None:
         self.calls: list[LlmRequest] = []
@@ -49,9 +92,7 @@ class _FakeLlmClient:
     def complete(self, request: LlmRequest) -> LlmResponse:
         self.calls.append(request)
         properties = (request.response_schema or {}).get("properties", {})
-        if "parameters" in properties:
-            payload = {"parameters": ["q"], "reason": "value is rendered into the page"}
-        else:
+        if "reflections" in properties:
             payload = {
                 "reflections": [
                     {
@@ -62,6 +103,14 @@ class _FakeLlmClient:
                     }
                 ]
             }
+        elif "server-side file path" in (request.system or ""):
+            payload = {"parameters": ["page"], "reason": "file include input"}
+        elif "SQL parser reachability" in (request.system or ""):
+            content = "\n".join(message.content for message in request.messages)
+            selected = "id" if "Parameters: id" in content else "q"
+            payload = {"parameters": [selected], "reason": "likely lookup input"}
+        else:
+            payload = {"parameters": ["q"], "reason": "value is rendered into the page"}
         return LlmResponse(payload=payload, model="fake")
 
 
@@ -113,8 +162,8 @@ class LlmWiringEndToEndTests(unittest.TestCase):
                 "report",
             ],
         )
-        # 계획 1회 + 해석 1회. 두 번째 analyzer 호출은 계획을 다시 묻지 않는다.
-        self.assertEqual(len(llm.calls), 2)
+        # XSS 계획·해석 각 1회 + SQLi 계획 1회. 재호출은 계획을 다시 묻지 않는다.
+        self.assertEqual(len(llm.calls), 3)
         # Agent는 실행하지 않는다 — 요청은 전부 중앙 Collector를 거친 것이어야 한다.
         self.assertTrue(
             all(request.task_id for request in runtime.requests), "모든 요청에 발신 Task가 있다"
@@ -161,6 +210,77 @@ class LlmWiringEndToEndTests(unittest.TestCase):
         # 구현된 Analyzer가 담당하는 유형만 나온다. SSTI·Path Traversal은 Router 규칙이
         # 있어도 Analyzer가 없으므로 Candidate 자체가 만들어지지 않는다.
         self.assertEqual(types, {"XSS", "SQLi"})
+
+    def test_llm_sqli_reaches_independent_proof_and_finding(self) -> None:
+        """LLM 선택 뒤에도 Validation이 독립 요청으로 SQLi를 재현해야 확정한다."""
+
+        llm = _FakeLlmClient()
+        runtime = _SqliDifferentialRuntime()
+        app = build_local_application(
+            {},
+            runtime=runtime,
+            router=standard_router(vulnerability_types=("SQLi",)),
+        )
+        register_standard_agents(app, llm_client=llm, recon_max_pages=1)
+
+        run = app.orchestrator.start(
+            RunRequest(
+                target_url=(
+                    "http://local.test/vulnerabilities/sqli/?id=1&Submit=Submit"
+                ),
+                scope=RunScope(allowed_hosts=frozenset({_HOST})),
+                request_budget=30,
+            )
+        )
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(len(llm.calls), 1)
+        findings = app.stores.findings.list_by_run(run.run_id)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].vulnerability_type, "SQLi")
+        signal = next(
+            item
+            for item in app.stores.evidence.list_by_run(run.run_id)
+            if item.observation.get("type") == "sql_error"
+        )
+        self.assertEqual(signal.created_by, "llm_sqli_analyzer")
+        proof_evidence = app.stores.evidence.get_many(
+            run.run_id, findings[0].evidence_ids
+        )
+        self.assertTrue(
+            all(item.validation_id == findings[0].validation_id for item in proof_evidence)
+        )
+
+    def test_llm_path_traversal_reaches_independent_proof_and_finding(self) -> None:
+        llm = _FakeLlmClient()
+        app = build_local_application(
+            {},
+            runtime=_PathTraversalSafeFileRuntime(),
+            router=standard_router(vulnerability_types=("Path Traversal",)),
+        )
+        register_standard_agents(app, llm_client=llm, recon_max_pages=1)
+
+        run = app.orchestrator.start(
+            RunRequest(
+                target_url=(
+                    "http://local.test/vulnerabilities/fi/?page=include.php"
+                ),
+                scope=RunScope(allowed_hosts=frozenset({_HOST})),
+                request_budget=20,
+            )
+        )
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(len(llm.calls), 1)
+        findings = app.stores.findings.list_by_run(run.run_id)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].vulnerability_type, "Path Traversal")
+        signal = next(
+            item
+            for item in app.stores.evidence.list_by_run(run.run_id)
+            if item.observation.get("type") == "path_traversal_file_read"
+        )
+        self.assertEqual(signal.created_by, "llm_path_traversal_analyzer")
 
 
 if __name__ == "__main__":

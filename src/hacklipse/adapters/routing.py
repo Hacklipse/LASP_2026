@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from hacklipse.domain import Candidate, Evidence, RouteDecision, Run, Surface
 
-from .request_safety import has_state_changing_parameters
+from .request_safety import (
+    has_state_changing_parameters,
+    object_identifier_parameters,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +23,9 @@ class RoutingRule:
     vulnerability_type: str
     agent_type: str
     priority: float = 0.5
+    # Observation 자체만으로는 부족한 Agent 계약(예: Path Traversal은 GET만)을
+    # 라우팅 단계에서 함께 표현한다. None이면 기존처럼 모든 메서드를 허용한다.
+    methods: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,16 +36,58 @@ class SurfaceRoutingRule:
     agent_type: str
     methods: tuple[str, ...] = ("GET",)
     requires_parameters: bool = True
+    parameter_hints: tuple[str, ...] = ()
     priority: float = 0.25
+
+    # SPA 클라이언트 라우트(`/#/search`)는 HTTP 요청 대상이 아니다. fragment 는
+    # 서버로 전송되지 않으므로 HTTP 기반 Analyzer 가 받으면 매번 같은 루트 문서만
+    # 받아 신호 없이 예산만 쓴다. 브라우저 도구를 쓰는 규칙만 opt-in 한다.
+    client_route: bool = False
 
     def matches(self, surface: Surface) -> bool:
         if surface.method.upper() not in self.methods:
+            return False
+        if bool(urlsplit(surface.url).fragment) is not self.client_route:
             return False
         # GET 폼이어도 비밀번호 변경·삭제 등은 상태를 바꿀 수 있다. 자동 Analysis
         # Candidate를 만들지 않되 Surface 자체는 Recon 결과로 보존한다.
         if has_state_changing_parameters(surface.parameters):
             return False
-        return bool(surface.parameters) if self.requires_parameters else True
+        if self.requires_parameters and not surface.parameters:
+            return False
+        if self.parameter_hints:
+            offered = {name.casefold() for name in surface.parameters}
+            if not offered.intersection(hint.casefold() for hint in self.parameter_hints):
+                return False
+        return True
+
+
+@dataclass(frozen=True, slots=True)
+class IdentifierSurfaceRoutingRule:
+    """객체 식별자 파라미터가 있는 Surface만 Access Control 탐색 대상으로 만든다.
+
+    Access Control은 "다른 사람의 객체를 가리키는 입력"이 있어야 성립한다. 파라미터가
+    있다는 것만으로 후보를 만들면 검색어·정렬 옵션까지 전부 권한 검사 대상이 되어
+    예산만 소모하고 신호는 나오지 않는다.
+    """
+
+    vulnerability_type: str
+    agent_type: str
+    methods: tuple[str, ...] = ("GET",)
+    priority: float = 0.35
+
+    def matches(self, surface: Surface) -> bool:
+        if surface.method.upper() not in self.methods:
+            return False
+        if urlsplit(surface.url).fragment:
+            return False
+        # 비밀번호 변경·삭제처럼 상태를 바꾸는 GET 폼은 자동 탐침 대상에서 제외한다.
+        if has_state_changing_parameters(surface.parameters):
+            return False
+        return bool(
+            object_identifier_parameters(surface.parameters)
+            or surface.path_identifier is not None
+        )
 
 
 # 첫 버전은 설명 가능하고 재현하기 쉬운 명시적 규칙으로 라우팅한다.
@@ -46,17 +95,51 @@ DEFAULT_RULES = (
     RoutingRule("reflection", "XSS", "xss_analyzer", 0.8),
     RoutingRule("sql_error", "SQLi", "sqli_analyzer", 0.8),
     RoutingRule("object_id_auth", "Access Control", "access_control_analyzer", 0.8),
-    RoutingRule("url_or_file_parameter", "Path Traversal", "path_traversal_analyzer", 0.6),
+    RoutingRule(
+        "url_or_file_parameter",
+        "Path Traversal",
+        "path_traversal_analyzer",
+        0.6,
+        methods=("GET",),
+    ),
+    RoutingRule(
+        "unlinked_render_parameter_candidate",
+        "Path Traversal",
+        "path_traversal_analyzer",
+        0.55,
+        methods=("POST",),
+    ),
     RoutingRule("template_error", "SSTI", "ssti_analyzer", 0.7),
+    RoutingRule("template_execution", "SSTI", "ssti_analyzer", 0.9),
+    RoutingRule(
+        "restricted_file_path",
+        "Path Traversal",
+        "path_traversal_analyzer",
+        0.7,
+        methods=("GET",),
+    ),
 )
 
-# Observation이 아직 없어도 입력 가능한 GET Surface를 담당 Analyzer까지 보낸다.
+# Observation이 아직 없어도 입력 가능한 Surface를 담당 Analyzer까지 보낸다.
 # 실제 취약점 판정이 아니라 탐색 대상을 만드는 규칙이므로 기존 Evidence 규칙보다
 # 낮은 priority를 사용한다.
 DEFAULT_SURFACE_RULES = (
     SurfaceRoutingRule("XSS", "xss_analyzer", priority=0.30),
+    # SPA 라우트의 DOM sink 는 브라우저로만 관측된다.
+    SurfaceRoutingRule(
+        "XSS", "browser_xss_analyzer", client_route=True, priority=0.40
+    ),
     SurfaceRoutingRule("SQLi", "sqli_analyzer", priority=0.30),
-    SurfaceRoutingRule("SSTI", "ssti_analyzer", priority=0.20),
+    SurfaceRoutingRule(
+        "SSTI",
+        "ssti_analyzer",
+        methods=("POST",),
+        parameter_hints=("username",),
+        priority=0.20,
+    ),
+    IdentifierSurfaceRoutingRule(
+        "Access Control", "access_control_analyzer", priority=0.35
+    ),
 )
 
 
@@ -87,6 +170,18 @@ class RuleBasedVulnerabilityRouter:
             rule = self._rules.get(observation_type)
             if rule is None or item.surface_id is None:
                 continue
+            if rule.methods is not None:
+                surface = next(
+                    (
+                        candidate_surface
+                        for candidate_surface in surfaces
+                        if candidate_surface.surface_id == item.surface_id
+                        and candidate_surface.run_id == run.run_id
+                    ),
+                    None,
+                )
+                if surface is None or surface.method.upper() not in rule.methods:
+                    continue
             key = (item.surface_id, rule.vulnerability_type)
             # 동일 Surface와 취약점 유형 조합은 하나의 Candidate만 생성한다.
             if key in decisions:

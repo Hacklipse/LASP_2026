@@ -14,7 +14,11 @@ from threading import RLock
 from typing import Any
 
 from hacklipse.domain import (
+    AccessIdentifierLocation,
+    AccessPrincipalRole,
     Candidate,
+    ProgressEvent,
+    ProgressEventKind,
     Evidence,
     EvidenceRequest,
     Finding,
@@ -130,6 +134,14 @@ def _initialize_schema(database: _SQLiteDatabase) -> None:
             data TEXT NOT NULL
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS progress_events (
+            run_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            data TEXT NOT NULL,
+            PRIMARY KEY (run_id, sequence)
+        )
+        """,
         "CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id, seq)",
         "CREATE INDEX IF NOT EXISTS idx_evidence_run ON evidence(run_id, seq)",
         "CREATE INDEX IF NOT EXISTS idx_surfaces_run ON surfaces(run_id, seq)",
@@ -189,6 +201,9 @@ def _decode_run(data: str) -> Run:
         allowed_path_prefixes=tuple(scope["allowed_path_prefixes"]),
     )
     value["phase"] = RunPhase(value["phase"])
+    # 역할·취약점 유형 → credential_ref 매핑은 쌍의 튜플이므로 안쪽까지 복원한다.
+    for name in ("principal_credentials", "agent_credentials"):
+        value[name] = tuple(tuple(item) for item in value.get(name, ()))
     for name in (
         "evidence_ids",
         "surface_ids",
@@ -212,7 +227,13 @@ def _decode_task(data: str) -> TaskRecord:
             )
             http_request["headers"] = tuple(tuple(item) for item in http_request["headers"])
             http_request["request_kind"] = HttpRequestKind(http_request["request_kind"])
+            location = http_request.get("identifier_location")
+            if location is not None:
+                http_request["identifier_location"] = AccessIdentifierLocation(location)
             request["http_request"] = HttpRequestSpec(**http_request)
+        role = request.get("principal_role")
+        if role is not None:
+            request["principal_role"] = AccessPrincipalRole(role)
         envelope["evidence_request"] = EvidenceRequest(**request)
     else:
         envelope["evidence_request"] = None
@@ -236,6 +257,9 @@ def _decode_evidence(data: str) -> Evidence:
 
 def _decode_surface(data: str) -> Surface:
     value = _load(data)
+    value["observed_query"] = tuple(
+        tuple(item) for item in value.get("observed_query", ())
+    )
     value["parameters"] = tuple(value["parameters"])
     return Surface(**value)
 
@@ -251,6 +275,12 @@ def _decode_finding(data: str) -> Finding:
     value["evidence_ids"] = tuple(value["evidence_ids"])
     value["remediation_refs"] = tuple(value["remediation_refs"])
     return Finding(**value)
+
+
+def _decode_progress_event(data: str) -> ProgressEvent:
+    value = _load(data)
+    value["kind"] = ProgressEventKind(value["kind"])
+    return ProgressEvent(**value)
 
 
 def _decode_report(data: str) -> ReportArtifact:
@@ -457,6 +487,42 @@ class SQLiteReportStore(_SQLiteStore):
         return self._list_by_run(run_id)
 
 
+class SQLiteProgressLog:
+    """진행 사건을 Run과 같은 파일에 보존하는 Sink.
+
+    사건이 메모리에만 있으면 프로세스가 죽는 순간 사라진다. 작업(Candidate 상태)은
+    복원되는데 진행 상태만 복원되지 않으면, 재개 화면이 "아무 일도 없었다"로 보인다.
+
+    같은 (run_id, sequence)가 두 번 들어오면 나중 것을 버린다. 재개가 이미 알린
+    구간을 다시 알리더라도 사건이 두 번 쌓이지 않는다.
+    """
+
+    def __init__(self, database: _SQLiteDatabase) -> None:
+        self._database = database
+
+    def emit(self, event: ProgressEvent) -> None:
+        with self._database.transaction() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO progress_events(run_id, sequence, data) "
+                "VALUES (?, ?, ?)",
+                (event.run_id, event.sequence, _dump(event)),
+            )
+
+    def list_by_run(self, run_id: str) -> tuple[ProgressEvent, ...]:
+        rows = self._database.all(
+            "SELECT data FROM progress_events WHERE run_id = ? ORDER BY sequence",
+            (run_id,),
+        )
+        return tuple(_decode_progress_event(row["data"]) for row in rows)
+
+    def last_sequence(self, run_id: str) -> int:
+        row = self._database.one(
+            "SELECT MAX(sequence) AS last FROM progress_events WHERE run_id = ?",
+            (run_id,),
+        )
+        return int(row["last"] or 0) if row is not None else 0
+
+
 @dataclass(slots=True)
 class SQLiteStoreBundle:
     """같은 SQLite 파일과 connection을 공유하는 영속 저장소 묶음."""
@@ -470,6 +536,7 @@ class SQLiteStoreBundle:
     candidates: SQLiteCandidateStore = field(init=False)
     findings: SQLiteFindingStore = field(init=False)
     reports: SQLiteReportStore = field(init=False)
+    progress: SQLiteProgressLog = field(init=False)
 
     def __post_init__(self) -> None:
         self._database = _SQLiteDatabase(self.database_path)
@@ -481,6 +548,7 @@ class SQLiteStoreBundle:
         self.candidates = SQLiteCandidateStore(self._database)
         self.findings = SQLiteFindingStore(self._database)
         self.reports = SQLiteReportStore(self._database)
+        self.progress = SQLiteProgressLog(self._database)
 
     def close(self) -> None:
         self._database.close()

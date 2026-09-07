@@ -339,7 +339,8 @@ class EndToEndWorkflowTests(unittest.TestCase):
         with self.assertRaises(WorkflowExecutionError) as caught:
             app.orchestrator.start(self._request())
 
-        self.assertIn("another provenance", str(caught.exception))
+        self.assertEqual(caught.exception.reason, "AgentContractError")
+        self.assertIn("another provenance", str(caught.exception.__cause__))
 
     def test_proof_type_must_match_candidate_vulnerability(self) -> None:
         """현재 세션 Evidence라도 다른 취약점 proof로는 확정할 수 없다."""
@@ -355,7 +356,8 @@ class EndToEndWorkflowTests(unittest.TestCase):
         with self.assertRaises(WorkflowExecutionError) as caught:
             app.orchestrator.start(self._request())
 
-        self.assertIn("proof type", str(caught.exception))
+        self.assertEqual(caught.exception.reason, "AgentContractError")
+        self.assertIn("proof type", str(caught.exception.__cause__))
 
 
 if __name__ == "__main__":

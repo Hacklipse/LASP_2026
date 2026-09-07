@@ -14,8 +14,15 @@ from .http_runtime import HttpExecutionRuntime
 from .xss_execution import (
     BROWSER_XSS_TOOL,
     browser_navigation_url,
+    dom_reflection_script,
     execution_marker_script,
+    reflection_marker,
 )
+
+# SPA 는 DOM 을 클라이언트에서 그린다. domcontentloaded 직후에는 라우트가 아직
+# 렌더되지 않아 반사도 실행도 관측되지 않는다. socket.io 를 쓰는 대상이 있어
+# networkidle 은 기다릴 수 없으므로 고정 정착 시간을 둔다.
+_SETTLE_MS = 2000
 
 
 class BrowserProbeRunner(Protocol):
@@ -53,7 +60,9 @@ class PlaywrightBrowserRuntime:
 
         navigation_url, marker = browser_navigation_url(request)
         cookies = self._http.session_cookies(request)
-        return self._browser_runner(request, navigation_url, marker, cookies)
+        return self._browser_runner(
+            request, navigation_url, marker or reflection_marker(request), cookies
+        )
 
     def close_session(self, run_id: str) -> None:
         self._http.close_session(run_id)
@@ -119,9 +128,14 @@ class PlaywrightBrowserRuntime:
                         wait_until="domcontentloaded",
                         timeout=max(1, int(request.timeout_seconds * 1000)),
                     )
+                    page.wait_for_timeout(_SETTLE_MS)
                     observed = page.evaluate(execution_marker_script())
                     executed = bool(
                         expected_marker is not None and observed == expected_marker
+                    )
+                    reflected = bool(
+                        expected_marker is not None
+                        and page.evaluate(dom_reflection_script(expected_marker))
                     )
                     status = response.status if response is not None else None
                     final_url = page.url
@@ -143,8 +157,11 @@ class PlaywrightBrowserRuntime:
                 "final_url": final_url,
                 "request_kind": request.request_kind.value,
                 "script_executed": executed,
+                # 값이 DOM 까지 도달했는가. Analysis 가 쓰는 신호이며 실행 증명이 아니다.
+                "dom_reflected": reflected,
                 # marker 원문은 무해한 canary이며 proof가 어떤 실행을 관측했는지 묶는다.
                 "execution_marker": expected_marker if executed else None,
+                "reflection_marker": expected_marker if reflected else None,
                 "blocked_request_count": blocked_requests,
                 "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
             },

@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import threading
 import unittest
+from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from hacklipse.adapters import HttpExecutionRuntime
 from hacklipse.adapters.memory import InMemoryEvidenceStore, InMemorySurfaceStore
 from hacklipse.adapters.recon import ReconAgent
+from hacklipse.adapters.routing import RuleBasedVulnerabilityRouter
 from hacklipse.application.errors import AgentContractError, WorkflowExecutionError
 from hacklipse.bootstrap import build_local_application
 from hacklipse.domain import (
@@ -14,6 +19,7 @@ from hacklipse.domain import (
     ExecutionRequest,
     ExecutionResult,
     RunRequest,
+    Run,
     RunScope,
     TaskEnvelope,
 )
@@ -37,10 +43,21 @@ class _FakeCollector:
         self._evidence = evidence_store
         self._body = body
         self.calls: list[tuple[str, str]] = []
+        self.credential_refs: list[str | None] = []
 
-    def collect(self, run_id, target_url, spec, *, task_id, timeout_seconds=120.0):
+    def collect(
+        self,
+        run_id,
+        target_url,
+        spec,
+        *,
+        task_id,
+        timeout_seconds=120.0,
+        credential_ref=None,
+    ):
         del timeout_seconds
         self.calls.append((run_id, target_url))
+        self.credential_refs.append(credential_ref)
         evidence_id = f"evi-fetch-{task_id}-{len(self.calls)}"
         self._evidence.append(
             Evidence(
@@ -69,7 +86,13 @@ def _make_agent(*, body: str | None = _SAMPLE_HTML):
     return agent, evidence_store, surface_store
 
 
-def _task(run_id: str, target_url: str, *, allowed_tools=("http_get",)) -> TaskEnvelope:
+def _task(
+    run_id: str,
+    target_url: str,
+    *,
+    allowed_tools=("http_get",),
+    credential_ref: str | None = None,
+) -> TaskEnvelope:
     return TaskEnvelope(
         task_id=f"task-{run_id}",
         run_id=run_id,
@@ -77,6 +100,7 @@ def _task(run_id: str, target_url: str, *, allowed_tools=("http_get",)) -> TaskE
         target_url=target_url,
         allowed_tools=allowed_tools,
         request_budget=5,
+        credential_ref=credential_ref,
     )
 
 
@@ -124,6 +148,50 @@ class ReconAgentTests(unittest.TestCase):
         self.assertEqual(root.parameters, ("page",))
         observations = [item.observation for item in evidence.list_by_run("run-3")]
         self.assertTrue(any(o.get("type") == "url_or_file_parameter" for o in observations))
+
+    def test_extracts_numeric_rest_path_as_an_object_identifier(self) -> None:
+        body = '<html><body><a href="/users/17">profile</a></body></html>'
+        agent, _, surfaces = _make_agent(body=body)
+
+        agent.handle(_task("run-path", "http://localhost/index.php"))
+
+        profile = next(
+            surface
+            for surface in surfaces.list_by_run("run-path")
+            if surface.url == "http://localhost/users/17"
+        )
+        self.assertEqual(profile.path_identifier, "user_id")
+        self.assertEqual(profile.path_identifier_index, 2)
+        self.assertEqual(profile.observed_path_identifier, "17")
+
+        decisions = RuleBasedVulnerabilityRouter(
+            id_factory=iter(str(index) for index in range(100)).__next__
+        ).route(
+            Run(
+                run_id="run-path",
+                target_url="http://localhost/index.php",
+                scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+                policy_profile="safe",
+                request_budget=10,
+            ),
+            (profile,),
+            (),
+        )
+        self.assertEqual(
+            [item.candidate.vulnerability_type for item in decisions],
+            ["Access Control"],
+        )
+
+    def test_extracts_juice_shop_singular_basket_path_identifier(self) -> None:
+        agent, _, surfaces = _make_agent(body="<html><body>basket</body></html>")
+
+        agent.handle(_task("run-basket", "http://localhost/rest/basket/7"))
+
+        basket = surfaces.list_by_run("run-basket")[0]
+        self.assertEqual(basket.url, "http://localhost/rest/basket/7")
+        self.assertEqual(basket.path_identifier, "basket_id")
+        self.assertEqual(basket.path_identifier_index, 3)
+        self.assertEqual(basket.observed_path_identifier, "7")
 
     def test_missing_target_url_is_a_contract_error(self) -> None:
         agent, *_ = _make_agent()
@@ -212,6 +280,20 @@ class Api{
 }
 """
 
+_DOCUMENT_NAVIGATION_BUNDLE = """
+class AccountMenu {
+  openExport(){ window.location.replace(environment.hostServer + `/account/export`) }
+}
+"""
+
+_SERVER_RENDERED_FORM = """
+<html><body>
+<form action="/account/export" method="POST">
+  <input name="email"><input name="securityAnswer">
+</form>
+</body></html>
+"""
+
 _PAGE_TWO = """
 <html><body>
 <a href="/deep.php?file=secret.txt">deep</a>
@@ -227,10 +309,21 @@ class _RoutingCollector:
         self._evidence = evidence_store
         self._bodies = bodies
         self.calls: list[str] = []
+        self.credential_refs: list[str | None] = []
 
-    def collect(self, run_id, target_url, spec, *, task_id, timeout_seconds=120.0):
+    def collect(
+        self,
+        run_id,
+        target_url,
+        spec,
+        *,
+        task_id,
+        timeout_seconds=120.0,
+        credential_ref=None,
+    ):
         del timeout_seconds
         self.calls.append(target_url)
+        self.credential_refs.append(credential_ref)
         evidence_id = f"evi-page-{len(self.calls)}"
         self._evidence.append(
             Evidence(
@@ -265,6 +358,44 @@ def _crawling_agent(bodies: dict[str, str], **kwargs):
 
 
 class ReconCrawlTests(unittest.TestCase):
+    def test_fetches_an_authenticated_additional_seed_with_the_recon_credential(
+        self,
+    ) -> None:
+        agent, collector, surfaces = _crawling_agent(
+            {
+                "http://localhost/": "<html><body>spa</body></html>",
+                "http://localhost/profile": (
+                    '<form action="/profile" method="post">'
+                    '<input name="username"></form>'
+                ),
+            },
+            max_pages=2,
+            seed_urls=("http://localhost/profile",),
+        )
+
+        agent.handle(
+            _task(
+                "run-seeds",
+                "http://localhost/",
+                credential_ref="juice-ssti-session",
+            )
+        )
+
+        self.assertEqual(
+            collector.calls,
+            ["http://localhost/", "http://localhost/profile"],
+        )
+        self.assertEqual(
+            collector.credential_refs,
+            ["juice-ssti-session", "juice-ssti-session"],
+        )
+        profile = next(
+            item
+            for item in surfaces.list_by_run("run-seeds")
+            if item.url == "http://localhost/profile" and item.method == "POST"
+        )
+        self.assertEqual(profile.parameters, ("username",))
+
     def test_follows_links_and_finds_surfaces_on_later_pages(self) -> None:
         agent, collector, surfaces = _crawling_agent(
             {
@@ -313,6 +444,51 @@ class ReconCrawlTests(unittest.TestCase):
         # 외부 URL의 경로 조각이 표면으로 새어 들어오면 안 된다.
         self.assertTrue(all("twitter.com" not in url for url in found))
 
+    def test_crawls_document_navigation_and_flags_unlinked_render_option(self) -> None:
+        """제품별 URL seed 없이 SPA 밖의 서버 렌더링 POST 폼까지 이어간다."""
+
+        agent, collector, surfaces = _crawling_agent(
+            {
+                "http://localhost/": _SPA_HTML,
+                "http://localhost/main.js": _DOCUMENT_NAVIGATION_BUNDLE,
+                "http://localhost/account/export": _SERVER_RENDERED_FORM,
+            },
+            max_pages=4,
+        )
+
+        agent.handle(
+            replace(
+                _task("run-document-navigation", "http://localhost/"),
+                request_budget=10,
+            )
+        )
+
+        self.assertIn("http://localhost/account/export", collector.calls)
+        form = next(
+            surface
+            for surface in surfaces.list_by_run("run-document-navigation")
+            if surface.url == "http://localhost/account/export"
+            and surface.method == "POST"
+        )
+        self.assertEqual(form.parameters, ("email", "securityAnswer"))
+        inferred = [
+            item.observation
+            for item in collector._evidence.list_by_run("run-document-navigation")
+            if item.surface_id == form.surface_id
+            and item.observation.get("type")
+            == "unlinked_render_parameter_candidate"
+        ]
+        self.assertEqual(
+            inferred,
+            [
+                {
+                    "type": "unlinked_render_parameter_candidate",
+                    "parameter": "layout",
+                    "source": "bounded_unlinked_render_parameter",
+                }
+            ],
+        )
+
     def test_leaves_request_budget_for_later_phases(self) -> None:
         chain = {
             f"http://localhost/p{index}.php": f'<html><a href="/p{index + 1}.php">n</a></html>'
@@ -336,3 +512,87 @@ class ReconCrawlTests(unittest.TestCase):
         self.assertEqual(len(collector.calls), 1)
         urls = {surface.url for surface in surfaces.list_by_run("run-c5")}
         self.assertIn("http://localhost/deep.php", urls)
+
+
+# 512KiB를 넘긴 뒤에야 검색 엔드포인트가 나오는 번들. 실제 Juice Shop의 main.js 가 이
+# 모양이라 응답 본문 상한이 낮으면 후반부 경로가 통째로 사라진다.
+_LARGE_BUNDLE_SPA = (
+    b'<html><body><div id="app"></div>'
+    b'<script src="/main.js"></script></body></html>'
+)
+_LARGE_BUNDLE = (
+    b"// " + b"x" * (512 * 1024) + b"\n"
+    b"search(e){ return this.http.get(`${this.host}/rest/products/search?q=${e}`) }\n"
+)
+
+
+class _LargeBundleHandler(BaseHTTPRequestHandler):
+    """루트 HTML과 대형 JS 번들만 돌려주는 최소 서버."""
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/main.js":
+            body, content_type = _LARGE_BUNDLE, "application/javascript"
+        else:
+            body, content_type = _LARGE_BUNDLE_SPA, "text/html"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+class ReconReadsLargeBundlesTests(unittest.TestCase):
+    """대역이 아닌 실제 HttpExecutionRuntime 으로 응답 본문 상한까지 함께 검증한다.
+
+    다른 Recon 테스트는 본문을 그대로 넘겨주는 대역을 쓰므로 상한 회귀를 잡지 못한다.
+    여기서는 기본 생성자로 만든 Runtime 을 그대로 써서 전역 기본값이 512KiB 로 되돌아가면
+    실패하게 한다.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), _LargeBundleHandler)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def test_endpoint_after_512kib_becomes_a_surface(self) -> None:
+        # 기본 생성자. 여기에 max_body_bytes 를 넘기면 회귀를 가리게 된다.
+        app = build_local_application({}, runtime=HttpExecutionRuntime(timeout_seconds=5.0))
+        app.dispatcher.register(
+            "recon",
+            ReconAgent(
+                collector=app.collector,
+                evidence_store=app.stores.evidence,
+                surface_store=app.stores.surfaces,
+            ),
+            allowed_tools=("http_get",),
+        )
+
+        # Analysis Agent를 등록하지 않았으므로 ROUTE 까지만 진행하고 ANALYZE 에서 멈춘다.
+        with self.assertRaises(WorkflowExecutionError) as ctx:
+            app.orchestrator.start(
+                RunRequest(
+                    target_url=f"http://127.0.0.1:{self.port}/",
+                    scope=RunScope(allowed_hosts=frozenset({"127.0.0.1"})),
+                    request_budget=10,
+                )
+            )
+
+        found = {
+            surface.url: surface.parameters
+            for surface in app.stores.surfaces.list_by_run(ctx.exception.run_id)
+        }
+        self.assertEqual(
+            found.get(f"http://127.0.0.1:{self.port}/rest/products/search"), ("q",)
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
