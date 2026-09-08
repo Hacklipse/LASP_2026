@@ -38,6 +38,14 @@ from hacklipse.domain import (
 )
 from hacklipse.ports import EvidenceStore, SurfaceStore
 
+from .llm_recon_planner import (
+    RECON_PLANNER,
+    ReconCandidate,
+    ReconPlan,
+    ReconPlanner,
+    build_recon_plan_observation,
+    find_stored_recon_plan,
+)
 from .path_traversal_analysis import (
     RESTRICTED_FILE_OBSERVATION,
     UNLINKED_RENDER_PARAMETER_OBSERVATION,
@@ -189,6 +197,7 @@ class ReconAgent:
         max_scripts: int = DEFAULT_MAX_SCRIPTS,
         seed_urls: Sequence[str] = (),
         id_factory: Callable[[], str] | None = None,
+        planner: ReconPlanner | None = None,
     ) -> None:
         if max_pages < 1:
             raise ValueError("recon must fetch at least one page")
@@ -199,6 +208,9 @@ class ReconAgent:
         self._max_scripts = max_scripts
         self._seed_urls = tuple(dict.fromkeys(seed_urls))
         self._id_factory = id_factory or (lambda: str(uuid4()))
+        # None이면(휴리스틱 프로필) 아래 두 번째 crawl() 직전 분기 자체가 실행되지
+        # 않아 기존 결정적 동작과 한 줄도 다르지 않다.
+        self._planner = planner
 
     def handle(self, task: TaskEnvelope) -> AgentResult:
         """예산 안에서 크롤링하며 Surface·Evidence를 채운다."""
@@ -223,8 +235,22 @@ class ReconAgent:
         document_pages: set[str] = set()
         evidence_ids: list[str] = []
         # 발견과 수집은 다르다 — 크롤링 예산이 모자라도 발견한 URL은 Surface로 남긴다.
-        # (url, method, parameters) 조합으로 중복을 막는다.
-        surfaces: dict[tuple[str, str, tuple[str, ...]], str] = {}
+        # (url, method, parameters) 조합으로 중복을 막는다. 같은 run_id로 다시 호출되면
+        # (프로세스 재시작 후 재개 등) 이미 저장된 Surface를 먼저 채워 넣어 같은 URL에
+        # 매번 새 surface_id가 발급되지 않게 한다. 안 그러면 §3.7 저장 계획 재사용의
+        # offered_surface_ids 비교가 재개 때마다 어긋난다 — id_factory가 uuid4처럼
+        # 호출마다 다른 값을 내는 게 기본값이기 때문이다.
+        surfaces: dict[tuple[str, str, tuple[str, ...]], str] = {
+            (
+                _canonical_surface_url(existing.url, _path_identifier(existing.url)),
+                existing.method,
+                existing.parameters,
+            ): existing.surface_id
+            for existing in self._surfaces.list_by_run(task.run_id)
+        }
+        # pending에 오른 URL의 surface_id. Planner 후보를 만들 때 URL로 Store를 다시
+        # 뒤지지 않고 이 dict로 바로 대응시킨다.
+        pending_surface_ids: dict[str, str] = {}
 
         def remember(
             url: str,
@@ -287,7 +313,9 @@ class ReconAgent:
                     if not _same_origin(link, origin):
                         continue
                     # 예산과 무관하게 표면으로 기록하고, 여유가 있으면 크롤링까지 한다.
-                    remember(link, "GET", _query_names(link), _query_pairs(link))
+                    pending_surface_ids[link] = remember(
+                        link, "GET", _query_names(link), _query_pairs(link)
+                    )
                     if link not in fetched and link not in pending:
                         pending.append(link)
                 for source in sources:
@@ -303,14 +331,23 @@ class ReconAgent:
             for url, names, should_crawl in self._discover_from_script(
                 task, source, origin
             ):
-                remember(url, "GET", names)
+                pending_surface_ids[url] = remember(url, "GET", names)
                 # 번들이 가리킨 디렉터리와 서버 문서 navigation은 실제 응답을 봐야
                 # 내부 파일이나 HTML 폼을 발견할 수 있다.
                 if should_crawl:
                     document_pages.add(url)
                 if should_crawl and url not in fetched and url not in pending:
                     pending.append(url)
-        # 번들에서 찾은 디렉터리 목록을 남은 예산 안에서 마저 본다.
+
+        if self._planner is not None and pending:
+            remaining_budget = max(page_budget - len(fetched), 0)
+            candidates = self._recon_candidates(task.run_id, pending, pending_surface_ids)
+            if candidates:
+                plan, plan_evidence_id = self._plan(task, candidates, remaining_budget)
+                evidence_ids.append(plan_evidence_id)
+                pending[:] = self._apply_plan(plan, pending, pending_surface_ids)
+
+        # 번들에서 찾은 디렉터리 목록(또는 Planner가 고른 순서)을 남은 예산 안에서 마저 본다.
         crawl()
 
         surface_ids = list(surfaces.values())
@@ -481,6 +518,102 @@ class ReconAgent:
             )
             evidence_ids.append(evidence_id)
         return evidence_ids
+
+    def _recon_candidates(
+        self,
+        run_id: str,
+        pending: list[str],
+        pending_surface_ids: dict[str, str],
+    ) -> tuple[ReconCandidate, ...]:
+        """호출 시점의 pending URL과 정확히 대응하는 Surface만 Planner 후보로 만든다."""
+
+        observation_types: dict[str, list[str]] = {}
+        for item in self._evidence.list_by_run(run_id):
+            if item.evidence_type != "observation" or item.surface_id is None:
+                continue
+            observation_type = item.observation.get("type")
+            if isinstance(observation_type, str):
+                observation_types.setdefault(item.surface_id, []).append(
+                    observation_type
+                )
+
+        candidates: list[ReconCandidate] = []
+        for url in pending:
+            surface_id = pending_surface_ids.get(url)
+            if surface_id is None:
+                continue
+            surface = self._surfaces.get(run_id, surface_id)
+            candidates.append(
+                ReconCandidate(
+                    surface_id=surface_id,
+                    path=urlsplit(url).path or "/",
+                    method=surface.method,
+                    parameter_names=surface.parameters,
+                    observation_types=tuple(
+                        dict.fromkeys(observation_types.get(surface_id, ()))
+                    ),
+                )
+            )
+        return tuple(candidates)
+
+    def _plan(
+        self,
+        task: TaskEnvelope,
+        candidates: tuple[ReconCandidate, ...],
+        remaining_budget: int,
+    ) -> tuple[ReconPlan, str]:
+        """저장된 계획을 재사용하거나, Planner를 불러 새 계획 Evidence를 남긴다."""
+
+        offered_surface_ids = tuple(candidate.surface_id for candidate in candidates)
+        stored = find_stored_recon_plan(
+            self._evidence.list_by_run(task.run_id), offered_surface_ids
+        )
+        if stored is not None:
+            return stored
+
+        plan = self._planner.plan(
+            task=task, candidates=candidates, remaining_budget=remaining_budget
+        )
+        evidence_id = f"evi-{self._id_factory()}"
+        self._evidence.append(
+            Evidence(
+                evidence_id=evidence_id,
+                run_id=task.run_id,
+                surface_id=None,
+                created_by=RECON_PLANNER,
+                evidence_type="observation",
+                observation=build_recon_plan_observation(plan, offered_surface_ids),
+            )
+        )
+        return plan, evidence_id
+
+    def _apply_plan(
+        self,
+        plan: ReconPlan,
+        pending: list[str],
+        pending_surface_ids: dict[str, str],
+    ) -> list[str]:
+        """plan의 action과 allowlisted ID 순서를 실제 pending URL로 되돌린다.
+
+        LLM이 만든 것은 순서와 continue/stop뿐이다. pending에 없는 URL은 Planner가
+        어떤 ID를 내놓든 방문하지 않는다 — 새 URL을 만들지 않고, 코드가 이미 들고
+        있던 pending_surface_ids 매핑을 뒤집어서만 찾는다.
+        """
+
+        if plan.action == "stop":
+            return []
+
+        url_by_surface_id: dict[str, str] = {}
+        for url in pending:
+            surface_id = pending_surface_ids.get(url)
+            if surface_id is not None:
+                url_by_surface_id.setdefault(surface_id, url)
+
+        return [
+            url_by_surface_id[surface_id]
+            for surface_id in plan.ranked_surface_ids
+            if surface_id in url_by_surface_id
+        ]
 
 
 def _parse_page(
