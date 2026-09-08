@@ -12,4 +12,5 @@ dist/
 .serena/
 graphify-out/
 .DS_Store
+.venv/
 
