@@ -111,6 +111,13 @@ DEFAULT_RULES = (
     ),
     RoutingRule("template_error", "SSTI", "ssti_analyzer", 0.7),
     RoutingRule("template_execution", "SSTI", "ssti_analyzer", 0.9),
+)
+
+# `/ftp/*.bak%2500.md` 같은 제한 확장자 필터 우회 구현은 이후 별도 취약점 유형으로
+# 재분류할 수 있도록 보존한다. 기본 Router에는 넣지 않아 일반/all 실행에서 Candidate와
+# 반복 Analysis·Validation 요청을 만들지 않는다. 필요한 실험에서만 rules에 명시적으로
+# 합쳐 사용한다.
+OPTIONAL_RESTRICTED_FILE_BYPASS_RULES = (
     RoutingRule(
         "restricted_file_path",
         "Path Traversal",

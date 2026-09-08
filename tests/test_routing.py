@@ -5,6 +5,10 @@ from __future__ import annotations
 import unittest
 
 from hacklipse.adapters import RuleBasedVulnerabilityRouter
+from hacklipse.adapters.routing import (
+    DEFAULT_RULES,
+    OPTIONAL_RESTRICTED_FILE_BYPASS_RULES,
+)
 from hacklipse.application.errors import WorkflowExecutionError
 from hacklipse.bootstrap import build_local_application
 from hacklipse.domain import (
@@ -136,6 +140,42 @@ class SurfaceRoutingTests(unittest.TestCase):
         )
 
         self.assertEqual(decisions, ())
+
+    def test_restricted_file_bypass_is_disabled_by_default_but_remains_opt_in(self) -> None:
+        surface = Surface(
+            surface_id="surface-ftp-file",
+            run_id="run-1",
+            url="http://localhost/ftp/package.json.bak",
+            method="GET",
+        )
+        evidence = Evidence(
+            evidence_id="evi-restricted-file",
+            run_id="run-1",
+            surface_id=surface.surface_id,
+            created_by="recon",
+            evidence_type="observation",
+            observation={
+                "type": "restricted_file_path",
+                "parameter": "package.json.bak",
+            },
+        )
+
+        default_decisions = RuleBasedVulnerabilityRouter().route(
+            _run(), (surface,), (evidence,)
+        )
+        self.assertEqual(default_decisions, ())
+
+        opt_in_router = RuleBasedVulnerabilityRouter(
+            rules=(*DEFAULT_RULES, *OPTIONAL_RESTRICTED_FILE_BYPASS_RULES),
+            surface_rules=(),
+        )
+        opt_in_decisions = opt_in_router.route(_run(), (surface,), (evidence,))
+
+        self.assertEqual(len(opt_in_decisions), 1)
+        candidate = opt_in_decisions[0].candidate
+        self.assertEqual(candidate.vulnerability_type, "Path Traversal")
+        self.assertEqual(candidate.assigned_agent, "path_traversal_analyzer")
+        self.assertEqual(candidate.evidence_ids, (evidence.evidence_id,))
 
 
 class _SurfaceOnlyReconAgent:
