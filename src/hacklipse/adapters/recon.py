@@ -106,7 +106,10 @@ _JS_DIRECTORY = re.compile(
 )
 # SPA 클라이언트 라우트와 그 query 파라미터. 라우트 이동과 파라미터 선언이 서로
 # 앞뒤 어느 쪽에도 올 수 있어 좁은 창 안에서 함께 나타나는 짝만 취한다.
-_JS_ROUTE_NAVIGATE = re.compile(r"""navigate\(\["/([A-Za-z0-9._~-]{1,40})"\]""")
+# 따옴표 종류는 큰따옴표로 고정하지 않는다 — Angular 컴파일러 버전에 따라 배열 리터럴을
+# 백틱으로 내보내기도 한다(`navigate([`/search`],i)`). 다른 JS 정규식들과 같은
+# ["'`] 문자 클래스를 쓴다.
+_JS_ROUTE_NAVIGATE = re.compile(r"""navigate\(\[["'`]/([A-Za-z0-9._~-]{1,40})["'`]\]""")
 _JS_ROUTE_QUERY_PARAM = re.compile(r"""queryParams:\{([A-Za-z_][A-Za-z0-9_]{0,30}):""")
 _ROUTE_BINDING_WINDOW = 200
 
