@@ -14,10 +14,12 @@ from hacklipse.adapters.routing import RuleBasedVulnerabilityRouter
 from hacklipse.application.errors import AgentContractError, WorkflowExecutionError
 from hacklipse.bootstrap import build_local_application
 from hacklipse.domain import (
+    AgentResult,
     AgentResultStatus,
     Evidence,
     ExecutionRequest,
     ExecutionResult,
+    ProgressEventKind,
     RunRequest,
     Run,
     RunScope,
@@ -258,6 +260,36 @@ class ReconDrivesRoutingTests(unittest.TestCase):
         run = app.stores.runs.get(ctx.exception.run_id)
         self.assertTrue(run.candidate_ids)
         self.assertTrue(run.surface_ids)
+
+    def test_recon_planner_status_is_forwarded_as_a_progress_event(self) -> None:
+        class _StatusOnlyRecon:
+            def handle(self, task):
+                return AgentResult(
+                    task_id=task.task_id,
+                    status=AgentResultStatus.COMPLETED,
+                    message="recon_planner:fallback:timeout",
+                )
+
+        app = build_local_application(agents={})
+        app.dispatcher.register(
+            "recon", _StatusOnlyRecon(), allowed_tools=("http_get",)
+        )
+
+        run = app.orchestrator.start(
+            RunRequest(
+                target_url="http://localhost/",
+                scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+            )
+        )
+
+        planner_events = [
+            event
+            for event in app.progress_log.list_by_run(run.run_id)
+            if event.agent_type == "recon"
+            and event.detail == "recon_planner:fallback:timeout"
+        ]
+        self.assertEqual(len(planner_events), 1)
+        self.assertIs(planner_events[0].kind, ProgressEventKind.AGENT_COMPLETED)
 
 
 if __name__ == "__main__":

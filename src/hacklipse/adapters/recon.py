@@ -45,6 +45,7 @@ from .llm_recon_planner import (
     ReconPlanner,
     build_recon_plan_observation,
     find_stored_recon_plan,
+    recon_plan_status_detail,
 )
 from .path_traversal_analysis import (
     RESTRICTED_FILE_OBSERVATION,
@@ -237,6 +238,7 @@ class ReconAgent:
         scripts: list[str] = []
         document_pages: set[str] = set()
         evidence_ids: list[str] = []
+        planner_status: str | None = None
         # 발견과 수집은 다르다 — 크롤링 예산이 모자라도 발견한 URL은 Surface로 남긴다.
         # (url, method, parameters) 조합으로 중복을 막는다. 같은 run_id로 다시 호출되면
         # (프로세스 재시작 후 재개 등) 이미 저장된 Surface를 먼저 채워 넣어 같은 URL에
@@ -348,6 +350,7 @@ class ReconAgent:
             if candidates:
                 plan, plan_evidence_id = self._plan(task, candidates, remaining_budget)
                 evidence_ids.append(plan_evidence_id)
+                planner_status = recon_plan_status_detail(plan)
                 pending[:] = self._apply_plan(plan, pending, pending_surface_ids)
 
         # 번들에서 찾은 디렉터리 목록(또는 Planner가 고른 순서)을 남은 예산 안에서 마저 본다.
@@ -359,6 +362,7 @@ class ReconAgent:
             status=AgentResultStatus.COMPLETED,
             new_evidence_ids=tuple(dict.fromkeys(evidence_ids)),
             surface_ids=tuple(dict.fromkeys(surface_ids)),
+            message=planner_status,
         )
 
     def _page_budget(self, task: TaskEnvelope) -> int:

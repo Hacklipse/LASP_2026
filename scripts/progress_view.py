@@ -26,6 +26,7 @@ _WAITING = "·"
 _RUNNING = "▶"
 _DONE = "✓"
 _BROKEN = "✗"
+_RECON_PLANNER_PREFIX = "recon_planner:"
 
 _PHASE_LABELS = {
     "init": "준비",
@@ -108,6 +109,7 @@ class RunProgressView:
         self._parameters = 0
         self._budget_used = 0
         self._budget_total = 0
+        self._recon_planner_status: str | None = None
         self._closed = False
 
     # --- ProgressSink ---
@@ -142,6 +144,12 @@ class RunProgressView:
         self._phase = event.phase
         self._budget_used = event.budget_used
         self._budget_total = event.budget_total
+        if (
+            event.agent_type == "recon"
+            and event.detail
+            and event.detail.startswith(_RECON_PLANNER_PREFIX)
+        ):
+            self._recon_planner_status = event.detail
         name = event.vulnerability_type
         if name is None:
             return
@@ -189,6 +197,8 @@ class RunProgressView:
             else "수집 중"
         )
         lines.append(f"  {recon_mark} 탐색      {detail}")
+        if self._recon_planner_status:
+            lines.append(_recon_planner_progress_line(self._recon_planner_status))
         for name in sorted(self._types):
             state = self._types[name]
             lines.append(
@@ -208,6 +218,12 @@ class RunProgressView:
     def _event_line(self, event: ProgressEvent) -> str | None:
         """append-only 로그에 남길 한 줄. 조용한 종류는 건너뛴다."""
 
+        if (
+            event.agent_type == "recon"
+            and event.detail
+            and event.detail.startswith(_RECON_PLANNER_PREFIX)
+        ):
+            return _recon_planner_progress_line(event.detail)
         if event.kind in self._QUIET_KINDS:
             return None
         phase = _PHASE_LABELS.get(event.phase, event.phase)
@@ -237,3 +253,32 @@ class RunProgressView:
         flush = getattr(self._stream, "flush", None)
         if flush:
             flush()
+
+
+def format_recon_planner_status(detail: str) -> str | None:
+    """내부 상태 코드를 최종 결과에 표시할 짧은 문구로 바꾼다."""
+
+    if detail == f"{_RECON_PLANNER_PREFIX}llm_success":
+        return "LLM 성공"
+    fallback_prefix = f"{_RECON_PLANNER_PREFIX}fallback:"
+    if not detail.startswith(fallback_prefix):
+        return None
+    reason = detail[len(fallback_prefix) :]
+    labels = {
+        "timeout": "timeout",
+        "transport_error": "transport error",
+        "invalid_response": "invalid response",
+        "refused": "refused",
+        "no_budget": "예산 없음",
+        "unknown": "unknown",
+    }
+    return f"fallback 사용 ({labels.get(reason, 'unknown')})"
+
+
+def _recon_planner_progress_line(detail: str) -> str:
+    status = format_recon_planner_status(detail)
+    if status == "LLM 성공":
+        return "[진행] Recon LLM 호출 성공"
+    if status == "fallback 사용 (예산 없음)":
+        return "[진행] Recon LLM 호출 생략 → 결정적 fallback으로 계속 진행"
+    return "[진행] Recon LLM 호출 실패 → 결정적 fallback으로 계속 진행"

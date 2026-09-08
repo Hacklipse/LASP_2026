@@ -230,7 +230,7 @@ class HybridReconOrderingTests(unittest.TestCase):
         planner = LlmReconPlanner(llm_client=_RaisingLlmClient(LlmTimeout("slow")))
         agent, collector = _agent(evidence_store, surface_store, planner=planner)
 
-        agent.handle(_task("run-llm-timeout", "http://localhost/"))
+        result = agent.handle(_task("run-llm-timeout", "http://localhost/"))
 
         self.assertEqual(
             collector.calls,
@@ -242,6 +242,7 @@ class HybridReconOrderingTests(unittest.TestCase):
                 "http://localhost/c",
             ],
         )
+        self.assertEqual(result.message, "recon_planner:fallback:timeout")
 
     def test_visits_never_exceed_the_recon_page_budget(self) -> None:
         evidence_store = InMemoryEvidenceStore()
@@ -276,6 +277,7 @@ class HybridReconEvidenceTests(unittest.TestCase):
         self.assertIn("rejected_surface_ids", observation)
         self.assertEqual(len(observation["offered_surface_ids"]), 3)
         self.assertIn(plan_evidence.evidence_id, result.new_evidence_ids)
+        self.assertEqual(result.message, "recon_planner:llm_success")
 
 
 class HybridReconPlanReuseTests(unittest.TestCase):

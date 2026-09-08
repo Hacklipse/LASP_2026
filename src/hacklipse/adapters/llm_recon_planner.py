@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal, Mapping, Protocol
 
 from hacklipse.domain import Evidence, TaskEnvelope
 from hacklipse.ports.errors import LlmRefused, LlmResponseFormatError, LlmTimeout, LlmTransportError
@@ -30,6 +30,7 @@ from hacklipse.ports.llm import LlmClient, LlmMessage, LlmRequest
 # 별개로, "이 판단을 만든 컴포넌트가 무엇인가"는 항상 이 값으로 고정한다.
 RECON_PLANNER = "llm_recon_planner"
 _PLAN_OBSERVATION = "recon_plan"
+RECON_PLANNER_STATUS_PREFIX = "recon_planner:"
 
 _PLAN_SCHEMA = {
     "type": "object",
@@ -90,6 +91,52 @@ class ReconPlanner(Protocol):
         candidates: tuple[ReconCandidate, ...],
         remaining_budget: int,
     ) -> ReconPlan: ...
+
+
+def recon_plan_status_detail(plan: ReconPlan) -> str:
+    """진행 이벤트에 실을 수 있는 고정된 Planner 상태를 만든다.
+
+    LLM의 자유 텍스트 ``reason``이나 예외 메시지는 진행 화면에 내보내지 않는다.
+    fallback 원인은 코드가 만든 분류값으로만 축약해 비밀·응답 원문이 로그로 새는
+    경로를 만들지 않는다.
+    """
+
+    return _status_detail(plan.source, plan.reason)
+
+
+def recon_plan_status_from_observation(
+    observation: Mapping[str, object],
+) -> str | None:
+    """저장된 ``recon_plan`` Evidence에서 안전한 표시 상태만 복원한다."""
+
+    if observation.get("type") != _PLAN_OBSERVATION:
+        return None
+    source = observation.get("selection_source")
+    reason = observation.get("reason")
+    if source not in ("llm", "deterministic_fallback") or not isinstance(reason, str):
+        return None
+    return _status_detail(source, reason)
+
+
+def _status_detail(source: object, reason: str) -> str:
+    if source == "llm":
+        return f"{RECON_PLANNER_STATUS_PREFIX}llm_success"
+
+    if reason == "no remaining recon budget":
+        label = "no_budget"
+    elif reason.startswith("llm_call_failed:LlmTimeout"):
+        label = "timeout"
+    elif reason.startswith("llm_call_failed:LlmTransportError"):
+        label = "transport_error"
+    elif reason.startswith("llm_call_failed:LlmResponseFormatError"):
+        label = "invalid_response"
+    elif reason.startswith("llm_call_failed:LlmRefused"):
+        label = "refused"
+    elif reason.startswith("invalid_llm_plan:"):
+        label = "invalid_response"
+    else:
+        label = "unknown"
+    return f"{RECON_PLANNER_STATUS_PREFIX}fallback:{label}"
 
 
 class _InvalidReconPlan(ValueError):
