@@ -10,7 +10,7 @@ Analysis 는 반사까지만 관측한다. 실행 증명은 독립 Validation �
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from uuid import uuid4
 
 from hacklipse.application.errors import AgentContractError
@@ -21,6 +21,7 @@ from hacklipse.domain import (
     EvidenceRequest,
     HttpRequestKind,
     HttpRequestSpec,
+    Surface,
     TaskEnvelope,
 )
 from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
@@ -68,7 +69,7 @@ class BrowserXssAnalyzer:
             f"{task.task_id}{candidate.candidate_id}",
             prefix=XSS_REFLECTION_MARKER_PREFIX,
         )
-        requests = _build_reflection_requests(
+        requests = build_reflection_requests(
             surface.surface_id,
             parameters,
             marker,
@@ -93,42 +94,16 @@ class BrowserXssAnalyzer:
                 candidate_ids=(candidate.candidate_id,),
             )
 
-        new_evidence_ids: list[str] = []
-        for parameter, probe in zip(parameters, collected):
-            if probe is None:  # missing 분기 이후에는 도달하지 않는 방어선.
-                raise AgentContractError("browser xss probe evidence was not collected")
-            if probe.observation.get("dom_reflected") is not True:
-                continue
-            if has_observation_record(
-                evidence,
-                BROWSER_XSS_ANALYZER,
-                "reflection",
-                parameter,
-                probe.evidence_id,
-                probe.evidence_id,
-            ):
-                continue
-            reflection_id = f"evi-{self._id_factory()}"
-            self._evidence.append(
-                Evidence(
-                    evidence_id=reflection_id,
-                    run_id=task.run_id,
-                    surface_id=surface.surface_id,
-                    created_by=BROWSER_XSS_ANALYZER,
-                    evidence_type="observation",
-                    observation={
-                        "type": "reflection",
-                        "parameter": parameter,
-                        # 반사 탐침은 control 이 없다. 값이 DOM 에 있는지 없는지가
-                        # 그 자체로 차이이므로 비교 대상 요청이 필요 없다.
-                        "control_evidence_id": probe.evidence_id,
-                        "probe_evidence_id": probe.evidence_id,
-                        "observed_in": "dom",
-                    },
-                )
-            )
-            new_evidence_ids.append(reflection_id)
-
+        new_evidence_ids = record_dom_reflection_observations(
+            task=task,
+            surface=surface,
+            selected=parameters,
+            probes=collected,
+            evidence=evidence,
+            evidence_store=self._evidence,
+            created_by=BROWSER_XSS_ANALYZER,
+            id_factory=self._id_factory,
+        )
         return AgentResult(
             task_id=task.task_id,
             status=AgentResultStatus.COMPLETED,
@@ -137,7 +112,66 @@ class BrowserXssAnalyzer:
         )
 
 
-def _build_reflection_requests(
+def record_dom_reflection_observations(
+    *,
+    task: TaskEnvelope,
+    surface: Surface,
+    selected: Sequence[str],
+    probes: Sequence[Evidence | None],
+    evidence: Sequence[Evidence],
+    evidence_store: EvidenceStore,
+    created_by: str,
+    id_factory: Callable[[], str],
+    extra: dict[str, object] | None = None,
+) -> list[str]:
+    """Python 이 직접 확인한 DOM 반사만 공통 Observation 으로 저장한다.
+
+    ``dom_reflected`` 는 브라우저가 남긴 사실이다. 어떤 Analyzer 가 파라미터를 골랐든
+    반사 여부 자체는 여기서만 판정하므로, LLM 이 반사됐다고 주장해도 사실이 되지 않는다.
+    """
+
+    new_ids: list[str] = []
+    for parameter, probe in zip(selected, probes):
+        if probe is None:  # missing 분기 이후에는 도달하지 않는 방어선.
+            raise AgentContractError("browser xss probe evidence was not collected")
+        if probe.observation.get("dom_reflected") is not True:
+            continue
+        if has_observation_record(
+            evidence,
+            created_by,
+            "reflection",
+            parameter,
+            probe.evidence_id,
+            probe.evidence_id,
+        ):
+            continue
+        observation: dict[str, object] = {
+            "type": "reflection",
+            "parameter": parameter,
+            # 반사 탐침은 control 이 없다. 값이 DOM 에 있는지 없는지가
+            # 그 자체로 차이이므로 비교 대상 요청이 필요 없다.
+            "control_evidence_id": probe.evidence_id,
+            "probe_evidence_id": probe.evidence_id,
+            "observed_in": "dom",
+        }
+        if extra:
+            observation.update(extra)
+        reflection_id = f"evi-{id_factory()}"
+        evidence_store.append(
+            Evidence(
+                evidence_id=reflection_id,
+                run_id=task.run_id,
+                surface_id=surface.surface_id,
+                created_by=created_by,
+                evidence_type="observation",
+                observation=observation,
+            )
+        )
+        new_ids.append(reflection_id)
+    return new_ids
+
+
+def build_reflection_requests(
     surface_id: str,
     parameters: tuple[str, ...],
     marker: str,
