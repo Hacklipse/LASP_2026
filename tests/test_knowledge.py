@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from hacklipse.adapters.knowledge import (
+    knowledge_case_id,
     InMemoryKnowledgeBase,
     KnowledgeCaseFactory,
     SQLiteKnowledgeBase,
@@ -70,11 +71,17 @@ class KnowledgeCaseFactoryTests(unittest.TestCase):
         )
 
     def test_generalizes_only_structured_confirmed_finding_fields(self) -> None:
-        case = KnowledgeCaseFactory(id_factory=lambda: "fixed-1").from_finding(
+        case = KnowledgeCaseFactory().from_finding(
             self._finding(), self._candidate(), self._surface()
         )
 
-        self.assertEqual(case.case_id, "case-fixed-1")
+        # case_id 는 Finding 에서 결정된다. 같은 Finding 을 다시 발행해도 같은 ID 라
+        # KnowledgeBase 의 UNIQUE 제약이 내용 중복을 막아 준다.
+        again = KnowledgeCaseFactory().from_finding(
+            self._finding(), self._candidate(), self._surface()
+        )
+        self.assertEqual(case.case_id, again.case_id)
+        self.assertEqual(case.case_id, knowledge_case_id(self._finding()))
         self.assertEqual(case.category, "XSS")
         self.assertEqual(
             case.provenance_refs,
@@ -96,7 +103,7 @@ class KnowledgeCaseFactoryTests(unittest.TestCase):
             self.assertNotIn(raw_value, serialized)
 
     def test_rejects_unconfirmed_or_unrelated_sources(self) -> None:
-        factory = KnowledgeCaseFactory(id_factory=lambda: "fixed-1")
+        factory = KnowledgeCaseFactory()
 
         with self.assertRaisesRegex(ValueError, "confirmed candidate"):
             factory.from_finding(

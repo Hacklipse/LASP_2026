@@ -11,6 +11,7 @@ KnowledgeBase는 append-only다. 같은 case_id를 다시 발행하면 덮어쓰
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -71,11 +72,22 @@ _PROOF_TYPE_BY_VULNERABILITY = {
 }
 
 
+def knowledge_case_id(finding: Finding) -> str:
+    """같은 Finding은 언제 발행해도 같은 case_id를 받는다.
+
+    uuid를 쓰면 재개나 부분 실패 뒤 다시 발행할 때 내용이 같은 Case가 하나 더 생겨
+    Knowledge Plane이 오염된다. 결정적 ID면 KnowledgeBase의 UNIQUE 제약이 그대로
+    멱등성을 보장하므로 스키마를 바꾸지 않고 "여러 번 시도해도 한 번만 남는다"가 된다.
+
+    Finding 하나는 한 Run의 한 Validation에서만 나오므로 이 셋이 발행 단위를 정한다.
+    """
+
+    seed = "\0".join((finding.run_id, finding.finding_id, finding.validation_id))
+    return "case-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+
+
 class KnowledgeCaseFactory:
     """확정 Finding을 비밀 원문 없는 재사용 사례로 일반화한다."""
-
-    def __init__(self, id_factory: Callable[[], str] | None = None) -> None:
-        self._id_factory = id_factory or (lambda: str(uuid4()))
 
     def from_finding(
         self,
@@ -115,7 +127,7 @@ class KnowledgeCaseFactory:
             "surface_path": _generalize_path(surface.url),
         }
         case = KnowledgeCase(
-            case_id=f"case-{self._id_factory()}",
+            case_id=knowledge_case_id(finding),
             category=finding.vulnerability_type,
             summary=summary,
             provenance_refs=(

@@ -107,6 +107,8 @@ class RunProgressView:
         self._surfaces = 0
         self._parameters = 0
         self._budget_used = 0
+        # (발행 성공, 전체) - 발행을 켜지 않은 Run 은 None
+        self._knowledge: tuple[int, int] | None = None
         self._budget_total = 0
         self._closed = False
 
@@ -142,6 +144,10 @@ class RunProgressView:
         self._phase = event.phase
         self._budget_used = event.budget_used
         self._budget_total = event.budget_total
+        # RUN_COMPLETED 는 특정 취약점 유형의 사건이 아니라 아래 조기 반환에 걸린다.
+        # Knowledge 발행 결과는 그 전에 받아 둔다.
+        if event.kind is ProgressEventKind.RUN_COMPLETED:
+            self._knowledge = _knowledge_counts(event.detail)
         name = event.vulnerability_type
         if name is None:
             return
@@ -200,6 +206,12 @@ class RunProgressView:
         findings = sum(item.findings for item in self._types.values())
         lines.append(f"  {_WAITING} 검증      {validated} / {total}")
         lines.append(f"  {_WAITING} Finding   {findings}")
+        if self._knowledge is not None:
+            done, expected = self._knowledge
+            missed = expected - done
+            mark = _DONE if missed == 0 else _BROKEN
+            note = f" · {missed}건 발행 실패" if missed else ""
+            lines.append(f"  {mark} Knowledge {done} / {expected}{note}")
         lines.append(f"  {_WAITING} 예산      {self._budget_used} / {self._budget_total}")
         return lines
 
@@ -218,6 +230,14 @@ class RunProgressView:
         else:
             parts.append(event.kind.value)
         parts.append(f"예산 {event.budget_used}/{event.budget_total}")
+        counts = _knowledge_counts(event.detail)
+        if counts is not None:
+            done, expected = counts
+            missed = expected - done
+            parts.append(
+                f"Knowledge {done}/{expected}"
+                + (f" ({missed}건 실패)" if missed else "")
+            )
         return " ".join(parts)
 
     def _write(self, text: str) -> None:
@@ -237,3 +257,19 @@ class RunProgressView:
         flush = getattr(self._stream, "flush", None)
         if flush:
             flush()
+
+
+def _knowledge_counts(detail: str | None) -> tuple[int, int] | None:
+    """RUN_COMPLETED 의 detail 에서 발행 수치를 꺼낸다.
+
+    형식은 "knowledge <성공>/<전체>". 알 수 없는 값이면 표시하지 않는다 - 화면이
+    임의 문자열을 그대로 그리면 예외 메시지 같은 것이 섞여 들어올 수 있다.
+    """
+
+    if not detail or not detail.startswith("knowledge "):
+        return None
+    try:
+        done, total = detail.split(" ", 1)[1].split("/", 1)
+        return int(done), int(total)
+    except ValueError:
+        return None
