@@ -104,10 +104,13 @@ def validate_probe_selection(
     request_budget: int,
     *,
     analyzer_name: str,
+    control_requests: int = 1,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """LLM 선택을 실제 Surface와 요청 예산 안으로 제한한다.
 
     control 한 건이 항상 필요하므로 선택 가능한 probe 수는 남은 예산보다 하나 적다.
+    브라우저 DOM 반사처럼 control 요청이 없는 흐름은 ``control_requests=0``을 넘긴다 —
+    값이 DOM 에 있는지 없는지가 그 자체로 차이라 비교 대상 요청이 필요 없다.
     존재하지 않는 파라미터는 조용히 버리지 않고 Agent 계약 위반으로 처리한다.
     """
 
@@ -127,7 +130,7 @@ def validate_probe_selection(
         if name not in selected:
             selected.append(name)
 
-    affordable = max(request_budget - 1, 0)
+    affordable = max(request_budget - control_requests, 0)
     if len(selected) <= affordable:
         return tuple(selected), ()
     return tuple(selected[:affordable]), tuple(selected[affordable:])

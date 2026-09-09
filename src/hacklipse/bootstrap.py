@@ -27,6 +27,7 @@ from hacklipse.adapters import (
     LlmPathTraversalAnalyzer,
     LlmAccessControlAnalyzer,
     LlmXssAnalyzer,
+    LlmBrowserXssAnalyzer,
     LocalTaskDispatcher,
     MarkdownReportAgent,
     MemoryStoreBundle,
@@ -374,6 +375,11 @@ def register_standard_agents(
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
+        browser_xss_analyzer: Agent = BrowserXssAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
         profile = "heuristic"
     else:
         xss_analyzer = LlmXssAnalyzer(
@@ -408,19 +414,21 @@ def register_standard_agents(
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
+        browser_xss_analyzer = LlmBrowserXssAnalyzer(
+            llm_client=llm_client,
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
         profile = "llm"
     app.dispatcher.register(
         "xss_analyzer", xss_analyzer, allowed_tools=("http_get",)
     )
-    # SPA 라우트의 DOM 반사는 브라우저로만 관측된다. LLM 구성에서도 같은 관측을
-    # 쓰므로 두 프로필이 이 Analyzer 를 공유한다.
+    # SPA 라우트의 DOM 반사는 브라우저로만 관측된다. 반사 여부 판정은 두 프로필이
+    # 공유하지만 탐침 대상 선택은 프로필마다 다르다.
     app.dispatcher.register(
         "browser_xss_analyzer",
-        BrowserXssAnalyzer(
-            candidate_store=app.stores.candidates,
-            surface_store=app.stores.surfaces,
-            evidence_store=app.stores.evidence,
-        ),
+        browser_xss_analyzer,
         allowed_tools=("browser_xss",),
     )
     app.dispatcher.register(
