@@ -14,10 +14,12 @@ from hacklipse.adapters.routing import RuleBasedVulnerabilityRouter
 from hacklipse.application.errors import AgentContractError, WorkflowExecutionError
 from hacklipse.bootstrap import build_local_application
 from hacklipse.domain import (
+    AgentResult,
     AgentResultStatus,
     Evidence,
     ExecutionRequest,
     ExecutionResult,
+    ProgressEventKind,
     RunRequest,
     Run,
     RunScope,
@@ -259,6 +261,36 @@ class ReconDrivesRoutingTests(unittest.TestCase):
         self.assertTrue(run.candidate_ids)
         self.assertTrue(run.surface_ids)
 
+    def test_recon_planner_status_is_forwarded_as_a_progress_event(self) -> None:
+        class _StatusOnlyRecon:
+            def handle(self, task):
+                return AgentResult(
+                    task_id=task.task_id,
+                    status=AgentResultStatus.COMPLETED,
+                    message="recon_planner:fallback:timeout",
+                )
+
+        app = build_local_application(agents={})
+        app.dispatcher.register(
+            "recon", _StatusOnlyRecon(), allowed_tools=("http_get",)
+        )
+
+        run = app.orchestrator.start(
+            RunRequest(
+                target_url="http://localhost/",
+                scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+            )
+        )
+
+        planner_events = [
+            event
+            for event in app.progress_log.list_by_run(run.run_id)
+            if event.agent_type == "recon"
+            and event.detail == "recon_planner:fallback:timeout"
+        ]
+        self.assertEqual(len(planner_events), 1)
+        self.assertIs(planner_events[0].kind, ProgressEventKind.AGENT_COMPLETED)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -443,6 +475,30 @@ class ReconCrawlTests(unittest.TestCase):
         self.assertIn("http://localhost/api/Products", found)
         # 외부 URL의 경로 조각이 표면으로 새어 들어오면 안 된다.
         self.assertTrue(all("twitter.com" not in url for url in found))
+
+    def test_discovers_a_spa_route_navigated_with_backtick_quotes(self) -> None:
+        """실제 Juice Shop 빌드는 navigate 배열 리터럴을 백틱으로 내보낸다.
+
+        큰따옴표만 매칭하던 정규식으로는 `/search?q=` 같은 반사 XSS SPA 라우트 자체가
+        Surface로 안 잡혀서, XSS 후보가 하나도 안 만들어지는 채로 조용히 넘어갔다.
+        """
+
+        bundle = (
+            "class SearchComponent {\n"
+            "  applyFilter(e){ return this.router.navigate([`/search`],"
+            "{queryParams:{q:e}}) }\n"
+            "}\n"
+        )
+        agent, collector, surfaces = _crawling_agent(
+            {"http://localhost/": _SPA_HTML, "http://localhost/main.js": bundle}
+        )
+        agent.handle(_task("run-backtick-route", "http://localhost/"))
+
+        found = {
+            surface.url: surface.parameters
+            for surface in surfaces.list_by_run("run-backtick-route")
+        }
+        self.assertEqual(found.get("http://localhost/#/search"), ("q",))
 
     def test_crawls_document_navigation_and_flags_unlinked_render_option(self) -> None:
         """제품별 URL seed 없이 SPA 밖의 서버 렌더링 POST 폼까지 이어간다."""

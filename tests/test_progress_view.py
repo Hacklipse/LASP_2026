@@ -59,6 +59,35 @@ class ProgressFoldingTests(unittest.TestCase):
         self.assertIn("검증 대기", last)
         self.assertNotIn("SQLi 대기", last)
 
+    def test_recon_planner_success_is_visible(self) -> None:
+        view, stream = _view(tty=False)
+        emit = _Emitter(view)
+
+        emit(
+            ProgressEventKind.AGENT_COMPLETED,
+            phase="recon",
+            agent_type="recon",
+            detail="recon_planner:llm_success",
+        )
+
+        self.assertIn("[진행] Recon LLM 호출 성공", stream.getvalue())
+
+    def test_recon_planner_fallback_is_visible(self) -> None:
+        view, stream = _view(tty=False)
+        emit = _Emitter(view)
+
+        emit(
+            ProgressEventKind.AGENT_COMPLETED,
+            phase="recon",
+            agent_type="recon",
+            detail="recon_planner:fallback:timeout",
+        )
+
+        self.assertIn(
+            "[진행] Recon LLM 호출 실패 → 결정적 fallback으로 계속 진행",
+            stream.getvalue(),
+        )
+
     def test_validation_verdict_completes_the_type(self) -> None:
         view, stream = _view(tty=False)
         emit = _Emitter(view)

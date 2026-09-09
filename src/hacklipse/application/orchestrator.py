@@ -211,7 +211,17 @@ class Orchestrator:
         )
         result = self._tasks.execute(task)
         self._require_completed(result, "recon")
-        return self._merge_agent_result(run, result)
+        current = self._merge_agent_result(run, result)
+        # Recon Planner 상태는 AgentResult의 고정 분류값만 진행 이벤트로 옮긴다.
+        # LLM의 자유 텍스트 reason이나 예외 원문은 진행 화면에 노출하지 않는다.
+        if result.message and result.message.startswith("recon_planner:"):
+            self._emit(
+                current,
+                ProgressEventKind.AGENT_COMPLETED,
+                agent_type=self._config.recon_agent_type,
+                detail=result.message,
+            )
+        return current
 
     def _continue_progress(self, run_id: str) -> None:
         """저장된 진행 사건 뒤에서 순번과 경과 시간을 이어받는다.

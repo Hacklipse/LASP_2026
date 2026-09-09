@@ -15,8 +15,10 @@ from run_juice_shop_baseline import (  # noqa: E402
     _ProvisionedAccount,
     _all_mode_recon_seeds,
     _cleanup_provisioned_accounts,
+    _recon_planner_summary,
     _resolve_juice_shop_db,
 )
+from hacklipse.domain import Evidence
 
 
 class JuiceShopAllModeTests(unittest.TestCase):
@@ -32,6 +34,31 @@ class JuiceShopAllModeTests(unittest.TestCase):
                 "http://127.0.0.1:3000/", include_ssti=False
             ),
             (),
+        )
+
+    def test_recon_planner_summary_reports_success_and_fallback(self) -> None:
+        def evidence(source: str, reason: str) -> Evidence:
+            return Evidence(
+                evidence_id=f"evi-{source}",
+                run_id="run-1",
+                surface_id=None,
+                created_by="llm_recon_planner",
+                evidence_type="observation",
+                observation={
+                    "type": "recon_plan",
+                    "selection_source": source,
+                    "reason": reason,
+                },
+            )
+
+        self.assertEqual(
+            _recon_planner_summary((evidence("llm", "ranked"),)), "LLM 성공"
+        )
+        self.assertEqual(
+            _recon_planner_summary(
+                (evidence("deterministic_fallback", "llm_call_failed:LlmTimeout"),)
+            ),
+            "fallback 사용 (timeout)",
         )
 
 

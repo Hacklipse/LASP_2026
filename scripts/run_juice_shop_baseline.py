@@ -54,6 +54,9 @@ from hacklipse.adapters.ssti_analysis import (  # noqa: E402
 from hacklipse.adapters.path_traversal_analysis import (  # noqa: E402
     PATH_TRAVERSAL_POST_APPROVAL_REF,
 )
+from hacklipse.adapters.llm_recon_planner import (  # noqa: E402
+    recon_plan_status_from_observation,
+)
 from hacklipse.application import OrchestratorConfig, build_progress_snapshot  # noqa: E402
 from hacklipse.application.errors import WorkflowExecutionError  # noqa: E402
 from hacklipse.bootstrap import (  # noqa: E402
@@ -78,7 +81,7 @@ from hacklipse.ports.errors import LlmCredentialsMissing  # noqa: E402
 
 # 기존 DVWA 실행기와 같은 안전한 디버그 출력 구현을 재사용한다. 이 모듈은 main guard가
 # 있어 import만으로 실행되지 않는다.
-from progress_view import RunProgressView  # noqa: E402
+from progress_view import RunProgressView, format_recon_planner_status  # noqa: E402
 from run_dvwa_baseline import (  # noqa: E402
     _DebugAuditLog,
     _DebugProgress,
@@ -102,6 +105,21 @@ _DEFAULT_BUDGET = 20
 _ALL_MODE_BUDGET = 80
 _ALL_MODE_RECON_PAGES = 12
 _OBJECT_ID = re.compile(r"^[0-9]{1,10}$")
+
+
+def _recon_planner_summary(evidence) -> str | None:
+    """가장 최근 Recon 계획을 최종 결과용 안전 문구로 바꾼다."""
+
+    for item in reversed(tuple(evidence)):
+        if (
+            item.created_by != "llm_recon_planner"
+            or item.evidence_type != "observation"
+        ):
+            continue
+        detail = recon_plan_status_from_observation(item.observation)
+        if detail is not None:
+            return format_recon_planner_status(detail)
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -958,6 +976,11 @@ def main(argv: list[str]) -> int:
     )
     if llm_meter is not None:
         print(f"  LLM 사용량      {llm_meter.summary()}")
+    recon_planner_summary = _recon_planner_summary(
+        app.stores.evidence.list_by_run(run.run_id)
+    )
+    if recon_planner_summary is not None:
+        print(f"  Recon Planner: {recon_planner_summary}")
     if provision_run_id is not None:
         print(f"  계정 준비 실행  {len(audit.list_by_run(provision_run_id))}회")
     print()
