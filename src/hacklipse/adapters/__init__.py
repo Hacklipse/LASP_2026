@@ -5,6 +5,11 @@ from .authentication import FormLoginWorker
 from .browser_runtime import PlaywrightBrowserRuntime
 from .dispatcher import LocalTaskDispatcher
 from .http_runtime import HttpExecutionRuntime
+from .knowledge import (
+    InMemoryKnowledgeBase,
+    KnowledgeCaseFactory,
+    SQLiteKnowledgeBase,
+)
 from .gemini_llm_client import GeminiLlmClient
 from .llm_client import AnthropicLlmClient
 from .llm_path_traversal_analysis import LlmPathTraversalAnalyzer
@@ -43,6 +48,9 @@ __all__ = [
     "DenyAllApprovalGate",
     "DisabledExecutionRuntime",
     "HttpExecutionRuntime",
+    "InMemoryKnowledgeBase",
+    "KnowledgeCaseFactory",
+    "SQLiteKnowledgeBase",
     "FormLoginWorker",
     "AnthropicLlmClient",
     "GeminiLlmClient",

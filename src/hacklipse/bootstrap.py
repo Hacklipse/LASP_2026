@@ -11,6 +11,7 @@ from hacklipse.adapters import (
     AnthropicLlmClient,
     BoundedRetryPolicy,
     BrowserXssAnalyzer,
+    KnowledgeCaseFactory,
     DisabledExecutionRuntime,
     FormLoginWorker,
     GeminiLlmClient,
@@ -64,6 +65,7 @@ from hacklipse.ports import (
     LlmClient,
     CredentialResolver,
     TaskStore,
+    KnowledgeBase,
     VulnerabilityRouter,
 )
 from hacklipse.ports.errors import LlmCredentialsMissing
@@ -159,6 +161,7 @@ def build_local_application(
     | None = None,
     progress_sink: ProgressSink | None = None,
     clock: Callable[[], float] | None = None,
+    knowledge_base: KnowledgeBase | None = None,
 ) -> LocalApplication:
     """기본적으로 네트워크를 활성화하지 않는 로컬 시스템을 조립한다."""
 
@@ -264,6 +267,10 @@ def build_local_application(
         config=selected_config,
         progress_sink=selected_progress,
         clock=clock,
+        knowledge_base=knowledge_base,
+        # KnowledgeBase를 주지 않으면 발행 자체가 일어나지 않는다. 빌더만 있어도
+        # 아무 일도 하지 않으므로 조립을 한곳에 모아 둔다.
+        knowledge_case_builder=KnowledgeCaseFactory().from_finding,
     )
     return LocalApplication(
         orchestrator=orchestrator,
