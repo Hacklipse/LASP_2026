@@ -197,6 +197,31 @@ class RouterAdvisor(Protocol):
     ) -> Sequence[RouteSuggestion]: ...
 
 
+def _supports_suggestion(surface: Surface, suggestion: RouteSuggestion) -> bool:
+    """Advisor 제안이 실제 Analyzer의 현재 실행 계약에 맞는지 확인한다."""
+
+    method = surface.method.upper()
+    parameters = bool(surface.parameters)
+    client_route = bool(urlsplit(surface.url).fragment)
+    pair = (suggestion.vulnerability_type, suggestion.agent_type)
+    if pair == ("XSS", "browser_xss_analyzer"):
+        return method == "GET" and parameters and client_route
+    if client_route:
+        return False
+    if pair in {("XSS", "xss_analyzer"), ("SQLi", "sqli_analyzer")}:
+        return method == "GET" and parameters
+    if pair == ("Path Traversal", "path_traversal_analyzer"):
+        return method in {"GET", "POST"} and parameters
+    if pair == ("SSTI", "ssti_analyzer"):
+        return method == "POST" and "username" in surface.parameters
+    if pair == ("Access Control", "access_control_analyzer"):
+        return method == "GET" and bool(
+            object_identifier_parameters(surface.parameters)
+            or surface.path_identifier is not None
+        )
+    return False
+
+
 class RuleBasedVulnerabilityRouter:
     """Surface 탐색 규칙과 강한 Observation 규칙을 함께 사용하는 결정적 Router.
 
@@ -230,6 +255,11 @@ class RuleBasedVulnerabilityRouter:
             for rule in surface_rules
             if getattr(rule, "client_route", False)
         )
+        # 감사 Adapter가 규칙/Advisor 결과를 분리해 기록할 때 읽는 호출별 상태다.
+        self.last_rule_decisions: tuple[RouteDecision, ...] = ()
+        self.last_advisor_suggestions: tuple[RouteSuggestion, ...] = ()
+        self.last_advisor_outcomes: tuple[tuple[int, str], ...] = ()
+        self.last_advisor_status = "not_configured" if advisor is None else "not_called"
 
     def route(
         self,
@@ -239,6 +269,12 @@ class RuleBasedVulnerabilityRouter:
     ) -> tuple[RouteDecision, ...]:
         """Surface와 Evidence를 대조해 중복 없는 Candidate를 만든다."""
 
+        self.last_rule_decisions = ()
+        self.last_advisor_suggestions = ()
+        self.last_advisor_outcomes = ()
+        self.last_advisor_status = (
+            "not_configured" if self._advisor is None else "not_called"
+        )
         decisions: dict[tuple[str, str], RouteDecision] = {}
         for item in evidence:
             observation_type = str(item.observation.get("type", ""))
@@ -296,17 +332,19 @@ class RuleBasedVulnerabilityRouter:
                 )
                 decisions[key] = RouteDecision(candidate=candidate, priority=rule.priority)
 
+        self.last_rule_decisions = tuple(
+            sorted(decisions.values(), key=lambda item: item.priority, reverse=True)
+        )
+
         # 3단계. 규칙이 비워 둔 자리만 Advisor 제안으로 채운다. 이미 들어 있는 키는
         # 건드리지 않으므로 "LLM이 Rule을 덮어쓰지 않는다"가 검사 한 줄이 아니라 병합
         # 순서 자체로 보장된다.
         if self._advisor is not None:
-            suggested, _status = self._advisor_decisions(
+            suggested, status = self._advisor_decisions(
                 run, surfaces, evidence, decisions
             )
+            self.last_advisor_status = status
             decisions.update(suggested)
-            # _status는 Advisor 호출 결과 요약이다. Evidence로 남기는 배선은 아직 하지
-            # 않았다 - Router는 Agent가 아니라 Evidence Store에 쓸 통로가 없고, 어디에
-            # 기록할지(RouteDecision 확장 vs Port 반환 타입 변경)가 미결정이다.
 
         # 우선순위가 높은 분석 대상을 먼저 처리하도록 정렬한다.
         return tuple(
@@ -338,6 +376,10 @@ class RuleBasedVulnerabilityRouter:
             # decided에 들어 있으므로 그대로 두고 빈 결과를 돌려준다.
             return {}, f"advisor_failed:{type(error).__name__}"
 
+        self.last_advisor_suggestions = tuple(
+            item for item in suggestions if isinstance(item, RouteSuggestion)
+        )
+
         by_id = {
             surface.surface_id: surface
             for surface in surfaces
@@ -345,30 +387,36 @@ class RuleBasedVulnerabilityRouter:
         }
         accepted: dict[tuple[str, str], RouteDecision] = {}
         rejected = 0
-        for suggestion in suggestions:
+        outcomes: list[tuple[int, str]] = []
+        for index, suggestion in enumerate(suggestions):
             if not isinstance(suggestion, RouteSuggestion):
                 rejected += 1
+                outcomes.append((index, "invalid_suggestion"))
                 continue
             # 다른 Run의 Surface거나 존재하지 않는 Surface면 버린다.
             surface = by_id.get(suggestion.surface_id)
             if surface is None:
                 rejected += 1
+                outcomes.append((index, "unknown_surface"))
                 continue
             # 등록되지 않은 Agent로 보내면 Dispatcher가 Run 전체를 실패시킨다.
             if (suggestion.vulnerability_type, suggestion.agent_type) not in self._allowed_pairs:
                 rejected += 1
+                outcomes.append((index, "unsupported_route"))
                 continue
             # 규칙에 적용하는 안전 기준을 제안에도 똑같이 적용한다.
             if has_state_changing_parameters(surface.parameters):
                 rejected += 1
+                outcomes.append((index, "state_changing_surface"))
                 continue
-            is_client_route = bool(urlsplit(surface.url).fragment)
-            if is_client_route is not (suggestion.agent_type in self._client_route_agents):
+            if not _supports_suggestion(surface, suggestion):
                 rejected += 1
+                outcomes.append((index, "incompatible_surface"))
                 continue
             key = (suggestion.surface_id, suggestion.vulnerability_type)
             # 규칙이 이미 정한 자리와 Advisor가 중복 제안한 자리는 모두 건너뛴다.
             if key in decided or key in accepted:
+                outcomes.append((index, "rule_kept" if key in decided else "duplicate"))
                 continue
             candidate = Candidate(
                 candidate_id=f"candidate-{self._id_factory()}",
@@ -381,8 +429,15 @@ class RuleBasedVulnerabilityRouter:
                 assigned_agent=suggestion.agent_type,
                 # Advisor의 판단은 Claim이므로 관측 Evidence를 근거로 달지 않는다.
                 evidence_ids=(),
+                exploration_parameters=(
+                    tuple(dict.fromkeys(surface.parameters))
+                    if suggestion.vulnerability_type == "Path Traversal"
+                    else ()
+                ),
             )
             accepted[key] = RouteDecision(
                 candidate=candidate, priority=self._advisor_priority
             )
+            outcomes.append((index, "candidate_added"))
+        self.last_advisor_outcomes = tuple(outcomes)
         return accepted, f"advisor_ok:accepted={len(accepted)},rejected={rejected}"

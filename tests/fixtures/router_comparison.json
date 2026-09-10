@@ -1,0 +1,20 @@
+{
+  "surfaces": [
+    {"surface_id": "ambiguous", "url": "http://localhost/render", "method": "GET", "parameters": ["blob"]},
+    {"surface_id": "unmatched", "url": "http://localhost/render", "method": "POST", "parameters": ["blob"]},
+    {"surface_id": "strong", "url": "http://localhost/search", "method": "GET", "parameters": ["q"]},
+    {"surface_id": "browser", "url": "http://localhost/#/search", "method": "GET", "parameters": ["q"]},
+    {"surface_id": "excluded", "url": "http://localhost/account", "method": "GET", "parameters": ["deleteUser"]}
+  ],
+  "evidence": [
+    {"evidence_id": "reflection", "surface_id": "strong", "observation": {"type": "reflection", "parameter": "q"}}
+  ],
+  "llm_response": {
+    "suggestions": [
+      {"surface_id": "ambiguous", "vulnerability_type": "SQLi", "reason": "The selected input may reach a lookup query."},
+      {"surface_id": "ambiguous", "vulnerability_type": "Path Traversal", "reason": "The render endpoint may use the input to select a server-side resource."},
+      {"surface_id": "unmatched", "vulnerability_type": "Path Traversal", "reason": "A server-rendered form may accept a resource selector."},
+      {"surface_id": "excluded", "vulnerability_type": "SQLi", "reason": "Deliberately invalid proposal to exercise rejection."}
+    ]
+  }
+}

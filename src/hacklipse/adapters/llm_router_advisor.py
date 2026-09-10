@@ -26,8 +26,11 @@ LLM은 Candidate를 만들지 않고, 담당 Agent도 고르지 않는다. 고�
 
 from __future__ import annotations
 
+import re
+import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal
 from urllib.parse import urlsplit
 
 from hacklipse.domain import Evidence, Run, Surface
@@ -37,7 +40,7 @@ from hacklipse.ports.errors import (
     LlmTimeout,
     LlmTransportError,
 )
-from hacklipse.ports.llm import LlmClient, LlmMessage, LlmRequest
+from hacklipse.ports.llm import LlmClient, LlmMessage, LlmRequest, LlmUsage
 
 from .request_safety import has_state_changing_parameters
 from .routing import RouteSuggestion
@@ -50,6 +53,9 @@ ROUTER_ADVISOR = "llm_router_advisor"
 # 프롬프트가 비대해지고 비용이 표면 수에 비례해 늘어난다. Router는 Run당 한 번만 부르므로
 # 이 상한이 곧 이 기능의 비용 상한이다.
 DEFAULT_MAX_SURFACES = 40
+
+_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,63}$")
+_PATH_SEGMENT = re.compile(r"^[A-Za-z][A-Za-z_-]{0,63}(?:\.[A-Za-z]{1,10})?$")
 
 _SUGGESTION_SCHEMA = {
     "type": "object",
@@ -113,6 +119,22 @@ class _OfferedSurface:
     covered_types: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class RouterAdvisorTrace:
+    """감사 로그가 원문 prompt/응답 없이 읽는 마지막 호출의 계측 결과."""
+
+    suggestions: tuple[RouteSuggestion, ...] = ()
+    rejected_items: tuple[tuple[int, str], ...] = ()
+    offered_surface_ids: tuple[str, ...] = ()
+    source: Literal["llm", "deterministic_fallback", "skipped"] = "skipped"
+    status: str = "not_called"
+    llm_calls: int = 0
+    usage: LlmUsage = field(default_factory=LlmUsage)
+    usage_available: bool = False
+    model: str = ""
+    elapsed_ms: float | None = None
+
+
 class LlmRouterAdvisor:
     """LLM 제안을 검증해 ``RouteSuggestion``으로만 돌려주는 ``RouterAdvisor`` 구현.
 
@@ -131,6 +153,7 @@ class LlmRouterAdvisor:
         self._analyzers = tuple(analyzers)
         self._max_surfaces = max_surfaces
         self._timeout_seconds = timeout_seconds
+        self.last_trace = RouterAdvisorTrace()
 
     def advise(
         self,
@@ -143,8 +166,13 @@ class LlmRouterAdvisor:
         if not offered or not self._analyzers:
             # 보여 줄 표면이 없거나 제안 가능한 유형이 없다는 사실은 결정적이다.
             # LLM을 부를 이유가 없다.
+            self.last_trace = RouterAdvisorTrace(
+                offered_surface_ids=tuple(item.surface_id for item in offered),
+                status="no_candidates" if not offered else "no_routes",
+            )
             return ()
 
+        started = time.monotonic()
         try:
             response = self._llm.complete(
                 LlmRequest(
@@ -156,7 +184,7 @@ class LlmRouterAdvisor:
                     timeout_seconds=self._timeout_seconds,
                 )
             )
-        except (LlmTimeout, LlmTransportError, LlmResponseFormatError, LlmRefused):
+        except (LlmTimeout, LlmTransportError, LlmResponseFormatError, LlmRefused) as error:
             # 호출 실패는 규칙 결과를 그대로 두는 것으로 흡수한다. Router가 예외를 다시
             # 잡아 주지만, 여기서 먼저 처리해야 "왜 빈 제안인가"가 이 계층에 남는다.
             #
@@ -164,9 +192,39 @@ class LlmRouterAdvisor:
             # 실행 중 장애가 아니라 구성 오류이며, 조용히 규칙만 돌면 "LLM을 켰는데
             # 규칙 결과가 나왔다"는 오독을 만든다. 다만 Router가 모든 예외를 흡수하므로
             # 이 구분이 실제로 살아나려면 bootstrap이 배선 시점에 키를 확인해야 한다.
+            status = {
+                LlmTimeout: "timeout",
+                LlmResponseFormatError: "invalid_response",
+                LlmRefused: "refused",
+                LlmTransportError: "transport_error",
+            }.get(type(error), "llm_error")
+            self.last_trace = RouterAdvisorTrace(
+                offered_surface_ids=tuple(item.surface_id for item in offered),
+                source="deterministic_fallback",
+                status=status,
+                llm_calls=1,
+                elapsed_ms=(time.monotonic() - started) * 1000,
+            )
             return ()
 
-        return self._parse(response.payload, offered, routed)
+        suggestions, rejected, status = self._parse(response.payload, offered, routed)
+        self.last_trace = RouterAdvisorTrace(
+            suggestions=suggestions,
+            rejected_items=rejected,
+            offered_surface_ids=tuple(item.surface_id for item in offered),
+            source=(
+                "deterministic_fallback"
+                if status in {"invalid_response", "all_rejected"}
+                else "llm"
+            ),
+            status=status,
+            llm_calls=1,
+            usage=response.usage,
+            usage_available=True,
+            model=response.model,
+            elapsed_ms=(time.monotonic() - started) * 1000,
+        )
+        return suggestions
 
     # ------------------------------------------------------------------
     # 제안 대상 선정
@@ -208,7 +266,7 @@ class LlmRouterAdvisor:
                 _OfferedSurface(
                     surface_id=surface.surface_id,
                     method=surface.method.upper(),
-                    path=urlsplit(surface.url).path or "/",
+                    path=_path_hint(urlsplit(surface.url).path or "/"),
                     client_route=client_route,
                     parameter_names=tuple(surface.parameters),
                     observation_types=observations.get(surface.surface_id, ()),
@@ -276,37 +334,45 @@ class LlmRouterAdvisor:
         payload: object,
         offered: tuple[_OfferedSurface, ...],
         routed: frozenset[tuple[str, str]],
-    ) -> tuple[RouteSuggestion, ...]:
+    ) -> tuple[
+        tuple[RouteSuggestion, ...], tuple[tuple[int, str], ...], str
+    ]:
         """구조 위반은 전체를 버리고, 항목 위반은 해당 항목만 버린다."""
 
         if not isinstance(payload, dict):
-            return ()
+            return (), (), "invalid_response"
         raw = payload.get("suggestions")
         if not isinstance(raw, list):
-            return ()
+            return (), (), "invalid_response"
 
         by_id = {item.surface_id: item for item in offered}
         accepted: list[RouteSuggestion] = []
+        rejected: list[tuple[int, str]] = []
         taken: set[tuple[str, str]] = set()
-        for entry in raw:
+        for index, entry in enumerate(raw):
             if not isinstance(entry, dict):
+                rejected.append((index, "invalid_item"))
                 continue
             surface_id = entry.get("surface_id")
             vulnerability_type = entry.get("vulnerability_type")
             if not isinstance(surface_id, str) or not isinstance(vulnerability_type, str):
+                rejected.append((index, "invalid_item"))
                 continue
             # 보여 주지 않은 표면은 제안 대상이 아니다. 다른 Run의 Surface도 여기서 걸린다.
             surface = by_id.get(surface_id)
             if surface is None:
+                rejected.append((index, "unknown_surface"))
                 continue
             key = (surface_id, vulnerability_type)
             # 규칙이 이미 정한 자리와 같은 응답 안의 중복은 만들지 않는다. Router도
             # 같은 검사를 하지만, 쓸모없는 제안을 여기서 걸러야 무엇이 실제로 새로
             # 제안됐는지가 이 계층의 결과로 남는다.
             if key in routed or key in taken:
+                rejected.append((index, "duplicate_or_covered"))
                 continue
             agent_type = self._resolve_agent(vulnerability_type, surface.client_route)
             if agent_type is None:
+                rejected.append((index, "unsupported_route"))
                 continue
             reason = entry.get("reason")
             accepted.append(
@@ -318,7 +384,8 @@ class LlmRouterAdvisor:
                 )
             )
             taken.add(key)
-        return tuple(accepted)
+        status = "all_rejected" if raw and not accepted else "partial" if rejected else "ok"
+        return tuple(accepted), tuple(rejected), status
 
     def _resolve_agent(self, vulnerability_type: str, client_route: bool) -> str | None:
         """유형과 표면 모양으로 담당 Agent를 결정한다. LLM은 이 선택에 관여하지 않는다.
@@ -335,3 +402,42 @@ class LlmRouterAdvisor:
             ):
                 return choice.agent_type
         return None
+
+
+def surface_routing_summary(
+    surface: Surface, evidence: Sequence[Evidence]
+) -> dict[str, object]:
+    """동적 ID와 관측값을 제외한 실제 Router 입력의 안전한 구조 요약."""
+
+    parsed = urlsplit(surface.url)
+    return {
+        "surface_id": surface.surface_id,
+        "path": _path_hint(parsed.path or "/"),
+        "client_route": bool(parsed.fragment),
+        "client_route_path": (
+            _path_hint(parsed.fragment.split("?", 1)[0]) if parsed.fragment else None
+        ),
+        "method": surface.method.upper(),
+        "parameter_names": [
+            name for name in surface.parameters if _NAME.fullmatch(name)
+        ],
+        "requires_auth": surface.requires_auth,
+        "has_path_identifier": surface.path_identifier is not None,
+        "observation_types": sorted(
+            {
+                kind
+                for item in evidence
+                if item.surface_id == surface.surface_id
+                and item.evidence_type == "observation"
+                and isinstance((kind := item.observation.get("type")), str)
+                and _NAME.fullmatch(kind)
+            }
+        ),
+    }
+
+
+def _path_hint(path: str) -> str:
+    return "/".join(
+        segment if not segment or _PATH_SEGMENT.fullmatch(segment) else "{value}"
+        for segment in path.split("/")
+    )

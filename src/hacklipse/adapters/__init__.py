@@ -38,6 +38,8 @@ from .routing import (
     RuleBasedVulnerabilityRouter,
     SurfaceRoutingRule,
 )
+from .llm_recon_planner import LlmReconPlanner
+from .paired_routing import PairedVulnerabilityRouter
 from .runtime import DisabledExecutionRuntime
 from .security import (
     DenyAllApprovalGate,
@@ -91,6 +93,8 @@ __all__ = [
     "RouterAdvisor",
     "RoutingRule",
     "RuleBasedVulnerabilityRouter",
+    "LlmReconPlanner",
+    "PairedVulnerabilityRouter",
     "SensitiveDataSanitizer",
     "SurfaceRoutingRule",
     "ValidationAgent",

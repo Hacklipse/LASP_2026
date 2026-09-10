@@ -17,3 +17,4 @@ graphify-out/
 PR_BODY.md
 CLAUDE.md
 CLAUDE.md.bak
+/artifacts/*.jsonl

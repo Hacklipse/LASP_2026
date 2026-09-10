@@ -44,6 +44,9 @@ from hacklipse.adapters.routing import (
     RoutingRule,
     SurfaceRoutingRule,
 )
+from hacklipse.adapters.routing_audit import AuditedVulnerabilityRouter, RoutingAuditSink
+from hacklipse.adapters.paired_routing import PairedVulnerabilityRouter
+from hacklipse.adapters.llm_recon_planner import LlmReconPlanner, ReconPlanner
 from hacklipse.adapters.recon import DEFAULT_MAX_PAGES
 from hacklipse.application import (
     KnowledgeContextProvider,
@@ -303,7 +306,6 @@ def build_local_application(
 
 # 실제로 구현된 Analysis Agent. Router가 이 목록 밖 Candidate를 만들면 Dispatcher가
 # AgentUnavailable로 Run 전체를 실패시키므로, 배선과 라우팅 규칙이 같은 목록을 봐야 한다.
-# Analyzer를 추가하면 여기 한 줄만 늘리면 Router가 따라온다.
 IMPLEMENTED_ANALYZERS = (
     "access_control_analyzer",
     "xss_analyzer",
@@ -313,23 +315,46 @@ IMPLEMENTED_ANALYZERS = (
     "ssti_analyzer",
 )
 
-
 def standard_router(
     vulnerability_types: Collection[str] | None = None,
     *,
+    mode: str = "heuristic",
     llm_client: LlmClient | None = None,
-    router_advisor: bool = False,
-) -> RuleBasedVulnerabilityRouter:
+    audit_log: RoutingAuditSink | None = None,
+    audit_metadata: Mapping[str, str] | None = None,
+    review_policy: str = "weak",
+    compare: bool = False,
+    router_advisor: bool | None = None,
+) -> VulnerabilityRouter:
     """구현된 Analyzer로만 라우팅하는 Router를 만든다.
 
     미구현 취약점 유형을 조용히 건너뛰는 것이 아니라 애초에 Candidate를 만들지 않는다.
     "검사했는데 없었다"와 "검사하지 않았다"를 결과에서 구분할 수 있어야 한다.
 
-    ``router_advisor``는 Analysis 프로필과 독립적인 축이다. Analysis를 휴리스틱으로 두고
-    Router만 LLM으로 돌리면 라우팅 판단의 기여를 단독으로 분리할 수 있다. 그래서
-    ``register_standard_agents()``의 프로필 전환과 묶지 않는다.
+    ``mode``는 Analysis 프로필과 독립적인 축이다. ``router_advisor=True``는 팀원 PR의
+    기존 호출자를 위한 ``mode="hybrid"`` 호환 별칭이다.
     """
 
+    if router_advisor:
+        mode = "hybrid"
+    if mode not in {"heuristic", "hybrid"}:
+        raise ValueError("router mode must be heuristic or hybrid")
+    if (mode == "hybrid" or compare) and llm_client is None:
+        raise LlmCredentialsMissing("hybrid router requires an explicit LlmClient")
+    if review_policy not in {"weak", "ambiguous"}:
+        raise ValueError("review policy must be weak or ambiguous")
+    if compare:
+        return PairedVulnerabilityRouter(
+            primary=mode,
+            heuristic=standard_router(
+                vulnerability_types, mode="heuristic", audit_log=audit_log,
+                audit_metadata=audit_metadata, review_policy=review_policy,
+            ),
+            hybrid=standard_router(
+                vulnerability_types, mode="hybrid", llm_client=llm_client,
+                audit_log=audit_log, audit_metadata=audit_metadata, review_policy=review_policy,
+            ),
+        )
     selected_types = (
         frozenset(vulnerability_types) if vulnerability_types is not None else None
     )
@@ -345,16 +370,26 @@ def standard_router(
         if rule.agent_type in IMPLEMENTED_ANALYZERS
         and (selected_types is None or rule.vulnerability_type in selected_types)
     )
-    return RuleBasedVulnerabilityRouter(
+    router: VulnerabilityRouter = RuleBasedVulnerabilityRouter(
         rules=rules,
         surface_rules=surface_rules,
         advisor=_build_router_advisor(
             rules=rules,
             surface_rules=surface_rules,
             llm_client=llm_client,
-            requested=router_advisor,
+            requested=mode == "hybrid",
         ),
     )
+    if audit_log is not None:
+        router = AuditedVulnerabilityRouter(
+            router, mode=mode, audit_log=audit_log,
+            metadata=dict(
+                audit_metadata or {},
+                vulnerability_types="|".join(sorted(selected_types)) if selected_types is not None else "*",
+                router_review=review_policy,
+            ),
+        )
+    return router
 
 
 def _build_router_advisor(
@@ -405,6 +440,7 @@ def register_standard_agents(
     app: LocalApplication,
     *,
     llm_client: LlmClient | None = None,
+    recon_planner: ReconPlanner | None = None,
     recon_max_pages: int = DEFAULT_MAX_PAGES,
     recon_seed_urls: tuple[str, ...] = (),
     actor_object_id: str | None = None,
@@ -425,6 +461,7 @@ def register_standard_agents(
             surface_store=app.stores.surfaces,
             max_pages=recon_max_pages,
             seed_urls=recon_seed_urls,
+            planner=recon_planner,
         ),
         allowed_tools=("http_get",),
     )
@@ -548,3 +585,16 @@ def register_standard_agents(
         ),
     )
     return profile
+
+
+def standard_recon_planner(
+    *, mode: str = "heuristic", llm_client: LlmClient | None = None,
+) -> ReconPlanner | None:
+    """Analysis/Router 프로필과 독립적으로 Recon 판단 모듈을 선택한다."""
+    if mode == "heuristic":
+        return None
+    if mode != "hybrid":
+        raise ValueError("recon mode must be heuristic or hybrid")
+    if llm_client is None:
+        raise LlmCredentialsMissing("hybrid recon requires an explicit LlmClient")
+    return LlmReconPlanner(llm_client=llm_client)
