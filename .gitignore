@@ -13,4 +13,6 @@ dist/
 graphify-out/
 .DS_Store
 .venv/
-
+PR_BODY.md
+CLAUDE.md
+CLAUDE.md.bak
