@@ -10,7 +10,7 @@ import io
 import unittest
 
 from hacklipse.domain import ProgressEvent, ProgressEventKind
-from scripts.progress_view import RunProgressView
+from scripts.progress_view import RunProgressView, _display_width, _fit_terminal_line
 
 
 def _view(tty: bool) -> tuple[RunProgressView, io.StringIO]:
@@ -87,6 +87,43 @@ class ProgressFoldingTests(unittest.TestCase):
             "[진행] Recon LLM 호출 실패 → 결정적 fallback으로 계속 진행",
             stream.getvalue(),
         )
+
+    def test_knowledge_context_count_is_visible(self) -> None:
+        view, stream = _view(tty=False)
+        emit = _Emitter(view)
+
+        emit(
+            ProgressEventKind.KNOWLEDGE_RETRIEVED,
+            vulnerability_type="SQLi",
+            detail="knowledge_context:2",
+        )
+
+        self.assertIn("SQLi Knowledge 2건 검색", stream.getvalue())
+
+    def test_empty_knowledge_context_is_quiet(self) -> None:
+        view, stream = _view(tty=False)
+        emit = _Emitter(view)
+
+        emit(
+            ProgressEventKind.KNOWLEDGE_RETRIEVED,
+            vulnerability_type="SQLi",
+            detail="knowledge_context:0",
+        )
+
+        self.assertEqual(stream.getvalue(), "")
+
+    def test_knowledge_search_failure_is_visible_and_non_blocking(self) -> None:
+        view, stream = _view(tty=False)
+        emit = _Emitter(view)
+
+        emit(
+            ProgressEventKind.KNOWLEDGE_RETRIEVAL_FAILED,
+            vulnerability_type="XSS",
+            detail="knowledge_context:unavailable",
+        )
+
+        self.assertIn("Knowledge 조회 실패", stream.getvalue())
+        self.assertIn("기존 Analysis로 계속 진행", stream.getvalue())
 
     def test_validation_verdict_completes_the_type(self) -> None:
         view, stream = _view(tty=False)
@@ -177,6 +214,35 @@ class TerminalCompatibilityTests(unittest.TestCase):
         redrawn = stream.getvalue()[len(first) :]
         self.assertTrue(redrawn.startswith("\033["))
         self.assertIn("A\033[J", redrawn)
+
+    def test_tty_line_is_clipped_before_terminal_auto_wrap(self) -> None:
+        line = (
+            "  ✓ Path Traversal 완료 (Finding 1) 3.5초 · Candidate 2 "
+            "· Knowledge 2건 검색"
+        )
+
+        fitted = _fit_terminal_line(line, 48)
+
+        self.assertLessEqual(_display_width(fitted), 48)
+        self.assertTrue(fitted.endswith("…"))
+
+    def test_knowledge_status_uses_its_own_rendered_line(self) -> None:
+        view, _ = _view(tty=True)
+        emit = _Emitter(view)
+        emit(
+            ProgressEventKind.CANDIDATE_QUEUED,
+            phase="route",
+            vulnerability_type="Path Traversal",
+        )
+        emit(
+            ProgressEventKind.KNOWLEDGE_RETRIEVED,
+            vulnerability_type="Path Traversal",
+            detail="knowledge_context:2",
+        )
+
+        lines = view._render()
+
+        self.assertIn("      Knowledge 2건 검색", lines)
 
     def test_evidence_collection_is_quiet_in_the_append_log(self) -> None:
         """증적 수집은 요청마다 발생한다. 로그를 뒤덮으면 흐름이 안 보인다."""

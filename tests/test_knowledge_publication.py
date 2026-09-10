@@ -1,8 +1,7 @@
 """확정 Finding이 Knowledge Plane으로 발행되는 배선의 계약 테스트.
 
-Phase 9-A 는 저장 Core 만 만들었고 어떤 Run 도 KnowledgeBase 를 부르지 않았다.
-여기서 고정하는 것은 세 가지다 - 확정 Finding 만 발행된다, KnowledgeBase 를 주지
-않으면 아무 일도 일어나지 않는다, 그리고 발행이 실패해도 완주한 Run 을 되돌리지 않는다.
+발행·재시도뿐 아니라 다음 Run의 Analysis가 과거 Case를 별도 참고 정보로 받되 현재
+Evidence나 Validation proof로 섞지 않는 경계도 함께 고정한다.
 """
 
 from __future__ import annotations
@@ -203,6 +202,19 @@ class _FlakyKnowledgeBase:
         return self._base.search(query)
 
 
+class _SearchFailingKnowledgeBase:
+    """검색 실패는 격리하되 Run 완료 뒤 발행은 가능한 대역."""
+
+    def __init__(self) -> None:
+        self._base = InMemoryKnowledgeBase()
+
+    def publish(self, case: KnowledgeCase) -> None:
+        self._base.publish(case)
+
+    def search(self, query: KnowledgeQuery):
+        raise RuntimeError("knowledge search is unavailable")
+
+
 def _application(knowledge_base=None):
     app = build_local_application(
         {},
@@ -272,6 +284,42 @@ class KnowledgePublicationTests(unittest.TestCase):
 
         self.assertIs(run.phase, RunPhase.DONE)
         self.assertEqual(len(app.stores.findings.list_by_run(run.run_id)), 1)
+        analysis_tasks = tuple(
+            item
+            for item in app.stores.tasks.list_by_run(run.run_id)
+            if item.envelope.agent_type == "xss_analyzer"
+        )
+        self.assertTrue(analysis_tasks)
+        self.assertTrue(all(not item.envelope.knowledge_hints for item in analysis_tasks))
+
+    def test_enabling_prior_knowledge_does_not_change_scan_outcome(self) -> None:
+        """과거 Case는 선택 참고일 뿐 현재 Run의 결과나 예산을 대신하지 않는다."""
+
+        knowledge = InMemoryKnowledgeBase()
+        _application(knowledge).orchestrator.start(_request())
+        enabled_app = _application(knowledge)
+        disabled_app = _application(None)
+
+        enabled = enabled_app.orchestrator.start(_request())
+        disabled = disabled_app.orchestrator.start(_request())
+
+        def outcome(app, run):
+            candidates = app.stores.candidates.list_by_run(run.run_id)
+            findings = app.stores.findings.list_by_run(run.run_id)
+            evidence = app.stores.evidence.list_by_run(run.run_id)
+            return (
+                run.phase,
+                tuple(
+                    sorted((item.vulnerability_type, item.status.value) for item in candidates)
+                ),
+                tuple(
+                    sorted((item.vulnerability_type, item.status) for item in findings)
+                ),
+                tuple(sorted(item.evidence_type for item in evidence)),
+                app.budget_manager.remaining(run.run_id),
+            )
+
+        self.assertEqual(outcome(enabled_app, enabled), outcome(disabled_app, disabled))
 
     def test_publication_failure_does_not_revert_a_completed_run(self) -> None:
         failing = _FailingKnowledgeBase()
@@ -325,7 +373,6 @@ class KnowledgePublicationTests(unittest.TestCase):
             if event.kind is ProgressEventKind.RUN_COMPLETED
         ]
         self.assertIsNone(completed[0].detail)
-
 
     def test_resume_publishes_what_an_interrupted_run_missed(self) -> None:
         """보고서만 남기고 죽은 Run 을 재개하면 Knowledge 가 이어서 쌓여야 한다.
@@ -391,6 +438,84 @@ class KnowledgePublicationTests(unittest.TestCase):
         self.assertEqual(len(cases), 1)
         self.assertIn(f"run:{first.run_id}", cases[0].provenance_refs)
         self.assertIn(f"run:{second.run_id}", cases[0].provenance_refs)
+
+    def test_next_run_analysis_receives_prior_case_but_validation_does_not(self) -> None:
+        knowledge = InMemoryKnowledgeBase()
+        first_app = _application(knowledge)
+        first = first_app.orchestrator.start(_request())
+        case = knowledge.search(KnowledgeQuery(category="XSS", text=""))[0]
+
+        second_app = _application(knowledge)
+        second = second_app.orchestrator.start(_request())
+
+        analysis_tasks = tuple(
+            item.envelope
+            for item in second_app.stores.tasks.list_by_run(second.run_id)
+            if item.envelope.agent_type == "xss_analyzer"
+        )
+        self.assertEqual(len(analysis_tasks), 1)
+        self.assertEqual(
+            tuple(hint.case_id for hint in analysis_tasks[0].knowledge_hints),
+            (case.case_id,),
+        )
+        self.assertFalse(hasattr(analysis_tasks[0].knowledge_hints[0], "provenance_refs"))
+
+        validation_tasks = tuple(
+            item.envelope
+            for item in second_app.stores.tasks.list_by_run(second.run_id)
+            if item.envelope.agent_type == "validation"
+        )
+        self.assertTrue(validation_tasks)
+        self.assertTrue(all(not task.knowledge_hints for task in validation_tasks))
+
+        evidence_blob = repr(second_app.stores.evidence.list_by_run(second.run_id))
+        self.assertNotIn(case.case_id, evidence_blob)
+        self.assertNotIn(f"run:{first.run_id}", evidence_blob)
+
+        retrieved = tuple(
+            event
+            for event in second_app.progress_log.list_by_run(second.run_id)
+            if event.kind is ProgressEventKind.KNOWLEDGE_RETRIEVED
+        )
+        self.assertEqual(tuple(event.detail for event in retrieved), ("knowledge_context:1",))
+
+    def test_knowledge_without_current_candidate_cannot_create_a_finding(self) -> None:
+        knowledge = InMemoryKnowledgeBase()
+        seeded = _application(knowledge)
+        seeded.orchestrator.start(_request())
+
+        app = build_local_application(
+            {},
+            runtime=_LocalRuntime(),
+            router=RuleBasedVulnerabilityRouter(rules=(), surface_rules=()),
+            knowledge_base=knowledge,
+        )
+        app.dispatcher.register(
+            "recon",
+            _ReconFixture(app.stores.evidence, app.stores.surfaces),
+            allowed_tools=("http_get",),
+        )
+
+        run = app.orchestrator.start(_request())
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(run.candidate_ids, ())
+        self.assertEqual(app.stores.findings.list_by_run(run.run_id), ())
+
+    def test_knowledge_search_failure_falls_back_to_normal_analysis(self) -> None:
+        app = _application(_SearchFailingKnowledgeBase())
+
+        run = app.orchestrator.start(_request())
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(len(app.stores.findings.list_by_run(run.run_id)), 1)
+        failed = tuple(
+            event
+            for event in app.progress_log.list_by_run(run.run_id)
+            if event.kind is ProgressEventKind.KNOWLEDGE_RETRIEVAL_FAILED
+        )
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0].detail, "knowledge_context:unavailable")
 
 
 class KnowledgeProgressDisplayTests(unittest.TestCase):

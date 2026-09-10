@@ -420,7 +420,7 @@ class LlmPathTraversalAnalyzerTests(unittest.TestCase):
 
         self.assertEqual(len(llm.requests), 1)
 
-    def test_empty_selection_spends_no_http_requests(self) -> None:
+    def test_empty_selection_spends_no_http_requests_for_weak_name_hint(self) -> None:
         agent, _, llm, runtime, task = _fixture(
             {"parameters": [], "reason": "no file input"}
         )
@@ -477,6 +477,27 @@ class LlmPathTraversalAnalyzerTests(unittest.TestCase):
         )
         self.assertEqual(signal.observation["parameter"], "layout")
         self.assertEqual(signal.observation["selection_source"], "llm")
+
+    def test_empty_llm_response_cannot_drop_bounded_layout_recon_signal(self) -> None:
+        agent, app, llm, runtime, task = _post_form_fixture()
+        llm.payload = {"parameters": [], "reason": "looks presentation-only"}
+
+        requested = agent.handle(task)
+        result = agent.handle(_collect(requested, app, task))
+
+        self.assertIs(result.status, AgentResultStatus.COMPLETED)
+        self.assertIn(
+            "Current-run structured Recon signals (the caller will retain these): layout",
+            llm.requests[0].messages[0].content,
+        )
+        self.assertEqual(len(runtime.requests), 2)
+        signal = next(
+            item
+            for item in app.stores.evidence.list_by_run(_RUN_ID)
+            if item.observation.get("type") == PATH_TRAVERSAL_OBSERVATION
+        )
+        self.assertEqual(signal.observation["parameter"], "layout")
+        self.assertEqual(signal.observation["selection_source"], "recon")
 
 
 if __name__ == "__main__":

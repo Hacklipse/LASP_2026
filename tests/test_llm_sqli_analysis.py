@@ -19,6 +19,7 @@ from hacklipse.domain import (
     ExecutionRequest,
     ExecutionResult,
     HttpRequestKind,
+    KnowledgeHint,
     Run,
     RunScope,
     Surface,
@@ -152,6 +153,39 @@ def _signals(app):
 
 
 class LlmSqliAnalyzerTests(unittest.TestCase):
+    def test_prior_knowledge_is_advisory_prompt_context_not_evidence(self) -> None:
+        hint = KnowledgeHint(
+            case_id="case-prior-sqli",
+            category="SQLi",
+            summary="Confirmed generalized SQL parser reachability on a search surface.",
+            metadata={"parameter_names": "id", "surface_method": "GET"},
+        )
+        copied_reason = f"use {hint.case_id}: {hint.summary}"
+        agent, app, llm, _, task = _fixture(
+            payload={"parameters": ["id"], "reason": copied_reason}
+        )
+        task = replace(task, knowledge_hints=(hint,))
+
+        agent.handle(task)
+
+        prompt = llm.requests[0].messages[0].content
+        self.assertIn(hint.case_id, prompt)
+        self.assertIn(hint.summary, prompt)
+        self.assertIn("not current evidence", prompt)
+        self.assertIn("not evidence about the current target", llm.requests[0].system)
+
+        plan = next(
+            item
+            for item in app.stores.evidence.list_by_run(_RUN_ID)
+            if item.observation.get("type") == "sqli_probe_plan"
+        )
+        self.assertEqual(
+            plan.observation["reason"],
+            "selected from offered surface coordinates with generalized prior-case context",
+        )
+        self.assertNotIn(hint.case_id, repr(plan.observation))
+        self.assertNotIn(hint.summary, repr(plan.observation))
+
     def test_llm_selects_names_but_python_owns_request_values(self) -> None:
         agent, app, llm, runtime, task = _fixture(
             payload={"parameters": ["id"], "reason": "identifier lookup"}
@@ -162,6 +196,8 @@ class LlmSqliAnalyzerTests(unittest.TestCase):
         _collect(requested, app, task)
 
         self.assertEqual(len(llm.requests), 1)
+        self.assertNotIn("prior-case", llm.requests[0].system)
+        self.assertNotIn("prior-case", llm.requests[0].messages[0].content)
         self.assertEqual(
             [request.request_kind for request in runtime.requests],
             [HttpRequestKind.CONTROL, HttpRequestKind.PROBE],

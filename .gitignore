@@ -11,6 +11,7 @@ dist/
 .claude/
 .serena/
 graphify-out/
+/knowledge/
 .DS_Store
 .venv/
 PR_BODY.md

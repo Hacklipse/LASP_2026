@@ -454,7 +454,8 @@ class EvidenceRequest:
 class TaskEnvelope:
     """Orchestrator가 Agent/Worker에 전달하는 표준 작업 메시지.
 
-    Evidence 원문이나 인증정보 원문 대신 ID와 참조만 전달한다.
+    Evidence 원문이나 인증정보 원문 대신 ID와 참조만 전달한다. 과거 Knowledge는
+    민감정보와 provenance를 제거한 별도 Hint로만 Analysis에 전달한다.
     """
 
     task_id: str
@@ -464,6 +465,9 @@ class TaskEnvelope:
     surface_id: str | None = None
     candidate_id: str | None = None
     evidence_ids: tuple[str, ...] = ()
+    # 과거 Knowledge는 현재 Run의 Evidence가 아니다. Analysis에 참고 정보로만
+    # 전달하고 Validation·수집 Task에는 넣지 않는다.
+    knowledge_hints: tuple[KnowledgeHint, ...] = ()
     finding_ids: tuple[str, ...] = ()
     allowed_tools: tuple[str, ...] = ()
     request_budget: int = 0
@@ -479,6 +483,11 @@ class TaskEnvelope:
             raise DomainInvariantError("task request budget cannot be negative")
         if self.timeout_seconds <= 0:
             raise DomainInvariantError("task timeout must be positive")
+        if len(self.knowledge_hints) > 10:
+            raise DomainInvariantError("task knowledge context cannot exceed 10 hints")
+        case_ids = tuple(item.case_id for item in self.knowledge_hints)
+        if len(case_ids) != len(set(case_ids)):
+            raise DomainInvariantError("task knowledge hints cannot be duplicated")
 
 
 @dataclass(frozen=True, slots=True)
@@ -899,6 +908,8 @@ class ProgressEventKind(str, Enum):
     RUN_STARTED = "run_started"
     PHASE_CHANGED = "phase_changed"
     CANDIDATE_QUEUED = "candidate_queued"
+    KNOWLEDGE_RETRIEVED = "knowledge_retrieved"
+    KNOWLEDGE_RETRIEVAL_FAILED = "knowledge_retrieval_failed"
     AGENT_STARTED = "agent_started"
     AGENT_COMPLETED = "agent_completed"
     EVIDENCE_COLLECTED = "evidence_collected"
@@ -1016,3 +1027,28 @@ class KnowledgeCase:
     summary: str
     provenance_refs: tuple[str, ...]
     metadata: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeHint:
+    """Analysis에만 전달하는 provenance 없는 일반화 Knowledge 참고 정보."""
+
+    case_id: str
+    category: str
+    summary: str
+    metadata: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}", self.case_id):
+            raise DomainInvariantError("knowledge hint case_id has an invalid format")
+        if not self.category.strip() or len(self.category) > 80:
+            raise DomainInvariantError("knowledge hint category must be non-blank and bounded")
+        if not self.summary.strip() or len(self.summary) > 500:
+            raise DomainInvariantError("knowledge hint summary must be non-blank and bounded")
+        if len(self.metadata) > 16:
+            raise DomainInvariantError("knowledge hint metadata has too many entries")
+        for key, value in self.metadata.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise DomainInvariantError("knowledge hint metadata must contain strings")
+            if not key or len(key) > 80 or len(value) > 500:
+                raise DomainInvariantError("knowledge hint metadata is not bounded")

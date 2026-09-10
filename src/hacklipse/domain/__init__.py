@@ -1,6 +1,7 @@
 """인프라에 의존하지 않는 핵심 도메인 타입과 불변식을 공개한다."""
 
 from .errors import DomainInvariantError
+from .knowledge import generalize_parameter_names, generalize_surface_path
 from .models import (
     AgentResult,
     AgentResultStatus,
@@ -19,6 +20,7 @@ from .models import (
     HttpRequestKind,
     HttpRequestSpec,
     KnowledgeCase,
+    KnowledgeHint,
     KnowledgeQuery,
     ReportArtifact,
     RouteDecision,
@@ -63,6 +65,7 @@ __all__ = [
     "HttpRequestKind",
     "HttpRequestSpec",
     "KnowledgeCase",
+    "KnowledgeHint",
     "KnowledgeQuery",
     "ReportArtifact",
     "RouteDecision",
@@ -84,6 +87,8 @@ __all__ = [
     "ProgressSnapshot",
     "UncheckedCandidate",
     "credential_for_vulnerability",
+    "generalize_parameter_names",
+    "generalize_surface_path",
     "is_path_traversal_safe_probe_value",
     "is_path_traversal_safe_form_probe_value",
 ]

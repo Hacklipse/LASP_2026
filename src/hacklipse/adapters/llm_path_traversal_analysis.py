@@ -16,11 +16,17 @@ from .path_traversal_analysis import (
     PATH_TRAVERSAL_FORM_PROBE_PATH,
     PATH_TRAVERSAL_PROBE_PATH,
     PATH_TRAVERSAL_TOOL,
+    bounded_render_parameters_from_evidence,
     build_path_traversal_requests,
     handle_path_traversal_bypass,
     is_restricted_file_surface,
     path_parameter_candidates,
     record_path_traversal_observations,
+)
+from .knowledge_prompt import (
+    knowledge_system_prompt,
+    render_knowledge_hints,
+    safe_selection_reason,
 )
 from .probing import matching_evidence, resolve_analysis_task, validate_probe_selection
 
@@ -89,16 +95,21 @@ class LlmPathTraversalAnalyzer:
                 created_by=LLM_PATH_TRAVERSAL_ANALYZER,
                 id_factory=self._id_factory,
             )
+        recon_parameters = bounded_render_parameters_from_evidence(evidence, surface)
         parameters = path_parameter_candidates(evidence, surface, parameters)
         stored = _stored_plan(evidence, surface.surface_id)
         new_ids: list[str] = []
         if stored is None:
-            plan, plan_id = self._plan(task, surface, parameters)
+            plan, plan_id = self._plan(
+                task, surface, parameters, recon_parameters=recon_parameters
+            )
             new_ids.append(plan_id)
         else:
             plan, plan_id = stored
 
-        selected = tuple(plan["parameters"])
+        # 현재 Run의 구조화 Recon 신호는 과거 Knowledge나 확률적인 LLM 판단보다
+        # 우선한다. 저장된 예전 plan을 재개해도 이 좌표가 다시 빠지지 않게 합친다.
+        selected = tuple(dict.fromkeys((*recon_parameters, *plan["parameters"])))
         if not selected:
             return AgentResult(
                 task_id=task.task_id,
@@ -148,7 +159,7 @@ class LlmPathTraversalAnalyzer:
                 id_factory=self._id_factory,
                 extra={
                     "plan_evidence_id": plan_id,
-                    "selection_source": "llm",
+                    "selection_source": _selection_source(plan, recon_parameters),
                     "selection_reason": str(plan["reason"]),
                 },
             )
@@ -161,7 +172,12 @@ class LlmPathTraversalAnalyzer:
         )
 
     def _plan(
-        self, task: TaskEnvelope, surface: Surface, parameters: tuple[str, ...]
+        self,
+        task: TaskEnvelope,
+        surface: Surface,
+        parameters: tuple[str, ...],
+        *,
+        recon_parameters: tuple[str, ...],
     ) -> tuple[dict[str, object], str]:
         response = self._llm.complete(
             LlmRequest(
@@ -172,12 +188,15 @@ class LlmPathTraversalAnalyzer:
                             f"Surface path: {urlsplit(surface.url).path or '/'}\n"
                             f"Method: {surface.method.upper()}\n"
                             f"Parameters: {', '.join(parameters)}\n"
+                            "Current-run structured Recon signals (the caller will "
+                            f"retain these): {', '.join(recon_parameters) or '(none)'}\n"
                             f"Request budget for this analysis: {task.request_budget}\n"
                             "Select parameters that may control a server-side file path."
+                            + render_knowledge_hints(task.knowledge_hints)
                         ),
                     ),
                 ),
-                system=_PLAN_SYSTEM,
+                system=knowledge_system_prompt(_PLAN_SYSTEM, task.knowledge_hints),
                 response_schema=_PLAN_SCHEMA,
                 timeout_seconds=task.timeout_seconds,
             )
@@ -191,9 +210,18 @@ class LlmPathTraversalAnalyzer:
         reason = response.payload.get("reason")
         if not isinstance(reason, str):
             raise AgentContractError("llm path traversal plan reason must be a string")
+        llm_selected = selected
+        selected = tuple(dict.fromkeys((*recon_parameters, *llm_selected)))
+        if recon_parameters:
+            # 현재 Evidence에 남길 설명은 현재 Run의 구조화 신호만 가리킨다.
+            reason = "selected from current-run structured Recon signals"
+        else:
+            reason = safe_selection_reason(reason, task.knowledge_hints)
         plan: dict[str, object] = {
             "type": _PLAN_OBSERVATION,
             "parameters": list(selected),
+            "recon_parameters": list(recon_parameters),
+            "llm_parameters": list(llm_selected),
             "reason": reason,
             "offered_parameters": list(parameters),
             "dropped_for_budget": list(dropped),
@@ -230,8 +258,30 @@ def _stored_plan(
             parameters = item.observation.get("parameters")
             reason = item.observation.get("reason")
             if isinstance(parameters, list) and isinstance(reason, str):
-                return (
-                    {"parameters": [str(name) for name in parameters], "reason": reason},
-                    item.evidence_id,
-                )
+                plan: dict[str, object] = {
+                    "parameters": [str(name) for name in parameters],
+                    "reason": reason,
+                }
+                for key in ("recon_parameters", "llm_parameters"):
+                    names = item.observation.get(key)
+                    if isinstance(names, list):
+                        plan[key] = [str(name) for name in names]
+                return plan, item.evidence_id
     return None
+
+
+def _selection_source(
+    plan: dict[str, object], recon_parameters: tuple[str, ...]
+) -> str:
+    raw = plan.get("llm_parameters", plan.get("parameters", ()))
+    llm_parameters = {
+        item for item in raw if isinstance(item, str)
+    } if isinstance(raw, (list, tuple)) else set()
+    selected = set(recon_parameters).union(
+        item for item in plan.get("parameters", ()) if isinstance(item, str)
+    )
+    if selected and selected.issubset(llm_parameters):
+        return "llm"
+    if llm_parameters:
+        return "recon+llm"
+    return "recon"

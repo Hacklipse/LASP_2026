@@ -44,6 +44,11 @@ from .probing import (
     response_body,
     validate_probe_selection,
 )
+from .knowledge_prompt import (
+    knowledge_system_prompt,
+    render_knowledge_hints,
+    safe_selection_reason,
+)
 
 LLM_XSS_ANALYZER = "llm_xss_analyzer"
 _PLAN_OBSERVATION = "xss_probe_plan"
@@ -221,10 +226,11 @@ class LlmXssAnalyzer:
                             f"Parameters: {', '.join(parameters)}\n"
                             f"Request budget for this analysis: {task.request_budget}\n"
                             "Select the parameters worth probing for reflection."
+                            + render_knowledge_hints(task.knowledge_hints)
                         ),
                     ),
                 ),
-                system=_PLAN_SYSTEM,
+                system=knowledge_system_prompt(_PLAN_SYSTEM, task.knowledge_hints),
                 response_schema=_PLAN_SCHEMA,
                 timeout_seconds=task.timeout_seconds,
             )
@@ -235,11 +241,14 @@ class LlmXssAnalyzer:
             task.request_budget,
             analyzer_name="llm xss analyzer",
         )
+        reason = safe_selection_reason(
+            str(response.payload.get("reason", "")), task.knowledge_hints
+        )
         plan: dict[str, object] = {
             "type": _PLAN_OBSERVATION,
             "parameters": list(selected),
             "marker": probe_marker(self._id_factory()),
-            "reason": str(response.payload.get("reason", "")),
+            "reason": reason,
             "offered_parameters": list(parameters),
             # 예산 때문에 잘라낸 대상을 남긴다. 조용한 축소는 "전부 봤다"로 읽힌다.
             "dropped_for_budget": list(dropped),

@@ -16,7 +16,10 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import sys
+import unicodedata
 from dataclasses import dataclass
 
 from hacklipse.domain import ProgressEvent, ProgressEventKind
@@ -53,6 +56,8 @@ class _TypeState:
     unchecked: int = 0
     surface: str | None = None
     note: str | None = None
+    knowledge_hints: int = 0
+    knowledge_failed: bool = False
     started_ms: int = 0
     spent_ms: int = 0
 
@@ -97,11 +102,18 @@ class RunProgressView:
     여기서는 다시 거르지 않는다. 거꾸로 말하면 이 화면의 안전성은 이벤트 계층이 책임진다.
     """
 
-    def __init__(self, *, stream=None, tty: bool | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        stream=None,
+        tty: bool | None = None,
+        columns: int | None = None,
+    ) -> None:
         self._stream = stream if stream is not None else sys.stdout
         if tty is None:
             tty = bool(getattr(self._stream, "isatty", lambda: False)())
         self._tty = tty
+        self._columns = columns
         self._lines_drawn = 0
         self._phase = "init"
         self._types: dict[str, _TypeState] = {}
@@ -164,6 +176,10 @@ class RunProgressView:
 
         if kind is ProgressEventKind.CANDIDATE_QUEUED:
             state.candidates += 1
+        elif kind is ProgressEventKind.KNOWLEDGE_RETRIEVED:
+            state.knowledge_hints += _knowledge_hint_count(event.detail)
+        elif kind is ProgressEventKind.KNOWLEDGE_RETRIEVAL_FAILED:
+            state.knowledge_failed = True
         elif kind is ProgressEventKind.AGENT_STARTED:
             state.running += 1
             state.started_ms = event.elapsed_ms
@@ -208,9 +224,13 @@ class RunProgressView:
         for name in sorted(self._types):
             state = self._types[name]
             lines.append(
-                f"  {state.mark()} {name:<9} {state.label():<40}"
-                f" Candidate {state.candidates}"
+                f"  {state.mark()} {name:<9} {state.label()}"
+                f" · Candidate {state.candidates}"
             )
+            if state.knowledge_failed:
+                lines.append("      Knowledge 조회 실패 → 기존 Analysis로 계속 진행")
+            elif state.knowledge_hints:
+                lines.append(f"      Knowledge {state.knowledge_hints}건 검색")
         validated = sum(item.validated for item in self._types.values())
         total = sum(item.candidates for item in self._types.values())
         findings = sum(item.findings for item in self._types.values())
@@ -236,6 +256,19 @@ class RunProgressView:
             and event.detail.startswith(_RECON_PLANNER_PREFIX)
         ):
             return _recon_planner_progress_line(event.detail)
+        if event.kind is ProgressEventKind.KNOWLEDGE_RETRIEVED:
+            count = _knowledge_hint_count(event.detail)
+            if count == 0:
+                return None
+            return (
+                f"[진행] {event.vulnerability_type or 'Analysis'} "
+                f"Knowledge {count}건 검색"
+            )
+        if event.kind is ProgressEventKind.KNOWLEDGE_RETRIEVAL_FAILED:
+            return (
+                f"[진행] {event.vulnerability_type or 'Analysis'} "
+                "Knowledge 조회 실패 → 기존 Analysis로 계속 진행"
+            )
         if event.kind in self._QUIET_KINDS:
             return None
         phase = _PHASE_LABELS.get(event.phase, event.phase)
@@ -264,6 +297,11 @@ class RunProgressView:
 
     def _draw(self) -> None:
         lines = self._render()
+        if self._tty:
+            # 터미널 자동 줄바꿈은 화면상 두 줄이지만 기존 구현은 한 줄로 세어 다음
+            # redraw에서 일부를 지우지 못했다. 한 칸을 여유로 두고 물리 폭 안에 맞춘다.
+            width = max(20, self._terminal_columns() - 1)
+            lines = [_fit_terminal_line(line, width) for line in lines]
         if self._tty and self._lines_drawn:
             # 앞서 그린 블록만 지운다. 그 위의 출력은 건드리지 않는다.
             self._stream.write(f"\033[{self._lines_drawn}A\033[J")
@@ -273,6 +311,14 @@ class RunProgressView:
         flush = getattr(self._stream, "flush", None)
         if flush:
             flush()
+
+    def _terminal_columns(self) -> int:
+        if self._columns is not None:
+            return self._columns
+        try:
+            return os.get_terminal_size(self._stream.fileno()).columns
+        except (AttributeError, OSError, ValueError):
+            return shutil.get_terminal_size(fallback=(100, 24)).columns
 
 
 def format_recon_planner_status(detail: str) -> str | None:
@@ -302,6 +348,8 @@ def _recon_planner_progress_line(detail: str) -> str:
     if status == "fallback 사용 (예산 없음)":
         return "[진행] Recon LLM 호출 생략 → 결정적 fallback으로 계속 진행"
     return "[진행] Recon LLM 호출 실패 → 결정적 fallback으로 계속 진행"
+
+
 def _knowledge_counts(detail: str | None) -> tuple[int, int] | None:
     """RUN_COMPLETED 의 detail 에서 발행 수치를 꺼낸다.
 
@@ -316,3 +364,43 @@ def _knowledge_counts(detail: str | None) -> tuple[int, int] | None:
         return int(done), int(total)
     except ValueError:
         return None
+
+
+def _knowledge_hint_count(detail: str | None) -> int:
+    prefix = "knowledge_context:"
+    if not detail or not detail.startswith(prefix):
+        return 0
+    try:
+        return max(0, int(detail[len(prefix) :]))
+    except ValueError:
+        return 0
+
+
+def _display_width(value: str) -> int:
+    width = 0
+    for character in value:
+        if unicodedata.combining(character):
+            continue
+        width += 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+    return width
+
+
+def _fit_terminal_line(value: str, width: int) -> str:
+    """ANSI redraw가 어긋나지 않도록 한 물리 터미널 줄 안에 자른다."""
+
+    if _display_width(value) <= width:
+        return value
+    target = max(1, width - 1)
+    used = 0
+    output: list[str] = []
+    for character in value:
+        character_width = (
+            0
+            if unicodedata.combining(character)
+            else 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+        )
+        if used + character_width > target:
+            break
+        output.append(character)
+        used += character_width
+    return "".join(output) + "…"

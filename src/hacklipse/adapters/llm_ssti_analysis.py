@@ -20,6 +20,11 @@ from .ssti_analysis import (
     record_ssti_observation,
     resolve_ssti_task,
 )
+from .knowledge_prompt import (
+    knowledge_system_prompt,
+    render_knowledge_hints,
+    safe_selection_reason,
+)
 
 LLM_SSTI_ANALYZER = "llm_ssti_analyzer"
 _PLAN_OBSERVATION = "ssti_probe_plan"
@@ -148,10 +153,11 @@ class LlmSstiAnalyzer:
                             f"Parameters: {', '.join(parameters)}\n"
                             f"Request budget for this analysis: {task.request_budget}\n"
                             "Select fields that may reach server-side template rendering."
+                            + render_knowledge_hints(task.knowledge_hints)
                         ),
                     ),
                 ),
-                system=_PLAN_SYSTEM,
+                system=knowledge_system_prompt(_PLAN_SYSTEM, task.knowledge_hints),
                 response_schema=_PLAN_SCHEMA,
                 timeout_seconds=task.timeout_seconds,
             )
@@ -165,6 +171,7 @@ class LlmSstiAnalyzer:
         reason = response.payload.get("reason")
         if not isinstance(reason, str):
             raise AgentContractError("llm SSTI plan reason must be a string")
+        reason = safe_selection_reason(reason, task.knowledge_hints)
         plan: dict[str, object] = {
             "type": _PLAN_OBSERVATION,
             "parameters": list(selected),

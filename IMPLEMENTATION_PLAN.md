@@ -7,21 +7,25 @@
 
 ## 1. 현재 상태
 
-> 갱신 기준: 2026-09-10, `dev/dmswls`의 `686491f`
+> 갱신 기준: 2026-09-10, `dev/dmswls` 현재 작업 트리 (`686491f` 이후 Phase 9-B 보강 포함)
 
 Phase 1~8의 공통 실행 기반과 **5종(XSS·SQLi·Path Traversal·Access Control·SSTI)
 Analysis/Validation Agent의 휴리스틱·LLM 구현**이 완료됐다. 모든 외부 실행은 중앙 수집
 경계에서 Scope·도구 권한·예산·감사·민감정보 제거를 적용하고, Finding은 취약점별 독립
 Validation proof가 만들어진 경우에만 승격된다. Recon에는 발견된 후보 안에서 후속 탐색
 순서와 범위를 고르는 선택적 LLM Planner가 연결됐고, 잘못된 응답이나 호출 실패 시 결정적
-fallback으로 계속 진행한다. 전체 테스트는 2026-09-10 기준 369개가 통과했다.
+fallback으로 계속 진행한다. 전체 테스트는 2026-09-10 기준 429개가 통과했다.
 
 Phase 9에서는 확정 Finding을 민감정보가 제거된 `KnowledgeCase`로 일반화하는 Factory와
 append-only InMemory·SQLite KnowledgeBase를 구현하고, Run 완료 후 자동 발행까지
 Orchestrator·Bootstrap·Juice Shop CLI에 연결했다. 완료된 Run의 정상 `resume(run_id)`가
 실패한 발행을 재시도하며, 같은 취약점 패턴은 하나의 Case로 유지하고 Run별 관측만 별도
-provenance로 누적한다. 남은 Phase 9-B 범위는 다음 Run에서 관련 사례를 검색해 Analysis 등에
-안전한 참고 정보로 전달하고 효과를 비교하는 소비 경로다.
+provenance로 누적한다. Phase 9-B에서는 다음 Run의 Candidate 유형과 Surface 구조로 관련
+Case를 검색해 provenance 없는 `KnowledgeHint`로 LLM Analysis에 전달한다. 힌트와 사용한
+Case ID는 Analysis Task 이력에만 남고 현재 Evidence나 Validation proof에는 들어가지 않는다.
+구조화 관련성 필터, 실제 신호 좌표의 append-only 보강, Path Traversal의 제한된 Recon
+좌표 우선과 터미널 폭 안전 진행 화면까지 실제 Juice Shop 실행으로 확인했다. 남은 범위는
+Knowledge 활성/비활성 반복 실행으로 실제 효과를 비교하는 평가다.
 
 ### 대상 결정 — Juice Shop 단일화, DVWA 폐기
 
@@ -51,6 +55,30 @@ DVWA 실행기(`scripts/run_dvwa_baseline.py`)와 쿼리 파라미터 탈출 흐
   임의로 만들면 열거가 되므로 `all` 모드에서 의도적으로 제외한다.
 - HTTP Runtime의 기본 응답 본문 상한은 2 MiB로 올라가 Juice Shop의 큰 `main.js`를
   읽을 수 있으며, 그 결과 `/rest/products/search?q=` Surface와 SQLi Finding이 복구됐다.
+
+#### 최신 Knowledge 재사용 실측 (2026-09-10, `dev/dmswls` 현재 작업 트리)
+
+동일한 `knowledge/knowledge.sqlite`를 사용한 Juice Shop `--vuln all --profile llm` 반복
+실행에서 과거 Case 검색, LLM Analysis 전달, 현재 Run의 독립 검증과 재발행까지 완주했다.
+
+```plain text
+  Surface    140개 (파라미터 11종)
+  Candidate  XSS 7개, SQLi 4개, Path Traversal 2개, SSTI 1개
+  Knowledge  Path Traversal 1건, SQLi 1건, SSTI 1건 검색
+  탐지 신호  로컬 파일 읽기 1개, DOM 반사 1개, SQL 오류 1개, 템플릿 산술 실행 1개
+  검증 완료  14 / 14
+  결과       CONFIRMED — Finding 4개 (Path Traversal 1, SQLi 1, SSTI 1, XSS 1)
+  발행       Knowledge 4 / 4
+  실행       45회 / 상한 80회
+  LLM        14회, 입력 2,592 token, 출력 734 token
+```
+
+진행 화면은 긴 Knowledge 문구가 있어도 이전 프레임을 누적하지 않았다. 이전 실행에서
+Gemini가 `/dataerasure`의 `layout`을 빈 선택으로 버리던 사례는 현재 Run의 제한된 Recon
+신호를 Python이 보존하도록 수정한 뒤 Local File Read와 Finding으로 다시 확인됐다.
+SQLite에는 취약점 유형별 canonical Case 4개만 남고 Path Traversal 신호 좌표 `layout`이
+별도 append-only 테이블에 보강됐다. 이는 기능 E2E 기록이며, Knowledge 비활성 대조군과의
+반복 성능·탐지율 비교 결과는 아니다.
 
 #### 최신 LLM 참고 실측 (2026-09-10, `feat/team_recon`, **`--profile llm`**)
 
@@ -94,7 +122,7 @@ Path Traversal Finding 6개는 독립 curl 기준과 대조해 확인했다. `/f
 | Validation Agent | ✅ 5종 독립 proof와 Finding 승격 구현 |
 | Pipeline LLM | ⚠️ Recon Planner와 5종 Analysis에 연결됨. Router·Orchestrator·Validation·Report는 결정적 구현 |
 | Juice Shop 단일 Run | ✅ XSS·SQLi·Path Traversal 동시 라우팅, SSTI는 인증 시 포함. Access Control은 전용 Run |
-| KnowledgeBase | ⚠️ Core·자동 발행·재시도·의미 기반 중복 방지 완료, 다음 Run의 검색·사용 전 |
+| KnowledgeBase | ✅ 발행·재시도·의미 dedupe·구조화 검색·Analysis 재사용을 실제 `all` Run에서 확인. 비교 평가 전 |
 | 안전 통제 | ✅ Phase 8 baseline 구현 완료 |
 
 ### 지금 존재하는 Agent
@@ -111,7 +139,7 @@ path_traversal_analyzer → heuristic / LLM 구현           ✅
 access_control_analyzer → heuristic / LLM 구현           ✅
 ssti_analyzer       → heuristic / LLM 구현              ✅
 validation          → 5종 독립 proof 구현               ✅
-knowledge           → 저장·검색 Core + Run 완료 자동 발행 ✅ 발행 / ⚠️ 소비 전
+knowledge           → 저장·발행 + 다음 Run LLM Analysis 참고 ✅
 ```
 
 `bootstrap.build_local_application()`은 공통 Worker를 조립하고,
@@ -166,6 +194,7 @@ flowchart TB
     RC & AN & VA -.->|"EvidenceRequest"| PG --> RT --> ES
     ORCH --> DP
     ORCH -->|"확정 Finding 일반화·발행"| KB
+    KB -->|"provenance 없는 KnowledgeHint"| AN
 
     style RC fill:#e0ffe0,stroke:#0a0
     style AN fill:#e0ffe0,stroke:#0a0
@@ -481,7 +510,8 @@ Policy·예산·마스킹·감사·Runtime 선택은 중앙 `RuntimeEvidenceColl
 
 ### Phase 9 — KnowledgeBase
 
-**상태: ✅ Phase 9-A Core와 자동 발행 구현 완료. ⚠️ Phase 9-B 검색·재사용 전.**
+**상태: ✅ Phase 9-A Core·자동 발행과 Phase 9-B 검색·Analysis 전달 구현 및 Juice Shop
+`all` E2E 확인 완료. ⚠️ Knowledge 활성/비활성 반복 비교 평가 전.**
 
 **구현된 것** `KnowledgeCaseFactory`가 확정 Finding과 같은 Run의 Candidate·Surface만 받아
 민감한 자유 텍스트를 복사하지 않는 일반화 사례를 만든다. `InMemoryKnowledgeBase`와
@@ -492,16 +522,43 @@ Run이 보고서를 만든 뒤 확정 Finding을 자동 발행하도록 Orchestr
 KnowledgeBase가 주입됐다. CLI는 `--knowledge-db`를 지정할 때 SQLite Knowledge Plane을
 활성화하고 완료 화면에 `Knowledge <성공>/<전체>`와 실패 건수를 표시한다. 일시적 발행
 실패가 있어도 Run은 `DONE`을 유지하며 정상 `resume(run_id)`가 후처리를 다시 실행한다.
+CLI에 `knowledge.sqlite`처럼 파일명만 주면 본 DB와 WAL/SHM sidecar를
+`knowledge/knowledge.sqlite*` 아래에 모으고, 명시적인 상위 경로가 있으면 그대로 사용한다.
+`knowledge/`는 실행 산출물이므로 Git 추적에서 제외한다.
 
 Case ID는 Run·Finding·Validation ID가 아니라 일반화된 category·summary·metadata로
 결정한다. 같은 패턴을 여러 Run에서 확인해도 canonical Case는 하나이며, 각 Run의 독립적인
 관측은 `knowledge_case_observations`에 provenance로 누적된다. 동일 관측 재발행과 동시 최초
-발행도 중복 Case를 만들지 않는다.
+발행도 중복 Case를 만들지 않는다. 현재 Run의 고정 probe가 실제 신호를 만든 안전한
+파라미터 이름은 Case 정체성과 분리된 `knowledge_case_signal_parameters`에 append-only로
+보강한다. 따라서 기존 Case ID를 바꾸거나 중복 Case를 만들지 않는다.
 
-**남은 것** 새 Run에서 관련 사례를 검색해 Router·Analysis 등에 제한된 참고 정보로
-전달하고, 어떤 Case를 어디서 사용했는지 추적하는 소비 경로다. Knowledge를 활성화하거나
-비활성화한 비교 실행도 필요하다. 검색된 지식은 현재 Run의 Evidence나 Validation proof가
-아니며, Knowledge만으로 Finding을 생성할 수 없어야 한다.
+다음 Run에서는 `KnowledgeContextProvider`가 Candidate의 취약점 유형과 대상 값이 제거된
+Surface 구조로 과거 Case를 검색한다. 결과는 provenance를 제외한 `KnowledgeHint`로 최대
+3건까지 Analysis Task에 실리며, SQLite Task 재개 후에도 같은 입력이 복원된다. LLM은
+힌트를 Surface에 실제 존재하는 좌표의 우선순위를 정하는 데만 쓸 수 있다. 힌트의 문장이나
+Case ID가 Analysis Evidence의 선택 이유로 복사되지 않도록 고정된 안전 설명을 기록한다.
+관련성은 동일한 일반화 경로 또는 과거 신호 파라미터와 현재 Surface의 중첩을 필수로 하며,
+GET/POST·인증 여부처럼 흔한 토큰만 같은 Case는 제외한다.
+
+Path Traversal에서는 현재 Run의 제한된 `unlinked_render_parameter_candidate` 좌표를 LLM
+선택보다 우선한다. LLM이 빈 목록을 반환해도 Recon이 허용 목록에서 구조적으로 특정한
+`layout` 같은 좌표는 고정 safe-file probe를 거친다. `redirectUrl` 같은 일반 이름 기반
+후보는 계속 LLM이 걸러내며, Knowledge는 현재 Run Evidence를 대체하지 않는다.
+
+조회한 Case ID와 개수는 Task 및 ProgressEvent로 추적한다. 검색 실패는 안전한 고정 상태만
+표시하고 빈 컨텍스트로 기존 Analysis를 계속한다. Validation·Evidence 수집 Task에는
+`knowledge_hints`를 전달하지 않으며, 현재 Candidate가 없으면 Knowledge만으로 Finding을
+만들지 않는다.
+
+**남은 것** 동일한 Juice Shop 상태에서 Knowledge 활성/비활성 조건을 반복 실행해 선택,
+요청 수, token, 시간과 Finding 결과를 비교하는 평가다. 검색 순위와 최대 힌트 수 조정은 이
+측정 결과가 있을 때만 진행한다.
+
+**구버전 DB 정책** 의미 기반 `case_id` 도입 전 생성된 opt-in Knowledge DB는 자동
+마이그레이션하지 않는다. 보존해야 할 축적 데이터가 없으므로 해당 세대 DB는 삭제하고 현재
+코드로 다시 발행한다. 현재 의미 기반 Case DB에 신호 파라미터를 보강하는 변경은 Case ID를
+유지하며 새 append-only 테이블을 자동 생성하므로 기존 DB를 삭제할 필요가 없다.
 
 **왜 분리했는가** 축적할 지식은 확정 Finding 이후에만 만들 수 있고, 저장 Core와 실제
 워크플로 소비를 한 번에 연결하면 과거 사례가 현재 Run의 증적으로 섞일 위험이 있다.
@@ -561,9 +618,9 @@ Access Control만 `all`에서 빠져 있다. Recon이 만드는 것은 `/basket`
 - **Path Traversal 후보 축소** — `/ftp`의 제한 확장자 파일을 전부 후보로 만든다. 필터는
   서버 전체에 걸리므로 한 파일이면 증명에 충분하지만, 어느 파일이 우회되는지는 요청해야
   알 수 있어 사전에 줄이기 어렵다.
-- **Knowledge 검색 효과 비교** — 자동 발행과 저장은 완료됐지만 다음 Run의 Analysis가
-  관련 Case를 소비하지 않는다. 안전한 참고 DTO와 사용 지점 추적을 먼저 구현한 뒤,
-  Knowledge 활성/비활성 조건의 요청 수·탐지 결과를 비교해야 한다.
+- **Knowledge 검색 효과 비교** — 다음 Run의 LLM Analysis 전달은 완료됐다. 동일한 DB와
+  대상 상태에서 Knowledge 활성/비활성 조건의 선택·요청 수·token·시간·Finding 결과를
+  반복 측정해야 한다.
 
 ---
 
@@ -694,14 +751,19 @@ Evidence 테이블에는 **UPDATE 문을 쓰지 않는다.** `EvidenceStore` Pro
 
 | 상태 | 파일 | 구현 결과 / 작업 |
 |---|---|---|
-| ✅ | `src/hacklipse/adapters/knowledge.py` | Factory, InMemory·SQLite append-only KnowledgeBase |
-| ✅ | `tests/test_knowledge.py` | 일반화·민감정보 제외·의미 기반 중복 방지·관측 누적·검색·영속성 검증 |
+| ✅ | `src/hacklipse/adapters/knowledge.py` | Factory, InMemory·SQLite append-only Case·관측·신호 좌표 KnowledgeBase |
+| ✅ | `tests/test_knowledge.py` | 일반화·민감정보 제외·의미 dedupe·관측/신호 보강·검색·영속성 검증 |
 | ✅ | `src/hacklipse/application/orchestrator.py` | Run 완료 발행, DONE 재개 후 재시도, 안전한 완료 수치 |
+| ✅ | `src/hacklipse/application/knowledge_context.py` | 구조화 경로/신호 관련성 검색과 provenance 없는 Hint 변환 |
+| ✅ | `src/hacklipse/domain/knowledge.py` | 발행·검색 공용 Surface 경로와 파라미터 이름 일반화 |
 | ✅ | `src/hacklipse/bootstrap.py` | 선택적 KnowledgeBase와 Factory 배선 |
-| ✅ | `scripts/run_juice_shop_baseline.py` | `--knowledge-db` SQLite 발행 옵션 |
-| ✅ | `scripts/progress_view.py` | 발행 성공·실패 수치의 TTY/non-TTY 표시 |
-| ✅ | `tests/test_knowledge_publication.py` | 발행·실패 격리·정상 재시도·교차 Run dedupe·화면 계약 |
-| ⏳ | 신규 Knowledge context 경계 | 다음 Run의 안전한 검색 결과를 Analysis 등에 전달하고 사용 지점 추적 |
+| ✅ | `src/hacklipse/domain/models.py` | `KnowledgeHint`, Analysis Task의 분리된 `knowledge_hints` 계약 |
+| ✅ | `src/hacklipse/adapters/knowledge_prompt.py` | LLM 참고 JSON·비활성 prompt 보존·Evidence 복사 방지 |
+| ✅ | `src/hacklipse/adapters/sqlite_store.py` | Analysis Task의 KnowledgeHint 영속·재개 |
+| ✅ | `scripts/run_juice_shop_baseline.py` | `--knowledge-db` SQLite 검색·발행과 전용 `knowledge/` 경로 |
+| ✅ | `scripts/progress_view.py` | 발행/검색 상태 표시와 터미널 폭 안전 TTY redraw |
+| ✅ | `tests/test_knowledge_publication.py` | 발행·재시도·교차 Run dedupe·다음 Run 전달·Evidence 격리 |
+| ✅ | `tests/test_knowledge_retrieval.py` | 검색 관련성·현재 Run 제외·provenance 제거 계약 |
 
 ### Phase 10 — 확장
 
@@ -729,6 +791,7 @@ src/hacklipse/
 │   ├── agents.py · control.py · runtime.py · knowledge.py
 ├── application/
 │   ├── execution.py                 ✏️ P2 collect() · ✏️ P8 훅
+│   ├── knowledge_context.py         ✅ P9  관련 Case 검색·안전한 Hint 변환
 │   ├── task_factory.py              ✏️ P4  allowed_tools
 │   ├── task_executor.py             ✏️ P8  timeout
 │   ├── orchestrator.py              ✅ P9  자동 발행·DONE 재시도
@@ -760,6 +823,7 @@ src/hacklipse/
 │   ├── browser_runtime.py           ✅ P8  XSS 실행 증명
 │   ├── xss_execution.py             ✅ P8  고정 browser probe 계약
 │   ├── knowledge.py                 ✅ P9 Factory·저장·검색·의미 dedupe·관측 누적
+│   ├── knowledge_prompt.py          ✅ P9 LLM 참고 문맥·비활성 prompt 보존
 │   ├── cost_budget.py               🆕 P10
 │   ├── llm_routing.py               🆕 P10
 │   ├── reporting_json.py            🆕 P10
@@ -788,6 +852,7 @@ tests/
 ├── test_juice_shop_runner.py        ✅ Juice Shop 실행기 fixture
 ├── test_knowledge.py                ✅ P9 Core·dedupe·관측
 ├── test_knowledge_publication.py    ✅ P9 발행·재시도·진행 표시
+├── test_knowledge_retrieval.py      ✅ P9 검색·provenance 격리
 ├── test_llm_end_to_end.py           ✅ P6
 ├── test_gemini_llm_client.py        ✅ P6
 ├── test_sqlite_store.py             ✅ P7
@@ -852,7 +917,10 @@ Phase 9  [x] KnowledgeCase 일반화 Factory
          [x] provenance·민감정보·의미 기반 dedupe·관측 누적·검색·영속성 테스트
          [x] Orchestrator 자동 발행 및 Bootstrap·CLI 배선
          [x] 발행 실패 표시와 DONE Run의 정상 resume 재시도
-         [ ] 다음 Run의 Knowledge 검색·안전한 Analysis 참고 정보 전달
+         [x] 다음 Run의 Knowledge 검색·안전한 LLM Analysis 참고 정보 전달
+         [x] KnowledgeHint Task 영속성·Validation/Evidence 격리·검색 실패 fallback
+         [x] 신호 좌표 append-only 보강·구조화 관련성 필터·Recon 좌표 우선
+         [x] Juice Shop LLM all에서 Knowledge 검색 3건·Finding 4건·발행 4/4 확인
          [ ] Knowledge 활성/비활성 비교 측정
 
 Phase 10 [x] 제한된 Recon LLM Planner와 fallback

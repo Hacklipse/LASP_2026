@@ -30,6 +30,11 @@ from .probing import (
     resolve_analysis_task,
     validate_probe_selection,
 )
+from .knowledge_prompt import (
+    knowledge_system_prompt,
+    render_knowledge_hints,
+    safe_selection_reason,
+)
 from .sqli_analysis import sql_error_signal
 
 LLM_SQLI_ANALYZER = "llm_sqli_analyzer"
@@ -195,10 +200,11 @@ class LlmSqliAnalyzer:
                             f"Parameters: {', '.join(parameters)}\n"
                             f"Request budget for this analysis: {task.request_budget}\n"
                             "Select parameters worth checking for SQL parser reachability."
+                            + render_knowledge_hints(task.knowledge_hints)
                         ),
                     ),
                 ),
-                system=_PLAN_SYSTEM,
+                system=knowledge_system_prompt(_PLAN_SYSTEM, task.knowledge_hints),
                 response_schema=_PLAN_SCHEMA,
                 timeout_seconds=task.timeout_seconds,
             )
@@ -212,6 +218,7 @@ class LlmSqliAnalyzer:
         reason = response.payload.get("reason")
         if not isinstance(reason, str):
             raise AgentContractError("llm sqli plan reason must be a string")
+        reason = safe_selection_reason(reason, task.knowledge_hints)
         plan: dict[str, object] = {
             "type": _PLAN_OBSERVATION,
             "parameters": list(selected),

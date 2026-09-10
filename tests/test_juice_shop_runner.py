@@ -15,6 +15,7 @@ from run_juice_shop_baseline import (  # noqa: E402
     _ProvisionedAccount,
     _all_mode_recon_seeds,
     _cleanup_provisioned_accounts,
+    _knowledge_database_path,
     _recon_planner_summary,
     _resolve_juice_shop_db,
 )
@@ -22,6 +23,16 @@ from hacklipse.domain import Evidence
 
 
 class JuiceShopAllModeTests(unittest.TestCase):
+    def test_bare_knowledge_database_name_uses_dedicated_directory(self) -> None:
+        self.assertEqual(
+            _knowledge_database_path("knowledge.sqlite"),
+            Path("knowledge/knowledge.sqlite"),
+        )
+        self.assertEqual(
+            _knowledge_database_path("var/cases.sqlite"),
+            Path("var/cases.sqlite"),
+        )
+
     def test_authenticated_all_mode_adds_the_profile_as_a_recon_seed(self) -> None:
         self.assertEqual(
             _all_mode_recon_seeds(

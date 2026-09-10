@@ -42,6 +42,11 @@ from .browser_xss_analysis import (
     build_reflection_requests,
     record_dom_reflection_observations,
 )
+from .knowledge_prompt import (
+    knowledge_system_prompt,
+    render_knowledge_hints,
+    safe_selection_reason,
+)
 from .probing import (
     matching_evidence,
     probe_marker,
@@ -195,10 +200,11 @@ class LlmBrowserXssAnalyzer:
                             f"Parameters: {', '.join(parameters)}\n"
                             f"Request budget for this analysis: {task.request_budget}\n"
                             "Select the parameters worth probing for DOM reflection."
+                            + render_knowledge_hints(task.knowledge_hints)
                         ),
                     ),
                 ),
-                system=_PLAN_SYSTEM,
+                system=knowledge_system_prompt(_PLAN_SYSTEM, task.knowledge_hints),
                 response_schema=_PLAN_SCHEMA,
                 timeout_seconds=task.timeout_seconds,
             )
@@ -214,6 +220,7 @@ class LlmBrowserXssAnalyzer:
         reason = response.payload.get("reason")
         if not isinstance(reason, str):
             raise AgentContractError("llm browser xss plan reason must be a string")
+        reason = safe_selection_reason(reason, task.knowledge_hints)
         evidence_id = f"evi-{self._id_factory()}"
         self._evidence.append(
             Evidence(

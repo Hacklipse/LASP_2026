@@ -16,6 +16,7 @@ from hacklipse.domain import (
     Candidate,
     Finding,
     KnowledgeCase,
+    KnowledgeHint,
     Run,
     RunPhase,
     RunRequest,
@@ -64,10 +65,13 @@ class OrchestratorConfig:
     authentication_agent_type: str = "session_authenticator"
     max_evidence_rounds: int = 1
     browser_xss_validation: bool = False
+    knowledge_context_limit: int = 3
 
     def __post_init__(self) -> None:
         if self.max_evidence_rounds < 0:
             raise ValueError("max_evidence_rounds cannot be negative")
+        if not 1 <= self.knowledge_context_limit <= 10:
+            raise ValueError("knowledge_context_limit must be between 1 and 10")
 
 
 class Orchestrator:
@@ -95,7 +99,13 @@ class Orchestrator:
         knowledge_base: KnowledgeBase | None = None,
         # Case 생성은 Port를 하나 더 만들 만큼 넓지 않다. 단일 호출 계약이므로
         # 호출 가능 객체로 받는다(bootstrap이 KnowledgeCaseFactory.from_finding을 넘긴다).
-        knowledge_case_builder: Callable[[Finding, Candidate, Surface], KnowledgeCase]
+        knowledge_case_builder: Callable[
+            [Finding, Candidate, Surface, Sequence[Evidence]], KnowledgeCase
+        ]
+        | None = None,
+        knowledge_context_provider: Callable[
+            [Candidate, Surface], Sequence[KnowledgeHint]
+        ]
         | None = None,
     ) -> None:
         self._runs = run_store
@@ -115,6 +125,7 @@ class Orchestrator:
         self._progress = progress_sink
         self._knowledge = knowledge_base
         self._knowledge_case = knowledge_case_builder
+        self._knowledge_context = knowledge_context_provider
         # 발행 결과. 조용히 사라지지 않도록 RUN_COMPLETED에 함께 싣는다.
         self._knowledge_failures: list[str] = []
         self._knowledge_published: tuple[int, int] | None = None
@@ -389,6 +400,7 @@ class Orchestrator:
         current = run
         # Candidate가 참조하는 Run-scoped Surface를 실제 Analysis 대상으로 해석한다.
         surface = self._surfaces.get(run.run_id, candidate.surface_id)
+        knowledge_hints = self._knowledge_hints(run, candidate, surface)
         self._emit(
             run,
             ProgressEventKind.AGENT_STARTED,
@@ -402,6 +414,7 @@ class Orchestrator:
                 candidate,
                 target_url=surface.url,
                 request_budget=self._budget.remaining(run.run_id),
+                knowledge_hints=knowledge_hints,
             )
             result = self._tasks.execute(task)
 
@@ -462,6 +475,46 @@ class Orchestrator:
                     detail=request.suggested_tool,
                 )
         return current
+
+    def _knowledge_hints(
+        self, run: Run, candidate: Candidate, surface: Surface
+    ) -> tuple[KnowledgeHint, ...]:
+        """과거 사례 조회 실패가 현재 대상의 Analysis를 중단시키지 않게 격리한다."""
+
+        if self._knowledge_context is None:
+            return ()
+        try:
+            hints = tuple(self._knowledge_context(candidate, surface))
+            if len(hints) > self._config.knowledge_context_limit:
+                raise AgentContractError("knowledge context returned too many hints")
+            if any(
+                hint.category.casefold() != candidate.vulnerability_type.casefold()
+                for hint in hints
+            ):
+                raise AgentContractError(
+                    "knowledge context returned a different vulnerability category"
+                )
+        except Exception:
+            # 검색은 참고용 후처리다. DB 손상·잠금이나 Provider 계약 오류 때문에 현재
+            # 대상의 독립 검사가 실패해서는 안 되며, 원문 예외는 진행 로그에 싣지 않는다.
+            self._emit(
+                run,
+                ProgressEventKind.KNOWLEDGE_RETRIEVAL_FAILED,
+                agent_type=candidate.assigned_agent,
+                candidate=candidate,
+                surface_url=surface.url,
+                detail="knowledge_context:unavailable",
+            )
+            return ()
+        self._emit(
+            run,
+            ProgressEventKind.KNOWLEDGE_RETRIEVED,
+            agent_type=candidate.assigned_agent,
+            candidate=candidate,
+            surface_url=surface.url,
+            detail=f"knowledge_context:{len(hints)}",
+        )
+        return hints
 
     def _validate(self, run: Run) -> Run:
         """Candidate를 독립 검증하고 필요하면 추가 Evidence 수집을 조정한다."""
@@ -688,8 +741,9 @@ class Orchestrator:
             try:
                 candidate = self._candidates.get(run.run_id, finding.candidate_id)
                 surface = self._surfaces.get(run.run_id, finding.surface_id)
+                evidence = self._evidence.get_many(run.run_id, candidate.evidence_ids)
                 self._knowledge.publish(
-                    self._knowledge_case(finding, candidate, surface)
+                    self._knowledge_case(finding, candidate, surface, evidence)
                 )
             except DuplicateRecord:
                 # 이미 발행된 Finding. 재개나 재시도에서는 정상이므로 성공으로 센다.

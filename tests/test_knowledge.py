@@ -13,7 +13,14 @@ from hacklipse.adapters.knowledge import (
     SQLiteKnowledgeBase,
 )
 from hacklipse.adapters.sqlite_store import SQLiteStoreBundle
-from hacklipse.domain import Candidate, Finding, KnowledgeCase, KnowledgeQuery, Surface
+from hacklipse.domain import (
+    Candidate,
+    Evidence,
+    Finding,
+    KnowledgeCase,
+    KnowledgeQuery,
+    Surface,
+)
 from hacklipse.ports.errors import DuplicateRecord
 
 
@@ -161,6 +168,55 @@ class KnowledgeCaseFactoryTests(unittest.TestCase):
                 self._surface(),
             )
 
+    def test_preserves_only_structured_parameters_that_produced_a_probe_signal(self) -> None:
+        surface = Surface(
+            surface_id="surface-1",
+            run_id="run-1",
+            url="https://target.invalid/dataerasure",
+            method="POST",
+            parameters=("email", "securityAnswer"),
+        )
+        candidate = Candidate(
+            candidate_id="candidate-1",
+            run_id="run-1",
+            surface_id="surface-1",
+            vulnerability_type="Path Traversal",
+            hypothesis="server render parameter",
+            assigned_agent="path_traversal_analyzer",
+            evidence_ids=("evidence-layout", "evidence-unrelated"),
+            status="confirmed",
+        )
+        finding = self._finding(vulnerability_type="Path Traversal")
+        evidence = (
+            Evidence(
+                evidence_id="evidence-layout",
+                run_id="run-1",
+                surface_id="surface-1",
+                created_by="llm_path_traversal_analyzer",
+                evidence_type="observation",
+                observation={
+                    "type": "path_traversal_file_read",
+                    "parameter": "layout",
+                },
+            ),
+            Evidence(
+                evidence_id="evidence-unrelated",
+                run_id="run-1",
+                surface_id="surface-1",
+                created_by="recon",
+                evidence_type="observation",
+                observation={"type": "reflection", "parameter": "email"},
+            ),
+        )
+
+        factory = KnowledgeCaseFactory()
+        original = factory.from_finding(finding, candidate, surface)
+        case = factory.from_finding(finding, candidate, surface, evidence)
+
+        self.assertEqual(case.case_id, original.case_id)
+        self.assertEqual(case.metadata["signal_parameter_names"], "layout")
+        self.assertEqual(case.metadata["parameter_names"], "email,securityAnswer")
+
 
 class KnowledgeBaseContractTests(unittest.TestCase):
     @staticmethod
@@ -209,6 +265,36 @@ class KnowledgeBaseContractTests(unittest.TestCase):
         self.assertEqual(stored[0].metadata["surface_path"], "/search")
         with self.assertRaises(DuplicateRecord):
             knowledge.publish(case)
+
+    def test_signal_parameter_enriches_existing_case_without_changing_identity(self) -> None:
+        knowledge = InMemoryKnowledgeBase()
+        original = self._case("case-pattern", provenance_id="run-1")
+        enriched = KnowledgeCase(
+            case_id=original.case_id,
+            category=original.category,
+            summary=original.summary,
+            provenance_refs=("run:run-2", "finding:run-2", "validation:run-2"),
+            metadata={**original.metadata, "signal_parameter_names": "layout"},
+        )
+
+        knowledge.publish(original)
+        knowledge.publish(enriched)
+
+        stored = knowledge.search(KnowledgeQuery(category="XSS", text=""))
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0].metadata["signal_parameter_names"], "layout")
+        self.assertEqual(
+            knowledge_case_id(
+                category=enriched.category,
+                summary=enriched.summary,
+                metadata=enriched.metadata,
+            ),
+            knowledge_case_id(
+                category=original.category,
+                summary=original.summary,
+                metadata=original.metadata,
+            ),
+        )
 
     def test_search_is_category_scoped_ranked_and_stable(self) -> None:
         knowledge = InMemoryKnowledgeBase()
@@ -349,6 +435,28 @@ class SQLiteKnowledgeBaseTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertIn("run:run-1", result[0].provenance_refs)
         self.assertIn("run:run-2", result[0].provenance_refs)
+
+    def test_existing_case_is_enriched_when_same_observation_is_republished(self) -> None:
+        original = self._case()
+        enriched = KnowledgeCase(
+            case_id=original.case_id,
+            category=original.category,
+            summary=original.summary,
+            provenance_refs=original.provenance_refs,
+            metadata={**original.metadata, "signal_parameter_names": "layout"},
+        )
+        with SQLiteKnowledgeBase(self.database_path) as knowledge:
+            knowledge.publish(original)
+            with self.assertRaises(DuplicateRecord):
+                knowledge.publish(enriched)
+
+        with SQLiteKnowledgeBase(self.database_path) as reopened:
+            cases = reopened.search(
+                KnowledgeQuery(category="Path Traversal", text="")
+            )
+
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0].metadata["signal_parameter_names"], "layout")
 
     def test_coexists_with_existing_store_bundle_schema(self) -> None:
         stores = SQLiteStoreBundle(self.database_path)

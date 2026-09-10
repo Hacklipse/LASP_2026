@@ -32,6 +32,11 @@ from .access_control_analysis import (
     HeuristicAccessControlAnalyzer,
     access_identifier_options,
 )
+from .knowledge_prompt import (
+    knowledge_system_prompt,
+    render_knowledge_hints,
+    safe_selection_reason,
+)
 from .probing import resolve_analysis_task
 from .request_safety import is_object_identifier_parameter
 
@@ -172,17 +177,19 @@ class LlmAccessControlAnalyzer:
                             f"Identifier candidates: {', '.join(parameters)}\n"
                             f"Request budget for this analysis: {task.request_budget}\n"
                             "Select the candidate that identifies the requested object."
+                            + render_knowledge_hints(task.knowledge_hints)
                         ),
                     ),
                 ),
-                system=_SELECTION_SYSTEM,
+                system=knowledge_system_prompt(_SELECTION_SYSTEM, task.knowledge_hints),
                 response_schema=_SELECTION_SCHEMA,
                 timeout_seconds=task.timeout_seconds,
             )
         )
         selected = _validate_selection(response.payload.get("parameters"), parameters)
         reason = response.payload.get("reason")
-        return selected, reason if isinstance(reason, str) else ""
+        raw_reason = reason if isinstance(reason, str) else ""
+        return selected, safe_selection_reason(raw_reason, task.knowledge_hints)
 
 
 def _validate_selection(raw: object, offered: tuple[str, ...]) -> str | None:

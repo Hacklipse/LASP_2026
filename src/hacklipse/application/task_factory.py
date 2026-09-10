@@ -8,6 +8,7 @@ from uuid import uuid4
 from hacklipse.domain import (
     Candidate,
     EvidenceRequest,
+    KnowledgeHint,
     Run,
     TaskEnvelope,
     credential_for_vulnerability,
@@ -50,6 +51,7 @@ class TaskFactory:
         *,
         target_url: str,
         request_budget: int,
+        knowledge_hints: tuple[KnowledgeHint, ...] = (),
     ) -> TaskEnvelope:
         """Candidate의 실제 Surface URL과 Evidence 참조를 Analysis Task에 담는다."""
 
@@ -73,6 +75,7 @@ class TaskFactory:
             surface_id=candidate.surface_id,
             candidate_id=candidate.candidate_id,
             evidence_ids=candidate.evidence_ids,
+            knowledge_hints=knowledge_hints,
             allowed_tools=allowed_tools,
             credential_ref=credential_for_vulnerability(
                 run, candidate.vulnerability_type
@@ -192,6 +195,7 @@ class TaskFactory:
         surface_id: str | None = None,
         candidate_id: str | None = None,
         evidence_ids: tuple[str, ...] = (),
+        knowledge_hints: tuple[KnowledgeHint, ...] = (),
         finding_ids: tuple[str, ...] = (),
         allowed_tools: tuple[str, ...] = (),
         validation_id: str | None = None,
@@ -212,6 +216,7 @@ class TaskFactory:
             surface_id=surface_id,
             candidate_id=candidate_id,
             evidence_ids=evidence_ids,
+            knowledge_hints=knowledge_hints,
             finding_ids=finding_ids,
             allowed_tools=allowed_tools,
             request_budget=request_budget,

@@ -17,6 +17,7 @@ from hacklipse.domain import (
     Finding,
     HttpRequestKind,
     HttpRequestSpec,
+    KnowledgeHint,
     ReportArtifact,
     Run,
     RunPhase,
@@ -69,6 +70,14 @@ class SQLiteStoreTests(unittest.TestCase):
                 target_url="http://localhost/index.php",
                 surface_id="surface-1",
                 evidence_ids=("evi-1",),
+                knowledge_hints=(
+                    KnowledgeHint(
+                        case_id="case-prior-xss",
+                        category="XSS",
+                        summary="Confirmed generalized reflection pattern.",
+                        metadata={"surface_method": "GET"},
+                    ),
+                ),
                 finding_ids=("finding-1",),
                 allowed_tools=("http_get",),
                 request_budget=9,

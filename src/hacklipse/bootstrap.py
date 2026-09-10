@@ -40,6 +40,7 @@ from hacklipse.adapters import (
 from hacklipse.adapters.routing import DEFAULT_RULES, DEFAULT_SURFACE_RULES
 from hacklipse.adapters.recon import DEFAULT_MAX_PAGES
 from hacklipse.application import (
+    KnowledgeContextProvider,
     Orchestrator,
     OrchestratorConfig,
     RunStateMachine,
@@ -272,6 +273,14 @@ def build_local_application(
         # KnowledgeBase를 주지 않으면 발행 자체가 일어나지 않는다. 빌더만 있어도
         # 아무 일도 하지 않으므로 조립을 한곳에 모아 둔다.
         knowledge_case_builder=KnowledgeCaseFactory().from_finding,
+        knowledge_context_provider=(
+            KnowledgeContextProvider(
+                knowledge_base,
+                limit=selected_config.knowledge_context_limit,
+            ).for_candidate
+            if knowledge_base is not None
+            else None
+        ),
     )
     return LocalApplication(
         orchestrator=orchestrator,

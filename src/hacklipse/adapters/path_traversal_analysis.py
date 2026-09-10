@@ -418,6 +418,23 @@ def path_parameters_from_evidence(
     )
 
 
+def bounded_render_parameters_from_evidence(
+    evidence: Sequence[Evidence], surface: Surface
+) -> tuple[str, ...]:
+    """Recon이 허용 목록에서 추가한 서버 렌더링 좌표만 반환한다."""
+
+    return tuple(
+        dict.fromkeys(
+            parameter
+            for item in evidence
+            if item.surface_id == surface.surface_id
+            and item.observation.get("type") == UNLINKED_RENDER_PARAMETER_OBSERVATION
+            and item.observation.get("source") == _INFERRED_PARAMETER_SOURCE
+            and isinstance((parameter := item.observation.get("parameter")), str)
+        )
+    )
+
+
 def path_parameter_candidates(
     evidence: Sequence[Evidence],
     surface: Surface,

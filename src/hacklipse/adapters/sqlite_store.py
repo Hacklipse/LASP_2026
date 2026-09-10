@@ -24,6 +24,7 @@ from hacklipse.domain import (
     Finding,
     HttpRequestKind,
     HttpRequestSpec,
+    KnowledgeHint,
     ReportArtifact,
     Run,
     RunPhase,
@@ -237,6 +238,15 @@ def _decode_task(data: str) -> TaskRecord:
         envelope["evidence_request"] = EvidenceRequest(**request)
     else:
         envelope["evidence_request"] = None
+    envelope["knowledge_hints"] = tuple(
+        KnowledgeHint(
+            case_id=item["case_id"],
+            category=item["category"],
+            summary=item["summary"],
+            metadata=dict(item.get("metadata", {})),
+        )
+        for item in envelope.get("knowledge_hints", ())
+    )
     for name in ("evidence_ids", "finding_ids", "allowed_tools"):
         envelope[name] = tuple(envelope[name])
     return TaskRecord(

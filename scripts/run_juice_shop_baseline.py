@@ -16,6 +16,7 @@
     py scripts/run_juice_shop_baseline.py http://127.0.0.1:3000/ --vuln sqli
     py scripts/run_juice_shop_baseline.py http://127.0.0.1:3000/ --vuln access_control
     py scripts/run_juice_shop_baseline.py http://127.0.0.1:3000/ --vuln all
+    py scripts/run_juice_shop_baseline.py http://127.0.0.1:3000/ --knowledge-db knowledge.sqlite
     py scripts/run_juice_shop_baseline.py http://127.0.0.1:3000/ --profile llm --debug-llm-content
 """
 
@@ -106,6 +107,7 @@ _DEFAULT_BUDGET = 20
 _ALL_MODE_BUDGET = 80
 _ALL_MODE_RECON_PAGES = 12
 _OBJECT_ID = re.compile(r"^[0-9]{1,10}$")
+_KNOWLEDGE_DIRECTORY = Path("knowledge")
 
 
 def _recon_planner_summary(evidence) -> str | None:
@@ -121,6 +123,15 @@ def _recon_planner_summary(evidence) -> str | None:
         if detail is not None:
             return format_recon_planner_status(detail)
     return None
+
+
+def _knowledge_database_path(value: str) -> Path:
+    """파일명만 받은 DB와 SQLite sidecar를 전용 디렉터리에 모은다."""
+
+    path = Path(value)
+    if path.parent == Path("."):
+        return _KNOWLEDGE_DIRECTORY / path.name
+    return path
 
 
 @dataclass(frozen=True, slots=True)
@@ -625,8 +636,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--knowledge-db",
         help=(
-            "확정 Finding을 일반화한 KnowledgeCase로 발행할 SQLite 경로. "
-            "주지 않으면 발행하지 않는다"
+            "과거 KnowledgeCase를 Analysis 참고용으로 검색하고 확정 Finding을 "
+            "발행할 SQLite 경로. 파일명만 주면 knowledge/ 아래에 저장하며, "
+            "주지 않으면 검색·발행하지 않는다"
         ),
     )
     parser.add_argument(
@@ -822,10 +834,13 @@ def main(argv: list[str]) -> int:
         else http_runtime
     )
     audit = _DebugAuditLog(progress) if debug_enabled else InMemoryExecutionAuditLog()
-    # 대상 Evidence 와 분리된 Knowledge Plane 이다. 경로를 주지 않으면 발행하지 않는다.
-    knowledge_base = (
-        SQLiteKnowledgeBase(args.knowledge_db) if args.knowledge_db else None
-    )
+    # 대상 Evidence 와 분리된 Knowledge Plane 이다. 경로를 주지 않으면
+    # 과거 Case 검색과 새 Finding 발행을 모두 사용하지 않는다.
+    knowledge_base = None
+    if args.knowledge_db:
+        knowledge_path = _knowledge_database_path(args.knowledge_db)
+        knowledge_path.parent.mkdir(parents=True, exist_ok=True)
+        knowledge_base = SQLiteKnowledgeBase(knowledge_path)
     app = build_local_application(
         {},
         runtime=runtime,

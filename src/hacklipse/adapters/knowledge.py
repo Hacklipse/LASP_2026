@@ -20,9 +20,16 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from threading import RLock
-from urllib.parse import unquote, urlsplit
-
-from hacklipse.domain import Candidate, Finding, KnowledgeCase, KnowledgeQuery, Surface
+from hacklipse.domain import (
+    Candidate,
+    Evidence,
+    Finding,
+    KnowledgeCase,
+    KnowledgeQuery,
+    Surface,
+    generalize_parameter_names,
+    generalize_surface_path,
+)
 from hacklipse.ports.errors import DuplicateRecord
 
 
@@ -31,13 +38,6 @@ _SUMMARY_LIMIT = 500
 _METADATA_VALUE_LIMIT = 500
 _CASE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _PROVENANCE_REF = re.compile(r"^[a-z][a-z0-9_]{0,31}:[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
-_SAFE_PARAMETER = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,63}$")
-_SAFE_PATH_SEGMENT = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
-_INTEGER_SEGMENT = re.compile(r"^[0-9]{1,20}$")
-_UUID_SEGMENT = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-    re.IGNORECASE,
-)
 _TOKEN = re.compile(r"[A-Za-z0-9_:-]+")
 _EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])")
 _JWT = re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b")
@@ -54,6 +54,7 @@ _ALLOWED_METADATA_KEYS = frozenset(
     {
         "parameter_count",
         "parameter_names",
+        "signal_parameter_names",
         "proof_type",
         "requires_auth",
         "severity",
@@ -62,6 +63,7 @@ _ALLOWED_METADATA_KEYS = frozenset(
         "surface_path",
     }
 )
+_ENRICHMENT_METADATA_KEYS = frozenset({"signal_parameter_names"})
 
 _PROOF_TYPE_BY_VULNERABILITY = {
     "XSS": "xss_execution",
@@ -86,7 +88,9 @@ def knowledge_case_id(
         {
             "category": category.casefold(),
             "summary": summary,
-            "metadata": dict(sorted(metadata.items())),
+            # 실제 probe 신호 좌표는 같은 일반화 Case에 Run별로 보강되는 관측이다.
+            # 정체성에 넣으면 기존 Case에 좌표를 추가하는 순간 중복 Case가 생긴다.
+            "metadata": dict(sorted(_identity_metadata(metadata).items())),
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -103,12 +107,13 @@ class KnowledgeCaseFactory:
         finding: Finding,
         candidate: Candidate,
         surface: Surface,
+        evidence: Sequence[Evidence] = (),
     ) -> KnowledgeCase:
         """소유 관계를 확인하고 구조화된 필드만 KnowledgeCase에 복사한다.
 
-        Candidate의 hypothesis와 Evidence 본문은 의도적으로 사용하지 않는다. 둘 다 LLM
-        자유 텍스트나 대상 응답을 포함할 수 있어, 일반화 없이 Knowledge Plane에 넣으면
-        다른 Run의 프롬프트로 유출될 수 있다.
+        Candidate의 hypothesis와 Evidence 본문은 의도적으로 사용하지 않는다. Evidence는
+        고정 probe가 만든 구조화된 신호 종류와 안전한 파라미터 이름만 읽는다. LLM 자유
+        텍스트나 대상 응답을 Knowledge Plane에 복사하지 않는다.
         """
 
         _validate_source_relationships(finding, candidate, surface)
@@ -125,7 +130,7 @@ class KnowledgeCaseFactory:
             f"Confirmed {finding.vulnerability_type} on an {auth} {method} "
             f"{surface_kind} surface using independent {proof_type} validation."
         )
-        parameter_names = tuple(sorted(_generalize_parameter_names(surface.parameters)))
+        parameter_names = tuple(sorted(generalize_parameter_names(surface.parameters)))
         metadata = {
             "parameter_count": str(len(parameter_names)),
             "parameter_names": ",".join(parameter_names),
@@ -134,8 +139,15 @@ class KnowledgeCaseFactory:
             "severity": finding.severity,
             "surface_kind": surface_kind,
             "surface_method": method,
-            "surface_path": _generalize_path(surface.url),
+            "surface_path": generalize_surface_path(surface.url),
         }
+        signal_parameters = _confirmed_signal_parameters(
+            finding, candidate, surface, evidence
+        )
+        if signal_parameters:
+            # Evidence 원문이나 LLM 설명이 아니라, 현재 Run에서 고정 probe 신호를 만든
+            # 안전한 파라미터 이름만 재사용 좌표로 보존한다.
+            metadata["signal_parameter_names"] = ",".join(signal_parameters)
         case = KnowledgeCase(
             case_id=knowledge_case_id(
                 category=finding.vulnerability_type,
@@ -161,6 +173,7 @@ class InMemoryKnowledgeBase:
     def __init__(self) -> None:
         self._cases: dict[str, KnowledgeCase] = {}
         self._observations: dict[str, list[tuple[str, ...]]] = {}
+        self._signal_parameters: dict[str, set[str]] = {}
         self._lock = RLock()
 
     def publish(self, case: KnowledgeCase) -> None:
@@ -170,9 +183,18 @@ class InMemoryKnowledgeBase:
             observation = tuple(case.provenance_refs)
             observations = self._observations.setdefault(case.case_id, [])
             if observation in observations:
+                if existing is not None and _same_pattern(existing, case):
+                    self._signal_parameters.setdefault(case.case_id, set()).update(
+                        _case_signal_parameters(case)
+                    )
                 raise DuplicateRecord(case.case_id)
             if existing is not None and not _same_pattern(existing, case):
                 raise ValueError("knowledge case_id refers to a different pattern")
+            # 같은 관측을 새 코드로 다시 발행하는 경우에도 기존 Case에 안전한 좌표를
+            # 보강한 뒤 DuplicateRecord를 반환한다.
+            self._signal_parameters.setdefault(case.case_id, set()).update(
+                _case_signal_parameters(case)
+            )
             if existing is None:
                 # metadata 구현체가 mutable dict여도 발행 뒤 바뀌지 않게 복사한다.
                 self._cases[case.case_id] = _copy_case(case)
@@ -182,7 +204,10 @@ class InMemoryKnowledgeBase:
         _validate_query(query)
         with self._lock:
             cases = tuple(
-                _with_observations(case, self._observations.get(case.case_id, ()))
+                _with_signal_parameters(
+                    _with_observations(case, self._observations.get(case.case_id, ())),
+                    self._signal_parameters.get(case.case_id, ()),
+                )
                 for case in self._cases.values()
             )
         return _search(cases, query)
@@ -235,6 +260,16 @@ class SQLiteKnowledgeBase:
                 "CREATE INDEX IF NOT EXISTS idx_knowledge_observation_case "
                 "ON knowledge_case_observations(case_id, seq)"
             )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS knowledge_case_signal_parameters (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    case_id TEXT NOT NULL,
+                    parameter_name TEXT NOT NULL,
+                    UNIQUE(case_id, parameter_name)
+                )
+                """
+            )
             # 기존 DB의 Case도 첫 관측으로 등록한다. INSERT OR IGNORE이므로 재개방해도
             # 관측이 중복되지 않고 기존 knowledge_cases 스키마도 그대로 사용할 수 있다.
             for row in self._connection.execute(
@@ -242,6 +277,7 @@ class SQLiteKnowledgeBase:
             ).fetchall():
                 stored = _decode_case(row["data"])
                 self._insert_observation(self._connection, stored, ignore_duplicate=True)
+                self._insert_signal_parameters(self._connection, stored)
             self._connection.commit()
 
     def publish(self, case: KnowledgeCase) -> None:
@@ -262,11 +298,20 @@ class SQLiteKnowledgeBase:
                 ).fetchone()
                 if row is None:
                     raise RuntimeError("knowledge case insert did not persist")
-                if not _same_pattern(_decode_case(row["data"]), case):
+                stored = _decode_case(row["data"])
+                duplicate = self._observation_exists(self._connection, case)
+                if duplicate:
+                    if _same_pattern(stored, case):
+                        self._insert_signal_parameters(self._connection, case)
+                    self._connection.commit()
+                    raise DuplicateRecord(case.case_id)
+                if not _same_pattern(stored, case):
                     raise ValueError("knowledge case_id refers to a different pattern")
+                self._insert_signal_parameters(self._connection, case)
                 self._insert_observation(self._connection, case)
                 self._connection.commit()
             except sqlite3.IntegrityError as error:
+                # 다른 연결이 같은 관측을 먼저 넣은 경쟁도 멱등 재발행으로 취급한다.
                 self._connection.rollback()
                 raise DuplicateRecord(case.case_id) from error
             except Exception:
@@ -282,15 +327,19 @@ class SQLiteKnowledgeBase:
                 (query.category.casefold(),),
             ).fetchall()
             cases = tuple(
-                self._case_with_stored_observations(_decode_case(row["data"]))
+                self._case_with_stored_signals(
+                    self._case_with_stored_observations(_decode_case(row["data"]))
+                )
                 for row in rows
             )
         return _search(cases, query)
 
     @staticmethod
-    def _insert_observation(connection, case: KnowledgeCase, *, ignore_duplicate=False) -> None:
+    def _insert_observation(
+        connection, case: KnowledgeCase, *, ignore_duplicate=False
+    ) -> bool:
         statement = "INSERT OR IGNORE" if ignore_duplicate else "INSERT"
-        connection.execute(
+        cursor = connection.execute(
             f"{statement} INTO knowledge_case_observations"
             "(case_id, observation_key, provenance_data) VALUES (?, ?, ?)",
             (
@@ -299,6 +348,24 @@ class SQLiteKnowledgeBase:
                 _encode_provenance(case.provenance_refs),
             ),
         )
+        return cursor.rowcount > 0
+
+    @staticmethod
+    def _insert_signal_parameters(connection, case: KnowledgeCase) -> None:
+        connection.executemany(
+            "INSERT OR IGNORE INTO knowledge_case_signal_parameters"
+            "(case_id, parameter_name) VALUES (?, ?)",
+            tuple((case.case_id, name) for name in _case_signal_parameters(case)),
+        )
+
+    @staticmethod
+    def _observation_exists(connection, case: KnowledgeCase) -> bool:
+        row = connection.execute(
+            "SELECT 1 FROM knowledge_case_observations "
+            "WHERE case_id = ? AND observation_key = ?",
+            (case.case_id, _observation_key(case.provenance_refs)),
+        ).fetchone()
+        return row is not None
 
     def _case_with_stored_observations(self, case: KnowledgeCase) -> KnowledgeCase:
         rows = self._connection.execute(
@@ -308,6 +375,16 @@ class SQLiteKnowledgeBase:
         ).fetchall()
         observations = tuple(_decode_provenance(row["provenance_data"]) for row in rows)
         return _with_observations(case, observations)
+
+    def _case_with_stored_signals(self, case: KnowledgeCase) -> KnowledgeCase:
+        rows = self._connection.execute(
+            "SELECT parameter_name FROM knowledge_case_signal_parameters "
+            "WHERE case_id = ? ORDER BY seq",
+            (case.case_id,),
+        ).fetchall()
+        return _with_signal_parameters(
+            case, tuple(str(row["parameter_name"]) for row in rows)
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -341,6 +418,37 @@ def _validate_source_relationships(
         raise ValueError("knowledge sources must agree on vulnerability type")
     if candidate.status != "confirmed":
         raise ValueError("only a confirmed candidate can be published as knowledge")
+
+
+def _confirmed_signal_parameters(
+    finding: Finding,
+    candidate: Candidate,
+    surface: Surface,
+    evidence: Sequence[Evidence],
+) -> tuple[str, ...]:
+    """확정 Candidate에서 구조화된 probe 신호를 만든 안전한 좌표만 추출한다."""
+
+    signal_type = _PROOF_TYPE_BY_VULNERABILITY.get(finding.vulnerability_type)
+    if signal_type is None:
+        return ()
+    allowed_ids = set(candidate.evidence_ids)
+    selected: list[str] = []
+    for item in evidence:
+        if (
+            item.evidence_id not in allowed_ids
+            or item.run_id != finding.run_id
+            or item.surface_id != surface.surface_id
+            or item.observation.get("type") != signal_type
+        ):
+            continue
+        parameter = item.observation.get("parameter")
+        if not isinstance(parameter, str):
+            continue
+        generalized = generalize_parameter_names((parameter,))[0]
+        if generalized == "{parameter}":
+            continue
+        selected.append(generalized)
+    return tuple(sorted(dict.fromkeys(selected)))
 
 
 def _validate_case(case: KnowledgeCase) -> None:
@@ -419,36 +527,6 @@ def _surface_kind(surface: Surface) -> str:
     return "static"
 
 
-def _generalize_parameter_names(parameters: Sequence[str]) -> tuple[str, ...]:
-    return tuple(
-        dict.fromkeys(
-            name if _SAFE_PARAMETER.fullmatch(name) is not None else "{parameter}"
-            for name in parameters
-        )
-    )
-
-
-def _generalize_path(url: str) -> str:
-    """호스트·query·사용자 값을 제거한 경로 모양만 반환한다."""
-
-    path = unquote(urlsplit(url).path or "/")
-    segments = path.split("/")
-    generalized: list[str] = []
-    for segment in segments:
-        if not segment:
-            generalized.append("")
-        elif _INTEGER_SEGMENT.fullmatch(segment) or _UUID_SEGMENT.fullmatch(segment):
-            generalized.append("{id}")
-        elif segment.startswith("{") and segment.endswith("}"):
-            generalized.append("{id}")
-        elif _SAFE_PATH_SEGMENT.fullmatch(segment):
-            generalized.append(segment.casefold())
-        else:
-            generalized.append("{value}")
-    value = "/".join(generalized)
-    return value if value.startswith("/") else f"/{value}"
-
-
 def _contains_sensitive_text(value: str) -> bool:
     return bool(
         "://" in value
@@ -467,8 +545,42 @@ def _same_pattern(left: KnowledgeCase, right: KnowledgeCase) -> bool:
     return (
         left.category.casefold() == right.category.casefold()
         and left.summary == right.summary
-        and dict(left.metadata) == dict(right.metadata)
+        and _identity_metadata(left.metadata) == _identity_metadata(right.metadata)
     )
+
+
+def _identity_metadata(metadata: Mapping[str, str]) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in metadata.items()
+        if key not in _ENRICHMENT_METADATA_KEYS
+    }
+
+
+def _case_signal_parameters(case: KnowledgeCase) -> tuple[str, ...]:
+    value = case.metadata.get("signal_parameter_names", "")
+    return tuple(dict.fromkeys(item for item in value.split(",") if item))
+
+
+def _with_signal_parameters(
+    case: KnowledgeCase, parameters: Sequence[str]
+) -> KnowledgeCase:
+    combined = tuple(
+        sorted(dict.fromkeys((*_case_signal_parameters(case), *parameters)))
+    )
+    if not combined:
+        return case
+    metadata = dict(case.metadata)
+    metadata["signal_parameter_names"] = ",".join(combined)
+    enriched = KnowledgeCase(
+        case_id=case.case_id,
+        category=case.category,
+        summary=case.summary,
+        provenance_refs=case.provenance_refs,
+        metadata=metadata,
+    )
+    _validate_case(enriched)
+    return enriched
 
 
 def _with_observations(
