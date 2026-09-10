@@ -12,6 +12,8 @@ Notion 「2026 연구과제 / Agent별 LLM 역할」 §4 Vulnerability Router가
 
 배선(`standard_router`)은 C의 구현체를 조립하는 작업이라 의존 방향상 C 커밋 위에 올렸다.
 
+3단계 Juice Shop E2E까지 완료했다. 이슈 #24의 완료 기준을 모두 충족한다.
+
 ---
 
 ## D 1단계 — 계약 확정 (2026-09-10)
@@ -335,6 +337,136 @@ D가 `bootstrap.standard_router()`에 advisor 주입을 추가한다. 이때 `An
 상속된다.
 
 Evidence 기록 경로 결정도 여전히 남아 있다.
+
+---
+
+## 3단계 — Juice Shop E2E (2026-09-10)
+
+### 1. 결과
+
+네 조건을 모두 실행했고 전부 완주했다. 대상은 `bkimminich/juice-shop` 컨테이너다.
+
+| | Analysis | Router | Candidate | 검증 | Finding | LLM 호출 | 입력 token | 예산 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 규칙 | 규칙 | 14 | 14/14 | 3 | 0 | 0 | 48/80 |
+| 2 | LLM | 규칙 | 14 | 14/14 | 3 | 14 | 1,960 | 42/80 |
+| 3 | 규칙 | **LLM** | **15** | 15/15 | 3 | **1** | 3,138 | 48/80 |
+| 4 | LLM | **LLM** | **15** | 15/15 | 3 | 16 | 5,242 | 42/80 |
+
+Candidate 내역은 조건 1·2가 XSS 7 · SQLi 4 · Path Traversal 2 · SSTI 1이고, 조건 3·4는
+Path Traversal이 3으로 늘어 15가 된다. Finding은 네 조건 모두 Path Traversal 1 · SQLi 1 ·
+XSS 1로 동일하다.
+
+기준선(조건 1)은 팀 문서의 최신 LLM 실행과 Surface 140개·파라미터 11종·Candidate 14개·
+검증 14/14가 정확히 일치한다. 환경이 올바르게 구축됐다는 근거다.
+
+팀 문서의 2026-09-06 휴리스틱 실측(Surface 95, Finding 8)과 다른 것은 그 뒤 커밋
+`1ea34fa`가 제한 확장자 우회 라우팅을 기본 비활성화해 Path Traversal Finding이 6에서
+1로 줄었고, Recon 개선으로 Surface가 95에서 140으로 늘었기 때문이다. 현재 코드 기준으로는
+위 수치가 맞다.
+
+### 2. 검증된 것
+
+**축 분리가 작동한다.** 조건 3이 결정적이다. `Agent 구성`이 `heuristic`으로 찍히면서 LLM은
+정확히 1회 호출됐다. Analysis는 휴리스틱 그대로 두고 Router만 LLM을 쓴 것이며, Advisor를
+Run당 한 번만 부르는 설계도 함께 확인된다.
+
+**Advisor가 규칙이 비워 둔 자리를 채운다.** Path Traversal Candidate가 2에서 3으로 늘었다.
+규칙이 분류하지 못한 표면 하나를 Advisor가 제안했다.
+
+**규칙 판정이 보존된다.** 네 조건의 Finding 수와 유형이 모두 같다. Advisor가 규칙 결과를
+덮어쓰지 않았다.
+
+**오탐이 늘지 않았다.** 새 Candidate는 검증까지 진행됐으나(15/15) Finding이 되지 않았다.
+Validation proof gate가 정상 작동한 것이며, 제안이 틀렸을 때 걸러진다는 뜻이다.
+
+**임시 계정 정리가 매 실행 검증됐다.** 모든 실행 후 `Users: 24` · `hacklipse 잔여: 0`을
+확인했다. 바인드 마운트가 라이브 DB를 가리킨다는 근거이기도 하다 — 복사본이었다면
+컨테이너 안에 계정이 남는다.
+
+### 3. 비용
+
+Advisor 1회 호출에 입력 약 3,100 token이 든다. `DEFAULT_MAX_SURFACES = 40` 상한이 그대로
+반영된 크기이며, 조건 2 대비 조건 4의 입력 증가분(1,960 → 5,242)과 일치한다.
+
+조건 4의 LLM 호출이 14에서 16으로 늘어난 것은 Advisor 1회와 새 Candidate에 대한 Analysis
+1회로 설명된다.
+
+### 4. 해석에 주의할 점
+
+**Finding이 늘지 않은 것이 Advisor가 무용하다는 뜻은 아니다.** 이번 대상에서 규칙이 놓친
+표면이 실제 취약점이 아니었을 뿐이다. 지시서가 정한 현 단계의 성공 기준은 탐지율이 아니라
+파이프라인 완주이며, 그것은 충족됐다.
+
+**1회 실행이므로 성능 판단의 근거가 되지 않는다.** 정량 비교는 반복 실행·고정 데이터셋·
+blind 평가가 갖춰진 뒤의 별도 과제다.
+
+### 5. 환경 구축 — WSL2 권한 문제
+
+팀원이 공유한 실행 문서는 macOS 기준이라 그대로 적용되지 않았다. 컨테이너가 uid 65532로
+실행되는데 바인드 마운트한 호스트 디렉터리는 호스트 사용자 소유라 세 번 막혔다.
+
+| 시도 | 결과 |
+| --- | --- |
+| 기본 사용자 + 호스트 소유 디렉터리 | `SQLITE_CANTOPEN` — DB 파일을 만들지 못한다 |
+| `--user $(id -u)`로 실행 | `/juice-shop/logs`, `.well-known/csaf/` 등 이미지 내부 경로에서 `EACCES` |
+| 기본 사용자 + 디렉터리 777 | 기동 성공. 단 DB가 65532 소유 0644라 호스트가 쓰지 못한다 |
+
+최종 해법은 기본 사용자로 띄운 뒤 **같은 디렉터리를 마운트한 별도 root 컨테이너로
+`chmod 666`**을 거는 것이다. 호스트 `sudo`가 필요 없고 컨테이너와 호스트가 모두 DB에 쓸 수
+있다. Juice Shop 이미지는 distroless라 `docker exec`로 셸을 쓸 수 없으므로 별도 컨테이너가
+필요하다.
+
+```bash
+mkdir -p ~/juice-shop
+docker create --name juiceshop-seed bkimminich/juice-shop
+docker cp juiceshop-seed:/juice-shop/data ~/juice-shop/data
+docker rm juiceshop-seed
+chmod 777 ~/juice-shop/data
+
+docker run -d --name hacklipse-juiceshop -p 3000:3000 \
+  -v "$HOME/juice-shop/data:/juice-shop/data" bkimminich/juice-shop
+
+# DB 생성을 기다린 뒤 양방향 쓰기 권한을 연다
+docker run --rm -u 0 -v "$HOME/juice-shop/data:/data" ubuntu:latest \
+  bash -c 'chmod 666 /data/juiceshop.sqlite*; chmod 777 /data'
+```
+
+`data/`를 먼저 꺼내는 이유는 그 안에 `datacreator.ts`·`static/` 같은 시드 파일이 있기
+때문이다. 빈 디렉터리를 마운트하면 이 파일들이 가려져 앱이 뜨지 않는다.
+
+`journal_mode`는 `delete`이므로 WAL·SHM 파일 권한은 문제되지 않는다.
+
+브라우저 XSS 검증에는 chromium과 headless shell이 모두 필요하다. `playwright install
+chromium`만으로는 `chrome-headless-shell`이 없어 실행되지 않는다.
+
+```bash
+playwright install chromium
+playwright install chromium-headless-shell
+```
+
+### 6. 재현 명령
+
+```bash
+DB=~/juice-shop/data/juiceshop.sqlite
+RUN="python scripts/run_juice_shop_baseline.py http://127.0.0.1:3000/"
+
+echo y | $RUN --vuln all --profile heuristic --juice-shop-db $DB
+echo y | $RUN --vuln all --profile llm --llm-provider gemini --juice-shop-db $DB
+echo y | $RUN --vuln all --profile heuristic --router-advisor --llm-provider gemini --juice-shop-db $DB
+echo y | $RUN --vuln all --profile llm --router-advisor --llm-provider gemini --juice-shop-db $DB
+```
+
+실행 후에는 매번 정리를 검증한다. 스크립트의 "정리 완료" 출력만 믿지 않는다.
+
+```bash
+python -c "
+import sqlite3, os
+c = sqlite3.connect('file:'+os.path.expanduser('~/juice-shop/data/juiceshop.sqlite')+'?mode=ro', uri=True)
+print('Users:', c.execute('SELECT COUNT(*) FROM Users').fetchone()[0])
+print('hacklipse 잔여:', c.execute(\"SELECT COUNT(*) FROM Users WHERE email LIKE 'hacklipse%'\").fetchone()[0])
+"
+```
 
 ---
 
