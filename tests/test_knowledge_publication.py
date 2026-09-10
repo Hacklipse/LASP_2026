@@ -7,12 +7,18 @@ Phase 9-A 는 저장 Core 만 만들었고 어떤 Run 도 KnowledgeBase 를 부�
 
 from __future__ import annotations
 
+import io
+import sys
 import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from hacklipse.adapters import InMemoryKnowledgeBase, RuleBasedVulnerabilityRouter
 from hacklipse.bootstrap import build_local_application
 from hacklipse.domain import (
     AgentResult,
+    ProgressEvent,
     AgentResultStatus,
     Evidence,
     EvidenceRequest,
@@ -174,6 +180,29 @@ class _FailingKnowledgeBase:
         return ()
 
 
+class _FlakyKnowledgeBase:
+    """처음 N번은 실패하고 그 뒤로는 정상 저장하는 대역.
+
+    SQLite 잠금처럼 일시적인 저장 오류를 흉내 낸다. 재개가 실패분만 이어서
+    발행하는지, 그리고 이미 발행된 Case 가 중복되지 않는지 본다.
+    """
+
+    def __init__(self, fail_times: int) -> None:
+        self._left = fail_times
+        self._base = InMemoryKnowledgeBase()
+        self.attempts = 0
+
+    def publish(self, case: KnowledgeCase) -> None:
+        self.attempts += 1
+        if self._left > 0:
+            self._left -= 1
+            raise RuntimeError("knowledge storage is locked")
+        self._base.publish(case)
+
+    def search(self, query: KnowledgeQuery):
+        return self._base.search(query)
+
+
 def _application(knowledge_base=None):
     app = build_local_application(
         {},
@@ -268,9 +297,12 @@ class KnowledgePublicationTests(unittest.TestCase):
             if event.kind is ProgressEventKind.RUN_COMPLETED
         ]
         self.assertEqual(len(completed), 1)
-        self.assertEqual(completed[0].detail, "knowledge publication skipped: 1")
+        # 발행을 켠 Run 은 성공해도 수치를 남긴다. 0/1 이면 한 건도 못 쌓았다는 뜻이다.
+        self.assertEqual(completed[0].detail, "knowledge 0/1")
 
-    def test_successful_publication_leaves_the_completion_event_clean(self) -> None:
+    def test_successful_publication_is_also_reported(self) -> None:
+        """\"0건 발행\"과 \"발행을 안 켬\"이 화면에서 구분돼야 한다."""
+
         app = _application(InMemoryKnowledgeBase())
 
         run = app.orchestrator.start(_request())
@@ -280,7 +312,142 @@ class KnowledgePublicationTests(unittest.TestCase):
             for event in app.progress_log.list_by_run(run.run_id)
             if event.kind is ProgressEventKind.RUN_COMPLETED
         ]
+        self.assertEqual(completed[0].detail, "knowledge 1/1")
+
+    def test_disabled_publication_reports_nothing(self) -> None:
+        app = _application(None)
+
+        run = app.orchestrator.start(_request())
+
+        completed = [
+            event
+            for event in app.progress_log.list_by_run(run.run_id)
+            if event.kind is ProgressEventKind.RUN_COMPLETED
+        ]
         self.assertIsNone(completed[0].detail)
+
+
+    def test_resume_publishes_what_an_interrupted_run_missed(self) -> None:
+        """보고서만 남기고 죽은 Run 을 재개하면 Knowledge 가 이어서 쌓여야 한다.
+
+        발행이 _report 의 조기 반환 안에 있으면 여기서 0건으로 남는다.
+        """
+
+        knowledge = InMemoryKnowledgeBase()
+        app = _application(knowledge)
+        run = app.orchestrator.start(_request())
+        self.assertEqual(len(knowledge.search(KnowledgeQuery(category="XSS", text=""))), 1)
+
+        # 보고서는 남기고 Knowledge 만 비운 채 REPORT 단계로 되돌린다.
+        drained = InMemoryKnowledgeBase()
+        app.orchestrator._knowledge = drained
+        app.stores.runs.save(
+            app.stores.runs.get(run.run_id).with_updates(phase=RunPhase.REPORT)
+        )
+
+        resumed = app.orchestrator.resume(run.run_id)
+
+        self.assertIs(resumed.phase, RunPhase.DONE)
+        self.assertEqual(len(drained.search(KnowledgeQuery(category="XSS", text=""))), 1)
+
+    def test_retry_publishes_only_what_failed_and_never_duplicates(self) -> None:
+        flaky = _FlakyKnowledgeBase(fail_times=1)
+        app = _application(flaky)
+
+        run = app.orchestrator.start(_request())
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(len(flaky.search(KnowledgeQuery(category="XSS", text=""))), 0)
+
+        # 실제 호출자는 완료된 Run의 상태를 REPORT로 되돌리지 않는다. DONE 상태의
+        # 정상 resume 경로가 Knowledge 후처리만 다시 실행해야 한다.
+        app.orchestrator.resume(run.run_id)
+        self.assertEqual(flaky.attempts, 2)
+        self.assertEqual(len(flaky.search(KnowledgeQuery(category="XSS", text=""))), 1)
+
+        # 한 번 더 재개해도 같은 Case 가 두 개가 되지 않는다.
+        app.orchestrator.resume(run.run_id)
+        self.assertEqual(flaky.attempts, 3)
+        self.assertEqual(len(flaky.search(KnowledgeQuery(category="XSS", text=""))), 1)
+
+    def test_already_published_run_keeps_its_case_count_on_resume(self) -> None:
+        knowledge = InMemoryKnowledgeBase()
+        app = _application(knowledge)
+        run = app.orchestrator.start(_request())
+
+        app.orchestrator.resume(run.run_id)
+
+        cases = knowledge.search(KnowledgeQuery(category="XSS", text=""))
+        self.assertEqual(len(cases), 1)
+
+    def test_same_pattern_across_runs_keeps_one_case_and_both_provenances(self) -> None:
+        knowledge = InMemoryKnowledgeBase()
+        first_app = _application(knowledge)
+        second_app = _application(knowledge)
+
+        first = first_app.orchestrator.start(_request())
+        second = second_app.orchestrator.start(_request())
+
+        cases = knowledge.search(KnowledgeQuery(category="XSS", text=""))
+        self.assertEqual(len(cases), 1)
+        self.assertIn(f"run:{first.run_id}", cases[0].provenance_refs)
+        self.assertIn(f"run:{second.run_id}", cases[0].provenance_refs)
+
+
+class KnowledgeProgressDisplayTests(unittest.TestCase):
+    """이벤트에 실린 발행 결과가 실제로 화면에 나오는지 본다.
+
+    이벤트만 검사하면 "데이터는 있는데 아무도 안 본다"를 놓친다.
+    """
+
+    def _view_lines(self, detail, *, tty):
+        from progress_view import RunProgressView
+
+        stream = io.StringIO()
+        stream.isatty = lambda: tty  # type: ignore[method-assign]
+        view = RunProgressView(stream=stream)
+        view.emit(
+            ProgressEvent(
+                run_id="run-1",
+                sequence=1,
+                kind=ProgressEventKind.RUN_COMPLETED,
+                phase="done",
+                detail=detail,
+                budget_used=5,
+                budget_total=30,
+            )
+        )
+        view.close()
+        return stream.getvalue()
+
+    def test_tty_screen_shows_publication_shortfall(self) -> None:
+        out = self._view_lines("knowledge 7/10", tty=True)
+
+        self.assertIn("Knowledge", out)
+        self.assertIn("7 / 10", out)
+        self.assertIn("3건 발행 실패", out)
+
+    def test_non_tty_log_shows_publication_shortfall(self) -> None:
+        out = self._view_lines("knowledge 7/10", tty=False)
+
+        self.assertIn("Knowledge 7/10", out)
+        self.assertIn("3건 실패", out)
+
+    def test_full_publication_shows_no_failure_note(self) -> None:
+        out = self._view_lines("knowledge 10/10", tty=True)
+
+        self.assertIn("Knowledge", out)
+        self.assertNotIn("실패", out)
+
+    def test_disabled_publication_shows_no_knowledge_line(self) -> None:
+        self.assertNotIn("Knowledge", self._view_lines(None, tty=True))
+
+    def test_unparsable_detail_is_not_rendered(self) -> None:
+        """예외 메시지 같은 임의 문자열이 화면으로 새지 않아야 한다."""
+
+        out = self._view_lines("sqlite3.OperationalError: /secret/path.db", tty=True)
+
+        self.assertNotIn("Knowledge", out)
+        self.assertNotIn("secret", out)
 
 
 if __name__ == "__main__":

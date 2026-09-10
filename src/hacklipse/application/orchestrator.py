@@ -36,7 +36,7 @@ from hacklipse.ports import (
     SurfaceStore,
     VulnerabilityRouter,
 )
-from hacklipse.ports.errors import AgentUnavailable, BudgetExceeded
+from hacklipse.ports.errors import AgentUnavailable, BudgetExceeded, DuplicateRecord
 
 from .errors import AgentContractError, WorkflowExecutionError, safe_error_reason
 from .state_machine import RunStateMachine
@@ -115,8 +115,9 @@ class Orchestrator:
         self._progress = progress_sink
         self._knowledge = knowledge_base
         self._knowledge_case = knowledge_case_builder
-        # 발행에 실패한 Finding. 조용히 사라지지 않도록 RUN_COMPLETED에 함께 싣는다.
+        # 발행 결과. 조용히 사라지지 않도록 RUN_COMPLETED에 함께 싣는다.
         self._knowledge_failures: list[str] = []
+        self._knowledge_published: tuple[int, int] | None = None
         self._sequence = 0
         # 경과 시간만 쓰므로 단조 시계를 쓴다. 시스템 시각이 바뀌어도 구간 길이가
         # 음수가 되지 않는다. 테스트는 결정적 시계를 주입한다.
@@ -147,6 +148,7 @@ class Orchestrator:
         self._sequence = 0
         self._started_at = None
         self._knowledge_failures = []
+        self._knowledge_published = None
         self._emit(run, ProgressEventKind.RUN_STARTED, detail=run.policy_profile)
         run = self._state.transition(run, RunPhase.RECON)
         self._runs.save(run)
@@ -156,7 +158,20 @@ class Orchestrator:
         """저장된 현재 phase부터 동기식 워크플로를 이어서 실행한다."""
 
         run = self._runs.get(run_id)
-        if run.phase in {RunPhase.DONE, RunPhase.FAILED}:
+        if run.phase is RunPhase.DONE:
+            # 취약점 Run의 완료와 Knowledge 발행 성공은 서로 다른 상태다. 발행 오류는
+            # Run을 실패로 뒤집지 않으므로, 완료된 Run을 resume하면 멱등적으로 다시
+            # 발행한다. 이미 저장된 관측은 DuplicateRecord로 성공 처리된다.
+            if self._knowledge is not None and self._knowledge_case is not None:
+                self._continue_progress(run_id)
+                self._publish_knowledge(run)
+                self._emit(
+                    run,
+                    ProgressEventKind.RUN_COMPLETED,
+                    detail=self._knowledge_publication_detail(),
+                )
+            return run
+        if run.phase is RunPhase.FAILED:
             return run
         self._continue_progress(run_id)
 
@@ -200,6 +215,11 @@ class Orchestrator:
                     run = self._state.transition(run, RunPhase.REPORT)
                 elif run.phase is RunPhase.REPORT:
                     run = self._report(run)
+                    # _report 는 이미 만든 보고서가 있으면 조기 반환한다. 발행은 그
+                    # 바깥에서 부른다 - 중단·부분 실패로 남은 Finding 을 재개가
+                    # 이어서 발행할 수 있어야 하기 때문이다. case_id 가 결정적이라
+                    # 이미 발행된 것은 KnowledgeBase 가 중복으로 걸러 준다.
+                    self._publish_knowledge(run)
                     run = self._state.transition(run, RunPhase.DONE)
                 else:
                     raise AgentContractError(f"unsupported active phase: {run.phase}")
@@ -207,11 +227,7 @@ class Orchestrator:
             self._emit(
                 run,
                 ProgressEventKind.RUN_COMPLETED,
-                detail=(
-                    f"knowledge publication skipped: {len(self._knowledge_failures)}"
-                    if self._knowledge_failures
-                    else None
-                ),
+                detail=self._knowledge_publication_detail(),
             )
             return run
         except Exception as error:
@@ -646,9 +662,6 @@ class Orchestrator:
             if report.run_id != run.run_id:
                 raise AgentContractError("report belongs to another run")
             self._reports.add(report)
-        # 보고서를 새로 만든 이 시점에만 발행한다. 위의 조기 반환이 재개 시 중복 발행을
-        # 막아 준다 - Case는 매번 새 case_id를 받으므로 KnowledgeBase가 걸러 주지 못한다.
-        self._publish_knowledge(run)
         return run.with_updates(report_ids=tuple(item.report_id for item in result.reports))
 
     def _publish_knowledge(self, run: Run) -> None:
@@ -661,24 +674,39 @@ class Orchestrator:
         Knowledge는 Evidence Store와 분리된 별도 Plane이다. 여기서 만든 Case는 현재 Run의
         증적이 아니며 Evidence로 되돌아가지 않는다.
 
-        ponytail: 재시도가 없다. 보고서 저장과 발행 사이에서 프로세스가 죽으면 그 Run의
-        Case는 남지 않는다. 재시도가 필요해지면 provenance_refs로 이미 발행된 Finding을
-        거르는 방식으로 올린다(KnowledgeBase.search는 category당 100건 상한이 있어 그때
-        함께 풀어야 한다).
+        프로세스 중단으로 REPORT에 머문 Run과 발행 실패 뒤 DONE이 된 Run 모두 resume에서
+        이 메서드를 다시 호출한다. Case ID와 provenance 관측 키가 결정적이므로 성공한
+        항목을 함께 재시도해도 중복되지 않는다.
         """
 
         if self._knowledge is None or self._knowledge_case is None:
             return
-        for finding in self._findings.list_by_run(run.run_id):
+        self._knowledge_failures = []
+        published = 0
+        findings = tuple(self._findings.list_by_run(run.run_id))
+        for finding in findings:
             try:
                 candidate = self._candidates.get(run.run_id, finding.candidate_id)
                 surface = self._surfaces.get(run.run_id, finding.surface_id)
                 self._knowledge.publish(
                     self._knowledge_case(finding, candidate, surface)
                 )
+            except DuplicateRecord:
+                # 이미 발행된 Finding. 재개나 재시도에서는 정상이므로 성공으로 센다.
+                pass
             except Exception:
                 # 예외 메시지는 싣지 않는다. 대상 응답이나 경로가 섞일 수 있다.
                 self._knowledge_failures.append(finding.finding_id)
+                continue
+            published += 1
+        self._knowledge_published = (published, len(findings))
+
+    def _knowledge_publication_detail(self) -> str | None:
+        """진행 화면에 전달할 고정 형식의 안전한 발행 수치."""
+
+        if self._knowledge_published is None:
+            return None
+        return f"knowledge {self._knowledge_published[0]}/{self._knowledge_published[1]}"
 
     def _merge_agent_result(self, run: Run, result: AgentResult) -> Run:
         """반환된 ID의 Evidence 실재 여부를 확인하고 Run에 병합한다."""
