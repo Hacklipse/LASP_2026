@@ -31,7 +31,13 @@ from .sqli_analysis import HeuristicSqliAnalyzer
 from .ssti_analysis import HeuristicSstiAnalyzer
 from .reporting import MarkdownReportAgent
 from .retry import BoundedRetryPolicy
-from .routing import RoutingRule, RuleBasedVulnerabilityRouter, SurfaceRoutingRule
+from .routing import (
+    RouteSuggestion,
+    RouterAdvisor,
+    RoutingRule,
+    RuleBasedVulnerabilityRouter,
+    SurfaceRoutingRule,
+)
 from .runtime import DisabledExecutionRuntime
 from .security import (
     DenyAllApprovalGate,
@@ -81,6 +87,8 @@ __all__ = [
     "MemoryStoreBundle",
     "PlaywrightBrowserRuntime",
     "ReconAgent",
+    "RouteSuggestion",
+    "RouterAdvisor",
     "RoutingRule",
     "RuleBasedVulnerabilityRouter",
     "SensitiveDataSanitizer",
