@@ -358,17 +358,15 @@ class KnowledgePublicationTests(unittest.TestCase):
         self.assertIs(run.phase, RunPhase.DONE)
         self.assertEqual(len(flaky.search(KnowledgeQuery(category="XSS", text=""))), 0)
 
-        app.stores.runs.save(
-            app.stores.runs.get(run.run_id).with_updates(phase=RunPhase.REPORT)
-        )
+        # 실제 호출자는 완료된 Run의 상태를 REPORT로 되돌리지 않는다. DONE 상태의
+        # 정상 resume 경로가 Knowledge 후처리만 다시 실행해야 한다.
         app.orchestrator.resume(run.run_id)
+        self.assertEqual(flaky.attempts, 2)
         self.assertEqual(len(flaky.search(KnowledgeQuery(category="XSS", text=""))), 1)
 
         # 한 번 더 재개해도 같은 Case 가 두 개가 되지 않는다.
-        app.stores.runs.save(
-            app.stores.runs.get(run.run_id).with_updates(phase=RunPhase.REPORT)
-        )
         app.orchestrator.resume(run.run_id)
+        self.assertEqual(flaky.attempts, 3)
         self.assertEqual(len(flaky.search(KnowledgeQuery(category="XSS", text=""))), 1)
 
     def test_already_published_run_keeps_its_case_count_on_resume(self) -> None:
@@ -376,13 +374,23 @@ class KnowledgePublicationTests(unittest.TestCase):
         app = _application(knowledge)
         run = app.orchestrator.start(_request())
 
-        app.stores.runs.save(
-            app.stores.runs.get(run.run_id).with_updates(phase=RunPhase.REPORT)
-        )
         app.orchestrator.resume(run.run_id)
 
         cases = knowledge.search(KnowledgeQuery(category="XSS", text=""))
         self.assertEqual(len(cases), 1)
+
+    def test_same_pattern_across_runs_keeps_one_case_and_both_provenances(self) -> None:
+        knowledge = InMemoryKnowledgeBase()
+        first_app = _application(knowledge)
+        second_app = _application(knowledge)
+
+        first = first_app.orchestrator.start(_request())
+        second = second_app.orchestrator.start(_request())
+
+        cases = knowledge.search(KnowledgeQuery(category="XSS", text=""))
+        self.assertEqual(len(cases), 1)
+        self.assertIn(f"run:{first.run_id}", cases[0].provenance_refs)
+        self.assertIn(f"run:{second.run_id}", cases[0].provenance_refs)
 
 
 class KnowledgeProgressDisplayTests(unittest.TestCase):

@@ -4,7 +4,8 @@ Phase 9-A는 워크플로 배선보다 저장 경계를 먼저 만든다. 이 �
 받지 않고, 확정 Finding과 구조화된 Candidate/Surface만 KnowledgeCase로 변환한다.
 따라서 과거 대상의 응답 본문이나 인증정보가 현재 Run의 판단 자료로 복사될 경로가 없다.
 
-KnowledgeBase는 append-only다. 같은 case_id를 다시 발행하면 덮어쓰지 않고 거부한다.
+KnowledgeBase는 append-only다. 같은 패턴의 Case는 하나만 두고, 서로 다른 Run에서
+확인된 provenance는 별도 관측으로 추가한다. 같은 관측을 다시 발행하면 거부한다.
 과거 사례는 Analysis 참고자료일 뿐이며, 이 Adapter에는 Finding이나 Validation을 만드는
 기능이 의도적으로 없다.
 """
@@ -15,12 +16,11 @@ import hashlib
 import json
 import re
 import sqlite3
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from threading import RLock
 from urllib.parse import unquote, urlsplit
-from uuid import uuid4
 
 from hacklipse.domain import Candidate, Finding, KnowledgeCase, KnowledgeQuery, Surface
 from hacklipse.ports.errors import DuplicateRecord
@@ -72,17 +72,26 @@ _PROOF_TYPE_BY_VULNERABILITY = {
 }
 
 
-def knowledge_case_id(finding: Finding) -> str:
-    """같은 Finding은 언제 발행해도 같은 case_id를 받는다.
+def knowledge_case_id(
+    *, category: str, summary: str, metadata: Mapping[str, str]
+) -> str:
+    """같은 일반화 패턴은 Run이 달라도 같은 case_id를 받는다.
 
-    uuid를 쓰면 재개나 부분 실패 뒤 다시 발행할 때 내용이 같은 Case가 하나 더 생겨
-    Knowledge Plane이 오염된다. 결정적 ID면 KnowledgeBase의 UNIQUE 제약이 그대로
-    멱등성을 보장하므로 스키마를 바꾸지 않고 "여러 번 시도해도 한 번만 남는다"가 된다.
-
-    Finding 하나는 한 Run의 한 Validation에서만 나오므로 이 셋이 발행 단위를 정한다.
+    Run/Finding/Validation ID는 독립 관측의 provenance일 뿐 재사용 지식의 정체성이
+    아니다. 일반화된 설명과 metadata를 정규화해 해시하므로 같은 대상을 반복 실행하거나
+    서로 다른 대상에서 같은 패턴을 확인해도 검색 가능한 Case는 하나만 남는다.
     """
 
-    seed = "\0".join((finding.run_id, finding.finding_id, finding.validation_id))
+    seed = json.dumps(
+        {
+            "category": category.casefold(),
+            "summary": summary,
+            "metadata": dict(sorted(metadata.items())),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
     return "case-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
 
 
@@ -116,9 +125,10 @@ class KnowledgeCaseFactory:
             f"Confirmed {finding.vulnerability_type} on an {auth} {method} "
             f"{surface_kind} surface using independent {proof_type} validation."
         )
+        parameter_names = tuple(sorted(_generalize_parameter_names(surface.parameters)))
         metadata = {
-            "parameter_count": str(len(tuple(dict.fromkeys(surface.parameters)))),
-            "parameter_names": ",".join(_generalize_parameter_names(surface.parameters)),
+            "parameter_count": str(len(parameter_names)),
+            "parameter_names": ",".join(parameter_names),
             "proof_type": proof_type,
             "requires_auth": "true" if surface.requires_auth else "false",
             "severity": finding.severity,
@@ -127,7 +137,11 @@ class KnowledgeCaseFactory:
             "surface_path": _generalize_path(surface.url),
         }
         case = KnowledgeCase(
-            case_id=knowledge_case_id(finding),
+            case_id=knowledge_case_id(
+                category=finding.vulnerability_type,
+                summary=summary,
+                metadata=metadata,
+            ),
             category=finding.vulnerability_type,
             summary=summary,
             provenance_refs=(
@@ -146,20 +160,31 @@ class InMemoryKnowledgeBase:
 
     def __init__(self) -> None:
         self._cases: dict[str, KnowledgeCase] = {}
+        self._observations: dict[str, list[tuple[str, ...]]] = {}
         self._lock = RLock()
 
     def publish(self, case: KnowledgeCase) -> None:
         _validate_case(case)
         with self._lock:
-            if case.case_id in self._cases:
+            existing = self._cases.get(case.case_id)
+            observation = tuple(case.provenance_refs)
+            observations = self._observations.setdefault(case.case_id, [])
+            if observation in observations:
                 raise DuplicateRecord(case.case_id)
-            # metadata 구현체가 mutable dict여도 발행 뒤 바뀌지 않게 복사한다.
-            self._cases[case.case_id] = _copy_case(case)
+            if existing is not None and not _same_pattern(existing, case):
+                raise ValueError("knowledge case_id refers to a different pattern")
+            if existing is None:
+                # metadata 구현체가 mutable dict여도 발행 뒤 바뀌지 않게 복사한다.
+                self._cases[case.case_id] = _copy_case(case)
+            observations.append(observation)
 
     def search(self, query: KnowledgeQuery) -> tuple[KnowledgeCase, ...]:
         _validate_query(query)
         with self._lock:
-            cases = tuple(self._cases.values())
+            cases = tuple(
+                _with_observations(case, self._observations.get(case.case_id, ()))
+                for case in self._cases.values()
+            )
         return _search(cases, query)
 
 
@@ -195,18 +220,51 @@ class SQLiteKnowledgeBase:
                 "CREATE INDEX IF NOT EXISTS idx_knowledge_category "
                 "ON knowledge_cases(category, seq)"
             )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS knowledge_case_observations (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    case_id TEXT NOT NULL,
+                    observation_key TEXT NOT NULL,
+                    provenance_data TEXT NOT NULL,
+                    UNIQUE(case_id, observation_key)
+                )
+                """
+            )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_knowledge_observation_case "
+                "ON knowledge_case_observations(case_id, seq)"
+            )
+            # 기존 DB의 Case도 첫 관측으로 등록한다. INSERT OR IGNORE이므로 재개방해도
+            # 관측이 중복되지 않고 기존 knowledge_cases 스키마도 그대로 사용할 수 있다.
+            for row in self._connection.execute(
+                "SELECT case_id, data FROM knowledge_cases ORDER BY seq"
+            ).fetchall():
+                stored = _decode_case(row["data"])
+                self._insert_observation(self._connection, stored, ignore_duplicate=True)
             self._connection.commit()
 
     def publish(self, case: KnowledgeCase) -> None:
         _validate_case(case)
-        data = _encode_case(case)
         with self._lock:
             self._ensure_open()
             try:
+                # 같은 패턴을 두 Run이 동시에 처음 발행해도 한쪽의 case_id UNIQUE
+                # 충돌로 트랜잭션 전체가 취소되지 않게 한다. canonical Case는 하나만
+                # 만들고 각 Run의 provenance 관측은 아래에서 모두 추가한다.
                 self._connection.execute(
-                    "INSERT INTO knowledge_cases(case_id, category, data) VALUES (?, ?, ?)",
-                    (case.case_id, case.category.casefold(), data),
+                    "INSERT OR IGNORE INTO knowledge_cases(case_id, category, data) "
+                    "VALUES (?, ?, ?)",
+                    (case.case_id, case.category.casefold(), _encode_case(case)),
                 )
+                row = self._connection.execute(
+                    "SELECT data FROM knowledge_cases WHERE case_id = ?", (case.case_id,)
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("knowledge case insert did not persist")
+                if not _same_pattern(_decode_case(row["data"]), case):
+                    raise ValueError("knowledge case_id refers to a different pattern")
+                self._insert_observation(self._connection, case)
                 self._connection.commit()
             except sqlite3.IntegrityError as error:
                 self._connection.rollback()
@@ -223,7 +281,33 @@ class SQLiteKnowledgeBase:
                 "SELECT data FROM knowledge_cases WHERE category = ? ORDER BY seq",
                 (query.category.casefold(),),
             ).fetchall()
-        return _search(tuple(_decode_case(row["data"]) for row in rows), query)
+            cases = tuple(
+                self._case_with_stored_observations(_decode_case(row["data"]))
+                for row in rows
+            )
+        return _search(cases, query)
+
+    @staticmethod
+    def _insert_observation(connection, case: KnowledgeCase, *, ignore_duplicate=False) -> None:
+        statement = "INSERT OR IGNORE" if ignore_duplicate else "INSERT"
+        connection.execute(
+            f"{statement} INTO knowledge_case_observations"
+            "(case_id, observation_key, provenance_data) VALUES (?, ?, ?)",
+            (
+                case.case_id,
+                _observation_key(case.provenance_refs),
+                _encode_provenance(case.provenance_refs),
+            ),
+        )
+
+    def _case_with_stored_observations(self, case: KnowledgeCase) -> KnowledgeCase:
+        rows = self._connection.execute(
+            "SELECT provenance_data FROM knowledge_case_observations "
+            "WHERE case_id = ? ORDER BY seq",
+            (case.case_id,),
+        ).fetchall()
+        observations = tuple(_decode_provenance(row["provenance_data"]) for row in rows)
+        return _with_observations(case, observations)
 
     def close(self) -> None:
         with self._lock:
@@ -375,6 +459,54 @@ def _contains_sensitive_text(value: str) -> bool:
         or _PHONE.search(value)
         or _KOREAN_RRN.search(value)
     )
+
+
+def _same_pattern(left: KnowledgeCase, right: KnowledgeCase) -> bool:
+    """provenance를 제외한 재사용 지식의 내용이 같은지 확인한다."""
+
+    return (
+        left.category.casefold() == right.category.casefold()
+        and left.summary == right.summary
+        and dict(left.metadata) == dict(right.metadata)
+    )
+
+
+def _with_observations(
+    case: KnowledgeCase, observations: Sequence[Sequence[str]]
+) -> KnowledgeCase:
+    """append-only 관측을 검색 결과의 provenance로 합쳐 반환한다."""
+
+    groups = tuple(tuple(group) for group in observations) or (case.provenance_refs,)
+    provenance = tuple(dict.fromkeys(ref for group in groups for ref in group))
+    combined = KnowledgeCase(
+        case_id=case.case_id,
+        category=case.category,
+        summary=case.summary,
+        provenance_refs=provenance,
+        metadata=dict(case.metadata),
+    )
+    _validate_case(combined)
+    return combined
+
+
+def _observation_key(provenance_refs: Sequence[str]) -> str:
+    normalized = "\0".join(sorted(provenance_refs))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _encode_provenance(provenance_refs: Sequence[str]) -> str:
+    return json.dumps(
+        list(provenance_refs),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _decode_provenance(data: str) -> tuple[str, ...]:
+    value = json.loads(data)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError("persisted knowledge provenance must be a string array")
+    return tuple(value)
 
 
 def _copy_case(case: KnowledgeCase) -> KnowledgeCase:

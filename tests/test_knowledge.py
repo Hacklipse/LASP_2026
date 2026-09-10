@@ -55,15 +55,17 @@ class KnowledgeCaseFactoryTests(unittest.TestCase):
     def _finding(
         *,
         run_id: str = "run-1",
+        finding_id: str = "finding-1",
+        validation_id: str = "validation-1",
         candidate_id: str = "candidate-1",
         surface_id: str = "surface-1",
         vulnerability_type: str = "XSS",
     ) -> Finding:
         return Finding(
-            finding_id="finding-1",
+            finding_id=finding_id,
             run_id=run_id,
             candidate_id=candidate_id,
-            validation_id="validation-1",
+            validation_id=validation_id,
             vulnerability_type=vulnerability_type,
             surface_id=surface_id,
             evidence_ids=("evidence-1",),
@@ -75,13 +77,30 @@ class KnowledgeCaseFactoryTests(unittest.TestCase):
             self._finding(), self._candidate(), self._surface()
         )
 
-        # case_id 는 Finding 에서 결정된다. 같은 Finding 을 다시 발행해도 같은 ID 라
-        # KnowledgeBase 의 UNIQUE 제약이 내용 중복을 막아 준다.
+        # case_id는 일반화된 패턴에서 결정된다. 같은 Finding 재시도뿐 아니라 다른
+        # Run에서 같은 패턴을 다시 확인해도 검색 가능한 Case가 늘어나지 않는다.
         again = KnowledgeCaseFactory().from_finding(
             self._finding(), self._candidate(), self._surface()
         )
+        another_run = KnowledgeCaseFactory().from_finding(
+            self._finding(
+                run_id="run-2",
+                finding_id="finding-2",
+                validation_id="validation-2",
+            ),
+            self._candidate(run_id="run-2"),
+            self._surface(run_id="run-2"),
+        )
         self.assertEqual(case.case_id, again.case_id)
-        self.assertEqual(case.case_id, knowledge_case_id(self._finding()))
+        self.assertEqual(case.case_id, another_run.case_id)
+        self.assertEqual(
+            case.case_id,
+            knowledge_case_id(
+                category=case.category,
+                summary=case.summary,
+                metadata=case.metadata,
+            ),
+        )
         self.assertEqual(case.category, "XSS")
         self.assertEqual(
             case.provenance_refs,
@@ -148,18 +167,20 @@ class KnowledgeBaseContractTests(unittest.TestCase):
     def _case(
         case_id: str,
         *,
+        provenance_id: str | None = None,
         category: str = "XSS",
         summary: str = "Confirmed XSS using independent execution validation.",
         proof_type: str = "xss_execution",
     ) -> KnowledgeCase:
+        source = provenance_id or case_id
         return KnowledgeCase(
             case_id=case_id,
             category=category,
             summary=summary,
             provenance_refs=(
-                f"run:{case_id}",
-                f"finding:{case_id}",
-                f"validation:{case_id}",
+                f"run:{source}",
+                f"finding:{source}",
+                f"validation:{source}",
             ),
             metadata={
                 "proof_type": proof_type,
@@ -218,6 +239,23 @@ class KnowledgeBaseContractTests(unittest.TestCase):
         self.assertEqual(
             knowledge.search(KnowledgeQuery(category="XSS", text="unrelated")), ()
         )
+
+    def test_same_pattern_from_another_run_keeps_one_case_and_both_provenances(
+        self,
+    ) -> None:
+        knowledge = InMemoryKnowledgeBase()
+        first = self._case("case-pattern", provenance_id="run-1")
+        second = self._case("case-pattern", provenance_id="run-2")
+
+        knowledge.publish(first)
+        knowledge.publish(second)
+
+        cases = knowledge.search(KnowledgeQuery(category="XSS", text="", limit=10))
+        self.assertEqual(len(cases), 1)
+        self.assertIn("run:run-1", cases[0].provenance_refs)
+        self.assertIn("run:run-2", cases[0].provenance_refs)
+        with self.assertRaises(DuplicateRecord):
+            knowledge.publish(second)
 
     def test_publication_rejects_sensitive_or_untraceable_cases(self) -> None:
         knowledge = InMemoryKnowledgeBase()
@@ -285,6 +323,32 @@ class SQLiteKnowledgeBaseTests(unittest.TestCase):
                 KnowledgeQuery(category="path traversal", text="file read")
             )
         self.assertEqual(result, (self._case(),))
+
+    def test_persists_multiple_observations_without_duplicating_the_case(self) -> None:
+        first = self._case()
+        second = KnowledgeCase(
+            case_id=first.case_id,
+            category=first.category,
+            summary=first.summary,
+            provenance_refs=(
+                "run:run-2",
+                "finding:finding-2",
+                "validation:validation-2",
+            ),
+            metadata=first.metadata,
+        )
+        with SQLiteKnowledgeBase(self.database_path) as knowledge:
+            knowledge.publish(first)
+            knowledge.publish(second)
+
+        with SQLiteKnowledgeBase(self.database_path) as reopened:
+            result = reopened.search(
+                KnowledgeQuery(category="Path Traversal", text="validation")
+            )
+
+        self.assertEqual(len(result), 1)
+        self.assertIn("run:run-1", result[0].provenance_refs)
+        self.assertIn("run:run-2", result[0].provenance_refs)
 
     def test_coexists_with_existing_store_bundle_schema(self) -> None:
         stores = SQLiteStoreBundle(self.database_path)

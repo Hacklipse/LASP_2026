@@ -158,7 +158,20 @@ class Orchestrator:
         """저장된 현재 phase부터 동기식 워크플로를 이어서 실행한다."""
 
         run = self._runs.get(run_id)
-        if run.phase in {RunPhase.DONE, RunPhase.FAILED}:
+        if run.phase is RunPhase.DONE:
+            # 취약점 Run의 완료와 Knowledge 발행 성공은 서로 다른 상태다. 발행 오류는
+            # Run을 실패로 뒤집지 않으므로, 완료된 Run을 resume하면 멱등적으로 다시
+            # 발행한다. 이미 저장된 관측은 DuplicateRecord로 성공 처리된다.
+            if self._knowledge is not None and self._knowledge_case is not None:
+                self._continue_progress(run_id)
+                self._publish_knowledge(run)
+                self._emit(
+                    run,
+                    ProgressEventKind.RUN_COMPLETED,
+                    detail=self._knowledge_publication_detail(),
+                )
+            return run
+        if run.phase is RunPhase.FAILED:
             return run
         self._continue_progress(run_id)
 
@@ -214,13 +227,7 @@ class Orchestrator:
             self._emit(
                 run,
                 ProgressEventKind.RUN_COMPLETED,
-                # 발행을 켠 Run 은 성공해도 수치를 남긴다. 실패만 알리면 "0건 발행"과
-                # "발행을 안 켬"을 화면에서 구분할 수 없다.
-                detail=(
-                    f"knowledge {self._knowledge_published[0]}/{self._knowledge_published[1]}"
-                    if self._knowledge_published is not None
-                    else None
-                ),
+                detail=self._knowledge_publication_detail(),
             )
             return run
         except Exception as error:
@@ -657,10 +664,9 @@ class Orchestrator:
         Knowledge는 Evidence Store와 분리된 별도 Plane이다. 여기서 만든 Case는 현재 Run의
         증적이 아니며 Evidence로 되돌아가지 않는다.
 
-        ponytail: 재시도가 없다. 보고서 저장과 발행 사이에서 프로세스가 죽으면 그 Run의
-        Case는 남지 않는다. 재시도가 필요해지면 provenance_refs로 이미 발행된 Finding을
-        거르는 방식으로 올린다(KnowledgeBase.search는 category당 100건 상한이 있어 그때
-        함께 풀어야 한다).
+        프로세스 중단으로 REPORT에 머문 Run과 발행 실패 뒤 DONE이 된 Run 모두 resume에서
+        이 메서드를 다시 호출한다. Case ID와 provenance 관측 키가 결정적이므로 성공한
+        항목을 함께 재시도해도 중복되지 않는다.
         """
 
         if self._knowledge is None or self._knowledge_case is None:
@@ -684,6 +690,13 @@ class Orchestrator:
                 continue
             published += 1
         self._knowledge_published = (published, len(findings))
+
+    def _knowledge_publication_detail(self) -> str | None:
+        """진행 화면에 전달할 고정 형식의 안전한 발행 수치."""
+
+        if self._knowledge_published is None:
+            return None
+        return f"knowledge {self._knowledge_published[0]}/{self._knowledge_published[1]}"
 
     def _merge_agent_result(self, run: Run, result: AgentResult) -> Run:
         """반환된 ID의 Evidence 실재 여부를 확인하고 Run에 병합한다."""
