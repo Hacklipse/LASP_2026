@@ -11,8 +11,14 @@ from hacklipse.adapters.routing import (
     OPTIONAL_RESTRICTED_FILE_BYPASS_RULES,
     RouteSuggestion,
 )
+from hacklipse.adapters.llm_router_advisor import LlmRouterAdvisor
 from hacklipse.application.errors import WorkflowExecutionError
-from hacklipse.bootstrap import build_local_application
+from hacklipse.bootstrap import (
+    IMPLEMENTED_ANALYZERS,
+    build_local_application,
+    standard_router,
+)
+from hacklipse.ports.errors import LlmCredentialsMissing
 from hacklipse.domain import (
     AgentResult,
     AgentResultStatus,
@@ -437,6 +443,71 @@ class SurfaceRoutingWorkflowTests(unittest.TestCase):
         self.assertEqual(analysis_task.surface_id, "surface-search")
         self.assertEqual(analysis_task.target_url, "http://localhost/search")
         self.assertEqual(analysis_task.allowed_tools, ("http_get",))
+
+
+class _StubLlmClient:
+    """호출되지 않아야 하는 자리에도 안전하게 넣을 수 있는 LlmClient 대역."""
+
+    def complete(self, request):  # pragma: no cover - 배선 테스트는 호출하지 않는다
+        raise AssertionError("bootstrap wiring test must not call the llm")
+
+
+class StandardRouterWiringTests(unittest.TestCase):
+    """bootstrap이 Advisor를 규칙과 같은 필터 아래에서 배선하는지 검증한다."""
+
+    def test_router_has_no_advisor_unless_requested(self) -> None:
+        self.assertIsNone(standard_router()._advisor)
+        self.assertIsNone(standard_router(llm_client=_StubLlmClient())._advisor)
+
+    def test_requesting_an_advisor_without_a_client_fails_at_wiring_time(self) -> None:
+        """키가 없는데 조용히 규칙만 도는 경로를 Run 시작 전에 막는다."""
+
+        with self.assertRaises(LlmCredentialsMissing):
+            standard_router(router_advisor=True)
+
+    def test_advisor_is_built_when_a_client_is_available(self) -> None:
+        router = standard_router(llm_client=_StubLlmClient(), router_advisor=True)
+
+        self.assertIsInstance(router._advisor, LlmRouterAdvisor)
+
+    def test_advisor_inherits_the_vulnerability_type_filter(self) -> None:
+        """--vuln xss로 만든 Router의 Advisor는 SQLi를 제안할 수 없어야 한다."""
+
+        router = standard_router(
+            ("XSS",), llm_client=_StubLlmClient(), router_advisor=True
+        )
+
+        offered = {choice.vulnerability_type for choice in router._advisor._analyzers}
+        self.assertEqual(offered, {"XSS"})
+
+    def test_advisor_only_offers_implemented_analyzers(self) -> None:
+        router = standard_router(llm_client=_StubLlmClient(), router_advisor=True)
+
+        agents = {choice.agent_type for choice in router._advisor._analyzers}
+        self.assertTrue(agents.issubset(set(IMPLEMENTED_ANALYZERS)))
+
+    def test_client_route_flag_is_carried_from_the_surface_rules(self) -> None:
+        """XSS는 담당 Analyzer가 둘이므로 표면 모양 구분이 함께 넘어가야 한다."""
+
+        router = standard_router(
+            ("XSS",), llm_client=_StubLlmClient(), router_advisor=True
+        )
+
+        by_agent = {
+            choice.agent_type: choice.client_route
+            for choice in router._advisor._analyzers
+        }
+        self.assertIs(by_agent["xss_analyzer"], False)
+        self.assertIs(by_agent["browser_xss_analyzer"], True)
+
+    def test_no_advisor_when_the_filter_removes_every_rule(self) -> None:
+        """제안할 유형이 없으면 Advisor를 만들지 않는다. 구성 오류가 아니라 선택의 결과다."""
+
+        router = standard_router(
+            ("Nonexistent",), llm_client=_StubLlmClient(), router_advisor=True
+        )
+
+        self.assertIsNone(router._advisor)
 
 
 if __name__ == "__main__":

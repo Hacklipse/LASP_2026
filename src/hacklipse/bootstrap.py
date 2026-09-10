@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Callable, Collection, Mapping, Protocol
+from typing import Callable, Collection, Mapping, Protocol, Sequence
 
 from hacklipse.adapters import (
     AllowlistPolicyGate,
@@ -37,7 +37,13 @@ from hacklipse.adapters import (
     SensitiveDataSanitizer,
     ValidationAgent,
 )
-from hacklipse.adapters.routing import DEFAULT_RULES, DEFAULT_SURFACE_RULES
+from hacklipse.adapters.llm_router_advisor import AnalyzerChoice, LlmRouterAdvisor
+from hacklipse.adapters.routing import (
+    DEFAULT_RULES,
+    DEFAULT_SURFACE_RULES,
+    RoutingRule,
+    SurfaceRoutingRule,
+)
 from hacklipse.adapters.recon import DEFAULT_MAX_PAGES
 from hacklipse.application import (
     KnowledgeContextProvider,
@@ -310,30 +316,89 @@ IMPLEMENTED_ANALYZERS = (
 
 def standard_router(
     vulnerability_types: Collection[str] | None = None,
+    *,
+    llm_client: LlmClient | None = None,
+    router_advisor: bool = False,
 ) -> RuleBasedVulnerabilityRouter:
     """구현된 Analyzer로만 라우팅하는 Router를 만든다.
 
     미구현 취약점 유형을 조용히 건너뛰는 것이 아니라 애초에 Candidate를 만들지 않는다.
     "검사했는데 없었다"와 "검사하지 않았다"를 결과에서 구분할 수 있어야 한다.
+
+    ``router_advisor``는 Analysis 프로필과 독립적인 축이다. Analysis를 휴리스틱으로 두고
+    Router만 LLM으로 돌리면 라우팅 판단의 기여를 단독으로 분리할 수 있다. 그래서
+    ``register_standard_agents()``의 프로필 전환과 묶지 않는다.
     """
 
     selected_types = (
         frozenset(vulnerability_types) if vulnerability_types is not None else None
     )
+    rules = tuple(
+        rule
+        for rule in DEFAULT_RULES
+        if rule.agent_type in IMPLEMENTED_ANALYZERS
+        and (selected_types is None or rule.vulnerability_type in selected_types)
+    )
+    surface_rules = tuple(
+        rule
+        for rule in DEFAULT_SURFACE_RULES
+        if rule.agent_type in IMPLEMENTED_ANALYZERS
+        and (selected_types is None or rule.vulnerability_type in selected_types)
+    )
     return RuleBasedVulnerabilityRouter(
-        rules=tuple(
-            rule
-            for rule in DEFAULT_RULES
-            if rule.agent_type in IMPLEMENTED_ANALYZERS
-            and (selected_types is None or rule.vulnerability_type in selected_types)
-        ),
-        surface_rules=tuple(
-            rule
-            for rule in DEFAULT_SURFACE_RULES
-            if rule.agent_type in IMPLEMENTED_ANALYZERS
-            and (selected_types is None or rule.vulnerability_type in selected_types)
+        rules=rules,
+        surface_rules=surface_rules,
+        advisor=_build_router_advisor(
+            rules=rules,
+            surface_rules=surface_rules,
+            llm_client=llm_client,
+            requested=router_advisor,
         ),
     )
+
+
+def _build_router_advisor(
+    *,
+    rules: Sequence[RoutingRule],
+    surface_rules: Sequence[SurfaceRoutingRule],
+    llm_client: LlmClient | None,
+    requested: bool,
+) -> LlmRouterAdvisor | None:
+    """Advisor를 요청받았을 때만 만들고, 만들 수 없으면 조용히 넘어가지 않는다.
+
+    키가 없는데 규칙만으로 진행하면 "Router LLM을 켰는데 규칙 결과가 나왔다"는 오독이
+    생긴다. Run이 시작된 뒤가 아니라 배선 시점에 실패시켜야 잘못된 데이터가 만들어지지
+    않는다 - 키 유무는 Run을 돌려 봐야 아는 사실이 아니라 이미 확정된 구성이다.
+
+    Router 자체는 Advisor의 모든 예외를 흡수하므로(완주 보장), 이 검사를 여기서 하지
+    않으면 LlmCredentialsMissing이 어디에서도 드러나지 않는다.
+    """
+
+    if not requested:
+        return None
+    if llm_client is None:
+        raise LlmCredentialsMissing(
+            "router advisor was requested without an LlmClient; "
+            "pass one or drop the router advisor option"
+        )
+    # 제안 가능 범위를 이미 필터링된 규칙에서 그대로 도출한다. 별도 목록을 두면
+    # --vuln 필터와 IMPLEMENTED_ANALYZERS 필터를 두 번 관리하게 되고, 어긋나는 순간
+    # Dispatcher가 AgentUnavailable로 Run을 죽인다.
+    analyzers = tuple(
+        dict.fromkeys(
+            AnalyzerChoice(
+                vulnerability_type=rule.vulnerability_type,
+                agent_type=rule.agent_type,
+                client_route=getattr(rule, "client_route", False),
+            )
+            for rule in (*rules, *surface_rules)
+        )
+    )
+    if not analyzers:
+        # --vuln 필터가 모든 규칙을 걷어낸 경우다. 제안할 유형이 없으므로 Advisor를
+        # 만들지 않는다. 이것은 구성 오류가 아니라 선택의 결과다.
+        return None
+    return LlmRouterAdvisor(llm_client=llm_client, analyzers=analyzers)
 
 
 def register_standard_agents(

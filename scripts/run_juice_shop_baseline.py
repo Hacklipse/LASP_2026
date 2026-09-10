@@ -623,6 +623,14 @@ def main(argv: list[str]) -> int:
         help="analysis profile (default: heuristic)",
     )
     parser.add_argument(
+        "--router-advisor",
+        action="store_true",
+        help=(
+            "Router가 규칙으로 분류하지 못한 표면을 LLM에게 물어본다. "
+            "--profile과 독립적인 축이라 heuristic 프로필에서도 켤 수 있다"
+        ),
+    )
+    parser.add_argument(
         "--llm-provider",
         choices=("gemini", "anthropic"),
         default="gemini",
@@ -693,7 +701,8 @@ def main(argv: list[str]) -> int:
     llm_client = None
     llm_meter: _LlmUsageMeter | None = None
     selected_model = ""
-    if args.profile == "llm":
+    # Router Advisor는 Analysis 프로필과 독립이므로, 둘 중 하나만 켜도 Client가 필요하다.
+    if args.profile == "llm" or args.router_advisor:
         selected_model = args.llm_model or (
             DEFAULT_GEMINI_LLM_MODEL
             if args.llm_provider == "gemini"
@@ -721,6 +730,10 @@ def main(argv: list[str]) -> int:
             f"LLM 구성 완료: provider={_safe_log_value(args.llm_provider)}, "
             f"model={_safe_log_value(selected_model)}"
         )
+
+    # Analysis Agent는 --profile llm일 때만 LLM으로 바꾼다. --router-advisor만 켠 실행은
+    # Analysis를 휴리스틱으로 고정해 라우팅 판단의 기여만 분리해서 본다.
+    analysis_llm_client = llm_client if args.profile == "llm" else None
 
     agent_credentials: tuple[tuple[str, str], ...] = ()
     recon_seed_urls: tuple[str, ...] = ()
@@ -846,7 +859,11 @@ def main(argv: list[str]) -> int:
         runtime=runtime,
         knowledge_base=knowledge_base,
         # 전체 모드는 유형을 제한하지 않는다. Router가 Surface별로 관련 Candidate만 만든다.
-        router=standard_router(None if run_all else (target_label,)),
+        router=standard_router(
+            None if run_all else (target_label,),
+            llm_client=llm_client,
+            router_advisor=args.router_advisor,
+        ),
         credential_resolver=resolver,
         approval_gate=StaticApprovalGate(approvals),
         audit_log=audit,
@@ -914,7 +931,7 @@ def main(argv: list[str]) -> int:
     try:
         profile = register_standard_agents(
             app,
-            llm_client=llm_client,
+            llm_client=analysis_llm_client,
             recon_max_pages=_ALL_MODE_RECON_PAGES if needs_discovery else 1,
             recon_seed_urls=recon_seed_urls,
             actor_object_id=actor_object_id,
@@ -923,9 +940,10 @@ def main(argv: list[str]) -> int:
         if profile == "llm":
             profile = f"llm/{args.llm_provider} ({_safe_log_value(selected_model)})"
         try:
+            router_label = "advisor" if args.router_advisor else "rules"
             progress.log(
                 f"Run 시작: vuln={target_label}, profile={profile}, "
-                f"request_budget={request_budget}"
+                f"router={router_label}, request_budget={request_budget}"
             )
             run = app.orchestrator.start(
                 RunRequest(
