@@ -216,27 +216,76 @@ LLM 비용도 마찬가지이며, 도구별 예산 가중치는 프레임워크 
 
 ---
 
-## 8. 실측 (2026-09-10, Juice Shop)
+## 8. 실측 — Gemini · Juice Shop 최종 실험
 
-| | Analysis | Router | Candidate | 검증 | Finding | LLM 호출 | 입력 token |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | 규칙 | 규칙 | 14 | 14/14 | 3 | 0 | 0 |
-| 2 | LLM | 규칙 | 14 | 14/14 | 3 | 14 | 1,960 |
-| 3 | 규칙 | **LLM** | **15** | 15/15 | 3 | **1** | 3,138 |
-| 4 | LLM | **LLM** | **15** | 15/15 | 3 | 16 | 5,242 |
+`--compare-routers`로 한 번의 Recon 결과를 두 Router에 동일하게 넣고 비교했다.
 
-Advisor가 Path Traversal Candidate를 2에서 3으로 늘렸다. 네 조건의 Finding 수와 유형은
-모두 같다(Path Traversal 1 · SQLi 1 · XSS 1).
+```plain text
+Target            http://127.0.0.1:3000/
+Analysis profile  heuristic
+Recon             heuristic
+Router            hybrid (paired comparison)
+Model             gemini-3.5-flash-lite
+Scope             all (Access Control은 별도 실행)
+Request budget    100
+```
 
-조건 3에서 Analysis는 휴리스틱으로 유지되면서 LLM이 정확히 1회 호출됐다. 축 분리와 Run당
-1회 호출 설계가 함께 확인된다.
+### 동일 입력 검증
 
-새로 생긴 Candidate는 검증까지 진행됐으나 Finding이 되지 않았다. **proof gate가 정상
-동작해 오탐이 늘지 않았다는 뜻이다.**
+| 항목 | 결과 |
+| --- | ---: |
+| `same_router_input` / `same_raw_recon_input` / `paired_run` | 모두 `true` |
+| Surface | 140 / 140 |
+| Evidence | 20 / 20 |
+| Heuristic Candidate | 14 |
+| Hybrid Candidate | 14 |
+| Added / Removed / Changed | **0 / 0 / 0** |
 
-> ⚠️ **1회 실행이므로 성능 판단의 근거가 아니다.** 이번 대상에서 규칙이 놓친 표면이 실제
-> 취약점이 아니었을 뿐이며, Advisor의 효과를 부정하는 결과도 긍정하는 결과도 아니다.
+### 실행 결과
+
+| 항목 | 결과 |
+| --- | ---: |
+| Run 상태 | `done` |
+| 검증 | 14 / 14 |
+| Finding | 4 (Path Traversal 1 · SQLi 1 · SSTI 1 · XSS 1) |
+| 요청 사용량 | 51 / 100 |
+| LLM 호출 | **1** |
+| 입력 / 출력 token | 3,093 / 119 |
+| Heuristic Router 지연 | 약 0.5 ms |
+| Hybrid Router 지연 | 약 8,531 ms |
+
+### 무엇이 확인됐나
+
+**Gemini는 Path Traversal 제안 1개를 반환했으나 `incompatible_surface`로 차단됐다.**
+해당 Surface가 Analyzer의 실제 실행 계약과 맞지 않았기 때문이다. Candidate로 추가되지
+않았고 Finding으로도 이어지지 않았다.
+
+**규칙 결과가 그대로 보존됐다.** Added / Removed / Changed가 모두 0이다. 실제 Gemini
+호출에서도 규칙 판정이 변경되지 않는 안전 경계가 확인됐다.
+
+**Analysis가 휴리스틱인데 LLM이 정확히 1회 호출됐다.** 축 분리와 Run당 1회 호출 설계가
+함께 확인된다.
+
+### 비용과 이득
+
+**이번 Run의 탐지 이득은 0이다.** 비용은 LLM 호출 1회와 약 8.5초의 지연이다. 규칙 Router의
+지연이 0.5 ms인 것과 비교하면 라우팅 단계에서만 네 자릿수 배의 차이가 난다.
+
+다만 이는 **부적절한 제안이 안전하게 차단된 결과**이기도 하다. 잘못된 LLM 제안이 Candidate와
+Finding으로 이어지지 않는다는 것이 실제 호출로 입증됐다.
+
+> ⚠️ **1회 실행이므로 성능 판단의 근거가 아니다.** 이번 대상에서 Gemini의 제안이 실행
+> 계약과 맞지 않았을 뿐이며, Hybrid Router의 효과를 부정하는 결과도 긍정하는 결과도 아니다.
 > 탐지율·오탐률 정량 비교는 반복 실행·고정 데이터셋·blind 평가가 갖춰진 뒤의 별도 과제다.
+
+### 참고 — 초기 구현 시점의 측정
+
+`_supports_suggestion()`(실행 계약 검사)이 들어오기 전 C·D 초기 구현에서는 같은 제안이
+**통과해 Candidate 15개가 됐고**, Validation까지 진행된 뒤 Finding이 되지 않았다.
+
+계약 검사가 추가되면서 **거부 시점이 Validation 이후에서 라우팅 단계로 앞당겨졌다.**
+최종 판정은 같고 소비하는 예산만 줄었다. 두 측정은 코드 버전과 request budget(80 대 100)이
+다르므로 직접 비교하지 않는 편이 좋다.
 
 ---
 
@@ -269,6 +318,16 @@ Router에만 귀속되므로, 비교 때문에 대상에 추가 요청이 나가
 **Access Control은 여전히 `all`에 통합되지 않았다.** Advisor가 이 문제를 풀지 못한다.
 `/rest/basket/{id}` 같은 객체 ID는 크롤링으로 나오지 않고 임의로 만들면 열거가 되므로,
 표면 발견 계약을 먼저 정해야 한다.
+
+**실행 계약에 맞지 않는 Surface를 Advisor 호출 전에 걸러낼지 미정이다.** 최종 실험에서
+Gemini의 제안이 `incompatible_surface`로 차단됐는데, 그 Surface를 애초에 프롬프트에 싣지
+않았다면 token과 지연을 줄일 수 있었다. 다만 사전에 너무 좁히면 규칙이 놓친 표면을
+발견한다는 본래 목적과 충돌할 수 있어 판단이 필요하다. PR [#25](https://github.com/Hacklipse/LASP_2026/pull/25)의
+리뷰 포인트에 올려 두었다.
+
+**두 Router의 Analysis 성능을 반복 측정할지 미정이다.** paired 비교는 라우팅 판단만
+대조하며 실제 Analyzer는 primary 후보만 실행한다(`analysis_comparison_available: false`는
+오류가 아니라 이 설계의 결과다). 분석 단계까지 비교하려면 별도 실험 설계가 필요하다.
 
 ---
 

@@ -12,7 +12,12 @@ Notion 「2026 연구과제 / Agent별 LLM 역할」 §4 Vulnerability Router가
 
 배선(`standard_router`)은 C의 구현체를 조립하는 작업이라 의존 방향상 C 커밋 위에 올렸다.
 
-3단계 Juice Shop E2E까지 완료했다. 이슈 #24의 완료 기준을 모두 충족한다.
+Juice Shop E2E까지 완료했다. 이슈 #24의 완료 기준을 모두 충족한다.
+
+최종 결과는 「4단계 — Gemini · Juice Shop 최종 실험」이다. 3단계는 실행 계약 검사가
+도입되기 전 초기 구현 시점의 측정으로 이력 목적으로만 남긴다.
+
+다른 팀 대상 설명은 `ROUTER_HANDOFF.md`에 따로 있다.
 
 ---
 
@@ -340,7 +345,87 @@ Evidence 기록 경로 결정도 여전히 남아 있다.
 
 ---
 
+## 4단계 — Gemini · Juice Shop 최종 실험 (2026-09-10)
+
+**기준** `b5600b6` — C·D 통합에 실행 계약 검사(`_supports_suggestion`)와 paired 비교가
+추가된 상태다. 아래 3단계 측정은 그 이전 코드 기준이므로 **이 절이 최종 결과다.**
+
+### 1. 실행 조건
+
+```plain text
+Target            http://127.0.0.1:3000/
+Analysis profile  heuristic
+Recon             heuristic
+Router            hybrid (paired comparison)
+Model             gemini-3.5-flash-lite
+Scope             all
+Request budget    100
+```
+
+### 2. 동일 입력 검증
+
+| 항목 | 결과 |
+| --- | ---: |
+| `same_router_input` / `same_raw_recon_input` / `paired_run` | 모두 `true` |
+| Surface | 140 / 140 |
+| Evidence | 20 / 20 |
+| Heuristic Candidate | 14 |
+| Hybrid Candidate | 14 |
+| Added / Removed / Changed | 0 / 0 / 0 |
+
+### 3. 실행 결과
+
+| 항목 | 결과 |
+| --- | ---: |
+| Run 상태 | `done` |
+| 검증 | 14 / 14 |
+| Finding | 4 (Path Traversal 1 · SQLi 1 · SSTI 1 · XSS 1) |
+| 요청 사용량 | 51 / 100 |
+| LLM 호출 | 1 |
+| 입력 / 출력 token | 3,093 / 119 |
+| Heuristic Router 지연 | 약 0.5 ms |
+| Hybrid Router 지연 | 약 8,531 ms |
+
+### 4. 확인된 것
+
+**Gemini의 Path Traversal 제안 1개가 `incompatible_surface`로 차단됐다.** 해당 Surface가
+Analyzer의 실제 실행 계약과 맞지 않았다. Candidate로 추가되지 않았고 Finding으로도 이어지지
+않았다.
+
+**규칙 결과가 보존됐다.** Added / Removed / Changed가 모두 0이다. 실제 Gemini 호출에서도
+규칙 판정이 변경되지 않는다는 것이 입증됐다.
+
+**축 분리가 확인됐다.** Analysis가 휴리스틱인데 LLM이 정확히 1회 호출됐다.
+
+### 5. 비용과 이득
+
+**이번 Run의 탐지 이득은 0이다.** 비용은 LLM 1회와 약 8.5초의 지연이다. 규칙 Router가
+0.5 ms인 것과 비교하면 라우팅 단계에서 네 자릿수 배의 차이가 난다.
+
+다만 이는 부적절한 제안이 안전하게 차단된 결과이기도 하다. 잘못된 LLM 제안이 Candidate와
+Finding으로 이어지지 않는다는 안전 경계가 실제 호출로 입증됐다.
+
+`analysis_comparison_available: false`는 오류가 아니다. paired 실험은 동일 Recon 입력에서
+두 Router의 판단만 비교하며, 실제 Analyzer는 primary Router의 후보만 실행한다.
+
+### 6. 3단계 측정과의 차이
+
+계약 검사가 들어오기 전(3단계)에는 같은 성격의 제안이 통과해 Candidate가 15개가 됐고,
+Validation까지 진행된 뒤 Finding이 되지 않았다. 계약 검사가 추가되면서 **거부 시점이
+Validation 이후에서 라우팅 단계로 앞당겨졌다.** 최종 판정은 같고 소비하는 예산만 줄었다.
+
+Finding 수가 3에서 4로 다른 것(SSTI 추가)은 코드 버전과 request budget(80 대 100)이 함께
+달라진 결과이며, 원인을 분리해 확인하지는 않았다. 두 측정을 직접 비교하지 않는다.
+
+> **1회 실행이므로 성능 판단의 근거가 아니다.** 탐지율·오탐률 정량 비교는 반복 실행·
+> 고정 데이터셋·blind 평가가 갖춰진 뒤의 별도 과제다.
+
+---
+
 ## 3단계 — Juice Shop E2E (2026-09-10)
+
+> **참고** 아래는 `_supports_suggestion()` 도입 전, C·D 초기 구현 시점의 측정이다.
+> 최종 결과는 위 4단계를 본다.
 
 ### 1. 결과
 
