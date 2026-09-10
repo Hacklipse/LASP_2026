@@ -10,6 +10,8 @@ Notion 「2026 연구과제 / Agent별 LLM 역할」 §4 Vulnerability Router가
 | `feat/hybrid-router-integration` | D — Rule 우선 병합, 배선 | 1단계 완료 |
 | `feat/llm-router-advisor` | C — LLM 답 검증·정규화 | 1단계 완료 |
 
+배선(`standard_router`)은 C의 구현체를 조립하는 작업이라 의존 방향상 C 커밋 위에 올렸다.
+
 ---
 
 ## D 1단계 — 계약 확정 (2026-09-10)
@@ -333,6 +335,95 @@ D가 `bootstrap.standard_router()`에 advisor 주입을 추가한다. 이때 `An
 상속된다.
 
 Evidence 기록 경로 결정도 여전히 남아 있다.
+
+---
+
+## 실행 옵션
+
+### 두 축은 독립이다
+
+`--profile`은 Analysis Agent를, `--router-advisor`는 Router를 각각 결정한다. 서로를
+암시하지 않는다.
+
+| 명령 | Analysis | Router | 무엇을 보는가 |
+| --- | --- | --- | --- |
+| `--profile heuristic` | 규칙 | 규칙 | 대조군 |
+| `--profile llm` | LLM | 규칙 | Analysis LLM 효과 (기존 실험군) |
+| `--profile heuristic --router-advisor` | 규칙 | LLM | **Router LLM 단독 효과** |
+| `--profile llm --router-advisor` | LLM | LLM | 결합 효과 |
+
+`--profile llm`의 의미를 바꾸지 않은 것은 의도적이다. Router까지 포함하도록 바꾸면 이미
+기록된 `--profile llm` 측정치(Finding 4개·예산 45/80·LLM 14회)와 새 측정치가 같은
+이름표를 달고 다른 조건이 된다. 옵션을 늘리면 과거 기록이 그대로 유효하다.
+
+세 번째 조합이 특히 유용하다. Analysis를 고정한 채 Router만 바꾸므로 라우팅 판단의
+기여를 단독으로 분리할 수 있다.
+
+### 사용법
+
+```bash
+DB=~/juice-shop/data/juiceshop.sqlite
+RUN="python scripts/run_juice_shop_baseline.py http://127.0.0.1:3000/"
+
+# 대조군
+$RUN --vuln all --profile heuristic --juice-shop-db $DB
+
+# Router LLM 단독
+$RUN --vuln all --profile heuristic --router-advisor \
+     --llm-provider gemini --juice-shop-db $DB
+
+# 결합
+$RUN --vuln all --profile llm --router-advisor \
+     --llm-provider gemini --juice-shop-db $DB
+```
+
+### 자격증명
+
+`--router-advisor`는 `--profile heuristic`에서도 LLM Client를 필요로 한다. 키가 없으면
+**Run이 시작되기 전에** `LlmCredentialsMissing`으로 실패한다.
+
+```
+router advisor was requested without an LlmClient;
+pass one or drop the router advisor option
+```
+
+조용히 규칙만 돌지 않는 이유는, 그렇게 되면 "Router LLM을 켰는데 규칙 결과가 나왔다"는
+오독이 생기기 때문이다. 키 유무는 Run을 돌려 봐야 아는 사실이 아니라 이미 확정된
+구성이므로 배선 시점에 막는다.
+
+환경변수는 provider에 따라 `GEMINI_API_KEY` 또는 `ANTHROPIC_API_KEY`다.
+
+### 실행 조건 확인
+
+진행 로그 첫 줄에 조건이 찍힌다.
+
+```plain text
+Run 시작: vuln=all, profile=llm/gemini (gemini-3.5-flash-lite), router=advisor, request_budget=80
+```
+
+`router=advisor`면 Advisor가 붙은 것이고 `router=rules`면 규칙만 돈 것이다. **측정치를
+기록할 때 이 줄을 함께 남겨야 한다** — 아래 미해결 사항 참고.
+
+### 동작 범위
+
+Advisor는 규칙이 비워 둔 자리만 채운다. 규칙이 이미 만든
+`(surface_id, vulnerability_type)` 조합은 덮어쓰지 않으며, 제안으로 만들어진 Candidate는
+`priority=0.15`로 규칙 최저값(0.20)보다 뒤에 실행된다.
+
+`--vuln xss`처럼 유형을 제한하면 Advisor도 그 유형만 제안할 수 있다. 제안 가능 목록을
+필터링된 규칙에서 도출하기 때문이다.
+
+한 Run에서 LLM에게 보여 주는 Surface는 최대 40개다(`DEFAULT_MAX_SURFACES`). Router는
+Run당 한 번만 호출하므로 이 상한이 곧 기능 전체의 비용 상한이다.
+
+### 미해결 — 실행 조건이 저장되지 않는다
+
+`--profile`과 `--router-advisor` 값은 콘솔 로그에만 남고 저장소에는 기록되지 않는다.
+`Run` 모델에 분석 프로필 필드가 없어서 SQLite만 보면 어떤 조건으로 돌린 Run인지 복원할
+수 없다(`policy_profile`은 보안 정책이며 항상 `"safe"`다).
+
+당장은 로그를 함께 기록하는 것으로 대응하고, 근본 해결은 `RunRequest`·`Run`에 분석 조건
+필드를 추가하는 별도 작업이다. Router 범위가 아니라 도메인·저장소 작업이다.
 
 ---
 
