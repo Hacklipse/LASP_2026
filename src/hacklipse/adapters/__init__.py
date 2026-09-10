@@ -5,12 +5,21 @@ from .authentication import FormLoginWorker
 from .browser_runtime import PlaywrightBrowserRuntime
 from .dispatcher import LocalTaskDispatcher
 from .http_runtime import HttpExecutionRuntime
+from .knowledge import (
+    InMemoryKnowledgeBase,
+    KnowledgeCaseFactory,
+    SQLiteKnowledgeBase,
+)
 from .gemini_llm_client import GeminiLlmClient
 from .llm_client import AnthropicLlmClient
 from .llm_path_traversal_analysis import LlmPathTraversalAnalyzer
 from .llm_sqli_analysis import LlmSqliAnalyzer
 from .llm_ssti_analysis import LlmSstiAnalyzer
 from .browser_xss_analysis import BrowserXssAnalyzer
+from .llm_browser_xss_analysis import (
+    LLM_BROWSER_XSS_ANALYZER,
+    LlmBrowserXssAnalyzer,
+)
 from .llm_xss_analysis import LlmXssAnalyzer
 from .memory import CallbackProgressLog, InMemoryProgressLog, MemoryStoreBundle
 from .policy import AllowlistPolicyGate
@@ -43,6 +52,9 @@ __all__ = [
     "DenyAllApprovalGate",
     "DisabledExecutionRuntime",
     "HttpExecutionRuntime",
+    "InMemoryKnowledgeBase",
+    "KnowledgeCaseFactory",
+    "SQLiteKnowledgeBase",
     "FormLoginWorker",
     "AnthropicLlmClient",
     "GeminiLlmClient",
@@ -51,6 +63,8 @@ __all__ = [
     "HeuristicSstiAnalyzer",
     "HeuristicPathTraversalAnalyzer",
     "BrowserXssAnalyzer",
+    "LLM_BROWSER_XSS_ANALYZER",
+    "LlmBrowserXssAnalyzer",
     "HeuristicXssAnalyzer",
     "InMemoryBudgetManager",
     "InMemoryCredentialResolver",

@@ -11,6 +11,7 @@ from hacklipse.adapters import (
     AnthropicLlmClient,
     BoundedRetryPolicy,
     BrowserXssAnalyzer,
+    KnowledgeCaseFactory,
     DisabledExecutionRuntime,
     FormLoginWorker,
     GeminiLlmClient,
@@ -27,6 +28,7 @@ from hacklipse.adapters import (
     LlmPathTraversalAnalyzer,
     LlmAccessControlAnalyzer,
     LlmXssAnalyzer,
+    LlmBrowserXssAnalyzer,
     LocalTaskDispatcher,
     MarkdownReportAgent,
     MemoryStoreBundle,
@@ -64,6 +66,7 @@ from hacklipse.ports import (
     LlmClient,
     CredentialResolver,
     TaskStore,
+    KnowledgeBase,
     VulnerabilityRouter,
 )
 from hacklipse.ports.errors import LlmCredentialsMissing
@@ -159,6 +162,7 @@ def build_local_application(
     | None = None,
     progress_sink: ProgressSink | None = None,
     clock: Callable[[], float] | None = None,
+    knowledge_base: KnowledgeBase | None = None,
 ) -> LocalApplication:
     """기본적으로 네트워크를 활성화하지 않는 로컬 시스템을 조립한다."""
 
@@ -264,6 +268,10 @@ def build_local_application(
         config=selected_config,
         progress_sink=selected_progress,
         clock=clock,
+        knowledge_base=knowledge_base,
+        # KnowledgeBase를 주지 않으면 발행 자체가 일어나지 않는다. 빌더만 있어도
+        # 아무 일도 하지 않으므로 조립을 한곳에 모아 둔다.
+        knowledge_case_builder=KnowledgeCaseFactory().from_finding,
     )
     return LocalApplication(
         orchestrator=orchestrator,
@@ -374,6 +382,11 @@ def register_standard_agents(
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
+        browser_xss_analyzer: Agent = BrowserXssAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
         profile = "heuristic"
     else:
         xss_analyzer = LlmXssAnalyzer(
@@ -408,19 +421,21 @@ def register_standard_agents(
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
+        browser_xss_analyzer = LlmBrowserXssAnalyzer(
+            llm_client=llm_client,
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
         profile = "llm"
     app.dispatcher.register(
         "xss_analyzer", xss_analyzer, allowed_tools=("http_get",)
     )
-    # SPA 라우트의 DOM 반사는 브라우저로만 관측된다. LLM 구성에서도 같은 관측을
-    # 쓰므로 두 프로필이 이 Analyzer 를 공유한다.
+    # SPA 라우트의 DOM 반사는 브라우저로만 관측된다. 반사 여부 판정은 두 프로필이
+    # 공유하지만 탐침 대상 선택은 프로필마다 다르다.
     app.dispatcher.register(
         "browser_xss_analyzer",
-        BrowserXssAnalyzer(
-            candidate_store=app.stores.candidates,
-            surface_store=app.stores.surfaces,
-            evidence_store=app.stores.evidence,
-        ),
+        browser_xss_analyzer,
         allowed_tools=("browser_xss",),
     )
     app.dispatcher.register(

@@ -59,6 +59,7 @@ from hacklipse.adapters.llm_recon_planner import (  # noqa: E402
 )
 from hacklipse.application import OrchestratorConfig, build_progress_snapshot  # noqa: E402
 from hacklipse.application.errors import WorkflowExecutionError  # noqa: E402
+from hacklipse.adapters.knowledge import SQLiteKnowledgeBase  # noqa: E402
 from hacklipse.bootstrap import (  # noqa: E402
     DEFAULT_ANTHROPIC_LLM_MODEL,
     DEFAULT_GEMINI_LLM_MODEL,
@@ -622,6 +623,13 @@ def main(argv: list[str]) -> int:
         help="임시 계정 정리에 사용할 Juice Shop juiceshop.sqlite 경로",
     )
     parser.add_argument(
+        "--knowledge-db",
+        help=(
+            "확정 Finding을 일반화한 KnowledgeCase로 발행할 SQLite 경로. "
+            "주지 않으면 발행하지 않는다"
+        ),
+    )
+    parser.add_argument(
         "--request-budget",
         type=int,
         help="Run 전체 HTTP 요청 상한 (기본: 단일 유형 %d, 전체 모드 %d)"
@@ -814,9 +822,14 @@ def main(argv: list[str]) -> int:
         else http_runtime
     )
     audit = _DebugAuditLog(progress) if debug_enabled else InMemoryExecutionAuditLog()
+    # 대상 Evidence 와 분리된 Knowledge Plane 이다. 경로를 주지 않으면 발행하지 않는다.
+    knowledge_base = (
+        SQLiteKnowledgeBase(args.knowledge_db) if args.knowledge_db else None
+    )
     app = build_local_application(
         {},
         runtime=runtime,
+        knowledge_base=knowledge_base,
         # 전체 모드는 유형을 제한하지 않는다. Router가 Surface별로 관련 Candidate만 만든다.
         router=standard_router(None if run_all else (target_label,)),
         credential_resolver=resolver,

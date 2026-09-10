@@ -15,9 +15,11 @@ from hacklipse.domain import (
     AgentResultStatus,
     Candidate,
     Finding,
+    KnowledgeCase,
     Run,
     RunPhase,
     RunRequest,
+    Surface,
     ValidationProofType,
     ValidationVerdict,
 )
@@ -26,6 +28,7 @@ from hacklipse.ports import (
     CandidateStore,
     EvidenceStore,
     FindingStore,
+    KnowledgeBase,
     PolicyGate,
     ProgressSink,
     ReportStore,
@@ -89,6 +92,11 @@ class Orchestrator:
         id_factory: Callable[[], str] | None = None,
         progress_sink: ProgressSink | None = None,
         clock: Callable[[], float] | None = None,
+        knowledge_base: KnowledgeBase | None = None,
+        # Case 생성은 Port를 하나 더 만들 만큼 넓지 않다. 단일 호출 계약이므로
+        # 호출 가능 객체로 받는다(bootstrap이 KnowledgeCaseFactory.from_finding을 넘긴다).
+        knowledge_case_builder: Callable[[Finding, Candidate, Surface], KnowledgeCase]
+        | None = None,
     ) -> None:
         self._runs = run_store
         self._evidence = evidence_store
@@ -105,6 +113,10 @@ class Orchestrator:
         self._config = config or OrchestratorConfig()
         self._id_factory = id_factory or (lambda: str(uuid4()))
         self._progress = progress_sink
+        self._knowledge = knowledge_base
+        self._knowledge_case = knowledge_case_builder
+        # 발행에 실패한 Finding. 조용히 사라지지 않도록 RUN_COMPLETED에 함께 싣는다.
+        self._knowledge_failures: list[str] = []
         self._sequence = 0
         # 경과 시간만 쓰므로 단조 시계를 쓴다. 시스템 시각이 바뀌어도 구간 길이가
         # 음수가 되지 않는다. 테스트는 결정적 시계를 주입한다.
@@ -134,6 +146,7 @@ class Orchestrator:
         # 시작해야 한다. 그렇지 않으면 두 번째 Run의 단계 비용이 첫 Run까지 포함한다.
         self._sequence = 0
         self._started_at = None
+        self._knowledge_failures = []
         self._emit(run, ProgressEventKind.RUN_STARTED, detail=run.policy_profile)
         run = self._state.transition(run, RunPhase.RECON)
         self._runs.save(run)
@@ -191,7 +204,15 @@ class Orchestrator:
                 else:
                     raise AgentContractError(f"unsupported active phase: {run.phase}")
                 self._runs.save(run)
-            self._emit(run, ProgressEventKind.RUN_COMPLETED)
+            self._emit(
+                run,
+                ProgressEventKind.RUN_COMPLETED,
+                detail=(
+                    f"knowledge publication skipped: {len(self._knowledge_failures)}"
+                    if self._knowledge_failures
+                    else None
+                ),
+            )
             return run
         except Exception as error:
             # 하위 컴포넌트 실패도 Run의 FAILED 상태와 원인으로 일관되게 남긴다.
@@ -625,7 +646,39 @@ class Orchestrator:
             if report.run_id != run.run_id:
                 raise AgentContractError("report belongs to another run")
             self._reports.add(report)
+        # 보고서를 새로 만든 이 시점에만 발행한다. 위의 조기 반환이 재개 시 중복 발행을
+        # 막아 준다 - Case는 매번 새 case_id를 받으므로 KnowledgeBase가 걸러 주지 못한다.
+        self._publish_knowledge(run)
         return run.with_updates(report_ids=tuple(item.report_id for item in result.reports))
+
+    def _publish_knowledge(self, run: Run) -> None:
+        """확정 Finding을 Knowledge Plane으로 발행한다. 실패해도 Run을 되돌리지 않는다.
+
+        발행은 Run이 성공한 뒤의 후처리다. 여기서 예외가 올라가면 완주한 Run이 FAILED로
+        뒤집히고 이미 만든 보고서와 Finding까지 못 쓰게 된다. 지식 축적은 Run 성공의
+        조건이 아니므로 Finding 단위로 격리하고, 무엇이 빠졌는지는 RUN_COMPLETED에 남긴다.
+
+        Knowledge는 Evidence Store와 분리된 별도 Plane이다. 여기서 만든 Case는 현재 Run의
+        증적이 아니며 Evidence로 되돌아가지 않는다.
+
+        ponytail: 재시도가 없다. 보고서 저장과 발행 사이에서 프로세스가 죽으면 그 Run의
+        Case는 남지 않는다. 재시도가 필요해지면 provenance_refs로 이미 발행된 Finding을
+        거르는 방식으로 올린다(KnowledgeBase.search는 category당 100건 상한이 있어 그때
+        함께 풀어야 한다).
+        """
+
+        if self._knowledge is None or self._knowledge_case is None:
+            return
+        for finding in self._findings.list_by_run(run.run_id):
+            try:
+                candidate = self._candidates.get(run.run_id, finding.candidate_id)
+                surface = self._surfaces.get(run.run_id, finding.surface_id)
+                self._knowledge.publish(
+                    self._knowledge_case(finding, candidate, surface)
+                )
+            except Exception:
+                # 예외 메시지는 싣지 않는다. 대상 응답이나 경로가 섞일 수 있다.
+                self._knowledge_failures.append(finding.finding_id)
 
     def _merge_agent_result(self, run: Run, result: AgentResult) -> Run:
         """반환된 ID의 Evidence 실재 여부를 확인하고 Run에 병합한다."""
