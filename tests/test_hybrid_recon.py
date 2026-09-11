@@ -13,6 +13,9 @@ from uuid import uuid4
 
 from hacklipse.adapters.llm_recon_planner import LlmReconPlanner, ReconPlan
 from hacklipse.adapters.memory import InMemoryEvidenceStore, InMemorySurfaceStore
+from hacklipse.adapters.path_traversal_analysis import (
+    UNLINKED_RENDER_PARAMETER_OBSERVATION,
+)
 from hacklipse.adapters.recon import ReconAgent
 from hacklipse.domain import AgentResultStatus, Evidence, TaskEnvelope
 from hacklipse.ports.errors import LlmTimeout
@@ -169,7 +172,7 @@ class HybridReconOrderingTests(unittest.TestCase):
     def test_planner_reorders_the_second_round_of_visits(self) -> None:
         evidence_store = InMemoryEvidenceStore()
         surface_store = InMemorySurfaceStore()
-        planner = _OrderingPlanner(order_by_path=("/c", "/a"))
+        planner = _OrderingPlanner(order_by_path=("/c", "/a", "/b"))
         agent, collector = _agent(evidence_store, surface_store, planner=planner)
 
         agent.handle(_task("run-order", "http://localhost/"))
@@ -182,12 +185,18 @@ class HybridReconOrderingTests(unittest.TestCase):
                 "http://localhost/main.js",
                 "http://localhost/c",
                 "http://localhost/a",
+                "http://localhost/b",
             ],
         )
 
-    def test_unselected_candidate_is_not_visited_but_stays_in_the_surface_store(
-        self,
-    ) -> None:
+    def test_a_document_surface_the_planner_omitted_is_still_visited(self) -> None:
+        """Planner는 서버 문서 표면의 순서만 바꿀 수 있고 제외하지는 못한다.
+
+        제외를 허용하면 그 URL의 HTML 폼이 파싱되지 않아 POST Surface와 렌더 파라미터
+        신호가 사라진다. 실제로 /dataerasure가 순위에서 빠져 Path Traversal을 통째로
+        놓친 적이 있다.
+        """
+
         evidence_store = InMemoryEvidenceStore()
         surface_store = InMemorySurfaceStore()
         planner = _OrderingPlanner(order_by_path=("/c", "/a"))
@@ -195,11 +204,13 @@ class HybridReconOrderingTests(unittest.TestCase):
 
         agent.handle(_task("run-skip-b", "http://localhost/"))
 
-        self.assertNotIn("http://localhost/b", collector.calls)
+        self.assertIn("http://localhost/b", collector.calls)
         urls = {surface.url for surface in surface_store.list_by_run("run-skip-b")}
         self.assertIn("http://localhost/b", urls)
 
-    def test_stop_action_visits_nothing_more(self) -> None:
+    def test_stop_action_still_visits_protected_document_surfaces(self) -> None:
+        """stop은 새 탐색만 멈추고 이미 확보한 문서 표면까지 버리지는 않는다."""
+
         evidence_store = InMemoryEvidenceStore()
         surface_store = InMemorySurfaceStore()
         planner = _OrderingPlanner(order_by_path=("/a", "/b", "/c"), action="stop")
@@ -208,7 +219,14 @@ class HybridReconOrderingTests(unittest.TestCase):
         agent.handle(_task("run-stop", "http://localhost/"))
 
         self.assertEqual(
-            collector.calls, ["http://localhost/", "http://localhost/main.js"]
+            collector.calls,
+            [
+                "http://localhost/",
+                "http://localhost/main.js",
+                "http://localhost/a",
+                "http://localhost/b",
+                "http://localhost/c",
+            ],
         )
 
     def test_a_surface_id_the_planner_never_received_is_never_visited(self) -> None:
@@ -220,8 +238,17 @@ class HybridReconOrderingTests(unittest.TestCase):
 
         agent.handle(_task("run-foreign-id", "http://localhost/"))
 
+        # 지어낸 ID는 새 URL을 만들지 못한다. 방문한 것은 코드가 이미 알고 있던
+        # 표면뿐이고, 그중 보호 대상은 순위에서 빠졌어도 그대로 남는다.
         self.assertEqual(
-            collector.calls, ["http://localhost/", "http://localhost/main.js"]
+            set(collector.calls),
+            {
+                "http://localhost/",
+                "http://localhost/main.js",
+                "http://localhost/a",
+                "http://localhost/b",
+                "http://localhost/c",
+            },
         )
 
     def test_llm_failure_falls_back_to_the_original_fifo_visit_order(self) -> None:
@@ -256,6 +283,87 @@ class HybridReconOrderingTests(unittest.TestCase):
         agent.handle(_task("run-budget", "http://localhost/"))
 
         self.assertEqual(len(collector.calls), 3)
+
+
+class HybridReconProtectedSurfaceTests(unittest.TestCase):
+    """Planner가 문서 표면을 빠뜨려도 POST Surface와 렌더 파라미터 신호가 남는지 본다.
+
+    순서 검증만으로는 부족하다. 실제 회귀는 `/dataerasure`가 순위에서 빠지면서 HTML 폼이
+    파싱되지 않아 `POST /dataerasure`와 `layout` 신호가 통째로 사라진 것이었고, 그 결과
+    Path Traversal이 Analyzer까지 가지도 못했다.
+    """
+
+    _FORM_PAGE = (
+        "<html><body><form method='post' action='/erase'>"
+        "<input name='email'><input name='securityAnswer'>"
+        "</form></body></html>"
+    )
+    _BUNDLE = (
+        "class Nav {\n"
+        "  toErase(){ window.location.assign('/erase') }\n"
+        "  toOther(){ window.location.assign('/other') }\n"
+        "}\n"
+    )
+    _BODIES = {
+        "http://localhost/": _SPA_ROOT,
+        "http://localhost/main.js": _BUNDLE,
+        "http://localhost/erase": _FORM_PAGE,
+        "http://localhost/other": _EMPTY_PAGE,
+    }
+
+    def _run(self, planner):
+        evidence_store = InMemoryEvidenceStore()
+        surface_store = InMemorySurfaceStore()
+        collector = _RoutingCollector(evidence_store, self._BODIES)
+        counter = iter(range(10_000))
+        agent = ReconAgent(
+            collector=collector,
+            evidence_store=evidence_store,
+            surface_store=surface_store,
+            id_factory=lambda: str(next(counter)),
+            planner=planner,
+            max_pages=6,
+        )
+        agent.handle(_task("run-protected", "http://localhost/"))
+        return evidence_store, surface_store, collector
+
+    def test_omitted_document_surface_still_yields_its_post_form_and_signal(
+        self,
+    ) -> None:
+        # Planner가 /erase를 순위에서 빼도 방문·파싱돼야 한다.
+        planner = _OrderingPlanner(order_by_path=("/other",))
+
+        evidence_store, surface_store, collector = self._run(planner)
+
+        self.assertIn("http://localhost/erase", collector.calls)
+        post_surfaces = [
+            surface
+            for surface in surface_store.list_by_run("run-protected")
+            if surface.method.upper() == "POST"
+        ]
+        self.assertEqual(
+            [surface.url for surface in post_surfaces], ["http://localhost/erase"]
+        )
+        self.assertEqual(post_surfaces[0].parameters, ("email", "securityAnswer"))
+        signals = [
+            item
+            for item in evidence_store.list_by_run("run-protected")
+            if item.observation.get("type") == UNLINKED_RENDER_PARAMETER_OBSERVATION
+        ]
+        self.assertTrue(signals, "layout 신호가 남아야 Router가 Candidate를 만든다")
+
+    def test_stop_action_does_not_discard_the_form_signal(self) -> None:
+        planner = _OrderingPlanner(order_by_path=("/other",), action="stop")
+
+        evidence_store, _, collector = self._run(planner)
+
+        self.assertIn("http://localhost/erase", collector.calls)
+        signals = [
+            item
+            for item in evidence_store.list_by_run("run-protected")
+            if item.observation.get("type") == UNLINKED_RENDER_PARAMETER_OBSERVATION
+        ]
+        self.assertTrue(signals)
 
 
 class HybridReconEvidenceTests(unittest.TestCase):

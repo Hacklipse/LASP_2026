@@ -119,8 +119,23 @@ class LlmBrowserXssAnalyzer:
         else:
             selected, plan_id = stored
 
+        selection_source = "llm"
         if not selected:
-            # LLM 이 탐침할 값이 없다고 판단한 경우. 요청을 아예 쓰지 않는다.
+            # LLM 이 아무것도 고르지 않아도 이번 Run 의 Recon 이 실제로 관측한 파라미터는
+            # 남긴다. 빈 선택을 그대로 받으면 알려진 반사 지점조차 탐침하지 않은 채
+            # COMPLETED 가 되어, 기각이 "확인했는데 없음"인지 "검사하지 않음"인지 구분되지
+            # 않는다. 결정적 판이 쓰는 것과 같은 집합을 같은 예산 규칙으로 되돌린다.
+            selected, _ = validate_probe_selection(
+                list(parameters),
+                parameters,
+                task.request_budget,
+                analyzer_name="llm browser xss analyzer",
+                control_requests=0,
+            )
+            selection_source = "recon"
+
+        if not selected:
+            # 되돌릴 파라미터 자체가 없다. 요청을 아예 쓰지 않는다.
             return AgentResult(
                 task_id=task.task_id,
                 status=AgentResultStatus.COMPLETED,
@@ -171,7 +186,7 @@ class LlmBrowserXssAnalyzer:
                 id_factory=self._id_factory,
                 extra={
                     "plan_evidence_id": plan_id,
-                    "selection_source": "llm",
+                    "selection_source": selection_source,
                 },
             )
         )

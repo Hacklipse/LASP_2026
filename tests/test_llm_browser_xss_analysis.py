@@ -248,14 +248,40 @@ class LlmBrowserXssAnalyzerTests(unittest.TestCase):
         with self.assertRaises(AgentContractError):
             analyzer.handle(_task())
 
-    def test_empty_selection_spends_no_requests(self) -> None:
+    def test_empty_selection_falls_back_to_recon_parameters(self) -> None:
+        """LLM 이 아무것도 고르지 않아도 Recon 이 관측한 파라미터는 탐침한다.
+
+        빈 선택을 그대로 받으면 알려진 반사 지점조차 검사하지 않은 채 COMPLETED 가 되어,
+        기각이 "확인했는데 없음"인지 "검사하지 않음"인지 구분되지 않는다.
+        """
+
         app, analyzer, _ = _fixture({"parameters": [], "reason": "nothing renders"})
 
         result = analyzer.handle(_task())
 
+        self.assertIs(result.status, AgentResultStatus.NEEDS_EVIDENCE)
+        self.assertTrue(result.evidence_requests)
+
+    def test_fallback_probe_records_recon_as_its_selection_source(self) -> None:
+        """되돌린 탐침은 LLM 판단이 아니므로 출처를 그대로 남긴다."""
+
+        app, analyzer, _ = _fixture({"parameters": [], "reason": "nothing renders"})
+
+        result, _ = _run_to_completion(app, analyzer)
+
         self.assertIs(result.status, AgentResultStatus.COMPLETED)
-        self.assertEqual(result.evidence_requests, ())
-        self.assertEqual(len(result.new_evidence_ids), 1)  # 계획 증적만 남는다
+        reflections = [
+            item.observation
+            for item in app.stores.evidence.list_by_run(_RUN_ID)
+            if item.observation.get("type") == "reflection"
+        ]
+        # 되돌림은 LLM 선택이 없으므로 Recon 이 관측한 파라미터 전부를 탐침한다.
+        self.assertEqual(
+            {item["parameter"] for item in reflections}, {"q", "page", "sort"}
+        )
+        self.assertEqual(
+            {item["selection_source"] for item in reflections}, {"recon"}
+        )
 
     def test_every_request_of_the_budget_can_be_a_probe(self) -> None:
         """반사 탐침은 control 이 없으므로 예산 하나를 예약해 두지 않는다."""

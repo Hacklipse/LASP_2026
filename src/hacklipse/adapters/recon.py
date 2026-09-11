@@ -351,7 +351,9 @@ class ReconAgent:
                 plan, plan_evidence_id = self._plan(task, candidates, remaining_budget)
                 evidence_ids.append(plan_evidence_id)
                 planner_status = recon_plan_status_detail(plan)
-                pending[:] = self._apply_plan(plan, pending, pending_surface_ids)
+                pending[:] = self._apply_plan(
+                    plan, pending, pending_surface_ids, document_pages
+                )
 
         # 번들에서 찾은 디렉터리 목록(또는 Planner가 고른 순서)을 남은 예산 안에서 마저 본다.
         crawl()
@@ -599,16 +601,24 @@ class ReconAgent:
         plan: ReconPlan,
         pending: list[str],
         pending_surface_ids: dict[str, str],
+        protected: set[str],
     ) -> list[str]:
         """plan의 action과 allowlisted ID 순서를 실제 pending URL로 되돌린다.
 
         LLM이 만든 것은 순서와 continue/stop뿐이다. pending에 없는 URL은 Planner가
         어떤 ID를 내놓든 방문하지 않는다 — 새 URL을 만들지 않고, 코드가 이미 들고
         있던 pending_surface_ids 매핑을 뒤집어서만 찾는다.
+
+        ``protected``는 코드가 서버 문서로 판정한 표면이다. Planner는 이것을 재배열할
+        수는 있어도 제외할 수는 없다. 여기서 빠지면 그 URL의 HTML 폼이 영영 파싱되지
+        않아 POST Surface와 렌더 파라미터 신호가 통째로 사라지고, 결과적으로 "검사했지만
+        없었다"와 "애초에 검사하지 않았다"가 구분되지 않는다.
         """
 
+        # 원래 방문 순서를 유지한 채 보호 대상만 추린다.
+        protected_order = [url for url in pending if url in protected]
         if plan.action == "stop":
-            return []
+            return protected_order
 
         url_by_surface_id: dict[str, str] = {}
         for url in pending:
@@ -616,11 +626,15 @@ class ReconAgent:
             if surface_id is not None:
                 url_by_surface_id.setdefault(surface_id, url)
 
-        return [
+        ranked = [
             url_by_surface_id[surface_id]
             for surface_id in plan.ranked_surface_ids
             if surface_id in url_by_surface_id
         ]
+        # Planner가 순위에서 빠뜨린 보호 표면을 앞에 되돌린다. 뒤에 붙이면 예산이 먼저
+        # 소진돼 "제외"와 결과가 같아지므로, 순서 판단보다 누락 방지를 우선한다.
+        restored = [url for url in protected_order if url not in ranked]
+        return [*restored, *ranked]
 
 
 def _parse_page(
