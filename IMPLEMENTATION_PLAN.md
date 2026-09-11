@@ -7,14 +7,28 @@
 
 ## 1. 현재 상태
 
-> 갱신 기준: 2026-09-10, `dev/dmswls` 현재 작업 트리 (`686491f` 이후 Phase 9-B 보강 포함)
+> 갱신 기준: 2026-09-11, `dev/dmswls` 커밋 `3bde2f7`
 
-Phase 1~8의 공통 실행 기반과 **5종(XSS·SQLi·Path Traversal·Access Control·SSTI)
+Phase 1~9의 공통 실행 기반과 **5종(XSS·SQLi·Path Traversal·Access Control·SSTI)
 Analysis/Validation Agent의 휴리스틱·LLM 구현**이 완료됐다. 모든 외부 실행은 중앙 수집
 경계에서 Scope·도구 권한·예산·감사·민감정보 제거를 적용하고, Finding은 취약점별 독립
 Validation proof가 만들어진 경우에만 승격된다. Recon에는 발견된 후보 안에서 후속 탐색
 순서와 범위를 고르는 선택적 LLM Planner가 연결됐고, 잘못된 응답이나 호출 실패 시 결정적
-fallback으로 계속 진행한다. 전체 테스트는 2026-09-10 기준 429개가 통과했다.
+fallback으로 계속 진행한다.
+
+Router는 Analysis 프로필과 독립적인 `heuristic`·`hybrid` 모드를 지원한다. Hybrid에서는
+LLM Advisor가 규칙이 비워 둔 자리만 제안하며 기존 규칙 Candidate를 삭제하거나 덮어쓸 수
+없다. 제안은 현재 Run의 Surface, 구현된 취약점·Agent 조합, 메서드 및 상태 변경성 계약으로
+다시 검사된다. Recon이 특정한 공격 Surface와 문서 탐색 Surface는 LLM 순위·빈 선택 때문에
+누락되지 않는다. 안전하지 않은 파라미터 이름은 Surface를 버리지 않고 `parameter_N` 별칭으로
+치환해 Recon Planner·Router Advisor·모든 LLM Analyzer에 전달하며 원래 이름은 LLM 응답을
+검증한 뒤 내부에서만 복원한다.
+
+Router 판단과 최종 Candidate 결과는 민감한 원문 없이 append-only JSONL로 연결해 기록한다.
+Gemini 호출은 기본 14회/rolling 60초의 프로세스 공용 제한을 적용하며 실패한 호출 시도도
+공급자 quota를 소비할 수 있으므로 횟수에 포함한다. 브라우저 XSS는 SPA 렌더링의 고정 2초
+대기 대신 DOM 반사 또는 실행 marker를 최대 5초 동안 조건 기반 polling한다. 전체 테스트는
+2026-09-11 기준 534개가 통과했다.
 
 Phase 9에서는 확정 Finding을 민감정보가 제거된 `KnowledgeCase`로 일반화하는 Factory와
 append-only InMemory·SQLite KnowledgeBase를 구현하고, Run 완료 후 자동 발행까지
@@ -93,7 +107,7 @@ SQLite에는 취약점 유형별 canonical Case 4개만 남고 Path Traversal �
 ```
 
 이 수치는 Recon 기능 브랜치에서 사용자가 실행한 단일 참고 기록이다. 해당 Recon 구현은
-현재 `dev/dmswls`에 합쳐졌지만, `686491f` 전체 통합 커밋에서 같은 조건의 반복 측정은 아직
+현재 `dev/dmswls`에 합쳐졌지만, `3bde2f7` 기준으로 같은 조건의 반복 측정은 아직
 하지 않았다. 따라서 정식 heuristic/LLM 비교 결과나 탐지율 통계로 사용하지 않는다.
 
 #### 이전 휴리스틱 실측 (2026-09-06, **`--profile heuristic`**)
@@ -120,7 +134,7 @@ Path Traversal Finding 6개는 독립 curl 기준과 대조해 확인했다. `/f
 | `adapters/` | ✅ HTTP·브라우저 Runtime, 메모리·SQLite 저장소, 인증·감사·Knowledge Adapter 구현 |
 | Analysis Agent | ✅ 5종 모두 휴리스틱·Gemini/Anthropic 공용 LLM 경로 구현 |
 | Validation Agent | ✅ 5종 독립 proof와 Finding 승격 구현 |
-| Pipeline LLM | ⚠️ Recon Planner와 5종 Analysis에 연결됨. Router·Orchestrator·Validation·Report는 결정적 구현 |
+| Pipeline LLM | ⚠️ Recon Planner·Hybrid Router Advisor·5종 Analysis에 연결됨. Orchestrator·Validation·Report는 결정적 구현 |
 | Juice Shop 단일 Run | ✅ XSS·SQLi·Path Traversal 동시 라우팅, SSTI는 인증 시 포함. Access Control은 전용 Run |
 | KnowledgeBase | ✅ 발행·재시도·의미 dedupe·구조화 검색·Analysis 재사용을 실제 `all` Run에서 확인. 비교 평가 전 |
 | 안전 통제 | ✅ Phase 8 baseline 구현 완료 |
@@ -132,6 +146,7 @@ report              → adapters/reporting.py          ✅
 evidence_collector  → application/execution.py       ✅
 session_authenticator → adapters/authentication.py   ✅
 recon               → 결정적 수집 + 선택적 LLM Planner/fallback ✅
+router              → 결정적 규칙 + 선택적 LLM Advisor/fallback·감사 ✅
 xss_analyzer        → heuristic / LLM 구현 (서버 반사)     ✅
 browser_xss_analyzer → heuristic / LLM 구현 (SPA DOM 반사) ✅
 sqli_analyzer       → heuristic / LLM 구현              ✅
@@ -144,10 +159,11 @@ knowledge           → 저장·발행 + 다음 Run LLM Analysis 참고 ✅
 
 `bootstrap.build_local_application()`은 공통 Worker를 조립하고,
 `register_standard_agents()`가 Recon·Analysis·Validation 구현을 등록한다. LLM Client를
-주입하지 않으면 휴리스틱 대조군, 주입하면 Recon Planner와 같은 등록 키의 LLM Analysis
-Agent를 사용한다. `browser_xss_analyzer`도 LLM 프로필에서는 제한된 구조화 선택을 수행하며,
-고정 probe와 독립 XSS 실행 proof는 결정적 코드에 남는다. Router는 선택된 취약점 유형과
-등록된 Analyzer를 기준으로 Candidate를 만든다.
+주입하지 않으면 휴리스틱 대조군, 주입하면 선택한 `--recon` 모드의 Planner와 같은 등록 키의
+LLM Analysis Agent를 사용한다. Router 모드는 `--profile`과 독립적이며 `--router hybrid`일
+때만 LLM Advisor를 붙인다. `browser_xss_analyzer`도 LLM 프로필에서는 제한된 구조화 선택을
+수행하며, 고정 probe와 독립 XSS 실행 proof는 결정적 코드에 남는다. Router는 선택된 취약점
+유형과 등록된 Analyzer만 대상으로 Candidate를 만들고 모든 Advisor 제안을 다시 검증한다.
 
 ---
 
@@ -155,11 +171,12 @@ Agent를 사용한다. `browser_xss_analyzer`도 LLM 프로필에서는 제한�
 
 ```mermaid
 flowchart TB
-    subgraph CP["Control Plane — 현재는 결정적 순서·정책 통제"]
+    subgraph CP["Control Plane — 결정적 순서·정책 + 선택적 Router Advisor"]
         ORCH["Orchestrator<br/>application/orchestrator.py"]
         SM["RunStateMachine<br/>phase 전이표"]
         TF["TaskFactory<br/>TaskEnvelope 생성"]
         TE["TaskExecutor<br/>예산·재시도"]
+        VR["Router<br/>규칙 + 선택적 LLM Advisor"]
     end
 
     subgraph GATE["Safety Boundary — 실행 직전 검사"]
@@ -188,6 +205,7 @@ flowchart TB
 
     ORCH --> SM
     ORCH --> TF --> TE --> AG
+    ORCH --> VR --> CS
     ORCH --> PG
     ORCH --> BM
     AG -->|"AgentResult (ID·EvidenceRequest)"| ORCH
@@ -199,14 +217,16 @@ flowchart TB
     style RC fill:#e0ffe0,stroke:#0a0
     style AN fill:#e0ffe0,stroke:#0a0
     style VA fill:#e0ffe0,stroke:#0a0
+    style VR fill:#e0ffe0,stroke:#0a0
     style RT fill:#e0ffe0,stroke:#0a0
     style RP fill:#e0ffe0,stroke:#0a0
 ```
 
-초록색은 현재 공통 실행 경로가 구현됐다는 뜻이다. LLM 호출은 선택적 Recon Planner와
-Analysis Agent 5종에 연결되어 있다. Recon의 실제 URL 추출·요청 실행과 Analysis의 probe
-생성·관찰 사실 판정은 결정적 코드가 담당한다. Router·Orchestrator·Validation·Report의
-LLM 역할은 아직 연결되지 않았으며 현재 결정적 로직으로 동작한다.
+초록색은 현재 공통 실행 경로가 구현됐다는 뜻이다. LLM 호출은 선택적 Recon Planner,
+Hybrid Router Advisor와 Analysis Agent 5종에 연결되어 있다. Recon의 실제 URL 추출·요청
+실행, Router의 최종 제안 검증·Candidate 생성, Analysis의 probe 생성·관찰 사실 판정은
+결정적 코드가 담당한다. Orchestrator·Validation·Report의 LLM 역할은 아직 연결되지 않았으며
+현재 결정적 로직으로 동작한다.
 
 ### 현재 워크플로 상태
 
@@ -353,7 +373,9 @@ Router가 Candidate를 만들 수 없고 워크플로가 ROUTE에서 REPORT로 �
 LLM 프로필에서는 `LlmReconPlanner`가 결정적 수집기가 이미 발견한 후보 ID만 받아 후속
 탐색 순서와 범위를 선택한다. 새 URL이나 요청 값을 만들 수 없고, 선택값 검증 실패·호출
 실패·예산 부족 시 결정적 fallback을 사용한다. 선택 출처와 fallback 여부는 Observation과
-CLI 진행 로그에 기록된다.
+CLI 진행 로그에 기록된다. LLM의 빈 선택이나 일부 선택은 Recon이 이미 식별한 공격 Surface를
+삭제하지 않으며, 문서 탐색 Surface는 일반 API Surface보다 앞서 유지해 SPA 렌더링에 필요한
+경로가 Planner 순위 때문에 탐색 상한 밖으로 밀려나지 않게 한다.
 
 **연결되는 기능** Notion §6 Recon 단계. 산출물인 `Surface`와 `Evidence`가 §8 Router의 입력이 된다.
 
@@ -418,19 +440,28 @@ Validation이 별도 재현을 수행해 `XSS_EXECUTION`, `SQLI_EFFECT`,
 `UNAUTHORIZED_OBJECT_ACCESS`, `PATH_TRAVERSAL_FILE_READ`, `SSTI_EXECUTION` 중 해당 proof를
 만들었을 때만 가능하다.
 
+대상이 제공한 파라미터명은 공통 `ParameterNameAliases` 경계에서 처리한다. 안전한 이름은
+의미 판단을 위해 그대로 전달하고, 프롬프트 구문을 바꿀 수 있는 이름은 결정적인
+`parameter_N` 별칭으로 치환한다. Surface 자체는 보존되며 LLM이 반환한 별칭만 허용된 원래
+이름으로 복원한다. 이 규칙은 Recon·Router뿐 아니라 5종의 후속 LLM Analyzer에도 동일하게
+적용된다.
+
 | Agent | 휴리스틱 | LLM | 실제 E2E |
 |---|---:|---:|---:|
 | XSS | ✅ 서버 반사 / ✅ 브라우저 DOM 반사 | ✅ 서버 반사 / ✅ 브라우저 DOM 반사 | ✅ LLM `all`에서 Finding |
 | SQLi | ✅ | ✅ | ✅ Juice Shop `/rest/products/search` Finding |
 | Access Control | ✅ | ✅ | ✅ Fake E2E·Juice Shop 전용 Run Finding |
-| Path Traversal | ✅ 확장자 필터 우회·POST Local File Read | ✅ parameterless GET·POST Local File Read | ✅ LLM `all`에서 Finding 7개 |
+| Path Traversal | ✅ 제한 확장자 우회·POST Local File Read | ✅ parameterless GET·POST Local File Read | ✅ 기본 LLM `all`에서 POST Local File Read Finding, 제한 확장자 우회는 선택 규칙 |
 | SSTI | ✅ | ✅ | ✅ Fake E2E·Juice Shop Finding |
 
 XSS는 담당 Analyzer가 둘이다. 서버가 본문에 값을 돌려주는 반사는 `xss_analyzer`,
 SPA의 DOM sink는 `browser_xss_analyzer`가 맡는다. Router가 Surface 모양(fragment 라우트
 여부)으로 갈라 보낸다. LLM 구현은 Surface에 실제 존재하는 좌표만 선택할 수 있고, 브라우저
 probe 생성과 DOM 반사 관찰은 Python이 담당한다. 최종 Finding은 Validation의 독립
-`XSS_EXECUTION` proof가 있어야 생성된다.
+`XSS_EXECUTION` proof가 있어야 생성된다. Browser Runtime은 `domcontentloaded` 뒤 고정
+sleep을 사용하지 않고 기대한 DOM 반사 또는 실행 marker가 나타날 때까지만 최대 5초 동안
+기다린다. marker가 나타나면 즉시 진행하고, polling timeout은 브라우저 장애가 아니라 정상
+미탐지로 기록한다.
 
 #### LLM `all` 완주 — 해결됨
 
@@ -494,6 +525,8 @@ Finding·Report 저장소를 제공하고, `adapters/sqlite_budget.py`가 재개
 | Agent별 도구 allowlist | ✅ 등록 권한과 Task 요청 권한을 Dispatcher에서 교차 검사 | `adapters/dispatcher.py` |
 | 인증 성공 확인 | ✅ 로그인 POST 후 보호 페이지를 별도로 요청해 검증 | `adapters/authentication.py` |
 | XSS Browser Runtime | ✅ 고정 probe, Run Cookie 전달, 동일 origin·Scope 제한 | `adapters/browser_runtime.py`, `adapters/xss_execution.py` |
+| LLM 파라미터명 격리 | ✅ 안전하지 않은 이름을 별칭으로 치환하고 검증 후 내부 복원 | `adapters/llm_parameter_names.py`, 각 LLM Adapter |
+| LLM 호출 속도 제한 | ✅ 프로세스 공용 rolling 60초 제한, Gemini 기본 14 RPM | `adapters/llm_rate_limit.py`, 대상별 CLI |
 
 **왜 이 시점인가** Phase 3에서 실제 네트워크가 열렸고, Phase 6에서 LLM이 요청을 생성하기 시작한다. **LLM이 만든 요청이 통제 없이 나가는 구간이 생기면 안 된다.** 마스킹과 감사 로그는 특히 Phase 6 전에 있는 게 안전하다.
 
@@ -572,12 +605,15 @@ Evidence는 "이번 대상에서 직접 관찰한 사실", Knowledge는 "민감�
 
 ### Phase 10 — 확장
 
-현재 코드에 연결되지 않은 후속 확장이다. 아래 표의 "현재" 열까지만 구현 상태로 본다.
+**상태: ⚠️ 제한된 Recon Planner·Hybrid Router Advisor·브라우저 XSS Runtime까지 구현.
+Orchestrator·Validation·Report LLM 보조와 비용·severity 확장은 미구현.**
+
+아래 표의 "현재" 열까지만 구현 상태로 본다.
 
 | 항목 | 현재 | 교체 방향 |
 |---|---|---|
-| `InMemoryBudgetManager` | 요청 횟수만 카운트 | LLM 토큰·비용·시간 기반 (Notion §3) |
-| `RuleBasedVulnerabilityRouter` | 고정 규칙 5개 | 모호한 사례만 LLM 라우팅 (Notion §8) |
+| `InMemoryBudgetManager` | 실행 요청 횟수 카운트 + LLM 호출의 프로세스 공용 RPM 제한 | LLM 토큰·비용·시간 기반 (Notion §3) |
+| `RuleBasedVulnerabilityRouter` | 규칙 우선 + 제한된 LLM Advisor의 Hybrid Router, fallback·감사·비교 구현 | 반복 실험에 따른 review 정책·우선순위 조정 (Notion §8) |
 | Recon·Orchestrator | Recon은 결정적 수집 + 제한된 LLM Planner, Orchestrator는 결정적 전이 | Orchestrator의 제한된 다음 작업 제안 |
 | `ValidationAgent` | 5종 결정적 재현·proof 판정 | 의미 해석·오탐 검토용 LLM 보조, proof gate는 코드 유지 |
 | `BoundedRetryPolicy(max_attempts=1)` | 사실상 재시도 없음 | 백오프 + 실패 유형별 정책 |
@@ -586,6 +622,15 @@ Evidence는 "이번 대상에서 직접 관찰한 사실", Knowledge는 "민감�
 | `RouteDecision.priority` | 정렬에만 사용 | 예산 배분에 반영 |
 | `AllowlistPolicyGate` | `safe` 프로필 하나 | 프로필별 정책 분리 |
 | 실행 Runtime | HTTP + XSS proof 전용 브라우저 | DOM Recon·범용 JS 실행이 필요한 범위로 제한 확장 |
+
+Router와 Recon 모드는 Analysis의 `--profile`과 독립적으로 선택한다. `--router hybrid`은
+규칙이 없거나 모호한 Surface를 LLM Advisor가 검토하게 하며, 기본
+`--router-review weak`은 Evidence 없는 단일 규칙 Candidate도 검토한다.
+`--router-review ambiguous`는 규칙 결과가 없거나 둘 이상인 Surface만 검토하는 좁은
+정책이다. 어느 정책에서도 강한 Observation 규칙은 LLM이 삭제하거나 덮어쓰지 못한다.
+`--compare-routers`는 동일 Recon 입력에 두 Router를 적용하되 실제 Analysis는 선택한
+Router 결과만 사용한다. 판단과 Run 결과는 기본 `artifacts/routing-decisions.jsonl`에
+민감한 원문 없이 기록한다.
 
 ### 현재 통합 마일스톤 — Juice Shop 5종 단일 Run
 
@@ -608,11 +653,13 @@ Access Control만 `all`에서 빠져 있다. Recon이 만드는 것은 `/basket`
 
 #### 남은 성능·비교 과제
 
-- **브라우저 XSS의 고정 렌더 대기 축소** — 지금은 요청마다 2초 고정 대기다. 실측상
-  브라우저 실행 자체는 0.08~0.3초로 싸고 대기가 비용의 전부다. 조건 충족까지만 기다리면
-  성공 경로는 0.28~0.33초로 줄지만 실패 경로는 상한까지 기다린다. `body`에 텍스트가
-  생겼는지로 렌더 완료를 판정하는 방법은 **쓸 수 없다** — 0.03초에 참이 되는데 marker는
-  500ms에 나타나 오탐이 난다.
+- **브라우저 XSS polling 상한 평가** — 고정 2초 대기는 제거됐고 DOM 반사·실행 marker가
+  나타나면 즉시 진행한다. 미탐지 경로는 최대 5초까지 기다리므로 반복 측정으로 탐지
+  안정성과 실행시간을 비교한 뒤 상한 조정 여부를 결정한다. `body`에 일반 텍스트가
+  생겼는지는 marker보다 먼저 참이 될 수 있어 렌더 완료 조건으로 사용하지 않는다.
+- **Hybrid Router 비교** — 동일 Recon 입력의 heuristic/hybrid Candidate 차이, Advisor
+  수락·거절 사유, Finding·요청 수·LLM token·시간을 반복 측정한다. `weak`과 `ambiguous`
+  review 정책도 같은 입력에서 비교해야 한다.
 - **도구별 예산 가중치** — 브라우저가 검증뿐 아니라 분석에도 들어와 요청 1회의 비용이
   도구마다 크게 다르다. 요청 수만 세는 현재 예산 모델로는 우선순위 조정에 근거가 없다.
 - **Path Traversal 후보 축소** — `/ftp`의 제한 확장자 파일을 전부 후보로 만든다. 필터는
@@ -689,6 +736,8 @@ Access Control만 `all`에서 빠져 있다. Recon이 만드는 것은 `/basket`
 | ✅ | `src/hacklipse/ports/llm.py` | 공급자 중립 `LlmClient`와 구조화 요청·응답·사용량 계약 |
 | ✅ | `src/hacklipse/adapters/llm_client.py` | `urllib` 기반 Anthropic Adapter 유지 |
 | ✅ | `src/hacklipse/adapters/gemini_llm_client.py` | Gemini Interactions API, 구조화 JSON, 오류·사용량 변환 |
+| ✅ | `src/hacklipse/adapters/llm_parameter_names.py` | 안전한 이름 유지·위험한 이름 별칭 치환·선택값 내부 복원 |
+| ✅ | `src/hacklipse/adapters/llm_rate_limit.py` | 여러 LLM 사용자가 공유하는 sliding-window 호출 제한 |
 | ✅ | `src/hacklipse/adapters/llm_xss_analysis.py` | LLM 파라미터 선택·반사 맥락 분류, Python 반사 사실 확인 |
 | ✅ | `src/hacklipse/adapters/llm_browser_xss_analysis.py` | SPA DOM XSS 좌표의 제한된 LLM 선택, Python 브라우저 관찰 |
 | ✅ | `src/hacklipse/adapters/llm_sqli_analysis.py` | LLM 파라미터 선택, Python control/probe SQL 오류 차이 판정 |
@@ -745,7 +794,9 @@ Evidence 테이블에는 **UPDATE 문을 쓰지 않는다.** `EvidenceStore` Pro
 | ✅ | `src/hacklipse/ports/errors.py` | `ApprovalRequired`, 인증·실행 오류 |
 | ✅ | `src/hacklipse/adapters/browser_runtime.py` | 인증 세션을 사용하는 XSS 실행 검증 |
 | ✅ | `tests/test_phase8_security.py` | 인증·마스킹·timeout·승인·감사 테스트 |
-| ✅ | `tests/test_browser_runtime.py` | 고정 XSS probe·Cookie·동일 origin 테스트 |
+| ✅ | `tests/test_browser_runtime.py` | 고정 XSS probe·Cookie·동일 origin·marker polling 테스트 |
+| ✅ | `tests/test_llm_parameter_names.py` | 별칭 충돌·결정성·원문 비노출 테스트 |
+| ✅ | `tests/test_llm_rate_limit.py` | rolling window·경계 여유·실패 호출 카운트 테스트 |
 
 ### Phase 9 — KnowledgeBase
 
@@ -767,13 +818,17 @@ Evidence 테이블에는 **UPDATE 문을 쓰지 않는다.** `EvidenceStore` Pro
 
 ### Phase 10 — 확장
 
-| | 파일 |
+| 상태 | 파일 / 구현 결과 |
 |---|---|
-| 🆕 | `src/hacklipse/adapters/cost_budget.py` — 토큰·비용 기반 예산 |
-| 🆕 | `src/hacklipse/adapters/llm_routing.py` — 모호 사례 LLM 라우팅 |
-| 🆕 | Orchestrator·Validation·Report LLM 보조 Adapter/계약 |
-| 🆕 | `src/hacklipse/adapters/reporting_json.py` — JSON/HTML 보고서 |
-| 🆕 | `src/hacklipse/adapters/severity.py` — `Finding.severity` 산정 |
+| ✅ | `src/hacklipse/adapters/routing.py` — 규칙 우선 병합·review 정책·Advisor 제안 실행 계약 검증 |
+| ✅ | `src/hacklipse/adapters/llm_router_advisor.py` — 제한된 구조화 Hybrid Router 제안과 fallback |
+| ✅ | `src/hacklipse/adapters/routing_audit.py` — 원문 없는 입력 지문·제안·최종 결과 JSONL 감사 |
+| ✅ | `scripts/routing_options.py`, `scripts/compare_routers.py` — 독립 실행 옵션과 동일 입력 비교 |
+| ✅ | `tests/test_router_pipeline.py`, `tests/test_llm_router_advisor.py` 등 — 안전 계약·감사·비교 테스트 |
+| ⏳ | `src/hacklipse/adapters/cost_budget.py` — 토큰·비용 기반 예산 |
+| ⏳ | Orchestrator·Validation·Report LLM 보조 Adapter/계약 |
+| ⏳ | `src/hacklipse/adapters/reporting_json.py` — JSON/HTML 보고서 |
+| ⏳ | `src/hacklipse/adapters/severity.py` — `Finding.severity` 산정 |
 | ✅ | `src/hacklipse/adapters/browser_runtime.py` — XSS proof 범위에서 Phase 8에 선행 구현 |
 
 ### 최종 트리
@@ -801,9 +856,13 @@ src/hacklipse/
 │   ├── http_runtime.py              🆕 P3
 │   ├── recon.py                     🆕 P4
 │   ├── llm_recon_planner.py         ✅ P4  제한된 후속 탐색 계획·fallback
+│   ├── llm_router_advisor.py         ✅ P10 제한된 Hybrid Router 제안·fallback
+│   ├── routing_audit.py              ✅ P10 Router 입력·판단·Run 결과 감사
 │   ├── validation.py                🆕 P5
 │   ├── llm_client.py                ✅ P6  Anthropic Adapter
 │   ├── gemini_llm_client.py         ✅ P6  Gemini Adapter
+│   ├── llm_parameter_names.py        ✅ P8  안전하지 않은 파라미터명 별칭
+│   ├── llm_rate_limit.py             ✅ P8  프로세스 공용 rolling LLM 제한
 │   ├── llm_xss_analysis.py          ✅ P6  XSS LLM Agent
 │   ├── llm_browser_xss_analysis.py  ✅ P6  SPA DOM XSS LLM Agent
 │   ├── llm_sqli_analysis.py         ✅ P6  SQLi LLM Agent
@@ -824,13 +883,12 @@ src/hacklipse/
 │   ├── xss_execution.py             ✅ P8  고정 browser probe 계약
 │   ├── knowledge.py                 ✅ P9 Factory·저장·검색·의미 dedupe·관측 누적
 │   ├── knowledge_prompt.py          ✅ P9 LLM 참고 문맥·비활성 prompt 보존
-│   ├── cost_budget.py               🆕 P10
-│   ├── llm_routing.py               🆕 P10
-│   ├── reporting_json.py            🆕 P10
-│   ├── severity.py                  🆕 P10
+│   ├── cost_budget.py               ⏳ P10 계획
+│   ├── reporting_json.py            ⏳ P10 계획
+│   ├── severity.py                  ⏳ P10 계획
 │   ├── __init__.py                  ✏️ P3·4·5·7  export
 │   └── budget.py · dispatcher.py · reporting.py · retry.py · routing.py · runtime.py
-└── bootstrap.py                     ✏️ P4 collector · ✏️ P7 store · ✅ P9 knowledge 발행
+└── bootstrap.py                     ✏️ P4 collector · ✏️ P7 store · ✅ P9 knowledge · ✅ P10 Hybrid Router
 
 tests/
 ├── test_invariants.py               ✏️ P1
@@ -838,6 +896,12 @@ tests/
 ├── test_recon.py                    🆕 P4
 ├── test_llm_recon_planner.py        ✅ P4
 ├── test_hybrid_recon.py             ✅ P4
+├── test_llm_router_advisor.py       ✅ P10 제한된 제안·fallback
+├── test_router_pipeline.py          ✅ P10 규칙 우선 Hybrid 병합
+├── test_router_comparison.py        ✅ P10 동일 입력 비교
+├── test_routing_audit.py            ✅ P10 안전한 판단 감사
+├── test_llm_parameter_names.py      ✅ P8 별칭 경계
+├── test_llm_rate_limit.py           ✅ P8 rolling LLM 제한
 ├── test_validation.py               🆕 P5
 ├── test_llm_xss_analysis.py         ✅ P6
 ├── test_llm_browser_xss_analysis.py ✅ P6
@@ -884,6 +948,7 @@ Phase 4  [x] ReconAgent (HTML 파싱 → Surface)
          [x] run.candidate_ids 비어 있지 않음
          [x] 제한된 LLM Recon Planner와 결정적 fallback
          [x] LLM 선택·생략·실패 상태의 Observation·CLI 표시
+         [x] 알려진 공격·문서 탐색 Surface를 Planner 선택과 무관하게 보존
 
 Phase 5  [x] ValidationAgent (독립 재현 → 판정)
          [x] evidence_requests 루프 실동작 확인
@@ -911,6 +976,8 @@ Phase 8  [x] timeout_seconds 실제 적용
          [x] 사람 승인 게이트
          [x] Agent별 도구 allowlist
          [x] XSS Browser Runtime 선행 구현
+         [x] 안전하지 않은 LLM 파라미터명 별칭 처리
+         [x] 프로세스 공용 rolling LLM RPM 제한
 
 Phase 9  [x] KnowledgeCase 일반화 Factory
          [x] InMemory·SQLite append-only KnowledgeBase
@@ -924,7 +991,9 @@ Phase 9  [x] KnowledgeCase 일반화 Factory
          [ ] Knowledge 활성/비활성 비교 측정
 
 Phase 10 [x] 제한된 Recon LLM Planner와 fallback
-         [ ] Router / Orchestrator / Validation / Report LLM 보조
+         [x] 규칙 우선 Hybrid Router Advisor와 결정적 fallback
+         [x] Router review 정책·안전한 감사 로그·동일 입력 비교
+         [ ] Orchestrator / Validation / Report LLM 보조
          [ ] 비용 예산 / 보고서 포맷 / severity
          [x] XSS proof 범위의 브라우저 Runtime은 Phase 8에서 선행 구현
 ```
