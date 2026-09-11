@@ -237,6 +237,7 @@ class ReconAgent:
         fetched: set[str] = set()
         scripts: list[str] = []
         document_pages: set[str] = set()
+        navigation_pages: set[str] = set()
         evidence_ids: list[str] = []
         planner_status: str | None = None
         # 발견과 수집은 다르다 — 크롤링 예산이 모자라도 발견한 URL은 Surface로 남긴다.
@@ -333,7 +334,7 @@ class ReconAgent:
         affordable = max(min(self._max_scripts, page_budget - len(fetched)), 0)
         for source in scripts[:affordable]:
             fetched.add(source)
-            for url, names, should_crawl in self._discover_from_script(
+            for url, names, should_crawl, is_navigation in self._discover_from_script(
                 task, source, origin
             ):
                 pending_surface_ids[url] = remember(url, "GET", names)
@@ -341,6 +342,10 @@ class ReconAgent:
                 # 내부 파일이나 HTML 폼을 발견할 수 있다.
                 if should_crawl:
                     document_pages.add(url)
+                # 그중 실제 문서 이동만 Planner가 뒤로 밀 수 없는 보호 대상이다.
+                # 디렉터리 추측과 달리 여기에 서버 렌더링 폼이 실제로 들어 있다.
+                if is_navigation:
+                    navigation_pages.add(url)
                 if should_crawl and url not in fetched and url not in pending:
                     pending.append(url)
 
@@ -352,7 +357,7 @@ class ReconAgent:
                 evidence_ids.append(plan_evidence_id)
                 planner_status = recon_plan_status_detail(plan)
                 pending[:] = self._apply_plan(
-                    plan, pending, pending_surface_ids, document_pages
+                    plan, pending, pending_surface_ids, navigation_pages
                 )
 
         # 번들에서 찾은 디렉터리 목록(또는 Planner가 고른 순서)을 남은 예산 안에서 마저 본다.
@@ -426,11 +431,12 @@ class ReconAgent:
                 f"{base}{path}",
                 tuple(sorted(parameters.get(path, ()))),
                 path in document_paths or path.endswith("/"),
+                path in document_paths,
             )
             for path in ordered_paths
         ]
         found.extend(
-            (f"{base}/#/{route}", names, False)
+            (f"{base}/#/{route}", names, False, False)
             for route, names in sorted(_client_routes(body).items())
         )
         return found
@@ -609,10 +615,16 @@ class ReconAgent:
         어떤 ID를 내놓든 방문하지 않는다 — 새 URL을 만들지 않고, 코드가 이미 들고
         있던 pending_surface_ids 매핑을 뒤집어서만 찾는다.
 
-        ``protected``는 코드가 서버 문서로 판정한 표면이다. Planner는 이것을 재배열할
-        수는 있어도 제외할 수는 없다. 여기서 빠지면 그 URL의 HTML 폼이 영영 파싱되지
-        않아 POST Surface와 렌더 파라미터 신호가 통째로 사라지고, 결과적으로 "검사했지만
-        없었다"와 "애초에 검사하지 않았다"가 구분되지 않는다.
+        ``protected``는 번들의 실제 문서 이동(``location.assign`` 등)으로 판정된 표면이다.
+        디렉터리 추측과 달리 여기에 서버 렌더링 폼이 실제로 들어 있다. Planner는 나머지의
+        순서만 정하고 이것은 건드리지 못한다 — 빠지면 그 URL의 HTML 폼이 영영 파싱되지
+        않아 POST Surface와 렌더 파라미터 신호가 통째로 사라지고, "검사했지만 없었다"와
+        "애초에 검사하지 않았다"가 구분되지 않는다.
+
+        제외뿐 아니라 **순서 강등도 막는다.** 정찰 예산은 pending 전부를 방문할 만큼
+        넉넉하지 않아서, 보호 표면을 뒤로 미는 것은 제외하는 것과 결과가 같다. 그래서
+        보호 표면은 원래 순서를 유지한 채 항상 앞에 둔다(``_discover_from_script``의
+        ``ordered_paths``가 세우는 것과 같은 우선순위다).
         """
 
         # 원래 방문 순서를 유지한 채 보호 대상만 추린다.
@@ -629,12 +641,9 @@ class ReconAgent:
         ranked = [
             url_by_surface_id[surface_id]
             for surface_id in plan.ranked_surface_ids
-            if surface_id in url_by_surface_id
+            if surface_id in url_by_surface_id and url_by_surface_id[surface_id] not in protected
         ]
-        # Planner가 순위에서 빠뜨린 보호 표면을 앞에 되돌린다. 뒤에 붙이면 예산이 먼저
-        # 소진돼 "제외"와 결과가 같아지므로, 순서 판단보다 누락 방지를 우선한다.
-        restored = [url for url in protected_order if url not in ranked]
-        return [*restored, *ranked]
+        return [*protected_order, *ranked]
 
 
 def _parse_page(

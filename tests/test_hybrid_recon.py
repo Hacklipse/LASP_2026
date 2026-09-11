@@ -172,20 +172,45 @@ class HybridReconOrderingTests(unittest.TestCase):
     def test_planner_reorders_the_second_round_of_visits(self) -> None:
         evidence_store = InMemoryEvidenceStore()
         surface_store = InMemorySurfaceStore()
-        planner = _OrderingPlanner(order_by_path=("/c", "/a", "/b"))
-        agent, collector = _agent(evidence_store, surface_store, planner=planner)
+        # 보호 대상(문서 이동)과 일반 경로(디렉터리)를 함께 둔다. Planner가 순서를
+        # 정할 수 있는 것은 후자뿐이다.
+        bundle = (
+            "class Nav {\n"
+            "  toA(){ window.location.assign('/a') }\n"
+            "}\n"
+            "const f = (n) => fetch(`/files/${n}`);\n"
+            "const d = (n) => fetch(`/docs/${n}`);\n"
+        )
+        bodies = {
+            "http://localhost/": _SPA_ROOT,
+            "http://localhost/main.js": bundle,
+            "http://localhost/a": _EMPTY_PAGE,
+            "http://localhost/files/": _EMPTY_PAGE,
+            "http://localhost/docs/": _EMPTY_PAGE,
+        }
+        collector = _RoutingCollector(evidence_store, bodies)
+        counter = iter(range(10_000))
+        agent = ReconAgent(
+            collector=collector,
+            evidence_store=evidence_store,
+            surface_store=surface_store,
+            id_factory=lambda: str(next(counter)),
+            planner=_OrderingPlanner(order_by_path=("/docs/", "/files/")),
+            max_pages=6,
+        )
 
         agent.handle(_task("run-order", "http://localhost/"))
 
-        # 첫 두 요청(root, main.js)은 결정적이고, 그 뒤 Planner가 고른 순서로 이어진다.
+        # 첫 두 요청(root, main.js)은 결정적이다. 그 뒤 보호 대상 /a 가 먼저 오고,
+        # 나머지만 Planner가 고른 순서로 이어진다.
         self.assertEqual(
             collector.calls,
             [
                 "http://localhost/",
                 "http://localhost/main.js",
-                "http://localhost/c",
                 "http://localhost/a",
-                "http://localhost/b",
+                "http://localhost/docs/",
+                "http://localhost/files/",
             ],
         )
 
