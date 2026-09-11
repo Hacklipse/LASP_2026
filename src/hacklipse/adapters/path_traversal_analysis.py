@@ -8,7 +8,7 @@ control에는 없고 probe에만 나타나는지 비교한다. Agent는 요청�
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from urllib.parse import parse_qsl, urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit
 from uuid import uuid4
 
 from hacklipse.application.errors import AgentContractError
@@ -39,6 +39,7 @@ from .probing import (
     resolve_analysis_task,
     response_body,
 )
+from .request_safety import has_state_changing_parameters
 
 PATH_TRAVERSAL_TOOL = "path_traversal_probe"
 HEURISTIC_PATH_TRAVERSAL_ANALYZER = "heuristic_path_traversal_analyzer"
@@ -153,6 +154,17 @@ class HeuristicPathTraversalAnalyzer:
             )
 
         selected = path_parameters_from_evidence(evidence, surface, parameters)
+        if candidate.exploration_parameters:
+            # 탐색 힌트는 성공 증적이 아니다. 다른 Surface의 이름, 숨은 필드 추론,
+            # 상태 변경 입력, 클라이언트 전용 URL은 이 경로에서 허용하지 않는다.
+            if (
+                any(name not in parameters for name in candidate.exploration_parameters)
+                or has_state_changing_parameters(surface.parameters)
+                or urlsplit(surface.url).fragment
+            ):
+                raise AgentContractError("invalid path traversal exploration parameters")
+            if not selected:
+                selected = candidate.exploration_parameters
         if not selected:
             return AgentResult(
                 task_id=task.task_id,

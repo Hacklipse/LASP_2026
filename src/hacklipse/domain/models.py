@@ -612,8 +612,18 @@ class Candidate:
     # 분석부터 다시 할지 검증만 다시 할지 정한다. 이것이 없으면 검증 직전에 멈춘
     # Candidate를 재개 시 처음부터 다시 분석하게 된다.
     resume_status: CandidateStatus | None = None
+    # Router가 관측된 Surface에서 고른 탐색 입력 이름. 관측/성공 Evidence가 아니다.
+    # Analyzer는 사용 전에 실제 Surface 소속과 실행 정책을 다시 검증해야 한다.
+    exploration_parameters: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.exploration_parameters, tuple) or any(
+            not isinstance(name, str) or not name or not name.isprintable()
+            for name in self.exploration_parameters
+        ):
+            raise DomainInvariantError("candidate exploration parameters must be names")
+        if len(set(self.exploration_parameters)) != len(self.exploration_parameters):
+            raise DomainInvariantError("candidate exploration parameters must be unique")
         # 저장소에서 문자열로 복원한 값도 같은 검사를 통과시킨다. 알 수 없는 상태는
         # 조용히 통과시키지 않고 여기서 막는다.
         for field_name in ("status", "resume_status"):

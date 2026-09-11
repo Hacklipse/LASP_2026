@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -150,18 +151,115 @@ DEFAULT_SURFACE_RULES = (
 )
 
 
+# 규칙이 만든 어떤 Candidate보다도 낮다(현재 규칙 최저값은 SSTI 탐색의 0.20).
+# priority는 예산이 모자랄 때 무엇을 포기하는지에 대한 결정이므로, 설명 가능한 규칙
+# 판정이 LLM 제안 때문에 잘리는 일이 없어야 한다.
+ADVISOR_PRIORITY = 0.15
+
+
+@dataclass(frozen=True, slots=True)
+class RouteSuggestion:
+    """Advisor가 돌려주는 제안 하나. Candidate가 아니라 Candidate 후보다.
+
+    Advisor는 Candidate를 만들지 않는다. candidate_id 부여·priority 결정·저장은 모두
+    Router와 Orchestrator에 남는다. 그래야 Advisor가 잘못된 값을 내놓아도 Router가
+    마지막 관문에서 한 번 더 거를 수 있다.
+
+    ``evidence_ids``가 없는 것은 의도적이다. Advisor의 판단은 관측(Observation)이 아니라
+    주장(Claim)이므로, 자기가 보지 않은 Evidence를 근거로 달 수 없다.
+    """
+
+    surface_id: str
+    vulnerability_type: str
+    agent_type: str
+    # 왜 이 제안을 했는지에 대한 Advisor의 서술. Evidence 기록용이며 TaskEnvelope로
+    # 넘기지 않는다 - 다른 Agent의 장문 추론을 Task에 싣지 않는다는 계약 때문이다.
+    reason: str = ""
+
+
+class RouterAdvisor(Protocol):
+    """규칙이 분류하지 못한 Surface에 대해 제안만 돌려주는 보조 판단자.
+
+    Router는 이 Protocol만 알고 LLM을 모른다. 구현이 없으면(``advisor=None``) Router는
+    규칙만으로 지금과 완전히 동일하게 동작한다.
+
+    ``routed``는 규칙이 이미 결정한 ``(surface_id, vulnerability_type)`` 조합이다.
+    구현체는 이 조합을 다시 제안하지 않는 것이 좋지만, 제안하더라도 Router가 규칙 결정을
+    유지하므로 덮어쓰이지 않는다.
+    """
+
+    def advise(
+        self,
+        run: Run,
+        surfaces: Sequence[Surface],
+        evidence: Sequence[Evidence],
+        routed: frozenset[tuple[str, str]],
+    ) -> Sequence[RouteSuggestion]: ...
+
+
+def _supports_suggestion(surface: Surface, suggestion: RouteSuggestion) -> bool:
+    """Advisor 제안이 실제 Analyzer의 현재 실행 계약에 맞는지 확인한다."""
+
+    method = surface.method.upper()
+    parameters = bool(surface.parameters)
+    client_route = bool(urlsplit(surface.url).fragment)
+    pair = (suggestion.vulnerability_type, suggestion.agent_type)
+    if pair == ("XSS", "browser_xss_analyzer"):
+        return method == "GET" and parameters and client_route
+    if client_route:
+        return False
+    if pair in {("XSS", "xss_analyzer"), ("SQLi", "sqli_analyzer")}:
+        return method == "GET" and parameters
+    if pair == ("Path Traversal", "path_traversal_analyzer"):
+        return method in {"GET", "POST"} and parameters
+    if pair == ("SSTI", "ssti_analyzer"):
+        return method == "POST" and "username" in surface.parameters
+    if pair == ("Access Control", "access_control_analyzer"):
+        return method == "GET" and bool(
+            object_identifier_parameters(surface.parameters)
+            or surface.path_identifier is not None
+        )
+    return False
+
+
 class RuleBasedVulnerabilityRouter:
-    """Surface 탐색 규칙과 강한 Observation 규칙을 함께 사용하는 결정적 Router."""
+    """Surface 탐색 규칙과 강한 Observation 규칙을 함께 사용하는 결정적 Router.
+
+    ``advisor``를 주면 규칙이 비워 둔 자리에 한해 제안을 받아 Candidate를 더 만든다.
+    주지 않으면 규칙만 사용하며 결과는 결정적이다.
+    """
 
     def __init__(
         self,
         rules: Sequence[RoutingRule] = DEFAULT_RULES,
         surface_rules: Sequence[SurfaceRoutingRule] = DEFAULT_SURFACE_RULES,
         id_factory: Callable[[], str] | None = None,
+        advisor: RouterAdvisor | None = None,
+        advisor_priority: float = ADVISOR_PRIORITY,
     ) -> None:
         self._rules = {rule.observation_type: rule for rule in rules}
         self._surface_rules = tuple(surface_rules)
         self._id_factory = id_factory or (lambda: str(uuid4()))
+        self._advisor = advisor
+        self._advisor_priority = advisor_priority
+        # 제안의 유효 범위를 규칙 목록에서 그대로 끌어온다. 별도 허용 목록을 두면
+        # `standard_router()`의 `--vuln` 필터와 `IMPLEMENTED_ANALYZERS` 필터를 두 번
+        # 관리하게 되고, 어긋나는 순간 Dispatcher가 AgentUnavailable로 Run을 죽인다.
+        self._allowed_pairs = frozenset(
+            (rule.vulnerability_type, rule.agent_type)
+            for rule in (*rules, *surface_rules)
+        )
+        # fragment 표면을 다룰 수 있는 Agent. 규칙과 같은 기준을 제안에도 적용한다.
+        self._client_route_agents = frozenset(
+            rule.agent_type
+            for rule in surface_rules
+            if getattr(rule, "client_route", False)
+        )
+        # 감사 Adapter가 규칙/Advisor 결과를 분리해 기록할 때 읽는 호출별 상태다.
+        self.last_rule_decisions: tuple[RouteDecision, ...] = ()
+        self.last_advisor_suggestions: tuple[RouteSuggestion, ...] = ()
+        self.last_advisor_outcomes: tuple[tuple[int, str], ...] = ()
+        self.last_advisor_status = "not_configured" if advisor is None else "not_called"
 
     def route(
         self,
@@ -171,6 +269,12 @@ class RuleBasedVulnerabilityRouter:
     ) -> tuple[RouteDecision, ...]:
         """Surface와 Evidence를 대조해 중복 없는 Candidate를 만든다."""
 
+        self.last_rule_decisions = ()
+        self.last_advisor_suggestions = ()
+        self.last_advisor_outcomes = ()
+        self.last_advisor_status = (
+            "not_configured" if self._advisor is None else "not_called"
+        )
         decisions: dict[tuple[str, str], RouteDecision] = {}
         for item in evidence:
             observation_type = str(item.observation.get("type", ""))
@@ -228,7 +332,112 @@ class RuleBasedVulnerabilityRouter:
                 )
                 decisions[key] = RouteDecision(candidate=candidate, priority=rule.priority)
 
+        self.last_rule_decisions = tuple(
+            sorted(decisions.values(), key=lambda item: item.priority, reverse=True)
+        )
+
+        # 3단계. 규칙이 비워 둔 자리만 Advisor 제안으로 채운다. 이미 들어 있는 키는
+        # 건드리지 않으므로 "LLM이 Rule을 덮어쓰지 않는다"가 검사 한 줄이 아니라 병합
+        # 순서 자체로 보장된다.
+        if self._advisor is not None:
+            suggested, status = self._advisor_decisions(
+                run, surfaces, evidence, decisions
+            )
+            self.last_advisor_status = status
+            decisions.update(suggested)
+
         # 우선순위가 높은 분석 대상을 먼저 처리하도록 정렬한다.
         return tuple(
             sorted(decisions.values(), key=lambda item: item.priority, reverse=True)
         )
+
+    def _advisor_decisions(
+        self,
+        run: Run,
+        surfaces: Sequence[Surface],
+        evidence: Sequence[Evidence],
+        decided: dict[tuple[str, str], RouteDecision],
+    ) -> tuple[dict[tuple[str, str], RouteDecision], str]:
+        """Advisor 제안을 검증해 Candidate로 바꾼다. 어떤 실패도 Run을 죽이지 않는다.
+
+        Orchestrator에도 Run 격리 검사가 있지만 거기서는 위반 시 ``AgentContractError``로
+        Run 전체가 죽는다. Advisor가 한 번 헛짚었다고 나머지 검사까지 버릴 이유가 없으므로
+        항목 위반은 여기서 그 항목만 버린다. ``llm_recon_planner``가 항목 위반과 구조
+        위반을 나눠 다루는 것과 같은 이유다.
+        """
+
+        assert self._advisor is not None
+        try:
+            suggestions = self._advisor.advise(
+                run, surfaces, evidence, frozenset(decided)
+            )
+        except Exception as error:  # noqa: BLE001 - Advisor 실패는 Run을 멈추지 않는다
+            # 여기서 예외를 올리면 LLM 장애가 곧 Run 실패가 된다. 규칙 결정은 이미
+            # decided에 들어 있으므로 그대로 두고 빈 결과를 돌려준다.
+            return {}, f"advisor_failed:{type(error).__name__}"
+
+        self.last_advisor_suggestions = tuple(
+            item for item in suggestions if isinstance(item, RouteSuggestion)
+        )
+
+        by_id = {
+            surface.surface_id: surface
+            for surface in surfaces
+            if surface.run_id == run.run_id
+        }
+        accepted: dict[tuple[str, str], RouteDecision] = {}
+        rejected = 0
+        outcomes: list[tuple[int, str]] = []
+        for index, suggestion in enumerate(suggestions):
+            if not isinstance(suggestion, RouteSuggestion):
+                rejected += 1
+                outcomes.append((index, "invalid_suggestion"))
+                continue
+            # 다른 Run의 Surface거나 존재하지 않는 Surface면 버린다.
+            surface = by_id.get(suggestion.surface_id)
+            if surface is None:
+                rejected += 1
+                outcomes.append((index, "unknown_surface"))
+                continue
+            # 등록되지 않은 Agent로 보내면 Dispatcher가 Run 전체를 실패시킨다.
+            if (suggestion.vulnerability_type, suggestion.agent_type) not in self._allowed_pairs:
+                rejected += 1
+                outcomes.append((index, "unsupported_route"))
+                continue
+            # 규칙에 적용하는 안전 기준을 제안에도 똑같이 적용한다.
+            if has_state_changing_parameters(surface.parameters):
+                rejected += 1
+                outcomes.append((index, "state_changing_surface"))
+                continue
+            if not _supports_suggestion(surface, suggestion):
+                rejected += 1
+                outcomes.append((index, "incompatible_surface"))
+                continue
+            key = (suggestion.surface_id, suggestion.vulnerability_type)
+            # 규칙이 이미 정한 자리와 Advisor가 중복 제안한 자리는 모두 건너뛴다.
+            if key in decided or key in accepted:
+                outcomes.append((index, "rule_kept" if key in decided else "duplicate"))
+                continue
+            candidate = Candidate(
+                candidate_id=f"candidate-{self._id_factory()}",
+                run_id=run.run_id,
+                surface_id=suggestion.surface_id,
+                vulnerability_type=suggestion.vulnerability_type,
+                hypothesis=(
+                    f"{suggestion.vulnerability_type} candidate suggested by router advisor"
+                ),
+                assigned_agent=suggestion.agent_type,
+                # Advisor의 판단은 Claim이므로 관측 Evidence를 근거로 달지 않는다.
+                evidence_ids=(),
+                exploration_parameters=(
+                    tuple(dict.fromkeys(surface.parameters))
+                    if suggestion.vulnerability_type == "Path Traversal"
+                    else ()
+                ),
+            )
+            accepted[key] = RouteDecision(
+                candidate=candidate, priority=self._advisor_priority
+            )
+            outcomes.append((index, "candidate_added"))
+        self.last_advisor_outcomes = tuple(outcomes)
+        return accepted, f"advisor_ok:accepted={len(accepted)},rejected={rejected}"

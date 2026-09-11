@@ -18,6 +18,7 @@ from hacklipse.adapters.path_traversal_analysis import (
     UNLINKED_RENDER_PARAMETER_OBSERVATION,
 )
 from hacklipse.adapters.policy import AllowlistPolicyGate
+from hacklipse.application.errors import AgentContractError
 from hacklipse.bootstrap import (
     build_local_application,
     register_standard_agents,
@@ -40,7 +41,7 @@ from hacklipse.domain import (
     TaskEnvelope,
     ValidationProofType,
 )
-from hacklipse.ports.errors import PolicyViolation
+from hacklipse.ports.errors import BudgetExceeded, PolicyViolation
 
 _RUN_ID = "run-path"
 _SURFACE_ID = "surface-fi"
@@ -198,6 +199,33 @@ class PathTraversalSafetyContractTests(unittest.TestCase):
 
 
 class HeuristicPathTraversalAnalyzerTests(unittest.TestCase):
+    def test_exploration_hint_cannot_select_foreign_or_unsafe_parameters(self) -> None:
+        for parameters, selected, suffix in (
+            (("page",), ("foreign",), ""),
+            (("password_new",), ("password_new",), ""),
+            (("page",), ("page",), "#/client"),
+        ):
+            with self.subTest(parameters=parameters, selected=selected, suffix=suffix):
+                agent, app, runtime, task = _fixture()
+                surface = Surface(surface_id="hint-surface", run_id=_RUN_ID,
+                                  url="http://local.test/render" + suffix, method="GET", parameters=parameters)
+                app.stores.surfaces.add(surface)
+                candidate = app.stores.candidates.get(_RUN_ID, _CANDIDATE_ID)
+                app.stores.candidates.save(replace(candidate, surface_id=surface.surface_id,
+                                                  evidence_ids=(), exploration_parameters=selected))
+                task = replace(task, surface_id=surface.surface_id, target_url=surface.url, evidence_ids=())
+                with self.assertRaises(AgentContractError):
+                    agent.handle(task)
+                self.assertEqual(runtime.requests, [])
+
+    def test_exploration_hint_still_requires_control_probe_budget(self) -> None:
+        agent, app, runtime, task = _fixture()
+        candidate = app.stores.candidates.get(_RUN_ID, _CANDIDATE_ID)
+        app.stores.candidates.save(replace(candidate, evidence_ids=(), exploration_parameters=("page",)))
+        with self.assertRaises(BudgetExceeded):
+            agent.handle(replace(task, evidence_ids=(), request_budget=1))
+        self.assertEqual(runtime.requests, [])
+
     def test_uses_central_fixed_safe_file_control_and_probe(self) -> None:
         agent, app, runtime, task = _fixture()
 

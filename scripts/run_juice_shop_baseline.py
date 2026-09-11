@@ -68,7 +68,7 @@ from hacklipse.bootstrap import (  # noqa: E402
     build_llm_client_from_env,
     build_local_application,
     register_standard_agents,
-    standard_router,
+    standard_recon_planner,
 )
 from hacklipse.domain import (  # noqa: E402
     CandidateStatus,
@@ -84,6 +84,7 @@ from hacklipse.ports.errors import LlmCredentialsMissing  # noqa: E402
 # 기존 DVWA 실행기와 같은 안전한 디버그 출력 구현을 재사용한다. 이 모듈은 main guard가
 # 있어 import만으로 실행되지 않는다.
 from progress_view import RunProgressView, format_recon_planner_status  # noqa: E402
+from routing_options import add_routing_arguments, append_run_result, build_run_router, needs_llm  # noqa: E402
 from run_dvwa_baseline import (  # noqa: E402
     _DebugAuditLog,
     _DebugProgress,
@@ -609,6 +610,7 @@ def _provision_path_traversal_account(
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_routing_arguments(parser)
     parser.add_argument("base_url", help="localhost/127.0.0.1 Juice Shop base URL")
     parser.add_argument(
         "--vuln",
@@ -623,10 +625,18 @@ def main(argv: list[str]) -> int:
         help="analysis profile (default: heuristic)",
     )
     parser.add_argument(
+        "--router-advisor",
+        action="store_true",
+        help=(
+            "Router가 규칙으로 분류하지 못한 표면을 LLM에게 물어본다. "
+            "--profile과 독립적인 축이라 heuristic 프로필에서도 켤 수 있다"
+        ),
+    )
+    parser.add_argument(
         "--llm-provider",
         choices=("gemini", "anthropic"),
         default="gemini",
-        help="LLM provider used with --profile llm (default: gemini)",
+        help="LLM provider for Analysis, Recon, Router or paired comparison (default: gemini)",
     )
     parser.add_argument("--llm-model", help="provider model id")
     parser.add_argument(
@@ -654,6 +664,9 @@ def main(argv: list[str]) -> int:
         help="LLM prompt와 구조화 응답 출력",
     )
     args = parser.parse_args(argv[1:])
+    if args.router_advisor:
+        # 팀원 PR에서 사용하던 옵션을 새 실험 축의 명칭으로 호환한다.
+        args.router = "hybrid"
 
     base_url = args.base_url.rstrip("/") + "/"
     parsed = urlsplit(base_url)
@@ -693,7 +706,7 @@ def main(argv: list[str]) -> int:
     llm_client = None
     llm_meter: _LlmUsageMeter | None = None
     selected_model = ""
-    if args.profile == "llm":
+    if needs_llm(args):
         selected_model = args.llm_model or (
             DEFAULT_GEMINI_LLM_MODEL
             if args.llm_provider == "gemini"
@@ -721,6 +734,16 @@ def main(argv: list[str]) -> int:
             f"LLM 구성 완료: provider={_safe_log_value(args.llm_provider)}, "
             f"model={_safe_log_value(selected_model)}"
         )
+
+    try:
+        router = build_run_router(
+            args, vulnerability_types=None if run_all else (target_label,),
+            llm_client=llm_client, selected_model=selected_model,
+        )
+    except OSError:
+        print("Router 기록 파일을 열 수 없습니다. --routing-log 경로와 권한을 확인하세요.")
+        return 2
+    print(f"Recon: {args.recon}; Router: {args.router}; 비교: {args.compare_routers}; 판단 기록: {_safe_log_value(args.routing_log, limit=300)}")
 
     agent_credentials: tuple[tuple[str, str], ...] = ()
     recon_seed_urls: tuple[str, ...] = ()
@@ -846,7 +869,7 @@ def main(argv: list[str]) -> int:
         runtime=runtime,
         knowledge_base=knowledge_base,
         # 전체 모드는 유형을 제한하지 않는다. Router가 Surface별로 관련 Candidate만 만든다.
-        router=standard_router(None if run_all else (target_label,)),
+        router=router,
         credential_resolver=resolver,
         approval_gate=StaticApprovalGate(approvals),
         audit_log=audit,
@@ -914,7 +937,8 @@ def main(argv: list[str]) -> int:
     try:
         profile = register_standard_agents(
             app,
-            llm_client=llm_client,
+            llm_client=llm_client if args.profile == "llm" else None,
+            recon_planner=standard_recon_planner(mode=args.recon, llm_client=llm_client),
             recon_max_pages=_ALL_MODE_RECON_PAGES if needs_discovery else 1,
             recon_seed_urls=recon_seed_urls,
             actor_object_id=actor_object_id,
@@ -925,7 +949,7 @@ def main(argv: list[str]) -> int:
         try:
             progress.log(
                 f"Run 시작: vuln={target_label}, profile={profile}, "
-                f"request_budget={request_budget}"
+                f"router={args.router}, request_budget={request_budget}"
             )
             run = app.orchestrator.start(
                 RunRequest(
@@ -951,10 +975,13 @@ def main(argv: list[str]) -> int:
                 cleanup_error = error
 
     if workflow_error is not None:
+        append_run_result(args, app, app.stores.runs.get(workflow_error.run_id))
         print(f"Run 실패: {workflow_error}")
         if cleanup_error is not None:
             print(f"임시 계정 정리 실패: {cleanup_error}")
         return 1
+    if run is not None:
+        append_run_result(args, app, run)
     if cleanup_error is not None:
         print(f"Run은 완료됐지만 임시 계정 정리에 실패했습니다: {cleanup_error}")
         return 1

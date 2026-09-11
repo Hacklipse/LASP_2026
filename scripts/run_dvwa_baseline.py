@@ -46,7 +46,7 @@ from hacklipse.bootstrap import (  # noqa: E402
     build_local_application,
     build_llm_client_from_env,
     register_standard_agents,
-    standard_router,
+    standard_recon_planner,
 )
 from hacklipse.domain import RunRequest, RunScope, TaskEnvelope  # noqa: E402
 from hacklipse.ports import (  # noqa: E402
@@ -59,6 +59,7 @@ from hacklipse.ports import (  # noqa: E402
 )
 from hacklipse.ports.errors import LlmCredentialsMissing  # noqa: E402
 from progress_view import RunProgressView  # noqa: E402
+from routing_options import add_routing_arguments, append_run_result, build_run_router, needs_llm  # noqa: E402
 
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1"})
 _CREDENTIAL_REF = "interactive-local-dvwa"
@@ -421,6 +422,7 @@ def _print_summary(
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_routing_arguments(parser)
     parser.add_argument("base_url", help="localhost/127.0.0.1 DVWA base URL")
     parser.add_argument(
         "--vuln",
@@ -438,7 +440,7 @@ def main(argv: list[str]) -> int:
         "--llm-provider",
         choices=("gemini", "anthropic"),
         default="gemini",
-        help="LLM provider used with --profile llm (default: gemini)",
+        help="LLM provider for Analysis, Recon, Router or paired comparison (default: gemini)",
     )
     parser.add_argument(
         "--llm-model",
@@ -487,7 +489,7 @@ def main(argv: list[str]) -> int:
 
     llm_client = None
     selected_model = ""
-    if args.profile == "llm":
+    if needs_llm(args):
         selected_model = args.llm_model or (
             DEFAULT_GEMINI_LLM_MODEL
             if args.llm_provider == "gemini"
@@ -517,6 +519,16 @@ def main(argv: list[str]) -> int:
             progress.log(
                 "LLM content 로그 활성화: prompt와 구조화 응답을 로컬 터미널에 출력"
             )
+
+    try:
+        router = build_run_router(
+            args, vulnerability_types=(_TARGET_LABELS[args.vuln],),
+            llm_client=llm_client, selected_model=selected_model,
+        )
+    except OSError:
+        print("Router 기록 파일을 열 수 없습니다. --routing-log 경로와 권한을 확인하세요.")
+        return 2
+    print(f"Recon: {args.recon}; Router: {args.router}; 비교: {args.compare_routers}; 판단 기록: {_safe_log_value(args.routing_log, limit=300)}")
 
     access_control = args.vuln == "access_control"
     if access_control:
@@ -598,7 +610,7 @@ def main(argv: list[str]) -> int:
     app = build_local_application(
         {},
         runtime=runtime,
-        router=standard_router(vulnerability_types=(_TARGET_LABELS[args.vuln],)),
+        router=router,
         credential_resolver=resolver,
         approval_gate=StaticApprovalGate((_APPROVAL_REF,)),
         audit_log=audit,
@@ -613,7 +625,8 @@ def main(argv: list[str]) -> int:
     # 시작 Surface가 아닌 크롤링 순서에 좌우된다. 대상 페이지 한 장만 열거한다.
     profile = register_standard_agents(
         app,
-        llm_client=llm_client,
+        llm_client=llm_client if args.profile == "llm" else None,
+        recon_planner=standard_recon_planner(mode=args.recon, llm_client=llm_client),
         recon_max_pages=1,
         actor_object_id=args.actor_object_id,
         owner_object_id=args.owner_object_id,
@@ -640,8 +653,10 @@ def main(argv: list[str]) -> int:
             )
         )
     except WorkflowExecutionError as error:
+        append_run_result(args, app, app.stores.runs.get(error.run_id))
         print(f"Run 실패: {error}")
         return 1
+    append_run_result(args, app, run)
     progress.log(f"Run 완료: phase={_safe_log_value(run.phase.value)}")
 
     if progress_view is not None:
