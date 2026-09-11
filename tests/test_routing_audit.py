@@ -87,6 +87,32 @@ class RoutingAuditTests(unittest.TestCase):
         self.assertEqual(record["rule_decisions"], record["final_decisions"])
         self.assertEqual([d["candidate_id"] for d in record["final_decisions"]], [d.candidate.candidate_id for d in result])
 
+    def test_normalized_surface_identity_keeps_duplicate_occurrences_distinct(self):
+        log = _Log()
+        second = replace(
+            _SURFACE,
+            surface_id="search-duplicate",
+            url="http://localhost/render?q=another-private-query",
+        )
+
+        standard_router(audit_log=log).route(_RUN, (_SURFACE, second), ())
+
+        decisions = log.records[0]["final_decisions"]
+        by_surface = {
+            surface_id: {
+                (item["routing_surface_key"], item["routing_surface_occurrence"])
+                for item in decisions if item["surface_id"] == surface_id
+            }
+            for surface_id in ("search", "search-duplicate")
+        }
+        self.assertEqual(
+            {identity for identities in by_surface.values() for identity in identities},
+            {
+                (decisions[0]["routing_surface_key"], 0),
+                (decisions[0]["routing_surface_key"], 1),
+            },
+        )
+
     def test_hybrid_records_rule_llm_and_merged_provenance(self):
         log = _Log()
         llm = _Llm(
@@ -109,7 +135,23 @@ class RoutingAuditTests(unittest.TestCase):
         self.assertEqual(len(result), 3)
         self.assertGreaterEqual(record["elapsed_ms"], record["llm"]["elapsed_ms"])
 
-    def test_parser_rejection_and_capability_rejection_are_distinguished(self):
+    def test_bootstrap_applies_router_review_policy_to_llm_calls(self):
+        weak_llm = _Llm()
+        ambiguous_llm = _Llm()
+
+        standard_router(
+            ("XSS",), mode="hybrid", llm_client=weak_llm,
+            review_policy="weak",
+        ).route(_RUN, (_SURFACE,), ())
+        standard_router(
+            ("XSS",), mode="hybrid", llm_client=ambiguous_llm,
+            review_policy="ambiguous",
+        ).route(_RUN, (_SURFACE,), ())
+
+        self.assertEqual(weak_llm.calls, 1)
+        self.assertEqual(ambiguous_llm.calls, 0)
+
+    def test_parser_rejection_records_unsupported_and_unoffered_items(self):
         log = _Log()
         llm = _Llm(
             _item(vulnerability_type="RCE", reason="private-rejected-text"),
@@ -118,10 +160,11 @@ class RoutingAuditTests(unittest.TestCase):
         post = replace(_SURFACE, surface_id="post", method="POST", parameters=("blob",))
         standard_router(mode="hybrid", llm_client=llm, audit_log=log).route(_RUN, (_SURFACE, post), ())
         record = log.records[0]
-        self.assertEqual(record["llm"]["rejected_items"], [{
-            "index": 0, "index_scope": "raw_items", "reason": "unsupported_route",
-        }])
-        self.assertEqual([d["outcome"] for d in record["llm"]["proposals"]], ["incompatible_surface"])
+        self.assertEqual(record["llm"]["rejected_items"], [
+            {"index": 0, "index_scope": "raw_items", "reason": "unsupported_route"},
+            {"index": 1, "index_scope": "raw_items", "reason": "unknown_surface"},
+        ])
+        self.assertEqual(record["llm"]["proposals"], [])
         self.assertNotIn("private-rejected-text", json.dumps(record))
 
     def test_strong_rules_record_skip_reason_and_evidence_references(self):

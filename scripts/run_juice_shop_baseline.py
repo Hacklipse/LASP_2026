@@ -45,6 +45,7 @@ from hacklipse.adapters import (  # noqa: E402
     InMemoryCredentialResolver,
     InMemoryExecutionAuditLog,
     PlaywrightBrowserRuntime,
+    SlidingWindowLlmClient,
     StaticApprovalGate,
 )
 from hacklipse.adapters.ssti_analysis import (  # noqa: E402
@@ -107,6 +108,9 @@ _DEFAULT_BUDGET = 20
 # 배분은 Task 3(Budget·스케줄링)에서 다루고, 여기서는 우선 상한만 넉넉히 잡는다.
 _ALL_MODE_BUDGET = 80
 _ALL_MODE_RECON_PAGES = 12
+# 공급자 상한 15 RPM을 꽉 채우지 않고 한 슬롯을 남긴다. 이 프로세스 밖에서 발생한
+# 호출이나 공급자 집계 경계의 오차 때문에 15번째가 429가 되는 일을 줄인다.
+_DEFAULT_GEMINI_RPM_LIMIT = 14
 _OBJECT_ID = re.compile(r"^[0-9]{1,10}$")
 _KNOWLEDGE_DIRECTORY = Path("knowledge")
 
@@ -720,6 +724,15 @@ def main(argv: list[str]) -> int:
         except LlmCredentialsMissing as error:
             print(f"LLM 구성 실패: {error}")
             return 2
+        rpm_limit = args.llm_rpm_limit
+        if rpm_limit is None and args.llm_provider == "gemini":
+            rpm_limit = _DEFAULT_GEMINI_RPM_LIMIT
+        if rpm_limit is not None:
+            llm_client = SlidingWindowLlmClient(
+                llm_client,
+                max_calls=rpm_limit,
+            )
+            progress.log(f"LLM 호출 제한 적용: {rpm_limit}회/60초")
         if debug_enabled:
             llm_client = _ProgressLlmClient(
                 llm_client,

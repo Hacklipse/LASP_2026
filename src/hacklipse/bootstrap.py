@@ -379,6 +379,7 @@ def standard_router(
             llm_client=llm_client,
             requested=mode == "hybrid",
         ),
+        review_policy=review_policy,
     )
     if audit_log is not None:
         router = AuditedVulnerabilityRouter(

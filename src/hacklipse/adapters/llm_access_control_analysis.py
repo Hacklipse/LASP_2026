@@ -37,6 +37,7 @@ from .knowledge_prompt import (
     render_knowledge_hints,
     safe_selection_reason,
 )
+from .llm_parameter_names import alias_parameter_names
 from .probing import resolve_analysis_task
 from .request_safety import is_object_identifier_parameter
 
@@ -166,6 +167,7 @@ class LlmAccessControlAnalyzer:
     ) -> tuple[str | None, str]:
         """LLM에 식별자 좌표만 보여주고 하나를 고르게 한다."""
 
+        aliases = alias_parameter_names(parameters)
         response = self._llm.complete(
             LlmRequest(
                 messages=(
@@ -174,7 +176,7 @@ class LlmAccessControlAnalyzer:
                         content=(
                             f"Surface path: {_path_of(surface)}\n"
                             f"Method: {surface.method.upper()}\n"
-                            f"Identifier candidates: {', '.join(parameters)}\n"
+                            f"Identifier candidates: {', '.join(aliases.prompt_names)}\n"
                             f"Request budget for this analysis: {task.request_budget}\n"
                             "Select the candidate that identifies the requested object."
                             + render_knowledge_hints(task.knowledge_hints)
@@ -186,7 +188,9 @@ class LlmAccessControlAnalyzer:
                 timeout_seconds=task.timeout_seconds,
             )
         )
-        selected = _validate_selection(response.payload.get("parameters"), parameters)
+        selected = _validate_selection(
+            aliases.decode_selection(response.payload.get("parameters")), parameters
+        )
         reason = response.payload.get("reason")
         raw_reason = reason if isinstance(reason, str) else ""
         return selected, safe_selection_reason(raw_reason, task.knowledge_hints)

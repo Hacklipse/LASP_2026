@@ -26,6 +26,8 @@ from hacklipse.domain import Evidence, TaskEnvelope
 from hacklipse.ports.errors import LlmRefused, LlmResponseFormatError, LlmTimeout, LlmTransportError
 from hacklipse.ports.llm import LlmClient, LlmMessage, LlmRequest
 
+from .llm_parameter_names import alias_parameter_names
+
 # recon.py가 Evidence.created_by에 쓰는 고정 식별자. selection_source(llm/fallback)와
 # 별개로, "이 판단을 만든 컴포넌트가 무엇인가"는 항상 이 값으로 고정한다.
 RECON_PLANNER = "llm_recon_planner"
@@ -204,7 +206,9 @@ class LlmReconPlanner:
 def _prompt(candidates: tuple[ReconCandidate, ...], remaining_budget: int) -> str:
     lines = [f"Remaining request budget: {remaining_budget}", "Candidates:"]
     for candidate in candidates:
-        parameters = ", ".join(candidate.parameter_names) or "(none)"
+        parameters = ", ".join(
+            alias_parameter_names(candidate.parameter_names).prompt_names
+        ) or "(none)"
         observations = ", ".join(candidate.observation_types) or "(none)"
         lines.append(
             f"- surface_id={candidate.surface_id} method={candidate.method} "

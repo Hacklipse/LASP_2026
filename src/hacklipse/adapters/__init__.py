@@ -12,6 +12,7 @@ from .knowledge import (
 )
 from .gemini_llm_client import GeminiLlmClient
 from .llm_client import AnthropicLlmClient
+from .llm_rate_limit import SlidingWindowLlmClient
 from .llm_path_traversal_analysis import LlmPathTraversalAnalyzer
 from .llm_sqli_analysis import LlmSqliAnalyzer
 from .llm_ssti_analysis import LlmSstiAnalyzer
@@ -80,6 +81,7 @@ __all__ = [
     "InMemoryExecutionAuditLog",
     "InMemoryProgressLog",
     "LlmSqliAnalyzer",
+    "SlidingWindowLlmClient",
     "LlmSstiAnalyzer",
     "LlmPathTraversalAnalyzer",
     "LlmAccessControlAnalyzer",

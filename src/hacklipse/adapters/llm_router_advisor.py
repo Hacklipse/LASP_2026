@@ -43,7 +43,8 @@ from hacklipse.ports.errors import (
 from hacklipse.ports.llm import LlmClient, LlmMessage, LlmRequest, LlmUsage
 
 from .request_safety import has_state_changing_parameters
-from .routing import RouteSuggestion
+from .llm_parameter_names import alias_parameter_names
+from .routing import RouteSuggestion, _supports_suggestion
 
 # Evidence.created_by에 쓸 고정 식별자. selection_source(llm/rule)와 별개로 "이 판단을
 # 만든 컴포넌트가 무엇인가"는 항상 이 값으로 고정한다.
@@ -117,6 +118,7 @@ class _OfferedSurface:
     parameter_names: tuple[str, ...]
     observation_types: tuple[str, ...]
     covered_types: tuple[str, ...]
+    allowed_types: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,19 +249,32 @@ class LlmRouterAdvisor:
             # 상태를 바꾸는 폼은 규칙이 후보로 만들지 않는다. LLM에게 물어볼 대상도 아니다.
             if has_state_changing_parameters(surface.parameters):
                 continue
+            parameter_names = alias_parameter_names(surface.parameters).prompt_names
             client_route = bool(urlsplit(surface.url).fragment)
-            # 이 표면 모양에서 실제로 배정 가능한 유형만 후보로 센다.
+            # 후속 Analyzer의 메서드·파라미터·POST 안전 계약을 실제로 통과할 수 있는
+            # 유형만 LLM에 제시한다. 응답을 받은 뒤 버릴 항목이 40개 상한을 차지하면
+            # 실행 가능한 Surface가 입력에서 밀려날 수 있다.
             assignable = {
                 choice.vulnerability_type
                 for choice in self._analyzers
                 if choice.client_route is client_route
+                and _supports_suggestion(
+                    surface,
+                    RouteSuggestion(
+                        surface_id=surface.surface_id,
+                        vulnerability_type=choice.vulnerability_type,
+                        agent_type=choice.agent_type,
+                    ),
+                    evidence,
+                )
             }
             covered = {
                 vulnerability_type
                 for surface_id, vulnerability_type in routed
                 if surface_id == surface.surface_id
             }
-            if not assignable - covered:
+            allowed_types = tuple(sorted(assignable - covered))
+            if not allowed_types:
                 # 배정 가능한 유형을 규칙이 이미 전부 채웠다. 물어볼 것이 없다.
                 continue
             offered.append(
@@ -268,15 +283,26 @@ class LlmRouterAdvisor:
                     method=surface.method.upper(),
                     path=_path_hint(urlsplit(surface.url).path or "/"),
                     client_route=client_route,
-                    parameter_names=tuple(surface.parameters),
+                    parameter_names=parameter_names,
                     observation_types=observations.get(surface.surface_id, ()),
                     covered_types=tuple(sorted(covered)),
+                    allowed_types=allowed_types,
                 )
             )
 
         # 규칙이 아무것도 만들지 못한 표면이 이 기능의 본래 대상이다. 조용히 검사에서
         # 빠지는 쪽을 먼저 보여 주고, 남는 자리에 일부만 채워진 표면을 싣는다.
-        offered.sort(key=lambda item: (bool(item.covered_types), item.surface_id))
+        offered.sort(
+            key=lambda item: (
+                bool(item.covered_types),
+                item.client_route,
+                item.path,
+                item.method,
+                item.parameter_names,
+                item.observation_types,
+                item.allowed_types,
+            )
+        )
         return tuple(offered[: self._max_surfaces])
 
     @staticmethod
@@ -289,8 +315,13 @@ class LlmRouterAdvisor:
         for item in evidence:
             if item.run_id != run.run_id or item.surface_id is None:
                 continue
+            if item.evidence_type != "observation":
+                continue
             observation_type = item.observation.get("type")
-            if not isinstance(observation_type, str) or not observation_type:
+            if (
+                not isinstance(observation_type, str)
+                or _NAME.fullmatch(observation_type) is None
+            ):
                 continue
             seen = collected.setdefault(item.surface_id, [])
             if observation_type not in seen:
@@ -312,11 +343,13 @@ class LlmRouterAdvisor:
             parameters = ", ".join(item.parameter_names) or "(none)"
             observations = ", ".join(item.observation_types) or "(none)"
             covered = ", ".join(item.covered_types) or "(none)"
+            allowed = ", ".join(item.allowed_types)
             location = "client_route" if item.client_route else "server_route"
             lines.append(
                 f"- surface_id={item.surface_id} method={item.method} "
                 f"path={item.path} kind={location} parameters=[{parameters}] "
-                f"observations=[{observations}] already_covered=[{covered}]"
+                f"observations=[{observations}] already_covered=[{covered}] "
+                f"allowed_types=[{allowed}]"
             )
         lines.append("")
         lines.append(
@@ -370,6 +403,9 @@ class LlmRouterAdvisor:
             if key in routed or key in taken:
                 rejected.append((index, "duplicate_or_covered"))
                 continue
+            if vulnerability_type not in surface.allowed_types:
+                rejected.append((index, "unsupported_route"))
+                continue
             agent_type = self._resolve_agent(vulnerability_type, surface.client_route)
             if agent_type is None:
                 rejected.append((index, "unsupported_route"))
@@ -418,9 +454,7 @@ def surface_routing_summary(
             _path_hint(parsed.fragment.split("?", 1)[0]) if parsed.fragment else None
         ),
         "method": surface.method.upper(),
-        "parameter_names": [
-            name for name in surface.parameters if _NAME.fullmatch(name)
-        ],
+        "parameter_names": list(alias_parameter_names(surface.parameters).prompt_names),
         "requires_auth": surface.requires_auth,
         "has_path_identifier": surface.path_identifier is not None,
         "observation_types": sorted(

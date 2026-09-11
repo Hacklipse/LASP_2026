@@ -94,6 +94,7 @@ class AuditedVulnerabilityRouter:
         finally:
             elapsed_ms = (time.monotonic() - started) * 1000
             surface_keys = {surface.surface_id: surface_key(surface) for surface in surfaces}
+            routing_identities = routing_surface_identities(surfaces, evidence)
             routed = (
                 self.router
                 if isinstance(self.router, RuleBasedVulnerabilityRouter)
@@ -160,7 +161,10 @@ class AuditedVulnerabilityRouter:
                     }
                     for surface in surfaces
                 ],
-                "rule_decisions": [_decision(item, "rule", surface_keys) for item in baseline],
+                "rule_decisions": [
+                    _decision(item, "rule", surface_keys, routing_identities)
+                    for item in baseline
+                ],
                 "llm": {
                     "source": (
                         "deterministic_fallback"
@@ -198,7 +202,10 @@ class AuditedVulnerabilityRouter:
                     "proposals": proposals,
                 },
                 "final_decisions": [
-                    _decision(item, _source(item, original), surface_keys) for item in decisions
+                    _decision(
+                        item, _source(item, original), surface_keys, routing_identities
+                    )
+                    for item in decisions
                 ],
             })
 
@@ -211,12 +218,18 @@ def _source(item: RouteDecision, original: Mapping[str, RouteDecision]) -> str:
 
 
 def _decision(
-    item: RouteDecision, source: str, surface_keys: Mapping[str, str],
+    item: RouteDecision,
+    source: str,
+    surface_keys: Mapping[str, str],
+    routing_identities: Mapping[str, tuple[str, int]],
 ) -> dict[str, object]:
     candidate = item.candidate
+    routing_key, occurrence = routing_identities.get(candidate.surface_id, (None, None))
     return {
         "candidate_id": candidate.candidate_id, "surface_id": candidate.surface_id,
         "surface_key": surface_keys.get(candidate.surface_id),
+        "routing_surface_key": routing_key,
+        "routing_surface_occurrence": occurrence,
         "vulnerability_type": candidate.vulnerability_type,
         "agent_type": candidate.assigned_agent, "priority": _priority(item.priority),
         "source": source, "reason": _text(candidate.hypothesis),
@@ -231,6 +244,30 @@ def surface_key(surface: Surface) -> str:
     data.pop("run_id")
     data.pop("surface_id")
     return _fingerprint(data)
+
+
+def routing_surface_key(surface: Surface, evidence: Sequence[Evidence]) -> str:
+    """동적 URL·관측값이 아닌 Router가 읽는 Surface 의미 구조의 지문."""
+
+    summary = surface_routing_summary(surface, evidence)
+    return _fingerprint(
+        {key: value for key, value in summary.items() if key != "surface_id"}
+    )
+
+
+def routing_surface_identities(
+    surfaces: Sequence[Surface], evidence: Sequence[Evidence]
+) -> dict[str, tuple[str, int]]:
+    """동일 의미 Surface도 잃지 않도록 정규화 지문과 순번을 함께 부여한다."""
+
+    counts: dict[str, int] = {}
+    identities: dict[str, tuple[str, int]] = {}
+    for surface in surfaces:
+        key = routing_surface_key(surface, evidence)
+        occurrence = counts.get(key, 0)
+        counts[key] = occurrence + 1
+        identities[surface.surface_id] = (key, occurrence)
+    return identities
 
 
 def input_fingerprint(run: Run, surfaces: Sequence[Surface], evidence: Sequence[Evidence]) -> str:
@@ -256,18 +293,14 @@ def routing_input_manifest(
         surface.surface_id: surface_routing_summary(surface, evidence)
         for surface in surfaces
     }
-    routing_keys = {
-        surface_id: _fingerprint(
-            {key: value for key, value in summary.items() if key != "surface_id"}
-        )
-        for surface_id, summary in summaries.items()
-    }
+    routing_identities = routing_surface_identities(surfaces, evidence)
     return {
         "surfaces": [
             {
                 "position": index,
                 "surface_key": keys[surface.surface_id],
-                "routing_surface_key": routing_keys[surface.surface_id],
+                "routing_surface_key": routing_identities[surface.surface_id][0],
+                "routing_surface_occurrence": routing_identities[surface.surface_id][1],
                 **summaries[surface.surface_id],
             }
             for index, surface in enumerate(surfaces)
@@ -276,7 +309,14 @@ def routing_input_manifest(
             {
                 "position": index,
                 "surface_key": keys.get(item.surface_id),
-                "routing_surface_key": routing_keys.get(item.surface_id),
+                "routing_surface_key": (
+                    routing_identities[item.surface_id][0]
+                    if item.surface_id in routing_identities else None
+                ),
+                "routing_surface_occurrence": (
+                    routing_identities[item.surface_id][1]
+                    if item.surface_id in routing_identities else None
+                ),
                 "evidence_type": item.evidence_type,
                 "observation_type": (
                     value if isinstance((value := item.observation.get("type")), str)

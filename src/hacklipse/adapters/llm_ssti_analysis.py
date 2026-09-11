@@ -25,6 +25,7 @@ from .knowledge_prompt import (
     render_knowledge_hints,
     safe_selection_reason,
 )
+from .llm_parameter_names import alias_parameter_names
 
 LLM_SSTI_ANALYZER = "llm_ssti_analyzer"
 _PLAN_OBSERVATION = "ssti_probe_plan"
@@ -142,6 +143,7 @@ class LlmSstiAnalyzer:
     def _plan(
         self, task: TaskEnvelope, surface: Surface, parameters: tuple[str, ...]
     ) -> tuple[dict[str, object], str]:
+        aliases = alias_parameter_names(parameters)
         response = self._llm.complete(
             LlmRequest(
                 messages=(
@@ -150,7 +152,7 @@ class LlmSstiAnalyzer:
                         content=(
                             f"Surface path: {urlsplit(surface.url).path or '/'}\n"
                             f"Method: {surface.method.upper()}\n"
-                            f"Parameters: {', '.join(parameters)}\n"
+                            f"Parameters: {', '.join(aliases.prompt_names)}\n"
                             f"Request budget for this analysis: {task.request_budget}\n"
                             "Select fields that may reach server-side template rendering."
                             + render_knowledge_hints(task.knowledge_hints)
@@ -163,7 +165,7 @@ class LlmSstiAnalyzer:
             )
         )
         selected, dropped = validate_probe_selection(
-            response.payload.get("parameters"),
+            aliases.decode_selection(response.payload.get("parameters")),
             parameters,
             task.request_budget,
             analyzer_name="llm SSTI analyzer",

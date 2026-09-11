@@ -108,6 +108,7 @@ class RoutingCliTests(unittest.TestCase):
                     runner.main(["runner", "--help"])
                 self.assertEqual(result.exception.code, 0)
                 self.assertIn("--router {heuristic,hybrid}", output.getvalue())
+                self.assertIn("--llm-rpm-limit", output.getvalue())
                 self.assertIn("--routing-log", output.getvalue())
                 self.assertIn("--recon {heuristic,hybrid}", output.getvalue())
                 self.assertIn("--compare-routers", output.getvalue())

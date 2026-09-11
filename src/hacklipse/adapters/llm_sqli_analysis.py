@@ -35,6 +35,7 @@ from .knowledge_prompt import (
     render_knowledge_hints,
     safe_selection_reason,
 )
+from .llm_parameter_names import alias_parameter_names
 from .sqli_analysis import sql_error_signal
 
 LLM_SQLI_ANALYZER = "llm_sqli_analyzer"
@@ -189,6 +190,7 @@ class LlmSqliAnalyzer:
         surface: Surface,
         parameters: tuple[str, ...],
     ) -> tuple[dict[str, object], str]:
+        aliases = alias_parameter_names(parameters)
         response = self._llm.complete(
             LlmRequest(
                 messages=(
@@ -197,7 +199,7 @@ class LlmSqliAnalyzer:
                         content=(
                             f"Surface path: {urlsplit(surface.url).path or '/'}\n"
                             f"Method: {surface.method.upper()}\n"
-                            f"Parameters: {', '.join(parameters)}\n"
+                            f"Parameters: {', '.join(aliases.prompt_names)}\n"
                             f"Request budget for this analysis: {task.request_budget}\n"
                             "Select parameters worth checking for SQL parser reachability."
                             + render_knowledge_hints(task.knowledge_hints)
@@ -210,7 +212,7 @@ class LlmSqliAnalyzer:
             )
         )
         selected, dropped = validate_probe_selection(
-            response.payload.get("parameters"),
+            aliases.decode_selection(response.payload.get("parameters")),
             parameters,
             task.request_budget,
             analyzer_name="llm sqli analyzer",

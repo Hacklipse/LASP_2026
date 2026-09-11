@@ -17,8 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from compare_routers import compare_records, latest_run, main, replay
 from routing_options import append_run_result
 from hacklipse.adapters.routing_audit import input_fingerprint, routing_input_fingerprint, surface_key
-from hacklipse.bootstrap import build_local_application
+from hacklipse.bootstrap import build_local_application, standard_router
 from hacklipse.domain import Candidate, CandidateStatus, Evidence, Run, RunScope, Surface
+from hacklipse.ports.llm import LlmResponse
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,8 +42,8 @@ class RouterComparisonTests(unittest.TestCase):
             self.assertTrue(comparison["same_raw_recon_input"])
             self.assertEqual(comparison["input_manifest_delta"]["surface_structure_equal"], True)
             self.assertTrue(comparison["same_analysis_profile"])
-            self.assertEqual(comparison["candidate_counts"], {"heuristic": 5, "hybrid": 7})
-            self.assertEqual(len(comparison["added"]), 2)
+            self.assertEqual(comparison["candidate_counts"], {"heuristic": 5, "hybrid": 6})
+            self.assertEqual(len(comparison["added"]), 1)
             self.assertTrue(all(item["vulnerability_type"] == "Path Traversal" for item in comparison["added"]))
             self.assertEqual(comparison["removed"], [])
             self.assertEqual(comparison["changed"], [])
@@ -84,6 +85,49 @@ class RouterComparisonTests(unittest.TestCase):
             raw_comparison = compare_records(baseline, raw_only)
             self.assertTrue(raw_comparison["same_router_input"])
             self.assertFalse(raw_comparison["same_raw_recon_input"])
+
+    def test_candidate_delta_uses_normalized_surface_identity_across_runs(self):
+        class Capture:
+            def __init__(self):
+                self.records = []
+
+            def append(self, record):
+                self.records.append(record)
+
+        class EmptyLlm:
+            def complete(self, request):
+                return LlmResponse(payload={"suggestions": []})
+
+        baseline_log, hybrid_log = Capture(), Capture()
+        first_run = Run(
+            run_id="first", target_url="http://localhost/", policy_profile="safe",
+            scope=RunScope(allowed_hosts=frozenset({"localhost"})), request_budget=10,
+        )
+        second_run = replace(first_run, run_id="second")
+        first_surface = Surface(
+            surface_id="first-surface", run_id="first",
+            url="http://localhost/search?q=dynamic-one", method="GET",
+            parameters=("q",), observed_query=(("q", "dynamic-one"),),
+        )
+        second_surface = replace(
+            first_surface, surface_id="second-surface", run_id="second",
+            url="http://localhost/search?q=dynamic-two",
+            observed_query=(("q", "dynamic-two"),),
+        )
+
+        standard_router(audit_log=baseline_log).route(first_run, (first_surface,), ())
+        standard_router(
+            mode="hybrid", llm_client=EmptyLlm(), audit_log=hybrid_log,
+        ).route(second_run, (second_surface,), ())
+
+        comparison = compare_records(
+            baseline_log.records[0], hybrid_log.records[0]
+        )
+        self.assertTrue(comparison["same_router_input"])
+        self.assertFalse(comparison["same_raw_recon_input"])
+        self.assertEqual(comparison["added"], [])
+        self.assertEqual(comparison["removed"], [])
+        self.assertEqual(comparison["changed"], [])
 
     def test_analysis_results_are_compared_only_when_both_are_present(self):
         with tempfile.TemporaryDirectory() as directory:

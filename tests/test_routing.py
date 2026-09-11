@@ -10,6 +10,8 @@ from hacklipse.adapters.routing import (
     DEFAULT_RULES,
     OPTIONAL_RESTRICTED_FILE_BYPASS_RULES,
     RouteSuggestion,
+    RoutingRule,
+    SurfaceRoutingRule,
 )
 from hacklipse.adapters.llm_router_advisor import LlmRouterAdvisor
 from hacklipse.application.errors import WorkflowExecutionError
@@ -192,9 +194,11 @@ class _StubAdvisor:
     def __init__(self, *suggestions: RouteSuggestion) -> None:
         self._suggestions = suggestions
         self.calls: list[frozenset[tuple[str, str]]] = []
+        self.surface_calls: list[tuple[Surface, ...]] = []
 
     def advise(self, run, surfaces, evidence, routed):
         self.calls.append(routed)
+        self.surface_calls.append(tuple(surfaces))
         return self._suggestions
 
 
@@ -250,6 +254,47 @@ class AdvisorRoutingTests(unittest.TestCase):
             advisor.calls[0],
             frozenset({("surface-search", "XSS"), ("surface-search", "SQLi")}),
         )
+
+    def test_review_policy_changes_single_weak_surface_selection(self) -> None:
+        weak_rule = SurfaceRoutingRule("XSS", "xss_analyzer", priority=0.30)
+        weak_advisor = _StubAdvisor()
+        ambiguous_advisor = _StubAdvisor()
+
+        RuleBasedVulnerabilityRouter(
+            rules=(), surface_rules=(weak_rule,), advisor=weak_advisor,
+            review_policy="weak",
+        ).route(_run(), (_surface(),), ())
+        RuleBasedVulnerabilityRouter(
+            rules=(), surface_rules=(weak_rule,), advisor=ambiguous_advisor,
+            review_policy="ambiguous",
+        ).route(_run(), (_surface(),), ())
+
+        self.assertEqual(weak_advisor.surface_calls[0], (_surface(),))
+        self.assertEqual(ambiguous_advisor.surface_calls[0], ())
+
+    def test_single_strong_surface_is_not_reviewed_under_either_policy(self) -> None:
+        strong_rule = RoutingRule("reflection", "XSS", "xss_analyzer", 0.8)
+        evidence = Evidence(
+            evidence_id="evi-reflection",
+            run_id="run-1",
+            surface_id="surface-search",
+            created_by="fixture",
+            evidence_type="observation",
+            observation={"type": "reflection"},
+        )
+
+        for policy in ("weak", "ambiguous"):
+            with self.subTest(policy=policy):
+                advisor = _StubAdvisor()
+                RuleBasedVulnerabilityRouter(
+                    rules=(strong_rule,), surface_rules=(), advisor=advisor,
+                    review_policy=policy,
+                ).route(_run(), (_surface(),), (evidence,))
+                self.assertEqual(advisor.surface_calls[0], ())
+
+    def test_invalid_review_policy_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            RuleBasedVulnerabilityRouter(review_policy="unknown")
 
     def test_advisor_cannot_overwrite_a_rule_decision(self) -> None:
         evidence = Evidence(
@@ -361,6 +406,25 @@ class AdvisorRoutingTests(unittest.TestCase):
         )
 
         self.assertEqual(decisions, ())
+
+    def test_advisor_cannot_turn_a_generic_post_into_path_traversal_probe(self) -> None:
+        advisor = _StubAdvisor(
+            RouteSuggestion(
+                surface_id="surface-search",
+                vulnerability_type="Path Traversal",
+                agent_type="path_traversal_analyzer",
+            )
+        )
+        router = RuleBasedVulnerabilityRouter(advisor=advisor)
+
+        decisions = router.route(
+            _run(),
+            (_surface(method="POST", parameters=("comment", "rating")),),
+            (),
+        )
+
+        self.assertEqual(decisions, ())
+        self.assertEqual(router.last_advisor_outcomes, ((0, "incompatible_surface"),))
 
     def test_http_agent_is_not_given_a_client_route_surface(self) -> None:
         """fragment 표면을 HTTP Analyzer로 보내면 같은 루트 문서만 받고 예산을 쓴다."""

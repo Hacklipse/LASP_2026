@@ -28,6 +28,7 @@ from .knowledge_prompt import (
     render_knowledge_hints,
     safe_selection_reason,
 )
+from .llm_parameter_names import alias_parameter_names
 from .probing import matching_evidence, resolve_analysis_task, validate_probe_selection
 
 LLM_PATH_TRAVERSAL_ANALYZER = "llm_path_traversal_analyzer"
@@ -179,6 +180,8 @@ class LlmPathTraversalAnalyzer:
         *,
         recon_parameters: tuple[str, ...],
     ) -> tuple[dict[str, object], str]:
+        aliases = alias_parameter_names(parameters)
+        recon_prompt_names = aliases.encode_names(recon_parameters)
         response = self._llm.complete(
             LlmRequest(
                 messages=(
@@ -187,9 +190,9 @@ class LlmPathTraversalAnalyzer:
                         content=(
                             f"Surface path: {urlsplit(surface.url).path or '/'}\n"
                             f"Method: {surface.method.upper()}\n"
-                            f"Parameters: {', '.join(parameters)}\n"
+                            f"Parameters: {', '.join(aliases.prompt_names)}\n"
                             "Current-run structured Recon signals (the caller will "
-                            f"retain these): {', '.join(recon_parameters) or '(none)'}\n"
+                            f"retain these): {', '.join(recon_prompt_names) or '(none)'}\n"
                             f"Request budget for this analysis: {task.request_budget}\n"
                             "Select parameters that may control a server-side file path."
                             + render_knowledge_hints(task.knowledge_hints)
@@ -202,7 +205,7 @@ class LlmPathTraversalAnalyzer:
             )
         )
         selected, dropped = validate_probe_selection(
-            response.payload.get("parameters"),
+            aliases.decode_selection(response.payload.get("parameters")),
             parameters,
             task.request_budget,
             analyzer_name="llm path traversal analyzer",

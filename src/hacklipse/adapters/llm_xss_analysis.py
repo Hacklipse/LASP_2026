@@ -49,6 +49,7 @@ from .knowledge_prompt import (
     render_knowledge_hints,
     safe_selection_reason,
 )
+from .llm_parameter_names import alias_parameter_names
 
 LLM_XSS_ANALYZER = "llm_xss_analyzer"
 _PLAN_OBSERVATION = "xss_probe_plan"
@@ -215,6 +216,7 @@ class LlmXssAnalyzer:
     ) -> tuple[dict[str, object], str]:
         """LLM에 탐침 대상을 묻고 계획을 Evidence로 고정한다."""
 
+        aliases = alias_parameter_names(parameters)
         response = self._llm.complete(
             LlmRequest(
                 messages=(
@@ -223,7 +225,7 @@ class LlmXssAnalyzer:
                         content=(
                             f"Surface path: {_path_of(surface.url)}\n"
                             f"Method: {surface.method.upper()}\n"
-                            f"Parameters: {', '.join(parameters)}\n"
+                            f"Parameters: {', '.join(aliases.prompt_names)}\n"
                             f"Request budget for this analysis: {task.request_budget}\n"
                             "Select the parameters worth probing for reflection."
                             + render_knowledge_hints(task.knowledge_hints)
@@ -236,7 +238,7 @@ class LlmXssAnalyzer:
             )
         )
         selected, dropped = validate_probe_selection(
-            response.payload.get("parameters"),
+            aliases.decode_selection(response.payload.get("parameters")),
             parameters,
             task.request_budget,
             analyzer_name="llm xss analyzer",
@@ -341,8 +343,11 @@ class LlmXssAnalyzer:
     ) -> dict[str, dict[str, object]]:
         """반사가 확인된 파라미터의 맥락만 LLM에 묻는다."""
 
+        aliases = alias_parameter_names(tuple(parameter for parameter, _, _ in confirmed))
         excerpts = "\n\n".join(
-            f"### parameter: {parameter}\n{excerpt}" for parameter, _, excerpt in confirmed
+            f"### parameter: {aliases.prompt_name(parameter)}\n"
+            f"{aliases.redact_text(excerpt)}"
+            for parameter, _, excerpt in confirmed
         )
         response = self._llm.complete(
             LlmRequest(
@@ -361,8 +366,21 @@ class LlmXssAnalyzer:
                 timeout_seconds=timeout_seconds,
             )
         )
+        raw_reflections = response.payload.get("reflections")
+        if isinstance(raw_reflections, list):
+            decoded_reflections: object = [
+                {
+                    **item,
+                    "parameter": aliases.decode_name(item.get("parameter")),
+                }
+                if isinstance(item, dict) and isinstance(item.get("parameter"), str)
+                else item
+                for item in raw_reflections
+            ]
+        else:
+            decoded_reflections = raw_reflections
         expected = {parameter for parameter, _, _ in confirmed}
-        return _validate_classifications(response.payload.get("reflections"), expected)
+        return _validate_classifications(decoded_reflections, expected)
 
 
 def _stored_plan(

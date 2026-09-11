@@ -44,10 +44,17 @@ class _Capture:
 
 def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
     def candidates(record):
-        return {
-            (item["surface_key"], item["vulnerability_type"]): item
-            for item in record["final_decisions"]
-        }
+        indexed = {}
+        for item in record["final_decisions"]:
+            routing_key = item.get("routing_surface_key")
+            if not isinstance(routing_key, str):
+                # 이전 감사 로그에는 정규화 키가 없으므로 strict 키로 호환한다.
+                routing_key = item["surface_key"]
+            occurrence = item.get("routing_surface_occurrence", 0)
+            if not isinstance(occurrence, int):
+                occurrence = 0
+            indexed[(routing_key, occurrence, item["vulnerability_type"])] = item
+        return indexed
 
     left, right = candidates(baseline), candidates(hybrid)
     left_manifest = baseline.get("routing_input_manifest")
@@ -87,7 +94,9 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
         "added": [right[key] for key in sorted(right.keys() - left.keys())],
         "removed": [left[key] for key in sorted(left.keys() - right.keys())],
         "changed": [{
-            "surface_key": key[0], "vulnerability_type": key[1],
+            "routing_surface_key": key[0],
+            "routing_surface_occurrence": key[1],
+            "vulnerability_type": key[2],
             "heuristic_priority": left[key]["priority"], "hybrid_priority": right[key]["priority"],
             "heuristic_agent": left[key]["agent_type"], "hybrid_agent": right[key]["agent_type"],
         } for key in sorted(left.keys() & right.keys()) if (

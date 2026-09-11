@@ -32,6 +32,22 @@ def add_routing_arguments(parser: argparse.ArgumentParser) -> None:
         "--compare-routers", action="store_true",
         help="run both routers on the exact same Recon input; analyze only --router output (uses LLM)",
     )
+    parser.add_argument(
+        "--llm-rpm-limit",
+        type=_positive_int,
+        help=(
+            "shared rolling 60-second LLM request limit; "
+            "default: 14 for Gemini (one slot below a 15 RPM quota), "
+            "unlimited for other providers"
+        ),
+    )
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def needs_llm(args: argparse.Namespace) -> bool:

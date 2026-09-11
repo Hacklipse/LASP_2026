@@ -156,6 +156,10 @@ DEFAULT_SURFACE_RULES = (
 # 판정이 LLM 제안 때문에 잘리는 일이 없어야 한다.
 ADVISOR_PRIORITY = 0.15
 
+_PATH_TRAVERSAL_POST_OBSERVATION = "unlinked_render_parameter_candidate"
+_PATH_TRAVERSAL_POST_SOURCE = "bounded_unlinked_render_parameter"
+_ROUTER_REVIEW_POLICIES = frozenset({"weak", "ambiguous"})
+
 
 @dataclass(frozen=True, slots=True)
 class RouteSuggestion:
@@ -197,7 +201,31 @@ class RouterAdvisor(Protocol):
     ) -> Sequence[RouteSuggestion]: ...
 
 
-def _supports_suggestion(surface: Surface, suggestion: RouteSuggestion) -> bool:
+def _path_traversal_post_parameters(
+    surface: Surface, evidence: Sequence[Evidence]
+) -> tuple[str, ...]:
+    """Recon이 현재 Run의 제한된 서버 렌더링 좌표로 표시한 POST 필드만 반환한다."""
+
+    return tuple(
+        dict.fromkeys(
+            parameter
+            for item in evidence
+            if item.run_id == surface.run_id
+            and item.surface_id == surface.surface_id
+            and item.evidence_type == "observation"
+            and item.observation.get("type") == _PATH_TRAVERSAL_POST_OBSERVATION
+            and item.observation.get("source") == _PATH_TRAVERSAL_POST_SOURCE
+            and isinstance((parameter := item.observation.get("parameter")), str)
+            and parameter
+        )
+    )
+
+
+def _supports_suggestion(
+    surface: Surface,
+    suggestion: RouteSuggestion,
+    evidence: Sequence[Evidence] = (),
+) -> bool:
     """Advisor 제안이 실제 Analyzer의 현재 실행 계약에 맞는지 확인한다."""
 
     method = surface.method.upper()
@@ -211,7 +239,12 @@ def _supports_suggestion(surface: Surface, suggestion: RouteSuggestion) -> bool:
     if pair in {("XSS", "xss_analyzer"), ("SQLi", "sqli_analyzer")}:
         return method == "GET" and parameters
     if pair == ("Path Traversal", "path_traversal_analyzer"):
-        return method in {"GET", "POST"} and parameters
+        if method == "POST":
+            # POST 검증은 일반 폼이 아니라 Recon이 코드의 제한 목록에서 표시한 서버
+            # 렌더링 좌표만 허용한다. 사용자 승인은 이 좌표의 고정 safe-file probe에
+            # 대한 것이지 Recon이 발견한 모든 POST endpoint에 대한 포괄 승인이 아니다.
+            return bool(_path_traversal_post_parameters(surface, evidence))
+        return method == "GET" and parameters
     if pair == ("SSTI", "ssti_analyzer"):
         return method == "POST" and "username" in surface.parameters
     if pair == ("Access Control", "access_control_analyzer"):
@@ -236,12 +269,16 @@ class RuleBasedVulnerabilityRouter:
         id_factory: Callable[[], str] | None = None,
         advisor: RouterAdvisor | None = None,
         advisor_priority: float = ADVISOR_PRIORITY,
+        review_policy: str = "weak",
     ) -> None:
+        if review_policy not in _ROUTER_REVIEW_POLICIES:
+            raise ValueError("review policy must be weak or ambiguous")
         self._rules = {rule.observation_type: rule for rule in rules}
         self._surface_rules = tuple(surface_rules)
         self._id_factory = id_factory or (lambda: str(uuid4()))
         self._advisor = advisor
         self._advisor_priority = advisor_priority
+        self._review_policy = review_policy
         # 제안의 유효 범위를 규칙 목록에서 그대로 끌어온다. 별도 허용 목록을 두면
         # `standard_router()`의 `--vuln` 필터와 `IMPLEMENTED_ANALYZERS` 필터를 두 번
         # 관리하게 되고, 어긋나는 순간 Dispatcher가 AgentUnavailable로 Run을 죽인다.
@@ -367,9 +404,22 @@ class RuleBasedVulnerabilityRouter:
         """
 
         assert self._advisor is not None
+        review_surfaces = self._review_surfaces(surfaces, decided)
+        routed_for_advisor = set(decided)
+        if self._review_policy == "weak":
+            # 단일 Surface 규칙 Candidate를 실제로 검토하려면 그 한 조합은 Advisor의
+            # already_covered 목록에서 제외해야 한다. 그렇지 않으면 제안 가능한 유형이
+            # 하나뿐인 표면에서 Advisor가 호출조차 되지 않아 weak와 ambiguous가 다시
+            # 같은 정책이 된다. 병합 단계는 원래 decided를 사용하므로 Rule은 보존된다.
+            decisions_by_surface: dict[str, list[tuple[tuple[str, str], RouteDecision]]] = {}
+            for key, decision in decided.items():
+                decisions_by_surface.setdefault(key[0], []).append((key, decision))
+            for items in decisions_by_surface.values():
+                if len(items) == 1 and not items[0][1].candidate.evidence_ids:
+                    routed_for_advisor.discard(items[0][0])
         try:
             suggestions = self._advisor.advise(
-                run, surfaces, evidence, frozenset(decided)
+                run, review_surfaces, evidence, frozenset(routed_for_advisor)
             )
         except Exception as error:  # noqa: BLE001 - Advisor 실패는 Run을 멈추지 않는다
             # 여기서 예외를 올리면 LLM 장애가 곧 Run 실패가 된다. 규칙 결정은 이미
@@ -382,7 +432,7 @@ class RuleBasedVulnerabilityRouter:
 
         by_id = {
             surface.surface_id: surface
-            for surface in surfaces
+            for surface in review_surfaces
             if surface.run_id == run.run_id
         }
         accepted: dict[tuple[str, str], RouteDecision] = {}
@@ -409,7 +459,7 @@ class RuleBasedVulnerabilityRouter:
                 rejected += 1
                 outcomes.append((index, "state_changing_surface"))
                 continue
-            if not _supports_suggestion(surface, suggestion):
+            if not _supports_suggestion(surface, suggestion, evidence):
                 rejected += 1
                 outcomes.append((index, "incompatible_surface"))
                 continue
@@ -430,7 +480,11 @@ class RuleBasedVulnerabilityRouter:
                 # Advisor의 판단은 Claim이므로 관측 Evidence를 근거로 달지 않는다.
                 evidence_ids=(),
                 exploration_parameters=(
-                    tuple(dict.fromkeys(surface.parameters))
+                    (
+                        _path_traversal_post_parameters(surface, evidence)
+                        if surface.method.upper() == "POST"
+                        else tuple(dict.fromkeys(surface.parameters))
+                    )
                     if suggestion.vulnerability_type == "Path Traversal"
                     else ()
                 ),
@@ -441,3 +495,30 @@ class RuleBasedVulnerabilityRouter:
             outcomes.append((index, "candidate_added"))
         self.last_advisor_outcomes = tuple(outcomes)
         return accepted, f"advisor_ok:accepted={len(accepted)},rejected={rejected}"
+
+    def _review_surfaces(
+        self,
+        surfaces: Sequence[Surface],
+        decided: dict[tuple[str, str], RouteDecision],
+    ) -> tuple[Surface, ...]:
+        """CLI review 정책에 따라 Advisor가 실제로 검토할 Surface를 고른다.
+
+        ``ambiguous``는 규칙 결과가 없거나 둘 이상인 표면만 검토한다. ``weak``는
+        여기에 Evidence 없는 단일 Surface 탐색 Candidate까지 포함한다. 강한 관측
+        하나로 명확히 분류된 표면은 어느 정책에서도 LLM에 다시 보내지 않는다.
+        """
+
+        decisions_by_surface: dict[str, list[RouteDecision]] = {}
+        for (surface_id, _), decision in decided.items():
+            decisions_by_surface.setdefault(surface_id, []).append(decision)
+
+        selected: list[Surface] = []
+        for surface in surfaces:
+            matches = decisions_by_surface.get(surface.surface_id, ())
+            ambiguous = len(matches) != 1
+            single_weak = (
+                len(matches) == 1 and not matches[0].candidate.evidence_ids
+            )
+            if ambiguous or (self._review_policy == "weak" and single_weak):
+                selected.append(surface)
+        return tuple(selected)
