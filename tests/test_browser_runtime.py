@@ -5,7 +5,11 @@ from __future__ import annotations
 import unittest
 from urllib.parse import parse_qsl, urlsplit
 
-from hacklipse.adapters.browser_runtime import PlaywrightBrowserRuntime, _url_in_scope
+from hacklipse.adapters.browser_runtime import (
+    PlaywrightBrowserRuntime,
+    _wait_for_probe_signal,
+    _url_in_scope,
+)
 from hacklipse.adapters.policy import AllowlistPolicyGate
 from hacklipse.adapters.xss_execution import (
     BROWSER_XSS_TOOL,
@@ -23,6 +27,7 @@ from hacklipse.ports.errors import PolicyViolation
 
 _SCOPE = RunScope(allowed_hosts=frozenset({"localhost"}))
 _MARKER = "hacklipsexecutionabc123"
+_REFLECTION_MARKER = "hacklipsreflectionabc123"
 
 
 def _request(
@@ -68,7 +73,79 @@ class _HttpRuntimeStub:
         del run_id
 
 
+class _WaitPage:
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.error = error
+        self.calls: list[tuple[str, int]] = []
+
+    def wait_for_function(self, script: str, *, timeout: int) -> None:
+        self.calls.append((script, timeout))
+        if self.error is not None:
+            raise self.error
+
+
+class _ExpectedTimeout(Exception):
+    pass
+
+
 class BrowserProbeContractTests(unittest.TestCase):
+    def test_reflection_probe_polls_for_its_dom_marker(self) -> None:
+        page = _WaitPage()
+        request = _request(value=_REFLECTION_MARKER)
+
+        _wait_for_probe_signal(
+            page,
+            request,
+            _REFLECTION_MARKER,
+            timeout_error=_ExpectedTimeout,
+        )
+
+        self.assertEqual(len(page.calls), 1)
+        script, timeout = page.calls[0]
+        self.assertIn(_REFLECTION_MARKER, script)
+        self.assertIn("document.body", script)
+        self.assertEqual(timeout, 5000)
+
+    def test_execution_probe_polls_for_the_window_signal(self) -> None:
+        page = _WaitPage()
+        request = _request()
+
+        _wait_for_probe_signal(
+            page,
+            request,
+            _MARKER,
+            timeout_error=_ExpectedTimeout,
+        )
+
+        self.assertEqual(len(page.calls), 1)
+        script, timeout = page.calls[0]
+        self.assertIn("window.__hacklipse_xss_probe__", script)
+        self.assertEqual(timeout, 5000)
+
+    def test_missing_marker_timeout_is_a_normal_negative_result(self) -> None:
+        page = _WaitPage(error=_ExpectedTimeout())
+
+        _wait_for_probe_signal(
+            page,
+            _request(value=_REFLECTION_MARKER),
+            _REFLECTION_MARKER,
+            timeout_error=_ExpectedTimeout,
+        )
+
+        self.assertEqual(len(page.calls), 1)
+
+    def test_control_request_does_not_wait_for_a_probe_marker(self) -> None:
+        page = _WaitPage()
+
+        _wait_for_probe_signal(
+            page,
+            _request(kind=HttpRequestKind.CONTROL, value="hacklipse-control"),
+            None,
+            timeout_error=_ExpectedTimeout,
+        )
+
+        self.assertEqual(page.calls, [])
+
     def test_browser_subresources_are_limited_to_the_exact_scoped_origin(self) -> None:
         origin = ("http", "localhost", 4280)
 

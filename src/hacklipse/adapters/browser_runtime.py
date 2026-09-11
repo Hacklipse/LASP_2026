@@ -20,9 +20,9 @@ from .xss_execution import (
 )
 
 # SPA 는 DOM 을 클라이언트에서 그린다. domcontentloaded 직후에는 라우트가 아직
-# 렌더되지 않아 반사도 실행도 관측되지 않는다. socket.io 를 쓰는 대상이 있어
-# networkidle 은 기다릴 수 없으므로 고정 정착 시간을 둔다.
-_SETTLE_MS = 2000
+# 렌더되지 않아 반사도 실행도 관측되지 않는다. socket.io 를 쓰는 대상이라 networkidle
+# 을 기다릴 수 없으므로, 고정 sleep 대신 기대한 marker 조건을 제한 시간 동안 polling한다.
+_PROBE_WAIT_TIMEOUT_MS = 5000
 
 
 class BrowserProbeRunner(Protocol):
@@ -128,7 +128,12 @@ class PlaywrightBrowserRuntime:
                         wait_until="domcontentloaded",
                         timeout=max(1, int(request.timeout_seconds * 1000)),
                     )
-                    page.wait_for_timeout(_SETTLE_MS)
+                    _wait_for_probe_signal(
+                        page,
+                        request,
+                        expected_marker,
+                        timeout_error=PlaywrightTimeoutError,
+                    )
                     observed = page.evaluate(execution_marker_script())
                     executed = bool(
                         expected_marker is not None and observed == expected_marker
@@ -166,6 +171,36 @@ class PlaywrightBrowserRuntime:
                 "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
             },
         )
+
+
+def _wait_for_probe_signal(
+    page,
+    request: ExecutionRequest,
+    expected_marker: str | None,
+    *,
+    timeout_error: type[Exception],
+) -> None:
+    """기대한 반사·실행 신호가 나타날 때까지만 bounded polling한다.
+
+    marker가 끝내 나타나지 않는 것은 브라우저 오류가 아니라 정상적인 미탐지다. 따라서
+    polling timeout은 삼키고, 이후의 결정적 evaluate가 False를 기록하게 한다.
+    """
+
+    if expected_marker is None:
+        return
+    wait_script = (
+        dom_reflection_script(expected_marker)
+        if reflection_marker(request) is not None
+        else execution_marker_script()
+    )
+    timeout_ms = min(
+        _PROBE_WAIT_TIMEOUT_MS,
+        max(1, int(request.timeout_seconds * 1000)),
+    )
+    try:
+        page.wait_for_function(wait_script, timeout=timeout_ms)
+    except timeout_error:
+        pass
 
 
 def _browser_error(
