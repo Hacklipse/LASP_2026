@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import sqlite3
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 _SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(_SCRIPTS))
@@ -16,6 +19,7 @@ from run_juice_shop_baseline import (  # noqa: E402
     _all_mode_recon_seeds,
     _cleanup_provisioned_accounts,
     _knowledge_database_path,
+    _print_execution_preview,
     _recon_planner_summary,
     _resolve_juice_shop_db,
 )
@@ -23,6 +27,42 @@ from hacklipse.domain import Evidence
 
 
 class JuiceShopAllModeTests(unittest.TestCase):
+    def test_execution_preview_groups_configuration_scope_and_cleanup(self) -> None:
+        args = SimpleNamespace(
+            vuln="all",
+            profile="llm",
+            llm_provider="gemini",
+            recon="hybrid",
+            router="hybrid",
+            router_review="weak",
+            compare_routers=False,
+            knowledge_db="knowledge.sqlite",
+            routing_log="artifacts/routing-decisions.jsonl",
+        )
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            _print_execution_preview(
+                args,
+                target_label="전체",
+                selected_model="gemini-3.5-flash-lite",
+                rpm_limit=14,
+            )
+
+        rendered = output.getvalue()
+        self.assertIn("[실행 구성]", rendered)
+        self.assertIn("검사 대상       통합 검사 (4종)", rendered)
+        self.assertIn("Router          hybrid · review weak", rendered)
+        self.assertIn("Router 비교     끔", rendered)
+        self.assertIn("LLM 호출 제한   14회 / rolling 60초", rendered)
+        self.assertIn("Knowledge       knowledge/knowledge.sqlite", rendered)
+        self.assertIn("[검사 범위]", rendered)
+        self.assertIn("XSS · SQLi · Path Traversal · SSTI", rendered)
+        self.assertIn("Access Control (--vuln access_control)", rendered)
+        self.assertIn("[계정 및 정리]", rendered)
+        self.assertIn("종료 처리       임시 계정과 연결 데이터를 삭제", rendered)
+        self.assertNotIn("비교: False", rendered)
+
     def test_bare_knowledge_database_name_uses_dedicated_directory(self) -> None:
         self.assertEqual(
             _knowledge_database_path("knowledge.sqlite"),

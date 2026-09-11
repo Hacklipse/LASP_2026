@@ -139,6 +139,55 @@ def _knowledge_database_path(value: str) -> Path:
     return path
 
 
+def _print_execution_preview(
+    args: argparse.Namespace,
+    *,
+    target_label: str,
+    selected_model: str,
+    rpm_limit: int | None,
+) -> None:
+    """실행 직전 설정과 통합 검사의 안전 조치를 읽기 쉽게 표시한다."""
+
+    run_all = args.vuln == "all"
+    analysis = args.profile
+    if args.profile == "llm":
+        analysis = f"llm · {args.llm_provider}/{selected_model}"
+    knowledge = (
+        _safe_log_value(str(_knowledge_database_path(args.knowledge_db)), limit=300)
+        if args.knowledge_db
+        else "끔"
+    )
+    print("=" * 58)
+    print("  Juice Shop 실행 전 확인")
+    print("=" * 58)
+    print("\n[실행 구성]")
+    print(f"  검사 대상       {'통합 검사 (4종)' if run_all else target_label}")
+    print(f"  Analysis        {analysis}")
+    print(f"  Recon           {args.recon}")
+    print(f"  Router          {args.router} · review {args.router_review}")
+    print(f"  Router 비교     {'켬' if args.compare_routers else '끔'}")
+    if needs_llm(args):
+        limit = f"{rpm_limit}회 / rolling 60초" if rpm_limit is not None else "없음"
+        print(f"  LLM 호출 제한   {limit}")
+    print(f"  Knowledge       {knowledge}")
+    print(
+        "  판단 기록       "
+        f"{_safe_log_value(args.routing_log, limit=300)}"
+    )
+
+    if run_all:
+        print("\n[검사 범위]")
+        print("  포함            XSS · SQLi · Path Traversal · SSTI")
+        print("  별도 실행       Access Control (--vuln access_control)")
+        print("\n[계정 및 정리]")
+        print("  XSS · SQLi      인증 없이 실행")
+        print("  Path Traversal  폐기 가능한 임시 계정과 분리 세션 사용")
+        print("  SSTI            폐기 가능한 임시 계정과 분리 세션 사용")
+        print(f"                  검증 후 username을 {SSTI_CLEANUP_VALUE!r}(으)로 복구")
+        print("  종료 처리       임시 계정과 연결 데이터를 삭제")
+    print("=" * 58)
+
+
 @dataclass(frozen=True, slots=True)
 class _VulnTarget:
     """취약점 유형별로 실행기가 알아야 하는 값.
@@ -710,6 +759,7 @@ def main(argv: list[str]) -> int:
     llm_client = None
     llm_meter: _LlmUsageMeter | None = None
     selected_model = ""
+    rpm_limit: int | None = None
     if needs_llm(args):
         selected_model = args.llm_model or (
             DEFAULT_GEMINI_LLM_MODEL
@@ -756,7 +806,12 @@ def main(argv: list[str]) -> int:
     except OSError:
         print("Router 기록 파일을 열 수 없습니다. --routing-log 경로와 권한을 확인하세요.")
         return 2
-    print(f"Recon: {args.recon}; Router: {args.router}; 비교: {args.compare_routers}; 판단 기록: {_safe_log_value(args.routing_log, limit=300)}")
+    _print_execution_preview(
+        args,
+        target_label=target_label,
+        selected_model=selected_model,
+        rpm_limit=rpm_limit,
+    )
 
     agent_credentials: tuple[tuple[str, str], ...] = ()
     recon_seed_urls: tuple[str, ...] = ()
@@ -765,13 +820,6 @@ def main(argv: list[str]) -> int:
         # Access Control은 /rest/basket/{id}처럼 구체적인 객체 ID가 있어야 성립하는데,
         # 그 ID는 크롤링으로 나오지 않고 임의로 만들어내면 열거가 된다. 그래서 전용
         # Run(--vuln access_control)으로 남긴다.
-        print(
-            "전체 모드는 한 Run에서 Recon이 찾아낸 Surface를 유형별로 라우팅합니다.\n"
-            "SQLi와 XSS는 인증 없이 실행합니다. SSTI와 Path Traversal은 폐기 가능한\n"
-            "임시 계정의 분리된 세션으로 검증하고 종료 시 연결 데이터를 삭제합니다.\n"
-            "Access Control은 객체 ID가 필요해 크롤링으로 찾을 수 없으므로 "
-            "--vuln access_control로 따로 실행하세요."
-        )
         credentials = {}
         approvals = (
             _PROVISION_APPROVAL_REF,
@@ -780,11 +828,7 @@ def main(argv: list[str]) -> int:
         )
         run_credential_ref = None
         recon_seed_urls = _all_mode_recon_seeds(base_url, include_ssti=True)
-        print(
-            "  SSTI 포함: username을 control/산술식으로 바꾼 뒤 "
-            f"{SSTI_CLEANUP_VALUE!r}(으)로 정리합니다."
-        )
-        confirmation = "로컬 Juice Shop 전체 취약점 검사를 실행할까요? [y/N] "
+        confirmation = "위 구성으로 로컬 Juice Shop 통합 검사를 시작할까요? [y/N] "
         principal_credentials = ()
         actor_object_id = None
         owner_object_id = None

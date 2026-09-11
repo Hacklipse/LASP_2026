@@ -28,7 +28,7 @@ Router 판단과 최종 Candidate 결과는 민감한 원문 없이 append-only 
 Gemini 호출은 기본 14회/rolling 60초의 프로세스 공용 제한을 적용하며 실패한 호출 시도도
 공급자 quota를 소비할 수 있으므로 횟수에 포함한다. 브라우저 XSS는 SPA 렌더링의 고정 2초
 대기 대신 DOM 반사 또는 실행 marker를 최대 5초 동안 조건 기반 polling한다. 전체 테스트는
-2026-09-11 기준 534개가 통과했다.
+2026-09-11 기준 535개가 통과했다.
 
 Phase 9에서는 확정 Finding을 민감정보가 제거된 `KnowledgeCase`로 일반화하는 Factory와
 append-only InMemory·SQLite KnowledgeBase를 구현하고, Run 완료 후 자동 발행까지
