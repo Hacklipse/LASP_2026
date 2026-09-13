@@ -59,6 +59,28 @@ class ValidationVerdict(str, Enum):
     BLOCKED = "blocked"
 
 
+class ValidationReasonCode(str, Enum):
+    """Validator가 실행한 분기를 나타내는 결정적 코드.
+
+    UNSPECIFIED는 기존 Validator와 저장 데이터의 이행 기간에만 사용한다. 각
+    Validation 분기의 구체적인 값 선택은 Validation Agent 구현의 책임이다.
+    """
+
+    UNSPECIFIED = "unspecified"
+    ANALYSIS_SIGNAL_MISSING = "analysis_signal_missing"
+    CONTROL_SIGNAL_PRESENT = "control_signal_present"
+    PROBE_SIGNAL_NOT_REPRODUCED = "probe_signal_not_reproduced"
+    REPRODUCTION_EXECUTION_ERROR = "reproduction_execution_error"
+    COMPARABLE_RESPONSES_MISSING = "comparable_responses_missing"
+    ACCESS_PLAN_MISSING = "access_plan_missing"
+    ACCESS_BUDGET_EXHAUSTED = "access_budget_exhausted"
+    VALIDATION_SESSION_MISMATCH = "validation_session_mismatch"
+    ACCESS_NOT_EXPOSED = "access_not_exposed"
+    CLEANUP_FAILED = "cleanup_failed"
+    GENERIC_NO_PROOF = "generic_no_proof"
+    CONFIRMED_PROOF = "confirmed_proof"
+
+
 class ValidationProofType(str, Enum):
     """취약점 유형별 CONFIRMED 판정이 요구하는 구조화된 증명 종류."""
 
@@ -723,10 +745,13 @@ class ValidationResult:
     reason: str
     reproduction_count: int = 0
     proof: ValidationProof | None = None
+    reason_code: ValidationReasonCode = ValidationReasonCode.UNSPECIFIED
 
     def __post_init__(self) -> None:
         if not isinstance(self.verdict, ValidationVerdict):
             raise DomainInvariantError("validation verdict must be structured")
+        if not isinstance(self.reason_code, ValidationReasonCode):
+            raise DomainInvariantError("validation reason code must be structured")
         if not self.validation_id:
             raise DomainInvariantError("validation result must identify its session")
         if not self.reason.strip():
@@ -758,6 +783,8 @@ class Finding:
     severity: str = "unrated"
     status: str = "confirmed"
     remediation_refs: tuple[str, ...] = ()
+    proof_type: ValidationProofType | None = None
+    reproduction_count: int = 0
 
     def __post_init__(self) -> None:
         # Finding Store에 들어가기 전 도메인 객체 자체에서도 핵심 규칙을 보장한다.
@@ -765,6 +792,16 @@ class Finding:
             raise DomainInvariantError("a finding must represent a confirmed verdict")
         if not self.evidence_ids:
             raise DomainInvariantError("a finding must reference supporting evidence")
+        if self.proof_type is not None and not isinstance(
+            self.proof_type, ValidationProofType
+        ):
+            raise DomainInvariantError("finding proof type must be structured")
+        if self.reproduction_count < 0:
+            raise DomainInvariantError("finding reproduction count cannot be negative")
+        if self.proof_type is None and self.reproduction_count != 0:
+            raise DomainInvariantError("finding without proof type cannot claim reproductions")
+        if self.proof_type is not None and self.reproduction_count == 0:
+            raise DomainInvariantError("finding proof type requires a reproduction")
 
     @classmethod
     def from_confirmed(
@@ -786,6 +823,9 @@ class Finding:
             raise DomainInvariantError("validation must refer to the candidate")
         if not validation.evidence_ids:
             raise DomainInvariantError("confirmed validation must reference evidence")
+        proof = validation.proof
+        if proof is None:
+            raise DomainInvariantError("confirmed validation must have proof")
         return cls(
             finding_id=finding_id,
             run_id=candidate.run_id,
@@ -795,6 +835,8 @@ class Finding:
             surface_id=candidate.surface_id,
             evidence_ids=tuple(dict.fromkeys(validation.evidence_ids)),
             severity=severity,
+            proof_type=proof.proof_type,
+            reproduction_count=validation.reproduction_count,
         )
 
 

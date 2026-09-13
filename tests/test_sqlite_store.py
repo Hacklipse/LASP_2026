@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,6 +29,7 @@ from hacklipse.domain import (
     TaskEnvelope,
     TaskRecord,
     TaskStatus,
+    ValidationProofType,
 )
 from hacklipse.ports.errors import (
     BudgetExceeded,
@@ -201,6 +205,39 @@ class SQLiteStoreTests(unittest.TestCase):
         )
         self.assertEqual(self.stores.findings.get("run-1", "finding-1"), finding)
         self.assertEqual(self.stores.reports.list_by_run("run-1"), (report,))
+
+    def test_finding_proof_facts_round_trip_and_legacy_json_defaults(self) -> None:
+        proved = replace(
+            self._finding(),
+            proof_type=ValidationProofType.XSS_EXECUTION,
+            reproduction_count=2,
+        )
+        legacy = replace(self._finding(), finding_id="finding-legacy")
+        self.stores.findings.add(proved)
+        self.stores.findings.add(legacy)
+        self.stores.close()
+
+        # 예전 DB의 Finding JSON에는 두 필드가 아예 없었다. schema version은 그대로다.
+        with sqlite3.connect(self.database_path) as connection:
+            row = connection.execute(
+                "SELECT data FROM findings WHERE finding_id = ?", ("finding-legacy",)
+            ).fetchone()
+            assert row is not None
+            stored = json.loads(row[0])
+            stored.pop("proof_type")
+            stored.pop("reproduction_count")
+            connection.execute(
+                "UPDATE findings SET data = ? WHERE finding_id = ?",
+                (json.dumps(stored), "finding-legacy"),
+            )
+
+        self.stores = SQLiteStoreBundle(self.database_path)
+        restored = self.stores.findings.get("run-1", "finding-1")
+        old_restored = self.stores.findings.get("run-1", "finding-legacy")
+        self.assertEqual(restored, proved)
+        self.assertIs(restored.proof_type, ValidationProofType.XSS_EXECUTION)
+        self.assertIsNone(old_restored.proof_type)
+        self.assertEqual(old_restored.reproduction_count, 0)
 
     def test_access_control_path_request_and_role_survive_task_resume(self) -> None:
         task = TaskRecord(

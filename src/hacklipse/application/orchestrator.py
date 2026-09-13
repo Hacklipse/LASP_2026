@@ -17,6 +17,7 @@ from hacklipse.domain import (
     Finding,
     KnowledgeCase,
     KnowledgeHint,
+    ReportArtifact,
     Run,
     RunPhase,
     RunRequest,
@@ -37,7 +38,12 @@ from hacklipse.ports import (
     SurfaceStore,
     VulnerabilityRouter,
 )
-from hacklipse.ports.errors import AgentUnavailable, BudgetExceeded, DuplicateRecord
+from hacklipse.ports.errors import (
+    AgentUnavailable,
+    BudgetExceeded,
+    DuplicateRecord,
+    RecordNotFound,
+)
 
 from .errors import AgentContractError, WorkflowExecutionError, safe_error_reason
 from .state_machine import RunStateMachine
@@ -577,6 +583,13 @@ class Orchestrator:
                 self._validate_validation_contract(
                     run, candidate, validation, validation_id
                 )
+                # Review claim은 proof Evidence와 별개다. 결정적 Validation 계약을
+                # 통과한 완료 결과의 일반 Evidence ID만 Run에 추가한다.
+                if result.surface_ids or result.candidate_ids or result.reports:
+                    raise AgentContractError(
+                        "completed validation returned unrelated artifacts"
+                    )
+                current = self._merge_agent_result(current, result)
                 break
 
             if result.status is not AgentResultStatus.NEEDS_EVIDENCE:
@@ -711,11 +724,26 @@ class Orchestrator:
         task = self._task_factory.report(run, agent_type=self._config.report_agent_type)
         result = self._tasks.execute(task)
         self._require_completed(result, "report")
+        if result.evidence_requests or result.validation is not None:
+            raise AgentContractError("completed report returned validation work")
+        if result.surface_ids or result.candidate_ids:
+            raise AgentContractError("completed report returned unrelated artifacts")
+        if not result.reports:
+            raise AgentContractError("completed report returned no artifacts")
         for report in result.reports:
-            if report.run_id != run.run_id:
+            if not isinstance(report, ReportArtifact) or report.run_id != run.run_id:
                 raise AgentContractError("report belongs to another run")
+            if not isinstance(report.format, str) or not report.format.strip():
+                raise AgentContractError("report format is missing")
+            if not isinstance(report.report_id, str) or not report.report_id.strip():
+                raise AgentContractError("report ID is missing")
+        # 모든 산출물 계약을 확인한 뒤에만 narrative claim ID를 병합한다.
+        current = self._merge_agent_result(run, result)
+        for report in result.reports:
             self._reports.add(report)
-        return run.with_updates(report_ids=tuple(item.report_id for item in result.reports))
+        return current.with_updates(
+            report_ids=tuple(item.report_id for item in result.reports)
+        )
 
     def _publish_knowledge(self, run: Run) -> None:
         """확정 Finding을 Knowledge Plane으로 발행한다. 실패해도 Run을 되돌리지 않는다.
@@ -766,7 +794,12 @@ class Orchestrator:
         """반환된 ID의 Evidence 실재 여부를 확인하고 Run에 병합한다."""
 
         if result.new_evidence_ids:
-            self._evidence.get_many(run.run_id, result.new_evidence_ids)
+            try:
+                self._evidence.get_many(run.run_id, result.new_evidence_ids)
+            except RecordNotFound as error:
+                raise AgentContractError(
+                    "agent result references missing or foreign evidence"
+                ) from error
         return run.with_updates(
             evidence_ids=self._merge(run.evidence_ids, result.new_evidence_ids),
             surface_ids=self._merge(run.surface_ids, result.surface_ids),

@@ -22,6 +22,7 @@ from hacklipse.domain import (
     Surface,
     ValidationProof,
     ValidationProofType,
+    ValidationReasonCode,
     ValidationResult,
     ValidationVerdict,
 )
@@ -94,6 +95,81 @@ class ArchitectureInvariantTests(unittest.TestCase):
                     summary="claimed script execution",
                 ),
             )
+
+    def test_validation_reason_code_is_structured_with_legacy_default(self) -> None:
+        validation = ValidationResult(
+            validation_id="validation-1",
+            run_id="run-1",
+            candidate_id="candidate-1",
+            verdict=ValidationVerdict.REJECTED,
+            evidence_ids=(),
+            reason="no proof",
+        )
+        self.assertIs(validation.reason_code, ValidationReasonCode.UNSPECIFIED)
+
+        with self.assertRaises(DomainInvariantError):
+            ValidationResult(
+                validation_id="validation-2",
+                run_id="run-1",
+                candidate_id="candidate-1",
+                verdict=ValidationVerdict.REJECTED,
+                evidence_ids=(),
+                reason="no proof",
+                reason_code="free form reason",  # type: ignore[arg-type]
+            )
+
+    def test_confirmed_finding_preserves_structured_proof_facts(self) -> None:
+        candidate = Candidate(
+            candidate_id="candidate-1",
+            run_id="run-1",
+            surface_id="surface-1",
+            vulnerability_type="XSS",
+            hypothesis="reflection",
+            assigned_agent="xss_analyzer",
+            evidence_ids=("evi-1",),
+        )
+        validation = ValidationResult(
+            validation_id="validation-1",
+            run_id="run-1",
+            candidate_id="candidate-1",
+            verdict=ValidationVerdict.CONFIRMED,
+            evidence_ids=("evi-1",),
+            reason="execution observed",
+            reproduction_count=1,
+            proof=ValidationProof(
+                proof_type=ValidationProofType.XSS_EXECUTION,
+                evidence_ids=("evi-1",),
+                summary="execution observed",
+            ),
+            reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+        )
+
+        finding = Finding.from_confirmed(
+            finding_id="finding-1", candidate=candidate, validation=validation
+        )
+
+        self.assertIs(finding.proof_type, ValidationProofType.XSS_EXECUTION)
+        self.assertEqual(finding.reproduction_count, 1)
+        self.assertEqual(finding.evidence_ids, ("evi-1",))
+
+    def test_finding_rejects_unstructured_proof_facts(self) -> None:
+        base = dict(
+            finding_id="finding-1",
+            run_id="run-1",
+            candidate_id="candidate-1",
+            validation_id="validation-1",
+            vulnerability_type="XSS",
+            surface_id="surface-1",
+            evidence_ids=("evi-1",),
+        )
+        with self.assertRaises(DomainInvariantError):
+            Finding(**base, proof_type="xss_execution")  # type: ignore[arg-type]
+        with self.assertRaises(DomainInvariantError):
+            Finding(**base, reproduction_count=-1)
+        with self.assertRaises(DomainInvariantError):
+            Finding(**base, reproduction_count=1)
+        with self.assertRaises(DomainInvariantError):
+            Finding(**base, proof_type=ValidationProofType.XSS_EXECUTION)
 
     def test_evidence_is_append_only_and_run_scoped(self) -> None:
         """Evidence 덮어쓰기와 다른 Run을 통한 조회를 모두 차단한다."""

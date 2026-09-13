@@ -33,6 +33,7 @@ from hacklipse.domain import (
     TaskEnvelope,
     TaskRecord,
     TaskStatus,
+    ValidationProofType,
 )
 from hacklipse.ports.errors import DuplicateRecord, RecordNotFound
 
@@ -285,6 +286,8 @@ def _decode_finding(data: str) -> Finding:
     value = _load(data)
     value["evidence_ids"] = tuple(value["evidence_ids"])
     value["remediation_refs"] = tuple(value["remediation_refs"])
+    if value.get("proof_type") is not None:
+        value["proof_type"] = ValidationProofType(value["proof_type"])
     return Finding(**value)
 
 
