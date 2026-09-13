@@ -7,10 +7,12 @@
 
 ## 1. 현재 상태
 
-> 갱신 기준: 2026-09-11, `dev/dmswls` 커밋 `3bde2f7`
+> 갱신 기준: 2026-09-13, 현재 작업 브랜치 `feat/p3-shared-contracts` 커밋 `e8de057`.
+> 로컬·원격 `dev/dmswls`는 `fad4267`이며 P-3은 아직 병합되지 않았다.
 
 Phase 1~9의 공통 실행 기반과 **5종(XSS·SQLi·Path Traversal·Access Control·SSTI)
-Analysis/Validation Agent의 휴리스틱·LLM 구현**이 완료됐다. 모든 외부 실행은 중앙 수집
+Analysis Agent의 휴리스틱·LLM 경로, Validation Agent의 결정적 재현·proof 경로**가 완료됐다.
+모든 외부 실행은 중앙 수집
 경계에서 Scope·도구 권한·예산·감사·민감정보 제거를 적용하고, Finding은 취약점별 독립
 Validation proof가 만들어진 경우에만 승격된다. Recon에는 발견된 후보 안에서 후속 탐색
 순서와 범위를 고르는 선택적 LLM Planner가 연결됐고, 잘못된 응답이나 호출 실패 시 결정적
@@ -27,8 +29,16 @@ LLM Advisor가 규칙이 비워 둔 자리만 제안하며 기존 규칙 Candida
 Router 판단과 최종 Candidate 결과는 민감한 원문 없이 append-only JSONL로 연결해 기록한다.
 Gemini 호출은 기본 14회/rolling 60초의 프로세스 공용 제한을 적용하며 실패한 호출 시도도
 공급자 quota를 소비할 수 있으므로 횟수에 포함한다. 브라우저 XSS는 SPA 렌더링의 고정 2초
-대기 대신 DOM 반사 또는 실행 marker를 최대 5초 동안 조건 기반 polling한다. 전체 테스트는
-2026-09-11 기준 535개가 통과했다.
+대기 대신 DOM 반사 또는 실행 marker를 최대 5초 동안 조건 기반 polling한다. P-3 이전
+기준에서는 전체 테스트 535개가 통과했다.
+
+Phase 10의 Report·Validation 공용 계약(P-3)은 `feat/p3-shared-contracts`에서 구현·커밋해
+원격 기능 브랜치까지 푸시했다. `ValidationReasonCode`와 `ValidationResult.reason_code`,
+확정 Finding의 proof type·재현 횟수와 기존 SQLite 데이터 복원 호환성, 완료된 Validation·Report
+결과의 계약 검사 후 `new_evidence_ids` 병합을 포함한다. 해당 브랜치에서 전체 테스트
+**547개가 통과**했다. **`dev/dmswls`에는 아직 병합되지 않았으므로**, Report·Validation 조는
+그 브랜치의 공용 계약을 `dev/dmswls` 기준으로 사용하기 전에 병합 상태를 확인해야 한다.
+LLM Reviewer·Narrator와 Orchestrator LLM 판단은 아직 구현되지 않았다.
 
 Phase 9에서는 확정 Finding을 민감정보가 제거된 `KnowledgeCase`로 일반화하는 Factory와
 append-only InMemory·SQLite KnowledgeBase를 구현하고, Run 완료 후 자동 발행까지
@@ -70,7 +80,7 @@ DVWA 실행기(`scripts/run_dvwa_baseline.py`)와 쿼리 파라미터 탈출 흐
 - HTTP Runtime의 기본 응답 본문 상한은 2 MiB로 올라가 Juice Shop의 큰 `main.js`를
   읽을 수 있으며, 그 결과 `/rest/products/search?q=` Surface와 SQLi Finding이 복구됐다.
 
-#### 최신 Knowledge 재사용 실측 (2026-09-10, `dev/dmswls` 현재 작업 트리)
+#### Knowledge 재사용 참고 실측 (2026-09-10, 당시 `dev/dmswls` 작업 트리)
 
 동일한 `knowledge/knowledge.sqlite`를 사용한 Juice Shop `--vuln all --profile llm` 반복
 실행에서 과거 Case 검색, LLM Analysis 전달, 현재 Run의 독립 검증과 재발행까지 완주했다.
@@ -94,7 +104,7 @@ SQLite에는 취약점 유형별 canonical Case 4개만 남고 Path Traversal �
 별도 append-only 테이블에 보강됐다. 이는 기능 E2E 기록이며, Knowledge 비활성 대조군과의
 반복 성능·탐지율 비교 결과는 아니다.
 
-#### 최신 LLM 참고 실측 (2026-09-10, `feat/team_recon`, **`--profile llm`**)
+#### LLM 단일 Run 참고 실측 (2026-09-10, `feat/team_recon`, **`--profile llm`**)
 
 ```plain text
   Surface    140개 (파라미터 11종)
@@ -107,8 +117,8 @@ SQLite에는 취약점 유형별 canonical Case 4개만 남고 Path Traversal �
 ```
 
 이 수치는 Recon 기능 브랜치에서 사용자가 실행한 단일 참고 기록이다. 해당 Recon 구현은
-현재 `dev/dmswls`에 합쳐졌지만, `3bde2f7` 기준으로 같은 조건의 반복 측정은 아직
-하지 않았다. 따라서 정식 heuristic/LLM 비교 결과나 탐지율 통계로 사용하지 않는다.
+`dev/dmswls`에 합쳐졌지만, 이 기록만으로는 같은 조건의 반복 측정 결과를 알 수 없다.
+따라서 정식 heuristic/LLM 비교 결과나 탐지율 통계로 사용하지 않는다.
 
 #### 이전 휴리스틱 실측 (2026-09-06, **`--profile heuristic`**)
 
@@ -134,6 +144,7 @@ Path Traversal Finding 6개는 독립 curl 기준과 대조해 확인했다. `/f
 | `adapters/` | ✅ HTTP·브라우저 Runtime, 메모리·SQLite 저장소, 인증·감사·Knowledge Adapter 구현 |
 | Analysis Agent | ✅ 5종 모두 휴리스틱·Gemini/Anthropic 공용 LLM 경로 구현 |
 | Validation Agent | ✅ 5종 독립 proof와 Finding 승격 구현 |
+| Report·Validation P-3 공용 계약 | 🟡 `feat/p3-shared-contracts`의 `e8de057` 구현·원격 푸시·547개 테스트 통과. `dev/dmswls` 병합 전 |
 | Pipeline LLM | ⚠️ Recon Planner·Hybrid Router Advisor·5종 Analysis에 연결됨. Orchestrator·Validation·Report는 결정적 구현 |
 | Juice Shop 단일 Run | ✅ XSS·SQLi·Path Traversal 동시 라우팅, SSTI는 인증 시 포함. Access Control은 전용 Run |
 | KnowledgeBase | ✅ 발행·재시도·의미 dedupe·구조화 검색·Analysis 재사용을 실제 `all` Run에서 확인. 비교 평가 전 |
@@ -605,7 +616,8 @@ Evidence는 "이번 대상에서 직접 관찰한 사실", Knowledge는 "민감�
 
 ### Phase 10 — 확장
 
-**상태: ⚠️ 제한된 Recon Planner·Hybrid Router Advisor·브라우저 XSS Runtime까지 구현.
+**상태: ⚠️ 제한된 Recon Planner·Hybrid Router Advisor·브라우저 XSS Runtime 구현.
+Report·Validation 공용 계약(P-3)은 기능 브랜치에서 완료됐으나 `dev/dmswls` 병합 전.
 Orchestrator·Validation·Report LLM 보조와 비용·severity 확장은 미구현.**
 
 아래 표의 "현재" 열까지만 구현 상태로 본다.
@@ -615,6 +627,7 @@ Orchestrator·Validation·Report LLM 보조와 비용·severity 확장은 미구
 | `InMemoryBudgetManager` | 실행 요청 횟수 카운트 + LLM 호출의 프로세스 공용 RPM 제한 | LLM 토큰·비용·시간 기반 (Notion §3) |
 | `RuleBasedVulnerabilityRouter` | 규칙 우선 + 제한된 LLM Advisor의 Hybrid Router, fallback·감사·비교 구현 | 반복 실험에 따른 review 정책·우선순위 조정 (Notion §8) |
 | Recon·Orchestrator | Recon은 결정적 수집 + 제한된 LLM Planner, Orchestrator는 결정적 전이 | Orchestrator의 제한된 다음 작업 제안 |
+| P-3 공용 계약 | 기능 브랜치에서 Validation reason code·Finding proof facts·Validation/Report Evidence ID 병합 구현, `dev/dmswls` 병합 전 | 병합 후 Report·Validation의 0단계 계약에서 소비 |
 | `ValidationAgent` | 5종 결정적 재현·proof 판정 | 의미 해석·오탐 검토용 LLM 보조, proof gate는 코드 유지 |
 | `BoundedRetryPolicy(max_attempts=1)` | 사실상 재시도 없음 | 백오프 + 실패 유형별 정책 |
 | `MarkdownReportAgent` | 결정적 Markdown만 | LLM 서술 보조 + JSON / HTML / PDF / Dashboard (Notion §13) |
@@ -622,6 +635,25 @@ Orchestrator·Validation·Report LLM 보조와 비용·severity 확장은 미구
 | `RouteDecision.priority` | 정렬에만 사용 | 예산 배분에 반영 |
 | `AllowlistPolicyGate` | `safe` 프로필 하나 | 프로필별 정책 분리 |
 | 실행 Runtime | HTTP + XSS proof 전용 브라우저 | DOM Recon·범용 JS 실행이 필요한 범위로 제한 확장 |
+
+#### Phase 10 다음 작업의 의존 순서 (2026-09-13 현재)
+
+1. P-3 `feat/p3-shared-contracts`를 `dev/dmswls`에 병합한다. 현재는 원격 기능 브랜치에만
+   있으므로 병합 완료로 표시하지 않는다.
+2. 병합된 P-3을 기준으로 Report 조는 `FindingReportFact`·`RunReportFacts`, Validation 조는
+   Reviewer-neutral context/result/protocol을 각각 0단계 계약으로 확정한다. 그 뒤 각 조의
+   A/B가 대역 facts/context와 FakeLLM을 사용해 병렬로 구현한다.
+3. Analysis·Orchestrator 조는 재탐색 상한, 상태 기계 재진입, 판단 Port 경계를 먼저 설계한다.
+   결정 지점이 확정되기 전에는 Orchestrator LLM을 기존 단계에 단순 삽입하지 않는다.
+4. Report·Validation 통합 뒤 `bootstrap.py`와 adapter export 등 공용 배선은 한 담당이
+   한 번에 연결하고 전체 E2E를 확인한다.
+5. P-1 Surface 비결정성 통제는 개발 중 회귀 판단을 위해 Recon 조가 별도로 진행한다.
+   P-2 Run 실행 조건 영속화는 Report·Validation 착수 조건이 아니지만 정식 off/on 비교
+   실험 전에는 완료한다. 성능·탐지 기여 주장은 반복 비교 실험 후에만 한다.
+
+Report·Validation의 세부 작업 범위는 `TEAM_REPORT_LLM.md`, `TEAM_VALIDATION_LLM.md`를
+따른다. 두 팀 문서와 `NEXT_TASKS.md`는 **P-3 병합 완료를 전제한 작업 지시서**이며,
+위의 실제 Git 상태를 대체하지 않는다.
 
 Router와 Recon 모드는 Analysis의 `--profile`과 독립적으로 선택한다. `--router hybrid`은
 규칙이 없거나 모호한 Surface를 LLM Advisor가 검토하게 하며, 기본
@@ -825,6 +857,10 @@ Evidence 테이블에는 **UPDATE 문을 쓰지 않는다.** `EvidenceStore` Pro
 | ✅ | `src/hacklipse/adapters/routing_audit.py` — 원문 없는 입력 지문·제안·최종 결과 JSONL 감사 |
 | ✅ | `scripts/routing_options.py`, `scripts/compare_routers.py` — 독립 실행 옵션과 동일 입력 비교 |
 | ✅ | `tests/test_router_pipeline.py`, `tests/test_llm_router_advisor.py` 등 — 안전 계약·감사·비교 테스트 |
+| 🟡 | P-3 `src/hacklipse/domain/models.py`, `src/hacklipse/domain/__init__.py` — Validation reason code와 Finding proof facts (`feat/p3-shared-contracts` 완료, 병합 전) |
+| 🟡 | P-3 `src/hacklipse/adapters/sqlite_store.py`, `src/hacklipse/application/orchestrator.py` — 기존 Finding 복원 호환과 Validation·Report Evidence ID 병합 (`feat/p3-shared-contracts` 완료, 병합 전) |
+| 🟡 | P-3 `tests/test_invariants.py`, `tests/test_sqlite_store.py`, `tests/test_p3_shared_contracts.py` — 계약 회귀 포함 전체 547개 테스트 통과 (`feat/p3-shared-contracts` 완료, 병합 전) |
+| ⏳ | Report facts 및 Validation Review 0단계 계약 — P-3 병합 후 각 조에서 확정 |
 | ⏳ | `src/hacklipse/adapters/cost_budget.py` — 토큰·비용 기반 예산 |
 | ⏳ | Orchestrator·Validation·Report LLM 보조 Adapter/계약 |
 | ⏳ | `src/hacklipse/adapters/reporting_json.py` — JSON/HTML 보고서 |
@@ -849,7 +885,7 @@ src/hacklipse/
 │   ├── knowledge_context.py         ✅ P9  관련 Case 검색·안전한 Hint 변환
 │   ├── task_factory.py              ✏️ P4  allowed_tools
 │   ├── task_executor.py             ✏️ P8  timeout
-│   ├── orchestrator.py              ✅ P9  자동 발행·DONE 재시도
+│   ├── orchestrator.py              ✅ P9  자동 발행·DONE 재시도 · 🟡 P-3 계약(병합 전)
 │   └── state_machine.py · errors.py
 ├── adapters/
 │   ├── memory.py                    ✏️ P1  InMemorySurfaceStore
@@ -993,7 +1029,11 @@ Phase 9  [x] KnowledgeCase 일반화 Factory
 Phase 10 [x] 제한된 Recon LLM Planner와 fallback
          [x] 규칙 우선 Hybrid Router Advisor와 결정적 fallback
          [x] Router review 정책·안전한 감사 로그·동일 입력 비교
+         [x] P-3 공용 계약 기능 브랜치 구현·원격 푸시·547개 테스트 통과
+         [ ] P-3을 dev/dmswls에 병합
+         [ ] Report facts / Validation Review 0단계 계약 확정
          [ ] Orchestrator / Validation / Report LLM 보조
+         [ ] P-1 Surface 비결정성 통제, 정식 비교 실험 전 P-2 실행 조건 영속화
          [ ] 비용 예산 / 보고서 포맷 / severity
          [x] XSS proof 범위의 브라우저 Runtime은 Phase 8에서 선행 구현
 ```
