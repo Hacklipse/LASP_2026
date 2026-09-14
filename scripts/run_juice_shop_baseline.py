@@ -59,6 +59,7 @@ from hacklipse.adapters.path_traversal_analysis import (  # noqa: E402
 from hacklipse.adapters.llm_recon_planner import (  # noqa: E402
     recon_plan_status_from_observation,
 )
+from hacklipse.adapters.llm_orchestration_advisor import LlmOrchestrationAdvisor  # noqa: E402
 from hacklipse.application import OrchestratorConfig, build_progress_snapshot  # noqa: E402
 from hacklipse.application.errors import WorkflowExecutionError  # noqa: E402
 from hacklipse.adapters.knowledge import SQLiteKnowledgeBase  # noqa: E402
@@ -165,6 +166,7 @@ def _print_execution_preview(
     print(f"  Analysis        {analysis}")
     print(f"  Recon           {args.recon}")
     print(f"  Router          {args.router} · review {args.router_review}")
+    print(f"  Orchestrator    {getattr(args, 'orchestrator', 'heuristic')}")
     print(f"  Router 비교     {'켬' if args.compare_routers else '끔'}")
     if needs_llm(args):
         limit = f"{rpm_limit}회 / rolling 60초" if rpm_limit is not None else "없음"
@@ -678,6 +680,12 @@ def main(argv: list[str]) -> int:
         help="analysis profile (default: heuristic)",
     )
     parser.add_argument(
+        "--orchestrator",
+        choices=("heuristic", "hybrid"),
+        default="heuristic",
+        help="optional LLM choice of one already discovered page for extra Recon",
+    )
+    parser.add_argument(
         "--router-advisor",
         action="store_true",
         help=(
@@ -925,6 +933,11 @@ def main(argv: list[str]) -> int:
         {},
         runtime=runtime,
         knowledge_base=knowledge_base,
+        orchestration_advisor=(
+            LlmOrchestrationAdvisor(llm_client=llm_client)
+            if args.orchestrator == "hybrid" and llm_client is not None
+            else None
+        ),
         # 전체 모드는 유형을 제한하지 않는다. Router가 Surface별로 관련 Candidate만 만든다.
         router=router,
         credential_resolver=resolver,
@@ -1082,6 +1095,7 @@ def main(argv: list[str]) -> int:
     print(f"  상태            완료 ({run.phase.value})")
     print(f"  분석 대상       {target_label}")
     print(f"  Agent 구성      {profile}")
+    print(f"  추가 Recon      {run.extra_recon_rounds}회")
     print(
         f"  감사된 실행     {len(audit.list_by_run(run.run_id))}회 / "
         f"예산 {snapshot.budget_used}회 사용, 상한 {snapshot.budget_total}회"

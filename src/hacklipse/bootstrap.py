@@ -78,6 +78,7 @@ from hacklipse.ports import (
     TaskStore,
     KnowledgeBase,
     VulnerabilityRouter,
+    OrchestrationAdvisor,
 )
 from hacklipse.ports.errors import LlmCredentialsMissing
 
@@ -173,6 +174,7 @@ def build_local_application(
     progress_sink: ProgressSink | None = None,
     clock: Callable[[], float] | None = None,
     knowledge_base: KnowledgeBase | None = None,
+    orchestration_advisor: OrchestrationAdvisor | None = None,
 ) -> LocalApplication:
     """기본적으로 네트워크를 활성화하지 않는 로컬 시스템을 조립한다."""
 
@@ -290,6 +292,7 @@ def build_local_application(
             if knowledge_base is not None
             else None
         ),
+        orchestration_advisor=orchestration_advisor,
     )
     return LocalApplication(
         orchestrator=orchestrator,

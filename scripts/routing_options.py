@@ -54,6 +54,7 @@ def needs_llm(args: argparse.Namespace) -> bool:
     return (
         args.profile == "llm" or args.router == "hybrid"
         or args.recon == "hybrid" or args.compare_routers
+        or getattr(args, "orchestrator", "heuristic") == "hybrid"
     )
 
 
@@ -88,6 +89,8 @@ def append_run_result(args, app, run) -> None:
         "schema_version": 1, "event": "run_result", "run_id": run.run_id,
         "router_mode": args.router, "analysis_profile": args.profile,
         "recon_mode": getattr(args, "recon", "heuristic"),
+        "orchestrator_mode": getattr(args, "orchestrator", "heuristic"),
+        "extra_recon_rounds": run.extra_recon_rounds,
         "phase": run.phase.value,
         "candidate_status_counts": dict(Counter(c.status.value for c in candidates)),
         "finding_count": len(app.stores.findings.list_by_run(run.run_id)),

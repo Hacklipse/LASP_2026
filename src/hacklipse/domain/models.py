@@ -249,7 +249,17 @@ class Run:
     candidate_ids: tuple[str, ...] = ()
     finding_ids: tuple[str, ...] = ()
     report_ids: tuple[str, ...] = ()
+    # Additional Recon is bounded and survives process restarts. The selected Surface
+    # is stored before re-entering RECON so resume cannot ask the advisor again.
+    extra_recon_rounds: int = 0
+    recon_target_surface_id: str | None = None
     last_error: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.extra_recon_rounds < 0:
+            raise DomainInvariantError("extra recon rounds cannot be negative")
+        if self.recon_target_surface_id is not None and self.extra_recon_rounds == 0:
+            raise DomainInvariantError("targeted recon requires an extra recon round")
 
     def with_updates(self, **changes: object) -> Run:
         """불변 dataclass를 직접 수정하지 않고 변경된 복사본을 만든다."""
@@ -960,6 +970,7 @@ class ProgressEventKind(str, Enum):
     RUN_STARTED = "run_started"
     PHASE_CHANGED = "phase_changed"
     CANDIDATE_QUEUED = "candidate_queued"
+    ORCHESTRATION_DECIDED = "orchestration_decided"
     KNOWLEDGE_RETRIEVED = "knowledge_retrieved"
     KNOWLEDGE_RETRIEVAL_FAILED = "knowledge_retrieval_failed"
     AGENT_STARTED = "agent_started"

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import time
+import re
+from urllib.parse import urlsplit
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from uuid import uuid4
@@ -37,6 +39,8 @@ from hacklipse.ports import (
     RunStore,
     SurfaceStore,
     VulnerabilityRouter,
+    OrchestrationAdvisor,
+    OrchestrationDecision,
 )
 from hacklipse.ports.errors import (
     AgentUnavailable,
@@ -72,12 +76,18 @@ class OrchestratorConfig:
     max_evidence_rounds: int = 1
     browser_xss_validation: bool = False
     knowledge_context_limit: int = 3
+    max_extra_recon_rounds: int = 1
+    min_budget_for_extra_recon: int = 3
 
     def __post_init__(self) -> None:
         if self.max_evidence_rounds < 0:
             raise ValueError("max_evidence_rounds cannot be negative")
         if not 1 <= self.knowledge_context_limit <= 10:
             raise ValueError("knowledge_context_limit must be between 1 and 10")
+        if self.max_extra_recon_rounds not in {0, 1}:
+            raise ValueError("max_extra_recon_rounds must be 0 or 1")
+        if self.min_budget_for_extra_recon < 2:
+            raise ValueError("min_budget_for_extra_recon must leave later execution budget")
 
 
 class Orchestrator:
@@ -113,6 +123,7 @@ class Orchestrator:
             [Candidate, Surface], Sequence[KnowledgeHint]
         ]
         | None = None,
+        orchestration_advisor: OrchestrationAdvisor | None = None,
     ) -> None:
         self._runs = run_store
         self._evidence = evidence_store
@@ -132,6 +143,7 @@ class Orchestrator:
         self._knowledge = knowledge_base
         self._knowledge_case = knowledge_case_builder
         self._knowledge_context = knowledge_context_provider
+        self._orchestration_advisor = orchestration_advisor
         # 발행 결과. 조용히 사라지지 않도록 RUN_COMPLETED에 함께 싣는다.
         self._knowledge_failures: list[str] = []
         self._knowledge_published: tuple[int, int] | None = None
@@ -222,7 +234,17 @@ class Orchestrator:
                     run = self._state.transition(run, RunPhase.ROUTE)
                 elif run.phase is RunPhase.ROUTE:
                     run = self._route(run)
-                    next_phase = RunPhase.ANALYZE if run.candidate_ids else RunPhase.REPORT
+                    selected = self._select_extra_recon(run)
+                    if selected is not None:
+                        # Save the chosen target with the backward transition. A restart
+                        # resumes this exact decision instead of asking the LLM again.
+                        run = run.with_updates(
+                            extra_recon_rounds=run.extra_recon_rounds + 1,
+                            recon_target_surface_id=selected.surface_id,
+                        )
+                        next_phase = RunPhase.RECON
+                    else:
+                        next_phase = RunPhase.ANALYZE if run.candidate_ids else RunPhase.REPORT
                     run = self._state.transition(run, next_phase)
                 elif run.phase is RunPhase.ANALYZE:
                     run = self._analyze(run)
@@ -258,14 +280,22 @@ class Orchestrator:
     def _recon(self, run: Run) -> Run:
         """Recon Task를 실행하고 새 Evidence·Surface 참조를 Run에 병합한다."""
 
+        target = (
+            self._surfaces.get(run.run_id, run.recon_target_surface_id)
+            if run.recon_target_surface_id is not None
+            else None
+        )
         task = self._task_factory.recon(
             run,
             agent_type=self._config.recon_agent_type,
             request_budget=self._budget.remaining(run.run_id),
+            target_surface=target,
         )
         result = self._tasks.execute(task)
         self._require_completed(result, "recon")
-        current = self._merge_agent_result(run, result)
+        current = self._merge_agent_result(run, result).with_updates(
+            recon_target_surface_id=None
+        )
         # Recon Planner 상태는 AgentResult의 고정 분류값만 진행 이벤트로 옮긴다.
         # LLM의 자유 텍스트 reason이나 예외 원문은 진행 화면에 노출하지 않는다.
         if result.message and result.message.startswith("recon_planner:"):
@@ -359,13 +389,28 @@ class Orchestrator:
         # 어떤 Candidate가 먼저 실행되는지가 곧 무엇을 포기하는지에 대한 결정이 된다.
         # 같은 우선순위는 Router가 만든 순서를 유지한다(안정 정렬).
         decisions = sorted(decisions, key=lambda item: item.priority, reverse=True)
+        # A process may stop after CandidateStore.add but before Run.save. Reconcile
+        # stored candidates as well as suppressing duplicates on the second ROUTE pass.
+        existing = {
+            (item.surface_id, item.vulnerability_type): item.candidate_id
+            for item in self._candidates.list_by_run(run.run_id)
+        }
         candidate_ids = list(run.candidate_ids)
+        candidate_ids.extend(existing.values())
         for decision in decisions:
             candidate = decision.candidate
             # Router가 다른 Run의 Candidate를 섞는 계약 위반을 차단한다.
             if candidate.run_id != run.run_id:
                 raise AgentContractError("router returned a candidate for another run")
+            key = (candidate.surface_id, candidate.vulnerability_type)
+            if key in existing:
+                stored = self._candidates.get(run.run_id, existing[key])
+                enriched = stored.add_evidence(candidate.evidence_ids)
+                if enriched != stored:
+                    self._candidates.save(enriched)
+                continue
             self._candidates.add(candidate)
+            existing[key] = candidate.candidate_id
             candidate_ids.append(candidate.candidate_id)
             self._emit(
                 run,
@@ -374,6 +419,89 @@ class Orchestrator:
                 candidate=candidate,
             )
         return run.with_updates(candidate_ids=tuple(dict.fromkeys(candidate_ids)))
+
+    def _select_extra_recon(self, run: Run) -> Surface | None:
+        """Accept only a known, unread GET surface; advice never authorizes execution."""
+
+        if self._orchestration_advisor is None:
+            return None
+        if run.extra_recon_rounds >= self._config.max_extra_recon_rounds:
+            return None
+        remaining = self._budget.remaining(run.run_id)
+        # An optional visit must not consume the last units needed by already
+        # routed candidates (at least one analysis and one validation request each).
+        minimum = max(
+            self._config.min_budget_for_extra_recon,
+            1 + 2 * len(run.candidate_ids),
+        )
+        if remaining < minimum:
+            self._emit_orchestration_decision(run, "skipped", "insufficient_budget")
+            return None
+        visited = {
+            item.surface_id
+            for item in self._evidence.get_many(run.run_id, run.evidence_ids)
+            if item.created_by == "execution_runtime:http_get"
+        }
+        options: list[Surface] = []
+        for surface in self._surfaces.list_by_run(run.run_id):
+            if surface.surface_id not in run.surface_ids or surface.surface_id in visited:
+                continue
+            parsed = urlsplit(surface.url)
+            if (
+                surface.run_id != run.run_id
+                or surface.method.upper() != "GET"
+                or surface.parameters
+                or parsed.query
+                or parsed.fragment
+                or _unsafe_recon_path(parsed.path)
+            ):
+                continue
+            try:
+                self._policy.validate_run(RunRequest(target_url=surface.url, scope=run.scope))
+            except Exception:
+                continue
+            options.append(surface)
+        if not options:
+            self._emit_orchestration_decision(run, "skipped", "no_options")
+            return None
+        # Bounded input also bounds prompt size and makes offered-set checks cheap.
+        options.sort(key=lambda item: (urlsplit(item.url).path, item.surface_id))
+        options = options[:20]
+        try:
+            decision = self._orchestration_advisor.decide(run, tuple(options), remaining)
+        except Exception:
+            self._emit_orchestration_decision(run, "deterministic_fallback", "continue")
+            return None
+        if not isinstance(decision, OrchestrationDecision):
+            self._emit_orchestration_decision(run, "deterministic_fallback", "continue")
+            return None
+        if decision.action == "continue" and decision.surface_id is None:
+            source = decision.source if decision.source in {"llm", "skipped"} else "deterministic_fallback"
+            self._emit_orchestration_decision(run, source, "continue")
+            return None
+        if decision.action != "recon" or not isinstance(decision.surface_id, str):
+            self._emit_orchestration_decision(run, "deterministic_fallback", "continue")
+            return None
+        selected = next(
+            (item for item in options if item.surface_id == decision.surface_id), None
+        )
+        if selected is None:
+            self._emit_orchestration_decision(run, "deterministic_fallback", "continue")
+            return None
+        source = decision.source if decision.source == "llm" else "advisor"
+        self._emit_orchestration_decision(run, source, "recon", selected)
+        return selected
+
+    def _emit_orchestration_decision(
+        self, run: Run, source: str, action: str, surface: Surface | None = None
+    ) -> None:
+        self._emit(
+            run,
+            ProgressEventKind.ORCHESTRATION_DECIDED,
+            agent_type="orchestrator_advisor",
+            surface_url=surface.url if surface is not None else None,
+            detail=f"{source}:{action}",
+        )
 
     def _analyze(self, run: Run) -> Run:
         """Candidate별로 Analysis를 수행하되 대상 쪽 실패를 서로 격리한다.
@@ -881,6 +1009,28 @@ def _path_only(url: str | None) -> str | None:
     from urllib.parse import urlsplit
 
     return urlsplit(url).path or "/"
+
+
+_UNSAFE_RECON_PATH_PARTS = frozenset(
+    {"create", "delete", "disable", "enable", "erase", "logout", "purchase", "remove", "reset", "transfer", "update", "upload"}
+)
+
+
+def _unsafe_recon_path(path: str) -> bool:
+    """Keep optional extra GETs to simple navigation paths."""
+
+    if re.fullmatch(r"/[A-Za-z0-9_./~-]*", path or "/") is None:
+        return True
+    if "//" in path:
+        return True
+    for part in path.split("/"):
+        if part in {".", ".."}:
+            return True
+        expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", part)
+        tokens = re.split(r"[^a-z0-9]+", expanded.casefold())
+        if set(tokens) & _UNSAFE_RECON_PATH_PARTS:
+            return True
+    return False
 
 
 def _pending_in(candidate: Candidate, phase_status: CandidateStatus) -> bool:

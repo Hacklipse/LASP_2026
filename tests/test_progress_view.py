@@ -72,6 +72,19 @@ class ProgressFoldingTests(unittest.TestCase):
 
         self.assertIn("[진행] Recon LLM 호출 성공", stream.getvalue())
 
+    def test_orchestrator_decision_is_visible_in_final_tty_view(self) -> None:
+        view, stream = _view(tty=True)
+        emit = _Emitter(view)
+        emit(
+            ProgressEventKind.ORCHESTRATION_DECIDED,
+            phase="route",
+            detail="skipped:no_options",
+        )
+        emit(ProgressEventKind.RUN_COMPLETED, phase="done")
+        view.close()
+
+        self.assertIn("Orchestrator 추가 탐색 후보 없음", stream.getvalue())
+
     def test_recon_planner_fallback_is_visible(self) -> None:
         view, stream = _view(tty=False)
         emit = _Emitter(view)

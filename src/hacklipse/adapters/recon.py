@@ -225,7 +225,17 @@ class ReconAgent:
             raise AgentContractError("recon tool is not allowed by the task")
 
         origin = urlsplit(task.target_url)
-        page_budget = self._page_budget(task)
+        targeted = task.surface_id is not None
+        if targeted:
+            target = self._surfaces.get(task.run_id, task.surface_id)
+            if (
+                target.url != task.target_url
+                or target.method.upper() != "GET"
+                or target.parameters
+                or origin.fragment
+            ):
+                raise AgentContractError("targeted recon requires an existing simple GET surface")
+        page_budget = 1 if targeted else self._page_budget(task)
 
         for seed_url in self._seed_urls:
             if not _same_origin(seed_url, origin):
@@ -233,10 +243,18 @@ class ReconAgent:
         # SPA 홈페이지와 별도 서버 렌더링 페이지처럼 서로 링크되지 않은 진입점을
         # 한 Recon 세션에서 함께 탐색할 수 있다. Juice Shop의 인증된 /profile이
         # 대표적이다.
-        pending = list(dict.fromkeys((task.target_url, *self._seed_urls)))
+        pending = (
+            [task.target_url]
+            if targeted
+            else list(dict.fromkeys((task.target_url, *self._seed_urls)))
+        )
         fetched: set[str] = set()
         scripts: list[str] = []
         document_pages: set[str] = set()
+        if targeted:
+            # A second pass only visits this selected document. Preserve the
+            # document-page form signal normally set during first-pass script discovery.
+            document_pages.add(task.target_url)
         navigation_pages: set[str] = set()
         evidence_ids: list[str] = []
         planner_status: str | None = None
@@ -349,7 +367,7 @@ class ReconAgent:
                 if should_crawl and url not in fetched and url not in pending:
                     pending.append(url)
 
-        if self._planner is not None and pending:
+        if self._planner is not None and pending and not targeted:
             remaining_budget = max(page_budget - len(fetched), 0)
             candidates = self._recon_candidates(task.run_id, pending, pending_surface_ids)
             if candidates:

@@ -25,3 +25,10 @@ Run the local verification suite with:
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
+
+The Juice Shop runner accepts `--orchestrator hybrid` as an independent LLM
+option. After routing, the advisor may select one already discovered, unread,
+same-scope GET page for an extra Recon visit. The application checks the
+selected surface and remaining request budget, persists the choice for resume,
+and continues normally when the model fails or returns an invalid choice. The
+default `--orchestrator heuristic` keeps the existing one-pass workflow.

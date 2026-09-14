@@ -10,11 +10,11 @@ from .errors import safe_error_reason
 class RunStateMachine:
     """상태 전이 규칙만 담당하며 Agent 호출이나 저장은 수행하지 않는다."""
 
-    # 정상 단계는 앞 방향으로만 진행하며, 모든 활성 단계에서 FAILED로 종료할 수 있다.
+    # ROUTE에서 저장된 대상이 있는 제한적 재탐색만 역방향으로 허용한다.
     _allowed: dict[RunPhase, frozenset[RunPhase]] = {
         RunPhase.INIT: frozenset({RunPhase.RECON, RunPhase.FAILED}),
         RunPhase.RECON: frozenset({RunPhase.ROUTE, RunPhase.FAILED}),
-        RunPhase.ROUTE: frozenset({RunPhase.ANALYZE, RunPhase.REPORT, RunPhase.FAILED}),
+        RunPhase.ROUTE: frozenset({RunPhase.RECON, RunPhase.ANALYZE, RunPhase.REPORT, RunPhase.FAILED}),
         RunPhase.ANALYZE: frozenset({RunPhase.VALIDATE, RunPhase.FAILED}),
         RunPhase.VALIDATE: frozenset({RunPhase.REPORT, RunPhase.FAILED}),
         RunPhase.REPORT: frozenset({RunPhase.DONE, RunPhase.FAILED}),
@@ -29,6 +29,9 @@ class RunStateMachine:
             raise DomainInvariantError(
                 f"invalid run transition: {run.phase.value} -> {target.value}"
             )
+        if run.phase is RunPhase.ROUTE and target is RunPhase.RECON:
+            if run.recon_target_surface_id is None or run.extra_recon_rounds <= 0:
+                raise DomainInvariantError("route may re-enter recon only with a saved target")
         return run.with_updates(phase=target, last_error=None)
 
     def fail(self, run: Run, error: Exception) -> Run:

@@ -10,6 +10,7 @@ from hacklipse.domain import (
     EvidenceRequest,
     KnowledgeHint,
     Run,
+    Surface,
     TaskEnvelope,
     credential_for_vulnerability,
 )
@@ -30,14 +31,22 @@ class TaskFactory:
         # 테스트에서는 결정적 ID 생성기를 주입할 수 있고, 기본값은 UUID를 사용한다.
         self._id_factory = id_factory or (lambda: f"task-{uuid4()}")
 
-    def recon(self, run: Run, *, agent_type: str, request_budget: int) -> TaskEnvelope:
+    def recon(
+        self,
+        run: Run,
+        *,
+        agent_type: str,
+        request_budget: int,
+        target_surface: Surface | None = None,
+    ) -> TaskEnvelope:
         """대상 URL을 탐색할 Recon Task를 생성한다."""
 
         return self._base(
             run,
             agent_type=agent_type,
             request_budget=request_budget,
-            target_url=run.target_url,
+            target_url=target_surface.url if target_surface is not None else run.target_url,
+            surface_id=target_surface.surface_id if target_surface is not None else None,
             # HttpExecutionRuntime의 GET 실행 도구 이름과 맞춰야 collect()가 통과한다.
             allowed_tools=("http_get",),
             # Recon은 특정 취약점에 속하지 않는 탐색이므로 Run 기본 세션으로 돈다.

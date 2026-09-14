@@ -30,6 +30,15 @@ _RUNNING = "▶"
 _DONE = "✓"
 _BROKEN = "✗"
 _RECON_PLANNER_PREFIX = "recon_planner:"
+_ORCHESTRATION_LABELS = {
+    "llm:recon": "LLM이 추가 탐색 선택",
+    "llm:continue": "LLM이 기존 흐름 선택",
+    "skipped:continue": "LLM 판단 건너뜀",
+    "skipped:no_options": "추가 탐색 후보 없음",
+    "skipped:insufficient_budget": "추가 탐색 예산 부족",
+    "deterministic_fallback:continue": "LLM 판단 실패 · 기존 흐름 유지",
+    "advisor:recon": "추가 탐색 선택",
+}
 
 _PHASE_LABELS = {
     "init": "준비",
@@ -124,6 +133,7 @@ class RunProgressView:
         self._knowledge: tuple[int, int] | None = None
         self._budget_total = 0
         self._recon_planner_status: str | None = None
+        self._orchestration_status: str | None = None
         self._closed = False
 
     # --- ProgressSink ---
@@ -164,6 +174,10 @@ class RunProgressView:
             and event.detail.startswith(_RECON_PLANNER_PREFIX)
         ):
             self._recon_planner_status = event.detail
+        if event.kind is ProgressEventKind.ORCHESTRATION_DECIDED:
+            self._orchestration_status = _ORCHESTRATION_LABELS.get(
+                event.detail, "판단 완료"
+            )
         # RUN_COMPLETED 는 특정 취약점 유형의 사건이 아니라 아래 조기 반환에 걸린다.
         # Knowledge 발행 결과는 그 전에 받아 둔다.
         if event.kind is ProgressEventKind.RUN_COMPLETED:
@@ -221,6 +235,8 @@ class RunProgressView:
         lines.append(f"  {recon_mark} 탐색      {detail}")
         if self._recon_planner_status:
             lines.append(_recon_planner_progress_line(self._recon_planner_status))
+        if self._orchestration_status:
+            lines.append(f"  {_DONE} Orchestrator {self._orchestration_status}")
         for name in sorted(self._types):
             state = self._types[name]
             lines.append(
@@ -250,6 +266,8 @@ class RunProgressView:
     def _event_line(self, event: ProgressEvent) -> str | None:
         """append-only 로그에 남길 한 줄. 조용한 종류는 건너뛴다."""
 
+        if event.kind is ProgressEventKind.ORCHESTRATION_DECIDED:
+            return f"[진행] Orchestrator {self._orchestration_status}"
         if (
             event.agent_type == "recon"
             and event.detail
