@@ -41,6 +41,7 @@ class ArchitectureInvariantTests(unittest.TestCase):
     def test_execution_profile_rejects_unreproducible_values(self) -> None:
         for changes in (
             {"router_mode": "freeform"},
+            {"surface_collection_mode": "unbounded"},
             {"compare_routers": 1},
             {"llm_rpm_limit": 0},
             {"analysis_profile": "llm"},

@@ -8,7 +8,7 @@
 ## 1. 현재 상태
 
 > 갱신 기준: 2026-09-14, 현재 작업 브랜치
-> `feat/orchestrator-budget-allocation` 기준 커밋 `eaa9425` + P-2 작업 트리.
+> `feat/p1-surface-determinism`, `dev/dmswls` 기준 커밋 `1cded0a` + P-1 작업 트리.
 > P-3은 `main`·`dev/dmswls`(`3552d3b`)에 병합됐다.
 
 Phase 1~9의 공통 실행 기반과 **5종(XSS·SQLi·Path Traversal·Access Control·SSTI)
@@ -40,8 +40,11 @@ Phase 10의 Report·Validation 공용 계약(P-3)은 `main`·`dev/dmswls`에 병
 추가 Recon 판단과 Candidate 순서·가중치·Validation 예약량을 저장하는 선택적
 예산 배분이 연결됐다. P-2는 Analysis·Recon·Router·Orchestrator·예산 배분·
 Validation·Report 모드와 LLM provider/model/RPM을 `RunExecutionProfile`로 Run·SQLite에
-영속화하며, P-2 이전 DB는 비교 제외 표시로 복원한다. 전체 테스트는 **569개가
-통과**했다. LLM Reviewer·Narrator와 비용 기반 예산은 아직 구현되지 않았다.
+영속화하며, P-2 이전 DB는 비교 제외 표시로 복원한다. 전체 테스트는 **574개가
+통과**했다. P-1은 기본 `adaptive`와 비교용 `deterministic` Surface 수집을
+분리하고, 후자에서는 Planner 결과를 감사 기록으로는 남기되 crawl 집합·순서에는
+반영하지 않도록 구현했다. LLM Reviewer·Narrator와 비용 기반 예산은 아직
+구현되지 않았다.
 
 Phase 9에서는 확정 Finding을 민감정보가 제거된 `KnowledgeCase`로 일반화하는 Factory와
 append-only InMemory·SQLite KnowledgeBase를 구현하고, Run 완료 후 자동 발행까지
@@ -620,7 +623,7 @@ Evidence는 "이번 대상에서 직접 관찰한 사실", Knowledge는 "민감�
 ### Phase 10 — 확장
 
 **상태: ⚠️ 제한된 Recon Planner·Hybrid Router Advisor·Orchestrator 추가 Recon·
-요청 횟수 기반 예산 배분·브라우저 XSS Runtime·P-2·P-3 구현.
+요청 횟수 기반 예산 배분·브라우저 XSS Runtime·P-1·P-2·P-3 구현.
 Validation·Report LLM 보조와 토큰·비용 기반 예산·severity 확장은 미구현.**
 
 아래 표의 "현재" 열까지만 구현 상태로 본다.
@@ -629,7 +632,7 @@ Validation·Report LLM 보조와 토큰·비용 기반 예산·severity 확장�
 |---|---|---|
 | `InMemoryBudgetManager` | 실행 요청 횟수 카운트 + Candidate 가중 배분·Validation 예약 + LLM 호출의 프로세스 공용 RPM 제한 | LLM 토큰·비용·시간 기반 (Notion §3) |
 | `RuleBasedVulnerabilityRouter` | 규칙 우선 + 제한된 LLM Advisor의 Hybrid Router, fallback·감사·비교 구현 | 반복 실험에 따른 review 정책·우선순위 조정 (Notion §8) |
-| Recon·Orchestrator | 결정적 Recon + LLM Planner, 최대 1회 추가 Recon 제안·저장·재개, Candidate 예산 배분 | 반복 실험 후 상한·가중치 조정 |
+| Recon·Orchestrator | 기본 adaptive Recon + LLM Planner, 비교용 deterministic Surface 수집, 최대 1회 추가 Recon 제안·저장·재개, Candidate 예산 배분 | 반복 실험 후 상한·가중치 조정 |
 | P-2 실행 조건 | `RunExecutionProfile`을 Run·SQLite·JSONL에 연결, 구 DB는 `recorded=False`로 복원 | 정식 off/on 비교의 필터·그룹 기준으로 소비 |
 | P-3 공용 계약 | Validation reason code·Finding proof facts·Validation/Report Evidence ID 병합 구현 및 main·dev 병합 | Report·Validation의 0단계 계약에서 소비 |
 | `ValidationAgent` | 5종 결정적 재현·proof 판정 | 의미 해석·오탐 검토용 LLM 보조, proof gate는 코드 유지 |
@@ -651,8 +654,25 @@ Validation·Report LLM 보조와 토큰·비용 기반 예산·severity 확장�
    A/B가 대역 facts/context와 FakeLLM을 사용해 병렬로 구현한다.
 5. Report·Validation 통합 뒤 `bootstrap.py`와 adapter export 등 공용 배선은 한 담당이
    한 번에 연결하고 전체 E2E를 확인한다.
-6. P-1 Surface 비결정성 통제는 개발 중 회귀 판단을 위해 Recon 조가 별도로 진행한다.
-   성능·탐지 기여 주장은 P-1 후 P-2로 저장된 조건을 기준으로 반복 비교한 후에만 한다.
+6. P-1 Surface 비결정성 통제를 구현했다. 성능·탐지 기여 주장은 P-2로
+   저장된 조건을 기준으로 정식 반복 비교한 후에만 한다.
+
+#### P-1 Surface 비결정성 통제
+
+`--surface-collection {adaptive,deterministic}`로 Recon 정책을 실험 목적과 분리한다.
+기본값 `adaptive`는 Planner의 정렬·stop 판단을 기존처럼 crawl에 반영한다.
+`deterministic`은 동일한 타깃 상태·seed·예산을 전제로 문서 navigation 표면을
+우선 보호하고, 나머지 URL과 script를 정규화된 순서로 유한 수집한다. Planner는
+그대로 호출하고 plan Evidence를 남기지만 순서·stop으로 Surface 수집 결과를
+바꾸지 못한다. 두 모드 모두 글로벌·페이지 예산, scope, 시작 URL·문서 표면
+보호, Orchestrator의 지정 Surface 1회 추가 Recon 계약을 유지한다.
+
+모드는 `RunExecutionProfile.surface_collection_mode`으로 Run·SQLite·JSONL에 저장한다.
+P-2 이전 SQLite profile은 누락 필드를 `adaptive`로 복원하되 `recorded=False`라는
+비교 제외 표시는 그대로다. 정식 반복 비교는 UUID가 아닌
+`(method, canonical URL, parameters)` Surface manifest를 비교한다. 타깃 자체의 동적
+데이터·세션 차이를 얼리거나 Recon LLM의 탐지 기여를 측정하는 것은 P-1 범위가
+아니다.
 
 Report·Validation의 세부 작업 범위는 `TEAM_REPORT_LLM.md`, `TEAM_VALIDATION_LLM.md`를
 따른다. 두 팀 문서와 `NEXT_TASKS.md`는 **P-3 병합 완료를 전제한 작업 지시서**이며,
@@ -1036,9 +1056,10 @@ Phase 10 [x] 제한된 Recon LLM Planner와 fallback
          [x] 상한 1회 Orchestrator 추가 Recon 판단·영속화·재개
          [x] Candidate 순서·가중치·Validation 예약 기반 예산 배분
          [x] P-2 Run 실행 조건 영속화·구 DB 호환·JSONL 일관성
+         [x] P-1 adaptive/deterministic Surface 수집 분리·실행 조건 영속화
          [ ] Report facts / Validation Review 0단계 계약 확정
          [ ] Validation / Report LLM 보조
-         [ ] P-1 Surface 비결정성 통제 및 정식 반복 비교
+         [ ] P-2 조건 필터를 적용한 Surface manifest 정식 반복 비교
          [ ] 비용 예산 / 보고서 포맷 / severity
          [x] XSS proof 범위의 브라우저 Runtime은 Phase 8에서 선행 구현
 ```

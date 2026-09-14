@@ -46,6 +46,7 @@ class RouterComparisonTests(unittest.TestCase):
         args = argparse.Namespace(
             profile="llm",
             recon="hybrid",
+            surface_collection="deterministic",
             router="hybrid",
             router_review="ambiguous",
             compare_routers=True,
@@ -61,6 +62,7 @@ class RouterComparisonTests(unittest.TestCase):
         )
 
         self.assertEqual(profile.analysis_profile, "llm")
+        self.assertEqual(profile.surface_collection_mode, "deterministic")
         self.assertEqual(profile.router_review, "ambiguous")
         self.assertTrue(profile.compare_routers)
         self.assertEqual(profile.budget_allocation_mode, "hybrid")
@@ -221,6 +223,7 @@ class RouterComparisonTests(unittest.TestCase):
                 execution_profile=RunExecutionProfile(
                     analysis_profile="llm",
                     recon_mode="hybrid",
+                    surface_collection_mode="deterministic",
                     router_mode="hybrid",
                     router_review="ambiguous",
                     compare_routers=True,
@@ -251,6 +254,7 @@ class RouterComparisonTests(unittest.TestCase):
             self.assertTrue(record["execution_profile_recorded"])
             self.assertEqual(record["analysis_profile"], "llm")
             self.assertEqual(record["recon_mode"], "hybrid")
+            self.assertEqual(record["surface_collection_mode"], "deterministic")
             self.assertEqual(record["router_mode"], "hybrid")
             self.assertEqual(record["router_review"], "ambiguous")
             self.assertTrue(record["compare_routers"])

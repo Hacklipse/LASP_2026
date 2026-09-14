@@ -18,6 +18,15 @@ def add_routing_arguments(parser: argparse.ArgumentParser) -> None:
         help="Recon planner mode, independent of --profile and --router",
     )
     parser.add_argument(
+        "--surface-collection",
+        choices=("adaptive", "deterministic"),
+        default="adaptive",
+        help=(
+            "adaptive applies Recon Planner ordering; deterministic keeps a stable "
+            "bounded crawl frontier for regression and non-Recon comparisons"
+        ),
+    )
+    parser.add_argument(
         "--router", choices=("heuristic", "hybrid"), default="heuristic",
         help="routing mode, independent of --profile (default: heuristic)",
     )
@@ -71,6 +80,7 @@ def execution_profile_from_args(
     return RunExecutionProfile(
         analysis_profile=getattr(args, "profile", "heuristic"),
         recon_mode=getattr(args, "recon", "heuristic"),
+        surface_collection_mode=getattr(args, "surface_collection", "adaptive"),
         router_mode=getattr(args, "router", "heuristic"),
         router_review=getattr(args, "router_review", "weak"),
         compare_routers=getattr(args, "compare_routers", False),
@@ -97,6 +107,9 @@ def build_run_router(
             "llm_provider": args.llm_provider if llm_client is not None else "",
             "llm_model": selected_model,
             "recon_mode": args.recon,
+            "surface_collection_mode": getattr(
+                args, "surface_collection", "adaptive"
+            ),
         },
     )
     # 계정 생성/로그인/HTTP 실행 전에 쓰기 실패를 확인한다. 기존 로그는 보존한다.
@@ -120,6 +133,7 @@ def append_run_result(args, app, run) -> None:
         "compare_routers": profile.compare_routers,
         "analysis_profile": profile.analysis_profile,
         "recon_mode": profile.recon_mode,
+        "surface_collection_mode": profile.surface_collection_mode,
         "orchestrator_mode": profile.orchestrator_mode,
         "extra_recon_rounds": run.extra_recon_rounds,
         "budget_allocation_mode": profile.budget_allocation_mode,

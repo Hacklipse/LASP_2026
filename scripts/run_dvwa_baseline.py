@@ -648,6 +648,7 @@ def main(argv: list[str]) -> int:
         llm_client=llm_client if args.profile == "llm" else None,
         recon_planner=standard_recon_planner(mode=args.recon, llm_client=llm_client),
         recon_max_pages=1,
+        recon_surface_collection_mode=args.surface_collection,
         actor_object_id=args.actor_object_id,
         owner_object_id=args.owner_object_id,
     )

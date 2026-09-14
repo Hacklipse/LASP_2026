@@ -17,7 +17,7 @@ from hacklipse.adapters.path_traversal_analysis import (
     UNLINKED_RENDER_PARAMETER_OBSERVATION,
 )
 from hacklipse.adapters.recon import ReconAgent
-from hacklipse.domain import AgentResultStatus, Evidence, TaskEnvelope
+from hacklipse.domain import AgentResultStatus, Evidence, Surface, TaskEnvelope
 from hacklipse.ports.errors import LlmTimeout
 from hacklipse.ports.llm import LlmRequest, LlmResponse
 
@@ -146,7 +146,14 @@ def _task(run_id: str, target_url: str, *, request_budget: int = 20) -> TaskEnve
     )
 
 
-def _agent(evidence_store, surface_store, *, planner=None, max_pages: int = 6):
+def _agent(
+    evidence_store,
+    surface_store,
+    *,
+    planner=None,
+    max_pages: int = 6,
+    surface_collection_mode: str = "adaptive",
+):
     collector = _RoutingCollector(evidence_store, _BODIES)
     counter = iter(range(10_000))
     agent = ReconAgent(
@@ -156,6 +163,7 @@ def _agent(evidence_store, surface_store, *, planner=None, max_pages: int = 6):
         id_factory=lambda: str(next(counter)),
         planner=planner,
         max_pages=max_pages,
+        surface_collection_mode=surface_collection_mode,
     )
     return agent, collector
 
@@ -308,6 +316,139 @@ class HybridReconOrderingTests(unittest.TestCase):
         agent.handle(_task("run-budget", "http://localhost/"))
 
         self.assertEqual(len(collector.calls), 3)
+
+
+class SurfaceCollectionDeterminismTests(unittest.TestCase):
+    """회귀 모드의 Surface 집합이 Planner 변동에 오염되지 않는지 검증한다."""
+
+    _BUNDLE = (
+        "const z = (n) => fetch(`/zeta/${n}`);\n"
+        "const a = (n) => fetch(`/alpha/${n}`);\n"
+        "const m = (n) => fetch(`/middle/${n}`);\n"
+    )
+    _BODIES = {
+        "http://localhost/": _SPA_ROOT,
+        "http://localhost/main.js": _BUNDLE,
+        "http://localhost/alpha/": (
+            '<form action="/submit-alpha" method="GET"><input name="alpha"></form>'
+        ),
+        "http://localhost/middle/": (
+            '<form action="/submit-middle" method="GET"><input name="middle"></form>'
+        ),
+        "http://localhost/zeta/": (
+            '<form action="/submit-zeta" method="GET"><input name="zeta"></form>'
+        ),
+    }
+
+    def _run(self, order: tuple[str, ...], *, mode: str, action: str = "continue"):
+        evidence_store = InMemoryEvidenceStore()
+        surface_store = InMemorySurfaceStore()
+        collector = _RoutingCollector(evidence_store, self._BODIES)
+        planner = _OrderingPlanner(order_by_path=order, action=action)
+        counter = iter(range(10_000))
+        agent = ReconAgent(
+            collector=collector,
+            evidence_store=evidence_store,
+            surface_store=surface_store,
+            id_factory=lambda: str(next(counter)),
+            planner=planner,
+            max_pages=4,
+            surface_collection_mode=mode,
+        )
+        agent.handle(_task(f"run-{mode}-{order[0]}", "http://localhost/"))
+        manifest = tuple(sorted(
+            (surface.method, surface.url, surface.parameters)
+            for surface in surface_store.list_by_run(f"run-{mode}-{order[0]}")
+        ))
+        return collector.calls, manifest, planner
+
+    def test_deterministic_mode_ignores_rank_and_stop_for_surface_admission(self):
+        forward = ("/alpha/", "/middle/", "/zeta/")
+        reverse = ("/zeta/", "/middle/", "/alpha/")
+
+        first_calls, first_manifest, first_planner = self._run(
+            forward, mode="deterministic"
+        )
+        second_calls, second_manifest, second_planner = self._run(
+            reverse, mode="deterministic", action="stop"
+        )
+
+        self.assertEqual(first_calls, second_calls)
+        self.assertEqual(first_manifest, second_manifest)
+        self.assertEqual(
+            first_calls,
+            [
+                "http://localhost/",
+                "http://localhost/main.js",
+                "http://localhost/alpha/",
+                "http://localhost/middle/",
+            ],
+        )
+        self.assertEqual(len(first_planner.calls), 1)
+        self.assertEqual(len(second_planner.calls), 1)
+
+    def test_adaptive_mode_keeps_existing_planner_influence(self):
+        forward = ("/alpha/", "/middle/", "/zeta/")
+        reverse = ("/zeta/", "/middle/", "/alpha/")
+
+        first_calls, first_manifest, _ = self._run(forward, mode="adaptive")
+        second_calls, second_manifest, _ = self._run(reverse, mode="adaptive")
+
+        self.assertNotEqual(first_calls, second_calls)
+        self.assertNotEqual(first_manifest, second_manifest)
+
+    def test_invalid_surface_collection_mode_is_rejected(self):
+        with self.assertRaises(ValueError):
+            _agent(
+                InMemoryEvidenceStore(),
+                InMemorySurfaceStore(),
+                surface_collection_mode="unbounded",
+            )
+
+    def test_targeted_recon_still_fetches_only_the_requested_surface(self):
+        evidence_store = InMemoryEvidenceStore()
+        surface_store = InMemorySurfaceStore()
+        surface_store.add(
+            Surface(
+                surface_id="surface-target",
+                run_id="run-targeted-deterministic",
+                url="http://localhost/alpha/",
+                method="GET",
+            )
+        )
+        planner = _OrderingPlanner(order_by_path=("/zeta/", "/middle/"))
+        collector = _RoutingCollector(evidence_store, self._BODIES)
+        agent = ReconAgent(
+            collector=collector,
+            evidence_store=evidence_store,
+            surface_store=surface_store,
+            planner=planner,
+            max_pages=4,
+            surface_collection_mode="deterministic",
+        )
+
+        result = agent.handle(
+            replace(
+                _task(
+                    "run-targeted-deterministic",
+                    "http://localhost/alpha/",
+                ),
+                surface_id="surface-target",
+            )
+        )
+
+        self.assertIs(result.status, AgentResultStatus.COMPLETED)
+        self.assertEqual(collector.calls, ["http://localhost/alpha/"])
+        self.assertFalse(planner.calls)
+        self.assertIn(
+            "http://localhost/submit-alpha",
+            {
+                surface.url
+                for surface in surface_store.list_by_run(
+                    "run-targeted-deterministic"
+                )
+            },
+        )
 
 
 class HybridReconProtectedSurfaceTests(unittest.TestCase):

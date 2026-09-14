@@ -209,6 +209,7 @@ class RunExecutionProfile:
     recorded: bool = True
     analysis_profile: str = "heuristic"
     recon_mode: str = "heuristic"
+    surface_collection_mode: str = "adaptive"
     router_mode: str = "heuristic"
     router_review: str = "weak"
     compare_routers: bool = False
@@ -226,6 +227,10 @@ class RunExecutionProfile:
         modes = {
             "analysis profile": (self.analysis_profile, {"heuristic", "llm"}),
             "recon mode": (self.recon_mode, {"heuristic", "hybrid"}),
+            "surface collection mode": (
+                self.surface_collection_mode,
+                {"adaptive", "deterministic"},
+            ),
             "router mode": (self.router_mode, {"heuristic", "hybrid"}),
             "router review": (self.router_review, {"weak", "ambiguous"}),
             "orchestrator mode": (self.orchestrator_mode, {"heuristic", "hybrid"}),

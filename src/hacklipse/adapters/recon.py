@@ -188,6 +188,39 @@ def _looks_like_restricted_file(url: str) -> bool:
     return any(name.endswith(suffix) for suffix in _RESTRICTED_FILE_EXTENSIONS)
 
 
+def _deterministic_url_key(url: str) -> tuple[str, str, str, str, str, str]:
+    """비교·회귀 모드에서 crawl frontier를 고정하는 URL 정렬 키."""
+
+    parsed = urlsplit(url)
+    return (
+        parsed.scheme.casefold(),
+        parsed.netloc.casefold(),
+        parsed.path or "/",
+        parsed.query,
+        parsed.fragment,
+        url,
+    )
+
+
+def _deterministic_pending(
+    urls: Sequence[str], protected: Sequence[str] | set[str] = ()
+) -> list[str]:
+    """보호 URL을 먼저, 나머지를 정규 URL 순서로 고정한다."""
+
+    unique = tuple(dict.fromkeys(urls))
+    protected_set = set(protected)
+    return [
+        *sorted(
+            (url for url in unique if url in protected_set),
+            key=_deterministic_url_key,
+        ),
+        *sorted(
+            (url for url in unique if url not in protected_set),
+            key=_deterministic_url_key,
+        ),
+    ]
+
+
 class ReconAgent:
     """대상을 크롤링하고 응답에서 공격 표면을 구조화해 저장한다."""
 
@@ -199,17 +232,21 @@ class ReconAgent:
         surface_store: SurfaceStore,
         max_pages: int = DEFAULT_MAX_PAGES,
         max_scripts: int = DEFAULT_MAX_SCRIPTS,
+        surface_collection_mode: str = "adaptive",
         seed_urls: Sequence[str] = (),
         id_factory: Callable[[], str] | None = None,
         planner: ReconPlanner | None = None,
     ) -> None:
         if max_pages < 1:
             raise ValueError("recon must fetch at least one page")
+        if surface_collection_mode not in {"adaptive", "deterministic"}:
+            raise ValueError("unsupported surface collection mode")
         self._collector = collector
         self._evidence = evidence_store
         self._surfaces = surface_store
         self._max_pages = max_pages
         self._max_scripts = max_scripts
+        self._surface_collection_mode = surface_collection_mode
         self._seed_urls = tuple(dict.fromkeys(seed_urls))
         self._id_factory = id_factory or (lambda: str(uuid4()))
         # None이면(휴리스틱 프로필) 아래 두 번째 crawl() 직전 분기 자체가 실행되지
@@ -309,8 +346,10 @@ class ReconAgent:
                 )
             return surface_id
 
-        def crawl() -> None:
+        def crawl(*, protected: Sequence[str] | set[str] = ()) -> None:
             while pending and len(fetched) < page_budget:
+                if self._surface_collection_mode == "deterministic":
+                    pending[:] = _deterministic_pending(pending, protected)
                 url = pending.pop(0)
                 if url in fetched:
                     continue
@@ -346,11 +385,17 @@ class ReconAgent:
                     if source not in scripts and _same_origin(source, origin):
                         scripts.append(source)
 
-        crawl()
+        # 비교 모드에서도 사용자가 지정한 시작 URL은 항상 먼저 본다.
+        crawl(protected=(task.target_url,))
 
         # 번들 분석은 크롤링 뒤에 한다. 남은 예산 안에서만 스크립트를 받는다.
         affordable = max(min(self._max_scripts, page_budget - len(fetched)), 0)
-        for source in scripts[:affordable]:
+        script_sources = (
+            sorted(scripts, key=_deterministic_url_key)
+            if self._surface_collection_mode == "deterministic"
+            else scripts
+        )
+        for source in script_sources[:affordable]:
             fetched.add(source)
             for url, names, should_crawl, is_navigation in self._discover_from_script(
                 task, source, origin
@@ -374,12 +419,17 @@ class ReconAgent:
                 plan, plan_evidence_id = self._plan(task, candidates, remaining_budget)
                 evidence_ids.append(plan_evidence_id)
                 planner_status = recon_plan_status_detail(plan)
-                pending[:] = self._apply_plan(
-                    plan, pending, pending_surface_ids, navigation_pages
-                )
+                if self._surface_collection_mode == "deterministic":
+                    # Planner 호출·결과는 감사를 위해 남기되 방문 집합은
+                    # LLM 순서·stop에 좌우되지 않게 고정한다.
+                    pending[:] = _deterministic_pending(pending, navigation_pages)
+                else:
+                    pending[:] = self._apply_plan(
+                        plan, pending, pending_surface_ids, navigation_pages
+                    )
 
         # 번들에서 찾은 디렉터리 목록(또는 Planner가 고른 순서)을 남은 예산 안에서 마저 본다.
-        crawl()
+        crawl(protected=navigation_pages)
 
         surface_ids = list(surfaces.values())
         return AgentResult(
