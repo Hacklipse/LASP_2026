@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "target": "http://127.0.0.1:3000/",
+  "vulnerability": "xss",
+  "analysis_profile": "heuristic",
+  "recon_mode": "heuristic",
+  "surface_collection_mode": "deterministic",
+  "router_mode": "heuristic",
+  "orchestrator_schedule": [
+    "heuristic",
+    "hybrid",
+    "hybrid",
+    "heuristic",
+    "heuristic",
+    "hybrid"
+  ],
+  "budget_allocation_mode": "heuristic",
+  "validation_mode": "heuristic",
+  "report_mode": "heuristic",
+  "knowledge_enabled": false,
+  "request_budget": 80,
+  "hybrid_llm_provider": "gemini",
+  "hybrid_llm_model": "runner_default",
+  "hybrid_llm_rpm_limit": 12,
+  "runs": [
+    {
+      "sequence": 1,
+      "orchestrator_mode": "heuristic",
+      "exit_code": 0,
+      "elapsed_seconds": 34.475,
+      "log_file": "run-01-heuristic.log"
+    },
+    {
+      "sequence": 2,
+      "orchestrator_mode": "hybrid",
+      "exit_code": 0,
+      "elapsed_seconds": 42.764,
+      "log_file": "run-02-hybrid.log"
+    },
+    {
+      "sequence": 3,
+      "orchestrator_mode": "hybrid",
+      "exit_code": 0,
+      "elapsed_seconds": 63.296,
+      "log_file": "run-03-hybrid.log"
+    },
+    {
+      "sequence": 4,
+      "orchestrator_mode": "heuristic",
+      "exit_code": 0,
+      "elapsed_seconds": 32.454,
+      "log_file": "run-04-heuristic.log"
+    },
+    {
+      "sequence": 5,
+      "orchestrator_mode": "heuristic",
+      "exit_code": 0,
+      "elapsed_seconds": 26.62,
+      "log_file": "run-05-heuristic.log"
+    },
+    {
+      "sequence": 6,
+      "orchestrator_mode": "hybrid",
+      "exit_code": 0,
+      "elapsed_seconds": 28.052,
+      "log_file": "run-06-hybrid.log"
+    }
+  ]
+}

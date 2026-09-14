@@ -1,0 +1,259 @@
+{
+  "schema_version": 1,
+  "event": "orchestrator_ab_comparison",
+  "pairing": "run_order_by_mode",
+  "available_runs": [
+    {
+      "run_id": "run-cddebe93-983f-4a0d-9407-959fdf6fe180",
+      "orchestrator_mode": "heuristic"
+    },
+    {
+      "run_id": "run-fc4550af-8158-4fd1-b754-61c05d22223a",
+      "orchestrator_mode": "hybrid"
+    },
+    {
+      "run_id": "run-e24aa472-5dac-4b83-81a2-b406f327e5be",
+      "orchestrator_mode": "hybrid"
+    },
+    {
+      "run_id": "run-1f4f500c-1b8a-4c6d-9f17-13cd54c56528",
+      "orchestrator_mode": "heuristic"
+    },
+    {
+      "run_id": "run-b7d65168-b06b-4f75-8577-ea0f51648d88",
+      "orchestrator_mode": "heuristic"
+    },
+    {
+      "run_id": "run-463128b2-86e8-4b77-975d-f4d78472362c",
+      "orchestrator_mode": "hybrid"
+    }
+  ],
+  "unpaired_run_counts": {
+    "heuristic": 0,
+    "hybrid": 0
+  },
+  "repeatability": {
+    "heuristic": {
+      "run_count": 3,
+      "assessable": true,
+      "same_initial_surface_manifest": true,
+      "same_normalized_router_input": true,
+      "same_recorded_conditions": true,
+      "finding_counts": [
+        1,
+        1,
+        1
+      ],
+      "request_counts": [
+        25,
+        25,
+        25
+      ]
+    },
+    "hybrid": {
+      "run_count": 3,
+      "assessable": true,
+      "same_initial_surface_manifest": true,
+      "same_normalized_router_input": true,
+      "same_recorded_conditions": true,
+      "finding_counts": [
+        1,
+        1,
+        1
+      ],
+      "request_counts": [
+        25,
+        25,
+        25
+      ]
+    }
+  },
+  "summary": {
+    "pair_count": 3,
+    "eligible_pair_count": 3,
+    "extra_recon_activated_count": 0,
+    "extra_recon_effect_observed": false,
+    "mean_delta_hybrid_minus_baseline": {
+      "finding_count": 0,
+      "requests_used": 0,
+      "new_surface_count": 0,
+      "new_candidate_count": 0,
+      "new_confirmed_candidate_count": 0
+    }
+  },
+  "pairs": [
+    {
+      "eligible": true,
+      "reasons": [],
+      "different_fixed_condition_names": [],
+      "same_initial_surface_manifest": true,
+      "same_normalized_router_input": true,
+      "same_raw_recon_input": false,
+      "initial_surface_delta": {
+        "baseline_only": 0,
+        "hybrid_only": 0
+      },
+      "baseline": {
+        "run_id": "run-cddebe93-983f-4a0d-9407-959fdf6fe180",
+        "phase": "done",
+        "initial_surface_count": 123,
+        "new_surface_count": 0,
+        "initial_candidate_count": 7,
+        "new_candidate_count": 0,
+        "new_confirmed_candidate_count": 0,
+        "candidate_count": 7,
+        "candidate_status_counts": {
+          "confirmed": 1,
+          "rejected": 6
+        },
+        "finding_count": 1,
+        "requests_used": 25,
+        "extra_recon_rounds": 0,
+        "routing_rounds": 1
+      },
+      "hybrid": {
+        "run_id": "run-fc4550af-8158-4fd1-b754-61c05d22223a",
+        "phase": "done",
+        "initial_surface_count": 123,
+        "new_surface_count": 0,
+        "initial_candidate_count": 7,
+        "new_candidate_count": 0,
+        "new_confirmed_candidate_count": 0,
+        "candidate_count": 7,
+        "candidate_status_counts": {
+          "confirmed": 1,
+          "rejected": 6
+        },
+        "finding_count": 1,
+        "requests_used": 25,
+        "extra_recon_rounds": 0,
+        "routing_rounds": 1
+      },
+      "delta_hybrid_minus_baseline": {
+        "finding_count": 0,
+        "requests_used": 0,
+        "candidate_count": 0,
+        "extra_recon_rounds": 0,
+        "new_surface_count": 0,
+        "new_candidate_count": 0,
+        "new_confirmed_candidate_count": 0
+      }
+    },
+    {
+      "eligible": true,
+      "reasons": [],
+      "different_fixed_condition_names": [],
+      "same_initial_surface_manifest": true,
+      "same_normalized_router_input": true,
+      "same_raw_recon_input": false,
+      "initial_surface_delta": {
+        "baseline_only": 0,
+        "hybrid_only": 0
+      },
+      "baseline": {
+        "run_id": "run-1f4f500c-1b8a-4c6d-9f17-13cd54c56528",
+        "phase": "done",
+        "initial_surface_count": 123,
+        "new_surface_count": 0,
+        "initial_candidate_count": 7,
+        "new_candidate_count": 0,
+        "new_confirmed_candidate_count": 0,
+        "candidate_count": 7,
+        "candidate_status_counts": {
+          "confirmed": 1,
+          "rejected": 6
+        },
+        "finding_count": 1,
+        "requests_used": 25,
+        "extra_recon_rounds": 0,
+        "routing_rounds": 1
+      },
+      "hybrid": {
+        "run_id": "run-e24aa472-5dac-4b83-81a2-b406f327e5be",
+        "phase": "done",
+        "initial_surface_count": 123,
+        "new_surface_count": 0,
+        "initial_candidate_count": 7,
+        "new_candidate_count": 0,
+        "new_confirmed_candidate_count": 0,
+        "candidate_count": 7,
+        "candidate_status_counts": {
+          "confirmed": 1,
+          "rejected": 6
+        },
+        "finding_count": 1,
+        "requests_used": 25,
+        "extra_recon_rounds": 0,
+        "routing_rounds": 1
+      },
+      "delta_hybrid_minus_baseline": {
+        "finding_count": 0,
+        "requests_used": 0,
+        "candidate_count": 0,
+        "extra_recon_rounds": 0,
+        "new_surface_count": 0,
+        "new_candidate_count": 0,
+        "new_confirmed_candidate_count": 0
+      }
+    },
+    {
+      "eligible": true,
+      "reasons": [],
+      "different_fixed_condition_names": [],
+      "same_initial_surface_manifest": true,
+      "same_normalized_router_input": true,
+      "same_raw_recon_input": false,
+      "initial_surface_delta": {
+        "baseline_only": 0,
+        "hybrid_only": 0
+      },
+      "baseline": {
+        "run_id": "run-b7d65168-b06b-4f75-8577-ea0f51648d88",
+        "phase": "done",
+        "initial_surface_count": 123,
+        "new_surface_count": 0,
+        "initial_candidate_count": 7,
+        "new_candidate_count": 0,
+        "new_confirmed_candidate_count": 0,
+        "candidate_count": 7,
+        "candidate_status_counts": {
+          "confirmed": 1,
+          "rejected": 6
+        },
+        "finding_count": 1,
+        "requests_used": 25,
+        "extra_recon_rounds": 0,
+        "routing_rounds": 1
+      },
+      "hybrid": {
+        "run_id": "run-463128b2-86e8-4b77-975d-f4d78472362c",
+        "phase": "done",
+        "initial_surface_count": 123,
+        "new_surface_count": 0,
+        "initial_candidate_count": 7,
+        "new_candidate_count": 0,
+        "new_confirmed_candidate_count": 0,
+        "candidate_count": 7,
+        "candidate_status_counts": {
+          "confirmed": 1,
+          "rejected": 6
+        },
+        "finding_count": 1,
+        "requests_used": 25,
+        "extra_recon_rounds": 0,
+        "routing_rounds": 1
+      },
+      "delta_hybrid_minus_baseline": {
+        "finding_count": 0,
+        "requests_used": 0,
+        "candidate_count": 0,
+        "extra_recon_rounds": 0,
+        "new_surface_count": 0,
+        "new_candidate_count": 0,
+        "new_confirmed_candidate_count": 0
+      }
+    }
+  ],
+  "interpretation": "Eligible pairs control recorded execution conditions, initial Surface manifest, and normalized Router input. Raw target responses may still differ; this is a repeated target experiment, not a fixed-input LLM replay. Knowledge mode and target state are not recorded in the Run profile; keep them fixed in the invocation protocol.",
+  "effect_note": "No hybrid Run performed extra Recon. Finding and request deltas, if any, cannot measure the benefit of extra Recon."
+}

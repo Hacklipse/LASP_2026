@@ -10,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from hacklipse.adapters import RuleBasedVulnerabilityRouter
-from hacklipse.adapters.routing_audit import JsonlRoutingAuditLog
+from hacklipse.adapters.routing_audit import JsonlRoutingAuditLog, comparison_surface_key, surface_key
 from hacklipse.bootstrap import standard_router
 from hacklipse.domain import Evidence, Run, RunScope, Surface
 from hacklipse.ports.errors import LlmCredentialsMissing, LlmTimeout
@@ -60,6 +60,28 @@ class _Log:
 
 
 class RoutingAuditTests(unittest.TestCase):
+    def test_p1_surface_key_ignores_observed_query_values(self):
+        first = replace(
+            _SURFACE, url="http://localhost/render",
+            observed_query=(("q", "first"),),
+        )
+        second = replace(first, observed_query=(("q", "second"),))
+
+        self.assertEqual(comparison_surface_key(first), comparison_surface_key(second))
+        self.assertNotEqual(surface_key(first), surface_key(second))
+        first_log, second_log = _Log(), _Log()
+        standard_router(audit_log=first_log).route(_RUN, (first,), ())
+        standard_router(audit_log=second_log).route(_RUN, (second,), ())
+        first_record, second_record = first_log.records[0], second_log.records[0]
+        self.assertEqual(
+            first_record["routing_input_manifest"]["surfaces"][0]["comparison_surface_key"],
+            second_record["routing_input_manifest"]["surfaces"][0]["comparison_surface_key"],
+        )
+        self.assertEqual(
+            first_record["routing_input_fingerprint"],
+            second_record["routing_input_fingerprint"],
+        )
+
     def test_default_bootstrap_stays_rule_based_without_llm(self):
         llm = _Llm()
         router = standard_router(llm_client=llm)

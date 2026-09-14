@@ -1,0 +1,92 @@
+==========================================================
+  Juice Shop 실행 전 확인
+==========================================================
+
+[실행 구성]
+  검사 대상       XSS
+  Analysis        heuristic
+  Recon           heuristic
+  Surface 수집    deterministic
+  Router          heuristic · review weak
+  Orchestrator    heuristic
+  예산 배분       heuristic
+  Router 비교     끔
+  Knowledge       끔
+  판단 기록       artifacts/orchestrator-ab-xss-rpm12-live-20260914/routing.jsonl
+==========================================================
+이 검증은 헤드리스 브라우저로 SPA 라우트를 열어 값이 DOM에 반사되는지 봅니다.
+요청은 읽기 전용 GET이며 대상 상태를 바꾸지 않습니다.
+로컬 Juice Shop XSS 검증을 실행할까요? [y/N] [준비] run_started 예산 0/80
+[탐색] phase_changed 예산 0/80
+[분류] phase_changed 예산 12/80
+[분류] XSS 대기 예산 12/80
+[분류] XSS 대기 예산 12/80
+[분류] XSS 대기 예산 12/80
+[분류] XSS 대기 예산 12/80
+[분류] XSS 대기 예산 12/80
+[분류] XSS 대기 예산 12/80
+[분류] XSS 대기 예산 12/80
+[진행] 예산 배분 결정적 순서 · 검증 1회 예약
+[분석] phase_changed 예산 12/80
+[분석] XSS 검사 중 / 예산 12/80
+[분석] XSS 검증 대기 예산 13/80
+[분석] XSS 검사 중 / 예산 13/80
+[분석] XSS 검증 대기 예산 14/80
+[분석] XSS 검사 중 / 예산 14/80
+[분석] XSS 검증 대기 예산 15/80
+[분석] XSS 검사 중 /api/Challenges/ 예산 15/80
+[분석] XSS 검증 대기 예산 17/80
+[분석] XSS 검사 중 /rest/products/search 예산 17/80
+[분석] XSS 검증 대기 예산 19/80
+[분석] XSS 검사 중 /rest/user/change-password 예산 19/80
+[분석] XSS 검증 대기 예산 21/80
+[분석] XSS 검사 중 /rest/user/security-question 예산 21/80
+[분석] XSS 검증 대기 예산 23/80
+[검증] phase_changed 예산 23/80
+[검증] XSS 검사 중 /rest/user/security-question 예산 23/80
+[검증] XSS 검증 대기 예산 23/80
+[검증] XSS 검사 중 /rest/user/security-question 예산 23/80
+[검증] XSS 검사 중 /rest/user/security-question 예산 25/80
+[검증] XSS 검증 대기 예산 25/80
+[검증] XSS 검사 중 /rest/user/security-question 예산 25/80
+[검증] XSS 검증 대기 예산 25/80
+[검증] XSS 검사 중 /rest/user/security-question 예산 25/80
+[검증] XSS 검증 대기 예산 25/80
+[검증] XSS 검사 중 /rest/user/security-question 예산 25/80
+[검증] XSS 검증 대기 예산 25/80
+[검증] XSS 검사 중 /rest/user/security-question 예산 25/80
+[검증] XSS 검증 대기 예산 25/80
+[검증] XSS 검사 중 /rest/user/security-question 예산 25/80
+[검증] XSS 완료 (Finding 1) 24.7초 예산 25/80
+[보고] phase_changed 예산 25/80
+[완료] run_completed 예산 25/80
+[진행] 완료
+  ✓ 탐색      Surface 123 · 파라미터 6
+  ✓ 예산 배분  결정적 순서 · 검증 1회 예약
+  ✓ XSS       완료 (Finding 1) 24.7초 · Candidate 7
+  · 검증      7 / 7
+  · Finding   1
+  · 예산      25 / 80
+
+
+======================================================
+  Juice Shop XSS 실행 결과
+======================================================
+
+[실행 정보]
+  상태            완료 (done)
+  분석 대상       XSS
+  Agent 구성      heuristic
+  추가 Recon      0회
+  예산 배분       heuristic · 검증 예약 1회/Candidate
+  감사된 실행     25회 / 예산 25회 사용, 상한 80회
+
+[분석 신호]
+  Candidate       XSS 7개
+  DOM 반사         1개
+
+[최종 판정]
+  결과            CONFIRMED (취약점 확인)
+  Finding         1개
+  취약점 유형     XSS 1개
+======================================================

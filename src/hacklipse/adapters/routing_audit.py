@@ -246,6 +246,16 @@ def surface_key(surface: Surface) -> str:
     return _fingerprint(data)
 
 
+def comparison_surface_key(surface: Surface) -> str:
+    """P-1 반복 비교용 (method, URL, parameters) 지문; 관측값은 제외한다."""
+
+    return _fingerprint({
+        "method": surface.method.upper(),
+        "url": surface.url,
+        "parameters": tuple(surface.parameters),
+    })
+
+
 def routing_surface_key(surface: Surface, evidence: Sequence[Evidence]) -> str:
     """동적 URL·관측값이 아닌 Router가 읽는 Surface 의미 구조의 지문."""
 
@@ -299,6 +309,7 @@ def routing_input_manifest(
             {
                 "position": index,
                 "surface_key": keys[surface.surface_id],
+                "comparison_surface_key": comparison_surface_key(surface),
                 "routing_surface_key": routing_identities[surface.surface_id][0],
                 "routing_surface_occurrence": routing_identities[surface.surface_id][1],
                 **summaries[surface.surface_id],
@@ -339,7 +350,7 @@ def routing_input_fingerprint(
     # observation_fingerprint는 raw 응답 차이를 진단할 뿐 Router 입력은 아니다.
     normalized_surfaces = [
         {key: value for key, value in item.items()
-         if key not in {"surface_key", "surface_id"}}
+         if key not in {"surface_key", "surface_id", "comparison_surface_key"}}
         for item in manifest["surfaces"]
     ]
     normalized_evidence = [
