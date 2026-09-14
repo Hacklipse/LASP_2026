@@ -87,7 +87,13 @@ from hacklipse.ports.errors import LlmCredentialsMissing  # noqa: E402
 # 기존 DVWA 실행기와 같은 안전한 디버그 출력 구현을 재사용한다. 이 모듈은 main guard가
 # 있어 import만으로 실행되지 않는다.
 from progress_view import RunProgressView, format_recon_planner_status  # noqa: E402
-from routing_options import add_routing_arguments, append_run_result, build_run_router, needs_llm  # noqa: E402
+from routing_options import (  # noqa: E402
+    add_routing_arguments,
+    append_run_result,
+    build_run_router,
+    execution_profile_from_args,
+    needs_llm,
+)
 from run_dvwa_baseline import (  # noqa: E402
     _DebugAuditLog,
     _DebugProgress,
@@ -1048,6 +1054,11 @@ def main(argv: list[str]) -> int:
                     credential_ref=run_credential_ref,
                     principal_credentials=principal_credentials,
                     agent_credentials=agent_credentials,
+                    execution_profile=execution_profile_from_args(
+                        args,
+                        selected_model=selected_model,
+                        llm_rpm_limit=rpm_limit,
+                    ),
                 )
             )
         except WorkflowExecutionError as error:

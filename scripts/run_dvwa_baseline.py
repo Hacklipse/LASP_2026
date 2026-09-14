@@ -60,7 +60,13 @@ from hacklipse.ports import (  # noqa: E402
 )
 from hacklipse.ports.errors import LlmCredentialsMissing  # noqa: E402
 from progress_view import RunProgressView  # noqa: E402
-from routing_options import add_routing_arguments, append_run_result, build_run_router, needs_llm  # noqa: E402
+from routing_options import (  # noqa: E402
+    add_routing_arguments,
+    append_run_result,
+    build_run_router,
+    execution_profile_from_args,
+    needs_llm,
+)
 
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1"})
 _CREDENTIAL_REF = "interactive-local-dvwa"
@@ -493,6 +499,7 @@ def main(argv: list[str]) -> int:
 
     llm_client = None
     selected_model = ""
+    rpm_limit: int | None = None
     if needs_llm(args):
         selected_model = args.llm_model or (
             DEFAULT_GEMINI_LLM_MODEL
@@ -663,6 +670,11 @@ def main(argv: list[str]) -> int:
                 request_budget=_DEFAULT_BUDGET,
                 credential_ref=run_credential_ref,
                 principal_credentials=principal_credentials,
+                execution_profile=execution_profile_from_args(
+                    args,
+                    selected_model=selected_model,
+                    llm_rpm_limit=rpm_limit,
+                ),
             )
         )
     except WorkflowExecutionError as error:

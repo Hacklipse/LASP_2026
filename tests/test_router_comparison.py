@@ -15,10 +15,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from compare_routers import compare_records, latest_run, main, replay
-from routing_options import append_run_result
+from routing_options import append_run_result, execution_profile_from_args
 from hacklipse.adapters.routing_audit import input_fingerprint, routing_input_fingerprint, surface_key
 from hacklipse.bootstrap import build_local_application, standard_router
-from hacklipse.domain import Candidate, CandidateStatus, Evidence, Run, RunScope, Surface
+from hacklipse.domain import (
+    Candidate,
+    CandidateStatus,
+    Evidence,
+    Run,
+    RunExecutionProfile,
+    RunScope,
+    Surface,
+)
 from hacklipse.ports.llm import LlmResponse
 
 
@@ -34,6 +42,32 @@ def _args(directory, failure="none"):
 
 
 class RouterComparisonTests(unittest.TestCase):
+    def test_cli_execution_profile_records_effective_conditions(self):
+        args = argparse.Namespace(
+            profile="llm",
+            recon="hybrid",
+            router="hybrid",
+            router_review="ambiguous",
+            compare_routers=True,
+            orchestrator="hybrid",
+            budget_allocation="hybrid",
+            llm_provider="gemini",
+        )
+
+        profile = execution_profile_from_args(
+            args,
+            selected_model="gemini-2.5-flash",
+            llm_rpm_limit=14,
+        )
+
+        self.assertEqual(profile.analysis_profile, "llm")
+        self.assertEqual(profile.router_review, "ambiguous")
+        self.assertTrue(profile.compare_routers)
+        self.assertEqual(profile.budget_allocation_mode, "hybrid")
+        self.assertEqual(profile.llm_provider, "gemini")
+        self.assertEqual(profile.llm_model, "gemini-2.5-flash")
+        self.assertEqual(profile.llm_rpm_limit, 14)
+
     def test_fixed_replay_reports_exact_candidate_delta_without_claiming_analysis(self):
         with tempfile.TemporaryDirectory() as directory:
             args = _args(directory)
@@ -178,8 +212,27 @@ class RouterComparisonTests(unittest.TestCase):
             args.router = "heuristic"
             args.profile = "heuristic"
             app = build_local_application({})
-            run = Run(run_id="result-run", target_url="http://localhost/", policy_profile="safe",
-                      scope=RunScope(allowed_hosts=frozenset({"localhost"})), request_budget=10)
+            run = Run(
+                run_id="result-run",
+                target_url="http://localhost/",
+                policy_profile="safe",
+                scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+                request_budget=10,
+                execution_profile=RunExecutionProfile(
+                    analysis_profile="llm",
+                    recon_mode="hybrid",
+                    router_mode="hybrid",
+                    router_review="ambiguous",
+                    compare_routers=True,
+                    orchestrator_mode="hybrid",
+                    budget_allocation_mode="heuristic",
+                    validation_mode="llm",
+                    report_mode="llm",
+                    llm_provider="fixture",
+                    llm_model="fixture-model",
+                    llm_rpm_limit=7,
+                ),
+            )
             # 실제 실행에서는 Orchestrator.start가 예산을 초기화한다.
             app.budget_manager.open_run(run.run_id, run.request_budget)
             app.stores.surfaces.add(Surface(surface_id="surface", run_id=run.run_id,
@@ -194,6 +247,20 @@ class RouterComparisonTests(unittest.TestCase):
             self.assertEqual(record["candidate_status_counts"], {"blocked": 1})
             self.assertEqual(record["requests_used"], 0)
             self.assertEqual(record["finding_count"], 0)
+            # JSONL은 현재 CLI args가 아니라 Run에 영속화된 조건을 사용한다.
+            self.assertTrue(record["execution_profile_recorded"])
+            self.assertEqual(record["analysis_profile"], "llm")
+            self.assertEqual(record["recon_mode"], "hybrid")
+            self.assertEqual(record["router_mode"], "hybrid")
+            self.assertEqual(record["router_review"], "ambiguous")
+            self.assertTrue(record["compare_routers"])
+            self.assertEqual(record["orchestrator_mode"], "hybrid")
+            self.assertEqual(record["budget_allocation_mode"], "heuristic")
+            self.assertEqual(record["validation_mode"], "llm")
+            self.assertEqual(record["report_mode"], "llm")
+            self.assertEqual(record["llm_provider"], "fixture")
+            self.assertEqual(record["llm_model"], "fixture-model")
+            self.assertEqual(record["llm_rpm_limit"], 7)
             self.assertNotIn("private-value", json.dumps(record))
 
     def test_comparison_cli_appends_results(self):

@@ -177,6 +177,7 @@ class Orchestrator:
             credential_ref=request.credential_ref,
             agent_credentials=request.agent_credentials,
             principal_credentials=request.principal_credentials,
+            execution_profile=request.execution_profile,
         )
         # Run과 예산을 먼저 등록한 뒤 첫 단계인 RECON으로 전이한다.
         self._runs.add(run)

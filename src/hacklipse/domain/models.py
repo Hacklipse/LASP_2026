@@ -201,6 +201,80 @@ class RunScope:
 
 
 @dataclass(frozen=True, slots=True)
+class RunExecutionProfile:
+    """재현·비교를 위해 Run과 함께 영속화하는 실제 실행 조건."""
+
+    # False는 P-2 이전 DB에서 복원한 Run이며, 아래 값을 실행 사실로
+    # 해석하면 안 된다는 뜻이다. 구버전 Run을 비교 실험에 섞지 않게 한다.
+    recorded: bool = True
+    analysis_profile: str = "heuristic"
+    recon_mode: str = "heuristic"
+    router_mode: str = "heuristic"
+    router_review: str = "weak"
+    compare_routers: bool = False
+    orchestrator_mode: str = "heuristic"
+    budget_allocation_mode: str = "off"
+    # Validation·Report LLM 보조가 연결되기 전에도 계약을 먼저 고정한다.
+    validation_mode: str = "heuristic"
+    report_mode: str = "heuristic"
+    # 비밀값은 저장하지 않고, 실제 호출에 쓴 provider/model만 남긴다.
+    llm_provider: str = ""
+    llm_model: str = ""
+    llm_rpm_limit: int | None = None
+
+    def __post_init__(self) -> None:
+        modes = {
+            "analysis profile": (self.analysis_profile, {"heuristic", "llm"}),
+            "recon mode": (self.recon_mode, {"heuristic", "hybrid"}),
+            "router mode": (self.router_mode, {"heuristic", "hybrid"}),
+            "router review": (self.router_review, {"weak", "ambiguous"}),
+            "orchestrator mode": (self.orchestrator_mode, {"heuristic", "hybrid"}),
+            "budget allocation mode": (
+                self.budget_allocation_mode,
+                {"off", "heuristic", "hybrid"},
+            ),
+            "validation mode": (self.validation_mode, {"heuristic", "llm"}),
+            "report mode": (self.report_mode, {"heuristic", "llm"}),
+        }
+        for label, (value, allowed) in modes.items():
+            if value not in allowed:
+                raise DomainInvariantError(f"unsupported {label}: {value!r}")
+        if type(self.recorded) is not bool:
+            raise DomainInvariantError("recorded execution profile flag must be boolean")
+        if type(self.compare_routers) is not bool:
+            raise DomainInvariantError("compare routers flag must be boolean")
+        if (
+            self.llm_rpm_limit is not None
+            and (type(self.llm_rpm_limit) is not int or self.llm_rpm_limit <= 0)
+        ):
+            raise DomainInvariantError("LLM RPM limit must be positive")
+        for label, value in (
+            ("LLM provider", self.llm_provider),
+            ("LLM model", self.llm_model),
+        ):
+            if not isinstance(value, str) or len(value) > 200 or (
+                value and (not value.strip() or not value.isprintable())
+            ):
+                raise DomainInvariantError(f"{label} must be a short printable string")
+        if bool(self.llm_provider) != bool(self.llm_model):
+            raise DomainInvariantError("LLM provider and model must be stored together")
+        uses_llm = (
+            self.analysis_profile == "llm"
+            or self.recon_mode == "hybrid"
+            or self.router_mode == "hybrid"
+            or self.compare_routers
+            or self.orchestrator_mode == "hybrid"
+            or self.budget_allocation_mode == "hybrid"
+            or self.validation_mode == "llm"
+            or self.report_mode == "llm"
+        )
+        if uses_llm != bool(self.llm_provider):
+            raise DomainInvariantError("LLM execution requires a provider and model")
+        if self.llm_rpm_limit is not None and not uses_llm:
+            raise DomainInvariantError("LLM RPM limit requires LLM execution")
+
+
+@dataclass(frozen=True, slots=True)
 class RunRequest:
     """사용자가 새로운 점검 Run을 시작할 때 전달하는 입력."""
 
@@ -217,6 +291,7 @@ class RunRequest:
     # 필요한 인증이 다르기 때문에 필요하다(SQLi는 인증 없음, SSTI는 실습 계정 token).
     # 비어 있으면 기존 단일 취약점 Run으로 보고 credential_ref를 그대로 쓴다.
     agent_credentials: tuple[tuple[str, str], ...] = ()
+    execution_profile: RunExecutionProfile = field(default_factory=RunExecutionProfile)
 
     def __post_init__(self) -> None:
         # 실행 예산은 이후 Runtime과 Agent 호출을 통제하는 상한선이다.
@@ -226,6 +301,8 @@ class RunRequest:
             raise DomainInvariantError("run timeout must be positive")
         if self.credential_ref is not None and not self.credential_ref.strip():
             raise DomainInvariantError("credential reference cannot be blank")
+        if not isinstance(self.execution_profile, RunExecutionProfile):
+            raise DomainInvariantError("run execution profile is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +320,7 @@ class Run:
     # 여기에 등록되지 않은 역할은 중앙 Collector가 거부한다.
     principal_credentials: tuple[tuple[str, str], ...] = ()
     agent_credentials: tuple[tuple[str, str], ...] = ()
+    execution_profile: RunExecutionProfile = field(default_factory=RunExecutionProfile)
     phase: RunPhase = RunPhase.INIT
     evidence_ids: tuple[str, ...] = ()
     surface_ids: tuple[str, ...] = ()
@@ -265,6 +343,8 @@ class Run:
     budget_active_floor: int | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.execution_profile, RunExecutionProfile):
+            raise DomainInvariantError("run execution profile is invalid")
         if self.extra_recon_rounds < 0:
             raise DomainInvariantError("extra recon rounds cannot be negative")
         if self.recon_target_surface_id is not None and self.extra_recon_rounds == 0:

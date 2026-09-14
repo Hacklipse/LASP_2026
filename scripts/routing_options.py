@@ -8,6 +8,7 @@ from collections.abc import Collection
 
 from hacklipse.adapters.routing_audit import JsonlRoutingAuditLog, surface_key
 from hacklipse.bootstrap import standard_router
+from hacklipse.domain import RunExecutionProfile
 from hacklipse.ports import LlmClient, VulnerabilityRouter
 
 
@@ -59,6 +60,30 @@ def needs_llm(args: argparse.Namespace) -> bool:
     )
 
 
+def execution_profile_from_args(
+    args: argparse.Namespace,
+    *,
+    selected_model: str = "",
+    llm_rpm_limit: int | None = None,
+) -> RunExecutionProfile:
+    """실제로 선택·적용된 CLI 실행 조건을 Run 계약으로 변환한다."""
+
+    return RunExecutionProfile(
+        analysis_profile=getattr(args, "profile", "heuristic"),
+        recon_mode=getattr(args, "recon", "heuristic"),
+        router_mode=getattr(args, "router", "heuristic"),
+        router_review=getattr(args, "router_review", "weak"),
+        compare_routers=getattr(args, "compare_routers", False),
+        orchestrator_mode=getattr(args, "orchestrator", "heuristic"),
+        budget_allocation_mode=getattr(args, "budget_allocation", "off"),
+        validation_mode=getattr(args, "validation", "heuristic"),
+        report_mode=getattr(args, "report", "heuristic"),
+        llm_provider=getattr(args, "llm_provider", "") if selected_model else "",
+        llm_model=selected_model,
+        llm_rpm_limit=llm_rpm_limit,
+    )
+
+
 def build_run_router(
     args: argparse.Namespace, *, vulnerability_types: Collection[str] | None,
     llm_client: LlmClient | None, selected_model: str,
@@ -82,17 +107,27 @@ def build_run_router(
 def append_run_result(args, app, run) -> None:
     """실제 Analysis/Validation 결과를 같은 Run ID로 연결한다. 증적 원문은 저장하지 않는다."""
     candidates = app.stores.candidates.list_by_run(run.run_id)
+    profile = run.execution_profile
     keys = {
         surface.surface_id: surface_key(surface)
         for surface in app.stores.surfaces.list_by_run(run.run_id)
     }
     JsonlRoutingAuditLog(args.routing_log).append({
         "schema_version": 1, "event": "run_result", "run_id": run.run_id,
-        "router_mode": args.router, "analysis_profile": args.profile,
-        "recon_mode": getattr(args, "recon", "heuristic"),
-        "orchestrator_mode": getattr(args, "orchestrator", "heuristic"),
+        "execution_profile_recorded": profile.recorded,
+        "router_mode": profile.router_mode,
+        "router_review": profile.router_review,
+        "compare_routers": profile.compare_routers,
+        "analysis_profile": profile.analysis_profile,
+        "recon_mode": profile.recon_mode,
+        "orchestrator_mode": profile.orchestrator_mode,
         "extra_recon_rounds": run.extra_recon_rounds,
-        "budget_allocation_mode": getattr(args, "budget_allocation", "off"),
+        "budget_allocation_mode": profile.budget_allocation_mode,
+        "validation_mode": profile.validation_mode,
+        "report_mode": profile.report_mode,
+        "llm_provider": profile.llm_provider,
+        "llm_model": profile.llm_model,
+        "llm_rpm_limit": profile.llm_rpm_limit,
         "budget_validation_reserve": run.budget_validation_reserve,
         "budget_allocation_source": run.budget_allocation_source,
         "budget_candidate_order": list(run.budget_candidate_order),

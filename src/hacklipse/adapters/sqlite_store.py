@@ -27,6 +27,7 @@ from hacklipse.domain import (
     KnowledgeHint,
     ReportArtifact,
     Run,
+    RunExecutionProfile,
     RunPhase,
     RunScope,
     Surface,
@@ -197,6 +198,12 @@ def _load(data: str) -> dict[str, Any]:
 
 def _decode_run(data: str) -> Run:
     value = _load(data)
+    execution_profile = value.pop("execution_profile", None)
+    value["execution_profile"] = (
+        RunExecutionProfile(**execution_profile)
+        if execution_profile is not None
+        else RunExecutionProfile(recorded=False)
+    )
     scope = value.pop("scope")
     value["scope"] = RunScope(
         allowed_hosts=frozenset(scope["allowed_hosts"]),

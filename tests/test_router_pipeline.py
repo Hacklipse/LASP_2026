@@ -26,7 +26,16 @@ from hacklipse.adapters.path_traversal_analysis import (
 from hacklipse.adapters.routing_audit import JsonlRoutingAuditLog
 from hacklipse.adapters.sqlite_store import _decode_candidate
 from hacklipse.bootstrap import build_local_application, register_standard_agents, standard_recon_planner, standard_router
-from hacklipse.domain import Candidate, CandidateStatus, DomainInvariantError, ExecutionResult, RunPhase, RunRequest, RunScope
+from hacklipse.domain import (
+    Candidate,
+    CandidateStatus,
+    DomainInvariantError,
+    ExecutionResult,
+    RunExecutionProfile,
+    RunPhase,
+    RunRequest,
+    RunScope,
+)
 from hacklipse.ports.errors import LlmCredentialsMissing, LlmTimeout
 from hacklipse.ports.llm import LlmResponse
 
@@ -96,9 +105,20 @@ def _execute(*, mode="hybrid", recon="hybrid", compare=True, log=None, method="G
                                   approval_gate=StaticApprovalGate((PATH_TRAVERSAL_POST_APPROVAL_REF,) if approved else ()))
     register_standard_agents(app, recon_max_pages=6,
                              recon_planner=standard_recon_planner(mode=recon, llm_client=model))
-    run = app.orchestrator.start(RunRequest(target_url="http://local.test/",
-                                           scope=RunScope(allowed_hosts=frozenset({"local.test"})),
-                                           request_budget=30))
+    uses_llm = mode == "hybrid" or recon == "hybrid" or compare
+    execution_profile = RunExecutionProfile(
+        recon_mode=recon,
+        router_mode=mode,
+        compare_routers=compare,
+        llm_provider="fixture" if uses_llm else "",
+        llm_model="pipeline-fixture" if uses_llm else "",
+    )
+    run = app.orchestrator.start(RunRequest(
+        target_url="http://local.test/",
+        scope=RunScope(allowed_hosts=frozenset({"local.test"})),
+        request_budget=30,
+        execution_profile=execution_profile,
+    ))
     return app, run, runtime, model
 
 
@@ -129,6 +149,8 @@ class RouterPipelineTests(unittest.TestCase):
             path = str(Path(directory) / "paired.jsonl")
             app, run, runtime, model = _execute(log=JsonlRoutingAuditLog(path), method="GET")
             self.assertIs(run.phase, RunPhase.DONE)
+            self.assertEqual(run.execution_profile.router_mode, "hybrid")
+            self.assertEqual(run.execution_profile.recon_mode, "hybrid")
             self.assertEqual(model.roles, ["recon", "router"])
             self.assertEqual(len(app.stores.findings.list_by_run(run.run_id)), 1)
             candidates = app.stores.candidates.list_by_run(run.run_id)

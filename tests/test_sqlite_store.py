@@ -23,6 +23,7 @@ from hacklipse.domain import (
     KnowledgeHint,
     ReportArtifact,
     Run,
+    RunExecutionProfile,
     RunPhase,
     RunScope,
     Surface,
@@ -59,6 +60,20 @@ class SQLiteStoreTests(unittest.TestCase):
             ),
             policy_profile="safe",
             request_budget=10,
+            execution_profile=RunExecutionProfile(
+                analysis_profile="llm",
+                recon_mode="hybrid",
+                router_mode="hybrid",
+                router_review="ambiguous",
+                compare_routers=True,
+                orchestrator_mode="hybrid",
+                budget_allocation_mode="hybrid",
+                validation_mode="llm",
+                report_mode="llm",
+                llm_provider="gemini",
+                llm_model="gemini-2.5-flash",
+                llm_rpm_limit=14,
+            ),
             phase=RunPhase.RECON,
             evidence_ids=("evi-1",),
             surface_ids=("surface-1",),
@@ -205,6 +220,30 @@ class SQLiteStoreTests(unittest.TestCase):
         )
         self.assertEqual(self.stores.findings.get("run-1", "finding-1"), finding)
         self.assertEqual(self.stores.reports.list_by_run("run-1"), (report,))
+
+    def test_legacy_run_without_execution_profile_uses_safe_defaults(self) -> None:
+        self.stores.runs.add(self._run())
+        self.stores.close()
+
+        # P-2 이전 Run JSON에는 실행 조건이 없었다. 기존 DB는 schema
+        # version을 올리거나 내려쓰지 않고 결정적 기본값으로 열린다.
+        with sqlite3.connect(self.database_path) as connection:
+            row = connection.execute(
+                "SELECT data FROM runs WHERE run_id = ?", ("run-1",)
+            ).fetchone()
+            assert row is not None
+            stored = json.loads(row[0])
+            stored.pop("execution_profile")
+            connection.execute(
+                "UPDATE runs SET data = ? WHERE run_id = ?",
+                (json.dumps(stored), "run-1"),
+            )
+
+        self.stores = SQLiteStoreBundle(self.database_path)
+        self.assertEqual(
+            self.stores.runs.get("run-1").execution_profile,
+            RunExecutionProfile(recorded=False),
+        )
 
     def test_finding_proof_facts_round_trip_and_legacy_json_defaults(self) -> None:
         proved = replace(

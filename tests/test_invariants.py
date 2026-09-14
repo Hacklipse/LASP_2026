@@ -16,6 +16,7 @@ from hacklipse.domain import (
     HttpRequestKind,
     HttpRequestSpec,
     Run,
+    RunExecutionProfile,
     RunPhase,
     RunRequest,
     RunScope,
@@ -36,6 +37,19 @@ from hacklipse.ports.errors import (
 
 class ArchitectureInvariantTests(unittest.TestCase):
     """구현체가 바뀌어도 유지되어야 하는 규칙을 검사한다."""
+
+    def test_execution_profile_rejects_unreproducible_values(self) -> None:
+        for changes in (
+            {"router_mode": "freeform"},
+            {"compare_routers": 1},
+            {"llm_rpm_limit": 0},
+            {"analysis_profile": "llm"},
+            {"llm_provider": "gemini"},
+            {"llm_provider": "gemini", "llm_model": "unused-model"},
+            {"llm_provider": "gemini", "llm_model": "bad\nmodel"},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(DomainInvariantError):
+                RunExecutionProfile(**changes)
 
     def test_unconfirmed_validation_cannot_create_finding(self) -> None:
         """suspected 판정은 Finding으로 승격할 수 없어야 한다."""

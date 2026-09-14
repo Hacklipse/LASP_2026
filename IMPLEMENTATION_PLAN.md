@@ -7,8 +7,9 @@
 
 ## 1. 현재 상태
 
-> 갱신 기준: 2026-09-13, 현재 작업 브랜치 `feat/p3-shared-contracts` 커밋 `e8de057`.
-> 로컬·원격 `dev/dmswls`는 `fad4267`이며 P-3은 아직 병합되지 않았다.
+> 갱신 기준: 2026-09-14, 현재 작업 브랜치
+> `feat/orchestrator-budget-allocation` 기준 커밋 `eaa9425` + P-2 작업 트리.
+> P-3은 `main`·`dev/dmswls`(`3552d3b`)에 병합됐다.
 
 Phase 1~9의 공통 실행 기반과 **5종(XSS·SQLi·Path Traversal·Access Control·SSTI)
 Analysis Agent의 휴리스틱·LLM 경로, Validation Agent의 결정적 재현·proof 경로**가 완료됐다.
@@ -32,13 +33,15 @@ Gemini 호출은 기본 14회/rolling 60초의 프로세스 공용 제한을 적
 대기 대신 DOM 반사 또는 실행 marker를 최대 5초 동안 조건 기반 polling한다. P-3 이전
 기준에서는 전체 테스트 535개가 통과했다.
 
-Phase 10의 Report·Validation 공용 계약(P-3)은 `feat/p3-shared-contracts`에서 구현·커밋해
-원격 기능 브랜치까지 푸시했다. `ValidationReasonCode`와 `ValidationResult.reason_code`,
+Phase 10의 Report·Validation 공용 계약(P-3)은 `main`·`dev/dmswls`에 병합됐다.
+`ValidationReasonCode`와 `ValidationResult.reason_code`,
 확정 Finding의 proof type·재현 횟수와 기존 SQLite 데이터 복원 호환성, 완료된 Validation·Report
-결과의 계약 검사 후 `new_evidence_ids` 병합을 포함한다. 해당 브랜치에서 전체 테스트
-**547개가 통과**했다. **`dev/dmswls`에는 아직 병합되지 않았으므로**, Report·Validation 조는
-그 브랜치의 공용 계약을 `dev/dmswls` 기준으로 사용하기 전에 병합 상태를 확인해야 한다.
-LLM Reviewer·Narrator와 Orchestrator LLM 판단은 아직 구현되지 않았다.
+결과의 계약 검사 후 `new_evidence_ids` 병합을 포함한다. Orchestrator에는 상한 1회의
+추가 Recon 판단과 Candidate 순서·가중치·Validation 예약량을 저장하는 선택적
+예산 배분이 연결됐다. P-2는 Analysis·Recon·Router·Orchestrator·예산 배분·
+Validation·Report 모드와 LLM provider/model/RPM을 `RunExecutionProfile`로 Run·SQLite에
+영속화하며, P-2 이전 DB는 비교 제외 표시로 복원한다. 전체 테스트는 **569개가
+통과**했다. LLM Reviewer·Narrator와 비용 기반 예산은 아직 구현되지 않았다.
 
 Phase 9에서는 확정 Finding을 민감정보가 제거된 `KnowledgeCase`로 일반화하는 Factory와
 append-only InMemory·SQLite KnowledgeBase를 구현하고, Run 완료 후 자동 발행까지
@@ -616,40 +619,40 @@ Evidence는 "이번 대상에서 직접 관찰한 사실", Knowledge는 "민감�
 
 ### Phase 10 — 확장
 
-**상태: ⚠️ 제한된 Recon Planner·Hybrid Router Advisor·브라우저 XSS Runtime 구현.
-Report·Validation 공용 계약(P-3)은 기능 브랜치에서 완료됐으나 `dev/dmswls` 병합 전.
-Orchestrator·Validation·Report LLM 보조와 비용·severity 확장은 미구현.**
+**상태: ⚠️ 제한된 Recon Planner·Hybrid Router Advisor·Orchestrator 추가 Recon·
+요청 횟수 기반 예산 배분·브라우저 XSS Runtime·P-2·P-3 구현.
+Validation·Report LLM 보조와 토큰·비용 기반 예산·severity 확장은 미구현.**
 
 아래 표의 "현재" 열까지만 구현 상태로 본다.
 
 | 항목 | 현재 | 교체 방향 |
 |---|---|---|
-| `InMemoryBudgetManager` | 실행 요청 횟수 카운트 + LLM 호출의 프로세스 공용 RPM 제한 | LLM 토큰·비용·시간 기반 (Notion §3) |
+| `InMemoryBudgetManager` | 실행 요청 횟수 카운트 + Candidate 가중 배분·Validation 예약 + LLM 호출의 프로세스 공용 RPM 제한 | LLM 토큰·비용·시간 기반 (Notion §3) |
 | `RuleBasedVulnerabilityRouter` | 규칙 우선 + 제한된 LLM Advisor의 Hybrid Router, fallback·감사·비교 구현 | 반복 실험에 따른 review 정책·우선순위 조정 (Notion §8) |
-| Recon·Orchestrator | Recon은 결정적 수집 + 제한된 LLM Planner, Orchestrator는 결정적 전이 | Orchestrator의 제한된 다음 작업 제안 |
-| P-3 공용 계약 | 기능 브랜치에서 Validation reason code·Finding proof facts·Validation/Report Evidence ID 병합 구현, `dev/dmswls` 병합 전 | 병합 후 Report·Validation의 0단계 계약에서 소비 |
+| Recon·Orchestrator | 결정적 Recon + LLM Planner, 최대 1회 추가 Recon 제안·저장·재개, Candidate 예산 배분 | 반복 실험 후 상한·가중치 조정 |
+| P-2 실행 조건 | `RunExecutionProfile`을 Run·SQLite·JSONL에 연결, 구 DB는 `recorded=False`로 복원 | 정식 off/on 비교의 필터·그룹 기준으로 소비 |
+| P-3 공용 계약 | Validation reason code·Finding proof facts·Validation/Report Evidence ID 병합 구현 및 main·dev 병합 | Report·Validation의 0단계 계약에서 소비 |
 | `ValidationAgent` | 5종 결정적 재현·proof 판정 | 의미 해석·오탐 검토용 LLM 보조, proof gate는 코드 유지 |
 | `BoundedRetryPolicy(max_attempts=1)` | 사실상 재시도 없음 | 백오프 + 실패 유형별 정책 |
 | `MarkdownReportAgent` | 결정적 Markdown만 | LLM 서술 보조 + JSON / HTML / PDF / Dashboard (Notion §13) |
 | `Finding.severity` | 항상 `"unrated"` | CVSS 등 산정 로직 |
-| `RouteDecision.priority` | 정렬에만 사용 | 예산 배분에 반영 |
+| `RouteDecision.priority` | 정렬 + Candidate 예산 가중치 배분에 사용 | 비용 기반 예산에서도 동일 우선순위 계약 유지 |
 | `AllowlistPolicyGate` | `safe` 프로필 하나 | 프로필별 정책 분리 |
 | 실행 Runtime | HTTP + XSS proof 전용 브라우저 | DOM Recon·범용 JS 실행이 필요한 범위로 제한 확장 |
 
-#### Phase 10 다음 작업의 의존 순서 (2026-09-13 현재)
+#### Phase 10 다음 작업의 의존 순서 (2026-09-14 현재)
 
-1. P-3 `feat/p3-shared-contracts`를 `dev/dmswls`에 병합한다. 현재는 원격 기능 브랜치에만
-   있으므로 병합 완료로 표시하지 않는다.
-2. 병합된 P-3을 기준으로 Report 조는 `FindingReportFact`·`RunReportFacts`, Validation 조는
+1. P-3의 `main`·`dev/dmswls` 병합은 완료됐다.
+2. Orchestrator의 상한 1회 추가 Recon과 예산 인지 Candidate 스케줄링은
+   `feat/orchestrator-budget-allocation`에 반영됐다.
+3. P-2 Run 실행 조건 영속화를 완료해 정식 off/on 비교의 선행 조건을 만족한다.
+4. 병합된 P-3을 기준으로 Report 조는 `FindingReportFact`·`RunReportFacts`, Validation 조는
    Reviewer-neutral context/result/protocol을 각각 0단계 계약으로 확정한다. 그 뒤 각 조의
    A/B가 대역 facts/context와 FakeLLM을 사용해 병렬로 구현한다.
-3. Analysis·Orchestrator 조는 재탐색 상한, 상태 기계 재진입, 판단 Port 경계를 먼저 설계한다.
-   결정 지점이 확정되기 전에는 Orchestrator LLM을 기존 단계에 단순 삽입하지 않는다.
-4. Report·Validation 통합 뒤 `bootstrap.py`와 adapter export 등 공용 배선은 한 담당이
+5. Report·Validation 통합 뒤 `bootstrap.py`와 adapter export 등 공용 배선은 한 담당이
    한 번에 연결하고 전체 E2E를 확인한다.
-5. P-1 Surface 비결정성 통제는 개발 중 회귀 판단을 위해 Recon 조가 별도로 진행한다.
-   P-2 Run 실행 조건 영속화는 Report·Validation 착수 조건이 아니지만 정식 off/on 비교
-   실험 전에는 완료한다. 성능·탐지 기여 주장은 반복 비교 실험 후에만 한다.
+6. P-1 Surface 비결정성 통제는 개발 중 회귀 판단을 위해 Recon 조가 별도로 진행한다.
+   성능·탐지 기여 주장은 P-1 후 P-2로 저장된 조건을 기준으로 반복 비교한 후에만 한다.
 
 Report·Validation의 세부 작업 범위는 `TEAM_REPORT_LLM.md`, `TEAM_VALIDATION_LLM.md`를
 따른다. 두 팀 문서와 `NEXT_TASKS.md`는 **P-3 병합 완료를 전제한 작업 지시서**이며,
@@ -1029,11 +1032,13 @@ Phase 9  [x] KnowledgeCase 일반화 Factory
 Phase 10 [x] 제한된 Recon LLM Planner와 fallback
          [x] 규칙 우선 Hybrid Router Advisor와 결정적 fallback
          [x] Router review 정책·안전한 감사 로그·동일 입력 비교
-         [x] P-3 공용 계약 기능 브랜치 구현·원격 푸시·547개 테스트 통과
-         [ ] P-3을 dev/dmswls에 병합
+         [x] P-3 공용 계약 구현 및 main·dev/dmswls 병합
+         [x] 상한 1회 Orchestrator 추가 Recon 판단·영속화·재개
+         [x] Candidate 순서·가중치·Validation 예약 기반 예산 배분
+         [x] P-2 Run 실행 조건 영속화·구 DB 호환·JSONL 일관성
          [ ] Report facts / Validation Review 0단계 계약 확정
-         [ ] Orchestrator / Validation / Report LLM 보조
-         [ ] P-1 Surface 비결정성 통제, 정식 비교 실험 전 P-2 실행 조건 영속화
+         [ ] Validation / Report LLM 보조
+         [ ] P-1 Surface 비결정성 통제 및 정식 반복 비교
          [ ] 비용 예산 / 보고서 포맷 / severity
          [x] XSS proof 범위의 브라우저 Runtime은 Phase 8에서 선행 구현
 ```
