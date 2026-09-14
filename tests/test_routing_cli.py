@@ -53,6 +53,7 @@ class RoutingCliTests(unittest.TestCase):
                                 runner.main([
                                     "runner", "http://localhost:3000/", "--vuln", "sqli",
                                     "--profile", profile, "--router", mode, "--recon", recon,
+                                    "--surface-collection", "deterministic",
                                     "--routing-log", str(path), "--llm-model", "fixture-model",
                                     *(["--compare-routers"] if compare else []),
                                 ])
@@ -71,6 +72,15 @@ class RoutingCliTests(unittest.TestCase):
                                 self.assertIsInstance(app.dispatcher._agents["recon"]._planner, LlmReconPlanner)
                             else:
                                 self.assertIsNone(app.dispatcher._agents["recon"]._planner)
+                            self.assertEqual(
+                                app.dispatcher._agents["recon"]._surface_collection_mode,
+                                "deterministic",
+                            )
+                            request = Orchestrator.start.call_args.args[0]
+                            self.assertEqual(
+                                request.execution_profile.surface_collection_mode,
+                                "deterministic",
+                            )
                             self.assertIsInstance(app.dispatcher._agents["sqli_analyzer"], LlmSqliAnalyzer if profile == "llm" else HeuristicSqliAnalyzer)
                             # 초기화만 했으며 Run/외부 HTTP/LLM 호출은 아직 시작하지 않았다.
                             self.assertEqual(path.read_text(), "")
@@ -111,6 +121,10 @@ class RoutingCliTests(unittest.TestCase):
                 self.assertIn("--llm-rpm-limit", output.getvalue())
                 self.assertIn("--routing-log", output.getvalue())
                 self.assertIn("--recon {heuristic,hybrid}", output.getvalue())
+                self.assertIn(
+                    "--surface-collection {adaptive,deterministic}",
+                    output.getvalue(),
+                )
                 self.assertIn("--compare-routers", output.getvalue())
                 self.assertIn("--router-review", output.getvalue())
 

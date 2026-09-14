@@ -172,6 +172,7 @@ def _print_execution_preview(
     print(f"  검사 대상       {'통합 검사 (4종)' if run_all else target_label}")
     print(f"  Analysis        {analysis}")
     print(f"  Recon           {args.recon}")
+    print(f"  Surface 수집    {getattr(args, 'surface_collection', 'adaptive')}")
     print(f"  Router          {args.router} · review {args.router_review}")
     print(f"  Orchestrator    {getattr(args, 'orchestrator', 'heuristic')}")
     print(f"  예산 배분       {getattr(args, 'budget_allocation', 'off')}")
@@ -1032,6 +1033,7 @@ def main(argv: list[str]) -> int:
             llm_client=llm_client if args.profile == "llm" else None,
             recon_planner=standard_recon_planner(mode=args.recon, llm_client=llm_client),
             recon_max_pages=_ALL_MODE_RECON_PAGES if needs_discovery else 1,
+            recon_surface_collection_mode=args.surface_collection,
             recon_seed_urls=recon_seed_urls,
             actor_object_id=actor_object_id,
             owner_object_id=owner_object_id,

@@ -63,6 +63,7 @@ class SQLiteStoreTests(unittest.TestCase):
             execution_profile=RunExecutionProfile(
                 analysis_profile="llm",
                 recon_mode="hybrid",
+                surface_collection_mode="deterministic",
                 router_mode="hybrid",
                 router_review="ambiguous",
                 compare_routers=True,
@@ -243,6 +244,31 @@ class SQLiteStoreTests(unittest.TestCase):
         self.assertEqual(
             self.stores.runs.get("run-1").execution_profile,
             RunExecutionProfile(recorded=False),
+        )
+
+    def test_older_execution_profile_defaults_to_adaptive_collection(self) -> None:
+        self.stores.runs.add(self._run())
+        self.stores.close()
+
+        # P-1 이전에 저장된 P-2 profile에는 수집 정책 필드만 없다.
+        with sqlite3.connect(self.database_path) as connection:
+            row = connection.execute(
+                "SELECT data FROM runs WHERE run_id = ?", ("run-1",)
+            ).fetchone()
+            assert row is not None
+            stored = json.loads(row[0])
+            stored["execution_profile"].pop("surface_collection_mode")
+            connection.execute(
+                "UPDATE runs SET data = ? WHERE run_id = ?",
+                (json.dumps(stored), "run-1"),
+            )
+
+        self.stores = SQLiteStoreBundle(self.database_path)
+        restored = self.stores.runs.get("run-1")
+        self.assertTrue(restored.execution_profile.recorded)
+        self.assertEqual(
+            restored.execution_profile.surface_collection_mode,
+            "adaptive",
         )
 
     def test_finding_proof_facts_round_trip_and_legacy_json_defaults(self) -> None:
