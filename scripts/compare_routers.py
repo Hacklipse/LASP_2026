@@ -184,7 +184,7 @@ def _normalized_manifest(manifest):
     # 정규화 Surface 구조 자체로 연결한다.
     normalized_surfaces = [
         {key: value for key, value in item.items()
-         if key not in {"surface_id", "surface_key", "comparison_surface_key", "routing_surface_key"}}
+         if key not in {"surface_id", "surface_key", "routing_surface_key"}}
         for item in surfaces
     ]
     by_strict_key = {
