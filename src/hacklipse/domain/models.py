@@ -254,12 +254,71 @@ class Run:
     extra_recon_rounds: int = 0
     recon_target_surface_id: str | None = None
     last_error: str | None = None
+    # The allocation order and protected validation units are decided before
+    # ANALYZE and reused on resume. Empty order means allocation is disabled.
+    budget_candidate_order: tuple[str, ...] = ()
+    budget_candidate_weights: tuple[int, ...] = ()
+    budget_validation_reserve: int = 0
+    budget_allocation_source: str = ""
+    budget_active_candidate_id: str | None = None
+    budget_active_phase: str | None = None
+    budget_active_floor: int | None = None
 
     def __post_init__(self) -> None:
         if self.extra_recon_rounds < 0:
             raise DomainInvariantError("extra recon rounds cannot be negative")
         if self.recon_target_surface_id is not None and self.extra_recon_rounds == 0:
             raise DomainInvariantError("targeted recon requires an extra recon round")
+        if type(self.budget_validation_reserve) is not int or self.budget_validation_reserve < 0:
+            raise DomainInvariantError("validation reserve cannot be negative")
+        if (
+            not isinstance(self.budget_candidate_order, tuple)
+            or any(not isinstance(item, str) for item in self.budget_candidate_order)
+            or not isinstance(self.budget_candidate_weights, tuple)
+        ):
+            raise DomainInvariantError("budget order and weights must be tuples")
+        if self.budget_candidate_order:
+            if self.budget_validation_reserve < 1:
+                raise DomainInvariantError("budget order requires a validation reserve")
+            if self.budget_allocation_source not in {
+                "heuristic", "llm", "advisor", "deterministic_fallback"
+            }:
+                raise DomainInvariantError("budget order requires a known source")
+            if (
+                len(set(self.budget_candidate_order)) != len(self.budget_candidate_order)
+                or set(self.budget_candidate_order) != set(self.candidate_ids)
+            ):
+                raise DomainInvariantError("budget order must contain every candidate once")
+            if (
+                len(self.budget_candidate_weights) != len(self.budget_candidate_order)
+                or any(type(weight) is not int or not 1 <= weight <= 3
+                       for weight in self.budget_candidate_weights)
+            ):
+                raise DomainInvariantError("budget weights must match the candidate order")
+        elif self.budget_validation_reserve:
+            raise DomainInvariantError("validation reserve requires a budget order")
+        elif self.budget_candidate_weights:
+            raise DomainInvariantError("budget weights require a candidate order")
+        elif self.budget_allocation_source:
+            raise DomainInvariantError("budget source requires a candidate order")
+        if any(value is None for value in (
+            self.budget_active_candidate_id,
+            self.budget_active_phase,
+            self.budget_active_floor,
+        )) and any(value is not None for value in (
+            self.budget_active_candidate_id,
+            self.budget_active_phase,
+            self.budget_active_floor,
+        )):
+            raise DomainInvariantError("active budget fields must be stored together")
+        if self.budget_active_candidate_id is not None:
+            if (
+                self.budget_active_candidate_id not in self.budget_candidate_order
+                or self.budget_active_phase not in {"analyze", "validate"}
+                or type(self.budget_active_floor) is not int
+                or self.budget_active_floor < 0
+            ):
+                raise DomainInvariantError("active budget floor is invalid")
 
     def with_updates(self, **changes: object) -> Run:
         """불변 dataclass를 직접 수정하지 않고 변경된 복사본을 만든다."""
@@ -971,6 +1030,7 @@ class ProgressEventKind(str, Enum):
     PHASE_CHANGED = "phase_changed"
     CANDIDATE_QUEUED = "candidate_queued"
     ORCHESTRATION_DECIDED = "orchestration_decided"
+    BUDGET_ALLOCATED = "budget_allocated"
     KNOWLEDGE_RETRIEVED = "knowledge_retrieved"
     KNOWLEDGE_RETRIEVAL_FAILED = "knowledge_retrieval_failed"
     AGENT_STARTED = "agent_started"

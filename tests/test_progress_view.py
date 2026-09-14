@@ -85,6 +85,19 @@ class ProgressFoldingTests(unittest.TestCase):
 
         self.assertIn("Orchestrator 추가 탐색 후보 없음", stream.getvalue())
 
+    def test_budget_allocation_is_visible_in_final_tty_view(self) -> None:
+        view, stream = _view(tty=True)
+        emit = _Emitter(view)
+        emit(
+            ProgressEventKind.BUDGET_ALLOCATED,
+            phase="route",
+            detail="llm:reserve_2",
+        )
+        emit(ProgressEventKind.RUN_COMPLETED, phase="done")
+        view.close()
+
+        self.assertIn("예산 배분  LLM 순서 · 검증 2회 예약", stream.getvalue())
+
     def test_recon_planner_fallback_is_visible(self) -> None:
         view, stream = _view(tty=False)
         emit = _Emitter(view)

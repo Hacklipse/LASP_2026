@@ -38,6 +38,7 @@ from hacklipse.adapters import (
     ValidationAgent,
 )
 from hacklipse.adapters.llm_router_advisor import AnalyzerChoice, LlmRouterAdvisor
+from hacklipse.adapters.reserved_budget import ReservedBudgetManager
 from hacklipse.adapters.routing import (
     DEFAULT_RULES,
     DEFAULT_SURFACE_RULES,
@@ -79,6 +80,7 @@ from hacklipse.ports import (
     KnowledgeBase,
     VulnerabilityRouter,
     OrchestrationAdvisor,
+    BudgetAllocationAdvisor,
 )
 from hacklipse.ports.errors import LlmCredentialsMissing
 
@@ -175,13 +177,14 @@ def build_local_application(
     clock: Callable[[], float] | None = None,
     knowledge_base: KnowledgeBase | None = None,
     orchestration_advisor: OrchestrationAdvisor | None = None,
+    budget_allocation_advisor: BudgetAllocationAdvisor | None = None,
 ) -> LocalApplication:
     """기본적으로 네트워크를 활성화하지 않는 로컬 시스템을 조립한다."""
 
     # 모든 컴포넌트는 여기에서 생성하여 의존 관계가 코드 전역에 흩어지지 않게 한다.
     selected_stores = stores if stores is not None else MemoryStoreBundle()
     dispatcher = LocalTaskDispatcher()
-    selected_budget = (
+    selected_budget = ReservedBudgetManager(
         budget_manager if budget_manager is not None else InMemoryBudgetManager()
     )
     policy = AllowlistPolicyGate(approval_gate=approval_gate)
@@ -293,6 +296,7 @@ def build_local_application(
             else None
         ),
         orchestration_advisor=orchestration_advisor,
+        budget_allocation_advisor=budget_allocation_advisor,
     )
     return LocalApplication(
         orchestrator=orchestrator,

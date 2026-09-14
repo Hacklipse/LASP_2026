@@ -1,6 +1,7 @@
 """Application 계층이 사용하는 교체 가능한 컴포넌트 계약을 공개한다."""
 
 from .agents import Agent, TaskDispatcher, VulnerabilityRouter
+from .budget_allocation import BudgetAllocationAdvisor, BudgetAllocationDecision
 from .control import (
     BudgetManager,
     PolicyGate,
@@ -35,6 +36,8 @@ __all__ = [
     "Agent",
     "ApprovalGate",
     "BudgetManager",
+    "BudgetAllocationAdvisor",
+    "BudgetAllocationDecision",
     "CandidateStore",
     "CredentialResolver",
     "EvidenceStore",

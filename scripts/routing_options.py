@@ -55,6 +55,7 @@ def needs_llm(args: argparse.Namespace) -> bool:
         args.profile == "llm" or args.router == "hybrid"
         or args.recon == "hybrid" or args.compare_routers
         or getattr(args, "orchestrator", "heuristic") == "hybrid"
+        or getattr(args, "budget_allocation", "off") == "hybrid"
     )
 
 
@@ -91,6 +92,11 @@ def append_run_result(args, app, run) -> None:
         "recon_mode": getattr(args, "recon", "heuristic"),
         "orchestrator_mode": getattr(args, "orchestrator", "heuristic"),
         "extra_recon_rounds": run.extra_recon_rounds,
+        "budget_allocation_mode": getattr(args, "budget_allocation", "off"),
+        "budget_validation_reserve": run.budget_validation_reserve,
+        "budget_allocation_source": run.budget_allocation_source,
+        "budget_candidate_order": list(run.budget_candidate_order),
+        "budget_candidate_weights": list(run.budget_candidate_weights),
         "phase": run.phase.value,
         "candidate_status_counts": dict(Counter(c.status.value for c in candidates)),
         "finding_count": len(app.stores.findings.list_by_run(run.run_id)),

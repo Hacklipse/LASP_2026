@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import re
+from contextlib import nullcontext
 from urllib.parse import urlsplit
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -41,6 +42,8 @@ from hacklipse.ports import (
     VulnerabilityRouter,
     OrchestrationAdvisor,
     OrchestrationDecision,
+    BudgetAllocationAdvisor,
+    BudgetAllocationDecision,
 )
 from hacklipse.ports.errors import (
     AgentUnavailable,
@@ -78,6 +81,8 @@ class OrchestratorConfig:
     knowledge_context_limit: int = 3
     max_extra_recon_rounds: int = 1
     min_budget_for_extra_recon: int = 3
+    budget_allocation_enabled: bool = False
+    max_validation_reserve_per_candidate: int = 2
 
     def __post_init__(self) -> None:
         if self.max_evidence_rounds < 0:
@@ -88,6 +93,8 @@ class OrchestratorConfig:
             raise ValueError("max_extra_recon_rounds must be 0 or 1")
         if self.min_budget_for_extra_recon < 2:
             raise ValueError("min_budget_for_extra_recon must leave later execution budget")
+        if self.max_validation_reserve_per_candidate < 1:
+            raise ValueError("validation reserve maximum must be positive")
 
 
 class Orchestrator:
@@ -124,6 +131,7 @@ class Orchestrator:
         ]
         | None = None,
         orchestration_advisor: OrchestrationAdvisor | None = None,
+        budget_allocation_advisor: BudgetAllocationAdvisor | None = None,
     ) -> None:
         self._runs = run_store
         self._evidence = evidence_store
@@ -144,6 +152,7 @@ class Orchestrator:
         self._knowledge_case = knowledge_case_builder
         self._knowledge_context = knowledge_context_provider
         self._orchestration_advisor = orchestration_advisor
+        self._budget_allocation_advisor = budget_allocation_advisor
         # 발행 결과. 조용히 사라지지 않도록 RUN_COMPLETED에 함께 싣는다.
         self._knowledge_failures: list[str] = []
         self._knowledge_published: tuple[int, int] | None = None
@@ -245,8 +254,13 @@ class Orchestrator:
                         next_phase = RunPhase.RECON
                     else:
                         next_phase = RunPhase.ANALYZE if run.candidate_ids else RunPhase.REPORT
+                        if next_phase is RunPhase.ANALYZE:
+                            run = self._plan_budget(run)
                     run = self._state.transition(run, next_phase)
                 elif run.phase is RunPhase.ANALYZE:
+                    if self._config.budget_allocation_enabled and not run.budget_candidate_order:
+                        run = self._plan_budget(run)
+                        self._runs.save(run)
                     run = self._analyze(run)
                     run = self._state.transition(run, RunPhase.VALIDATE)
                 elif run.phase is RunPhase.VALIDATE:
@@ -358,7 +372,7 @@ class Orchestrator:
             self._started_at = now
         self._sequence += 1
         try:
-            used = max(0, run.request_budget - self._budget.remaining(run.run_id))
+            used = max(0, run.request_budget - self._global_remaining(run.run_id))
         except Exception:
             used = 0
         self._progress.emit(
@@ -503,6 +517,146 @@ class Orchestrator:
             detail=f"{source}:{action}",
         )
 
+    def _global_remaining(self, run_id: str) -> int:
+        # During a candidate task, remaining() excludes units reserved for later
+        # validation. Progress and planning must still see the real Run total.
+        raw = getattr(self._budget, "global_remaining", self._budget.remaining)
+        return raw(run_id)
+
+    def _plan_budget(self, run: Run) -> Run:
+        if not self._config.budget_allocation_enabled or not run.candidate_ids:
+            return run
+        candidates = tuple(
+            self._candidates.get(run.run_id, candidate_id)
+            for candidate_id in run.candidate_ids
+        )
+        remaining = self._global_remaining(run.run_id)
+        decision = BudgetAllocationDecision(run.candidate_ids, source="heuristic")
+        source = "heuristic"
+        if self._budget_allocation_advisor is not None and remaining >= 2 and len(candidates) <= 30:
+            try:
+                suggested = self._budget_allocation_advisor.decide(
+                    run, candidates, remaining
+                )
+                if (
+                    not isinstance(suggested, BudgetAllocationDecision)
+                    or not isinstance(suggested.candidate_ids, tuple)
+                    or len(suggested.candidate_ids) != len(run.candidate_ids)
+                    or len(set(suggested.candidate_ids)) != len(suggested.candidate_ids)
+                    or set(suggested.candidate_ids) != set(run.candidate_ids)
+                    or type(suggested.validation_reserve_per_candidate) is not int
+                    or not 1 <= suggested.validation_reserve_per_candidate <= self._config.max_validation_reserve_per_candidate
+                    or suggested.validation_reserve_per_candidate >= remaining
+                    or (suggested.candidate_weights and (
+                        not isinstance(suggested.candidate_weights, tuple)
+                        or len(suggested.candidate_weights) != len(suggested.candidate_ids)
+                        or any(type(weight) is not int or not 1 <= weight <= 3
+                               for weight in suggested.candidate_weights)
+                    ))
+                ):
+                    raise ValueError("invalid budget allocation advice")
+                decision = suggested
+                source = "llm" if suggested.source == "llm" else "advisor"
+            except Exception:
+                source = "deterministic_fallback"
+        planned = run.with_updates(
+            budget_candidate_order=decision.candidate_ids,
+            budget_candidate_weights=(
+                decision.candidate_weights
+                or (1,) * len(decision.candidate_ids)
+            ),
+            budget_validation_reserve=decision.validation_reserve_per_candidate,
+            budget_allocation_source=source,
+        )
+        self._emit(
+            planned,
+            ProgressEventKind.BUDGET_ALLOCATED,
+            agent_type="budget_allocation_advisor",
+            detail=f"{source}:reserve_{decision.validation_reserve_per_candidate}",
+        )
+        return planned
+
+    def _budget_scope(self, run_id: str, floor: int):
+        if floor == 0:
+            return nullcontext()
+        guard = getattr(self._budget, "limited_to_floor", None)
+        if guard is None:
+            raise AgentContractError("budget allocation requires a reservation guard")
+        return guard(run_id, floor)
+
+    def _pending_validation_count(self, run: Run, candidate_ids: Sequence[str]) -> int:
+        return sum(
+            _pending_in(
+                self._candidates.get(run.run_id, candidate_id),
+                CandidateStatus.ANALYZED,
+            )
+            for candidate_id in candidate_ids
+        )
+
+    def _analysis_floor(self, run: Run, candidate_id: str) -> int:
+        if not run.budget_candidate_order:
+            return 0
+        order = run.budget_candidate_order
+        pending = tuple(
+            item_id for item_id in order
+            if _pending_in(self._candidates.get(run.run_id, item_id), CandidateStatus.ROUTED)
+        )
+        weights = dict(zip(order, run.budget_candidate_weights))
+        remaining = self._global_remaining(run.run_id)
+        reserve = run.budget_validation_reserve
+        analyzed = self._pending_validation_count(run, run.candidate_ids)
+        analysis_pool = max(0, remaining - (analyzed + len(pending)) * reserve)
+        weight = weights[candidate_id]
+        total_weight = sum(weights[item] for item in pending)
+        share = max(1, (analysis_pool * weight + total_weight - 1) // total_weight)
+        return max((analyzed + 1) * reserve, remaining - share)
+
+    def _validation_floor(
+        self, run: Run, candidate_id: str, remaining_ids: Sequence[str]
+    ) -> int:
+        if not run.budget_candidate_order:
+            return 0
+        pending = tuple(
+            item_id for item_id in remaining_ids
+            if _pending_in(self._candidates.get(run.run_id, item_id), CandidateStatus.ANALYZED)
+        )
+        weights = dict(zip(run.budget_candidate_order, run.budget_candidate_weights))
+        remaining = self._global_remaining(run.run_id)
+        reserve = run.budget_validation_reserve
+        total_weight = sum(weights[item] for item in pending)
+        share = max(
+            reserve,
+            (remaining * weights[candidate_id] + total_weight - 1) // total_weight,
+        )
+        return max((len(pending) - 1) * reserve, remaining - share)
+
+    def _activate_budget_candidate(
+        self, run: Run, candidate_id: str, phase: str, floor: int
+    ) -> tuple[Run, int]:
+        if not run.budget_candidate_order:
+            return run, floor
+        if run.budget_active_candidate_id == candidate_id and run.budget_active_phase == phase:
+            assert run.budget_active_floor is not None
+            return run, run.budget_active_floor
+        current = run.with_updates(
+            budget_active_candidate_id=candidate_id,
+            budget_active_phase=phase,
+            budget_active_floor=floor,
+        )
+        self._runs.save(current)
+        return current, floor
+
+    def _clear_active_budget_candidate(self, run: Run) -> Run:
+        if run.budget_active_candidate_id is None:
+            return run
+        current = run.with_updates(
+            budget_active_candidate_id=None,
+            budget_active_phase=None,
+            budget_active_floor=None,
+        )
+        self._runs.save(current)
+        return current
+
     def _analyze(self, run: Run) -> Run:
         """Candidate별로 Analysis를 수행하되 대상 쪽 실패를 서로 격리한다.
 
@@ -512,20 +666,30 @@ class Orchestrator:
         """
 
         current = run
-        for candidate_id in run.candidate_ids:
+        order = run.budget_candidate_order or run.candidate_ids
+        for candidate_id in order:
             candidate = self._candidates.get(run.run_id, candidate_id)
             # 이미 처리된 Candidate는 재개 시 중복 분석하지 않는다.
             if not _pending_in(candidate, CandidateStatus.ROUTED):
+                if current.budget_active_candidate_id == candidate_id:
+                    current = self._clear_active_budget_candidate(current)
                 continue
-            if self._budget.remaining(run.run_id) <= 0:
+            floor = self._analysis_floor(current, candidate_id)
+            current, floor = self._activate_budget_candidate(
+                current, candidate_id, "analyze", floor
+            )
+            if self._global_remaining(run.run_id) <= floor:
                 # 남은 예산이 없으면 시작하지 않는다. 일부만 요청하고 죽으면 아무것도
                 # 얻지 못한 채 예산만 쓰고, 결과에는 실패로 남는다.
                 current = self._skip_candidate_for_budget(current, candidate_id)
+                current = self._clear_active_budget_candidate(current)
                 continue
             try:
-                current = self._analyze_candidate(current, candidate)
+                with self._budget_scope(run.run_id, floor):
+                    current = self._analyze_candidate(current, candidate)
             except Exception as error:
                 current = self._fail_candidate(current, candidate_id, error)
+            current = self._clear_active_budget_candidate(current)
         return current
 
     def _analyze_candidate(self, run: Run, candidate: Candidate) -> Run:
@@ -656,18 +820,29 @@ class Orchestrator:
         current = run
         # 부분 재개를 고려해 저장소에 이미 존재하는 Finding부터 복원한다.
         finding_ids = [item.finding_id for item in self._findings.list_by_run(run.run_id)]
-        for candidate_id in run.candidate_ids:
+        order = run.budget_candidate_order or run.candidate_ids
+        for position, candidate_id in enumerate(order):
             candidate = self._candidates.get(run.run_id, candidate_id)
             if not _pending_in(candidate, CandidateStatus.ANALYZED):
+                if current.budget_active_candidate_id == candidate_id:
+                    current = self._clear_active_budget_candidate(current)
                 continue
-            if self._budget.remaining(run.run_id) <= 0:
+            floor = self._validation_floor(current, candidate_id, order[position:])
+            current, floor = self._activate_budget_candidate(
+                current, candidate_id, "validate", floor
+            )
+            if self._global_remaining(run.run_id) <= floor:
                 current = self._skip_candidate_for_budget(current, candidate_id)
+                current = self._clear_active_budget_candidate(current)
                 continue
             try:
-                current, finding_id = self._validate_candidate(current, candidate)
+                with self._budget_scope(run.run_id, floor):
+                    current, finding_id = self._validate_candidate(current, candidate)
             except Exception as error:
                 current = self._fail_candidate(current, candidate_id, error)
+                current = self._clear_active_budget_candidate(current)
                 continue
+            current = self._clear_active_budget_candidate(current)
             if finding_id is not None:
                 finding_ids.append(finding_id)
         return current.with_updates(finding_ids=tuple(dict.fromkeys(finding_ids)))

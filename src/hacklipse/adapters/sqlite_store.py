@@ -212,8 +212,10 @@ def _decode_run(data: str) -> Run:
         "candidate_ids",
         "finding_ids",
         "report_ids",
+        "budget_candidate_order",
+        "budget_candidate_weights",
     ):
-        value[name] = tuple(value[name])
+        value[name] = tuple(value.get(name, ()))
     return Run(**value)
 
 

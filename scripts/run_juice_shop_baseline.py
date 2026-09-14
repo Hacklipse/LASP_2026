@@ -60,6 +60,7 @@ from hacklipse.adapters.llm_recon_planner import (  # noqa: E402
     recon_plan_status_from_observation,
 )
 from hacklipse.adapters.llm_orchestration_advisor import LlmOrchestrationAdvisor  # noqa: E402
+from hacklipse.adapters.llm_budget_allocation_advisor import LlmBudgetAllocationAdvisor  # noqa: E402
 from hacklipse.application import OrchestratorConfig, build_progress_snapshot  # noqa: E402
 from hacklipse.application.errors import WorkflowExecutionError  # noqa: E402
 from hacklipse.adapters.knowledge import SQLiteKnowledgeBase  # noqa: E402
@@ -167,6 +168,7 @@ def _print_execution_preview(
     print(f"  Recon           {args.recon}")
     print(f"  Router          {args.router} · review {args.router_review}")
     print(f"  Orchestrator    {getattr(args, 'orchestrator', 'heuristic')}")
+    print(f"  예산 배분       {getattr(args, 'budget_allocation', 'off')}")
     print(f"  Router 비교     {'켬' if args.compare_routers else '끔'}")
     if needs_llm(args):
         limit = f"{rpm_limit}회 / rolling 60초" if rpm_limit is not None else "없음"
@@ -686,6 +688,12 @@ def main(argv: list[str]) -> int:
         help="optional LLM choice of one already discovered page for extra Recon",
     )
     parser.add_argument(
+        "--budget-allocation",
+        choices=("off", "heuristic", "hybrid"),
+        default="off",
+        help="protect validation requests and order candidates; hybrid asks the LLM",
+    )
+    parser.add_argument(
         "--router-advisor",
         action="store_true",
         help=(
@@ -697,7 +705,7 @@ def main(argv: list[str]) -> int:
         "--llm-provider",
         choices=("gemini", "anthropic"),
         default="gemini",
-        help="LLM provider for Analysis, Recon, Router or paired comparison (default: gemini)",
+        help="LLM provider for Analysis, Recon, Router, Orchestrator or allocation (default: gemini)",
     )
     parser.add_argument("--llm-model", help="provider model id")
     parser.add_argument(
@@ -938,6 +946,11 @@ def main(argv: list[str]) -> int:
             if args.orchestrator == "hybrid" and llm_client is not None
             else None
         ),
+        budget_allocation_advisor=(
+            LlmBudgetAllocationAdvisor(llm_client=llm_client)
+            if args.budget_allocation == "hybrid" and llm_client is not None
+            else None
+        ),
         # 전체 모드는 유형을 제한하지 않는다. Router가 Surface별로 관련 Candidate만 만든다.
         router=router,
         credential_resolver=resolver,
@@ -947,7 +960,10 @@ def main(argv: list[str]) -> int:
         # 진행 화면과 상세 로그 중 하나만 붙인다. 상세 로그가 중간에 끼면 화면을
         # 다시 그릴 때 앞서 출력한 줄과 어긋나 둘 다 읽을 수 없게 된다.
         progress_sink=None if debug_enabled else progress_view,
-        config=OrchestratorConfig(browser_xss_validation=needs_browser),
+        config=OrchestratorConfig(
+            browser_xss_validation=needs_browser,
+            budget_allocation_enabled=args.budget_allocation != "off",
+        ),
     )
     base_path = parsed.path if parsed.path.endswith("/") else f"{parsed.path}/"
     provision_run_id: str | None = None
@@ -1096,6 +1112,12 @@ def main(argv: list[str]) -> int:
     print(f"  분석 대상       {target_label}")
     print(f"  Agent 구성      {profile}")
     print(f"  추가 Recon      {run.extra_recon_rounds}회")
+    if run.budget_candidate_order:
+        print(
+            "  예산 배분       "
+            f"{run.budget_allocation_source} · "
+            f"검증 예약 {run.budget_validation_reserve}회/Candidate"
+        )
     print(
         f"  감사된 실행     {len(audit.list_by_run(run.run_id))}회 / "
         f"예산 {snapshot.budget_used}회 사용, 상한 {snapshot.budget_total}회"

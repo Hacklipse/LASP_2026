@@ -39,6 +39,14 @@ _ORCHESTRATION_LABELS = {
     "deterministic_fallback:continue": "LLM 판단 실패 · 기존 흐름 유지",
     "advisor:recon": "추가 탐색 선택",
 }
+_BUDGET_ALLOCATION_LABELS = {
+    "heuristic:reserve_1": "결정적 순서 · 검증 1회 예약",
+    "llm:reserve_1": "LLM 순서 · 검증 1회 예약",
+    "llm:reserve_2": "LLM 순서 · 검증 2회 예약",
+    "advisor:reserve_1": "Advisor 순서 · 검증 1회 예약",
+    "advisor:reserve_2": "Advisor 순서 · 검증 2회 예약",
+    "deterministic_fallback:reserve_1": "LLM 판단 실패 · 결정적 배분",
+}
 
 _PHASE_LABELS = {
     "init": "준비",
@@ -134,6 +142,7 @@ class RunProgressView:
         self._budget_total = 0
         self._recon_planner_status: str | None = None
         self._orchestration_status: str | None = None
+        self._budget_allocation_status: str | None = None
         self._closed = False
 
     # --- ProgressSink ---
@@ -177,6 +186,10 @@ class RunProgressView:
         if event.kind is ProgressEventKind.ORCHESTRATION_DECIDED:
             self._orchestration_status = _ORCHESTRATION_LABELS.get(
                 event.detail, "판단 완료"
+            )
+        if event.kind is ProgressEventKind.BUDGET_ALLOCATED:
+            self._budget_allocation_status = _BUDGET_ALLOCATION_LABELS.get(
+                event.detail, "배분 완료"
             )
         # RUN_COMPLETED 는 특정 취약점 유형의 사건이 아니라 아래 조기 반환에 걸린다.
         # Knowledge 발행 결과는 그 전에 받아 둔다.
@@ -237,6 +250,8 @@ class RunProgressView:
             lines.append(_recon_planner_progress_line(self._recon_planner_status))
         if self._orchestration_status:
             lines.append(f"  {_DONE} Orchestrator {self._orchestration_status}")
+        if self._budget_allocation_status:
+            lines.append(f"  {_DONE} 예산 배분  {self._budget_allocation_status}")
         for name in sorted(self._types):
             state = self._types[name]
             lines.append(
@@ -268,6 +283,8 @@ class RunProgressView:
 
         if event.kind is ProgressEventKind.ORCHESTRATION_DECIDED:
             return f"[진행] Orchestrator {self._orchestration_status}"
+        if event.kind is ProgressEventKind.BUDGET_ALLOCATED:
+            return f"[진행] 예산 배분 {self._budget_allocation_status}"
         if (
             event.agent_type == "recon"
             and event.detail
