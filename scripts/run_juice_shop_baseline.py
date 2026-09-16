@@ -733,6 +733,11 @@ def main(argv: list[str]) -> int:
         help="Run 전체 HTTP 요청 상한 (기본: 단일 유형 %d, 전체 모드 %d)"
         % (_DEFAULT_BUDGET, _ALL_MODE_BUDGET),
     )
+    parser.add_argument(
+        "--validation-review",
+        action="store_true",
+        help="비확정 Validation 결과에 LLM 분류 Claim을 남긴다(--profile llm 전용, 판정 불변)",
+    )
     parser.add_argument("--debug", action="store_true", help="안전한 진행 로그 출력")
     parser.add_argument(
         "--debug-llm-content",
@@ -1037,6 +1042,7 @@ def main(argv: list[str]) -> int:
             recon_seed_urls=recon_seed_urls,
             actor_object_id=actor_object_id,
             owner_object_id=owner_object_id,
+            validation_review=args.validation_review,
         )
         if profile == "llm":
             profile = f"llm/{args.llm_provider} ({_safe_log_value(selected_model)})"
