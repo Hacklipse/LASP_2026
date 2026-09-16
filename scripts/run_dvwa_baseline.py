@@ -471,11 +471,6 @@ def main(argv: list[str]) -> int:
         help="검사 대상 객체의 정상 소유자 객체 ID (access_control 전용)",
     )
     parser.add_argument(
-        "--validation-review",
-        action="store_true",
-        help="비확정 Validation 결과에 LLM 분류 Claim을 남긴다(--profile llm 전용, 판정 불변)",
-    )
-    parser.add_argument(
         "--debug",
         action="store_true",
         help="민감정보를 제외한 Task/HTTP/LLM 진행 로그 출력",
@@ -656,7 +651,6 @@ def main(argv: list[str]) -> int:
         recon_surface_collection_mode=args.surface_collection,
         actor_object_id=args.actor_object_id,
         owner_object_id=args.owner_object_id,
-        validation_review=args.validation_review,
     )
     if profile == "llm":
         profile = f"llm/{args.llm_provider} ({_safe_log_value(selected_model)})"

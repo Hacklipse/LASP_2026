@@ -14,7 +14,6 @@ from hacklipse.domain import (
     TaskEnvelope,
     ValidationProof,
     ValidationProofType,
-    ValidationReasonCode,
     ValidationResult,
     ValidationVerdict,
 )
@@ -187,7 +186,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.REJECTED,
                 evidence=(),
                 reason="analysis produced no reflected parameter to execute",
-                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
             )
 
         marker = probe_marker(
@@ -227,7 +225,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.BLOCKED,
                 evidence=reproduced,
                 reason="independent browser reproduction could not execute",
-                reason_code=ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR,
             )
 
         control = reproduced[0]
@@ -237,7 +234,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.REJECTED,
                 evidence=reproduced,
                 reason="browser control unexpectedly contained an execution signal",
-                reason_code=ValidationReasonCode.CONTROL_SIGNAL_PRESENT,
             )
 
         for parameter, probe in zip(signaled_parameters, reproduced[1:]):
@@ -261,7 +257,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.CONFIRMED,
                 evidence=proof_evidence,
                 reason="independent browser control/probe comparison executed the XSS marker",
-                reason_code=ValidationReasonCode.CONFIRMED_PROOF,
                 proof=proof,
             )
 
@@ -270,7 +265,6 @@ class ValidationAgent:
             verdict=ValidationVerdict.REJECTED,
             evidence=reproduced,
             reason="independent browser probe did not execute the XSS marker",
-            reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
         )
 
     def _validate_sqli(
@@ -299,7 +293,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.REJECTED,
                 evidence=(),
                 reason="analysis produced no SQL error signal to reproduce",
-                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
             )
 
         marker = probe_marker(
@@ -341,7 +334,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.BLOCKED,
                 evidence=reproduced,
                 reason="independent SQLi reproduction could not obtain comparable responses",
-                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
             )
 
         control = reproduced[0]
@@ -364,7 +356,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.CONFIRMED,
                 evidence=proof_evidence,
                 reason="independent control/probe comparison reproduced the SQLi effect",
-                reason_code=ValidationReasonCode.CONFIRMED_PROOF,
                 proof=proof,
             )
 
@@ -373,7 +364,6 @@ class ValidationAgent:
             verdict=ValidationVerdict.REJECTED,
             evidence=reproduced,
             reason="independent quote probe did not reproduce the SQL error differential",
-            reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
         )
 
     def _validate_access_control(
@@ -401,7 +391,6 @@ class ValidationAgent:
                     verdict=ValidationVerdict.SUSPECTED,
                     evidence=(),
                     reason="no object_id_auth observation to reproduce independently",
-                    reason_code=ValidationReasonCode.ACCESS_PLAN_MISSING,
                 ).validation,
             )
 
@@ -430,7 +419,6 @@ class ValidationAgent:
                         verdict=ValidationVerdict.SUSPECTED,
                         evidence=(),
                         reason="independent access control reproduction exceeded the request budget",
-                        reason_code=ValidationReasonCode.ACCESS_BUDGET_EXHAUSTED,
                     ).validation,
                 )
             return AgentResult(
@@ -457,7 +445,6 @@ class ValidationAgent:
                     verdict=ValidationVerdict.SUSPECTED,
                     evidence=(),
                     reason="access control reproduction did not belong to this validation session",
-                    reason_code=ValidationReasonCode.VALIDATION_SESSION_MISMATCH,
                 ).validation,
             )
 
@@ -474,7 +461,6 @@ class ValidationAgent:
                     verdict=ValidationVerdict.REJECTED,
                     evidence=session_evidence,
                     reason="actor session did not expose the owner object",
-                    reason_code=ValidationReasonCode.ACCESS_NOT_EXPOSED,
                 ).validation,
             )
 
@@ -494,7 +480,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.CONFIRMED,
                 evidence=session_evidence,
                 reason="independent reproduction exposed another principal's object",
-                reason_code=ValidationReasonCode.CONFIRMED_PROOF,
                 proof=proof,
             ).validation,
         )
@@ -530,7 +515,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.REJECTED,
                 evidence=(),
                 reason="analysis produced no safe-file read signal to reproduce",
-                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
             )
 
         requests = build_path_traversal_requests(
@@ -567,7 +551,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.BLOCKED,
                 evidence=reproduced,
                 reason="independent safe-file reproduction could not obtain comparable responses",
-                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
             )
 
         control = reproduced[0]
@@ -588,7 +571,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.CONFIRMED,
                 evidence=proof_evidence,
                 reason="independent control/probe comparison reproduced the safe-file read",
-                reason_code=ValidationReasonCode.CONFIRMED_PROOF,
                 proof=proof,
             )
 
@@ -597,7 +579,6 @@ class ValidationAgent:
             verdict=ValidationVerdict.REJECTED,
             evidence=reproduced,
             reason="independent probe did not reproduce the safe-file read",
-            reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
         )
 
     def _validate_path_traversal_bypass(
@@ -626,7 +607,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.REJECTED,
                 evidence=(),
                 reason="analysis produced no filter bypass signal to reproduce",
-                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
             )
 
         requests = build_path_traversal_bypass_requests(
@@ -661,7 +641,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.BLOCKED,
                 evidence=(control, probe),
                 reason="independent bypass reproduction could not obtain comparable responses",
-                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
             )
         if not path_traversal_bypass_signal(control, probe):
             return self._validation_result(
@@ -669,7 +648,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.REJECTED,
                 evidence=(control, probe),
                 reason="independent probe did not reproduce the filter bypass read",
-                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
             )
 
         proof_evidence = (control, probe)
@@ -686,7 +664,6 @@ class ValidationAgent:
             verdict=ValidationVerdict.CONFIRMED,
             evidence=proof_evidence,
             reason="independent control/probe comparison reproduced the filter bypass read",
-            reason_code=ValidationReasonCode.CONFIRMED_PROOF,
             proof=proof,
         )
 
@@ -716,7 +693,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.REJECTED,
                 evidence=(),
                 reason="analysis produced no fixed-arithmetic SSTI signal to reproduce",
-                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
             )
 
         requests = build_ssti_requests(
@@ -749,7 +725,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.BLOCKED,
                 evidence=reproduced,
                 reason="independent SSTI sequence encountered an HTTP execution error",
-                reason_code=ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR,
             )
         cleanup_status = reproduced[-1].observation.get("status")
         if cleanup_status not in {302, 303}:
@@ -758,7 +733,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.BLOCKED,
                 evidence=reproduced,
                 reason="independent SSTI sequence could not restore the safe username",
-                reason_code=ValidationReasonCode.CLEANUP_FAILED,
             )
         if not ssti_execution_signal(collected):
             return self._validation_result(
@@ -766,7 +740,6 @@ class ValidationAgent:
                 verdict=ValidationVerdict.REJECTED,
                 evidence=reproduced,
                 reason="independent fixed arithmetic probe was not evaluated by the template",
-                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
             )
 
         proof = ValidationProof(
@@ -782,7 +755,6 @@ class ValidationAgent:
             verdict=ValidationVerdict.CONFIRMED,
             evidence=reproduced,
             reason="independent control/probe comparison reproduced the SSTI effect",
-            reason_code=ValidationReasonCode.CONFIRMED_PROOF,
             proof=proof,
         )
 
@@ -793,11 +765,8 @@ class ValidationAgent:
         verdict: ValidationVerdict,
         evidence: Sequence[Evidence],
         reason: str,
-        reason_code: ValidationReasonCode,
         proof: ValidationProof | None = None,
     ) -> AgentResult:
-        # reason_code는 기본값 없는 키워드 인자다. 새 분기를 추가하면서 빠뜨리면
-        # 조용히 UNSPECIFIED로 흐르지 않고 호출 시점에 TypeError로 드러난다.
         evidence_ids = tuple(dict.fromkeys(item.evidence_id for item in evidence))
         validation = ValidationResult(
             validation_id=task.validation_id or "",
@@ -806,7 +775,6 @@ class ValidationAgent:
             verdict=verdict,
             evidence_ids=evidence_ids,
             reason=reason,
-            reason_code=reason_code,
             reproduction_count=len(evidence_ids),
             proof=proof,
         )
@@ -838,11 +806,6 @@ class ValidationAgent:
                     f"type={latest.observation.get('type')} status={status}, but no "
                     "vulnerability-specific proof was produced"
                 )
-            ),
-            reason_code=(
-                ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR
-                if blocked
-                else ValidationReasonCode.GENERIC_NO_PROOF
             ),
             reproduction_count=len(reproduction),
         )
