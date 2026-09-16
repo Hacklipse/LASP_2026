@@ -23,7 +23,6 @@ from hacklipse.adapters.memory import (
 from hacklipse.adapters.reviewing_validation import (
     ReviewingValidationAgent, build_llm_reviewing_validation_agent,
 )
-from hacklipse.adapters.reason_coded_validation import ReasonCodedValidationAgent, _REASONS
 from hacklipse.adapters.validation import ValidationAgent
 from hacklipse.adapters.validation_review_contract import (
     ValidationOutcomeClass, ValidationReviewContext,
@@ -190,36 +189,55 @@ class DecoratorTests(unittest.TestCase):
         claim = self.evidence.get("run-1", result.new_evidence_ids[0])
         self.assertEqual(claim.observation["status"], "reason_code_unspecified")
 
-    def test_reason_coded_validator_preserves_baseline_result(self):
+    def test_baseline_validator_sets_deterministic_reason_code(self):
+        # reason code는 LLM 기능이 아니라 결정적 Validation fact이므로, Reviewer를
+        # 감싸지 않은 순정 Validator만으로도 채워져야 한다.
         baseline = ValidationAgent(
             candidate_store=self.candidates, evidence_store=self.evidence,
             surface_store=self.surfaces,
         )
-        coded = ReasonCodedValidationAgent(
-            candidate_store=self.candidates, evidence_store=self.evidence,
-            surface_store=self.surfaces,
-        )
-        original = baseline.handle(self.task)
-        actual = coded.handle(self.task)
-        self.assertEqual(actual.validation.verdict, original.validation.verdict)
-        self.assertEqual(actual.validation.proof, original.validation.proof)
-        self.assertEqual(actual.evidence_requests, original.evidence_requests)
+        actual = baseline.handle(self.task)
+        self.assertEqual(actual.validation.verdict, ValidationVerdict.REJECTED)
+        self.assertIsNone(actual.validation.proof)
         self.assertEqual(actual.validation.reason_code, ValidationReasonCode.ANALYSIS_SIGNAL_MISSING)
 
-    def test_every_existing_nonconfirmed_branch_has_reason_code(self):
+    def test_every_validation_branch_states_its_reason_code(self):
+        # 새 분기가 reason code 없이 추가되면 UNSPECIFIED로 조용히 흐르지 않고
+        # 여기서 먼저 드러난다. 판정 문구가 아니라 분기 자체를 검사한다.
         tree = ast.parse(textwrap.dedent(inspect.getsource(ValidationAgent)))
+        branches = 0
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
                 continue
             if node.func.attr != "_validation_result":
                 continue
-            arguments = {keyword.arg: keyword.value for keyword in node.keywords}
-            verdict = arguments.get("verdict")
-            reason = arguments.get("reason")
-            if (isinstance(verdict, ast.Attribute) and verdict.attr == "CONFIRMED"
-                    or not isinstance(reason, ast.Constant)):
-                continue
-            self.assertIn(reason.value, _REASONS)
+            branches += 1
+            code = {keyword.arg: keyword.value for keyword in node.keywords}.get("reason_code")
+            self.assertIsInstance(code, ast.Attribute, "every branch must name a reason code")
+            self.assertNotEqual(code.attr, "UNSPECIFIED")
+            self.assertIn(code.attr, ValidationReasonCode.__members__)
+        self.assertGreater(branches, 0)
+
+    def test_generic_and_blocked_decisions_are_reason_coded(self):
+        # _validation_result를 거치지 않는 마지막 두 경로도 코드를 남긴다.
+        agent = ValidationAgent(
+            candidate_store=self.candidates, evidence_store=self.evidence,
+            surface_store=self.surfaces,
+        )
+        for observation, expected in (
+            ({"type": "http_response", "status": 200}, ValidationReasonCode.GENERIC_NO_PROOF),
+            ({"type": "http_error", "status": None},
+             ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR),
+        ):
+            with self.subTest(observation=observation):
+                evidence = Evidence(
+                    evidence_id="runtime-decide", run_id="run-1", surface_id="surface-1",
+                    validation_id="validation-1", source_task_id="collection-1",
+                    created_by="execution_runtime:http_get", evidence_type="http_response",
+                    observation=observation,
+                )
+                result = agent._decide(self.task, (evidence,))
+                self.assertEqual(result.validation.reason_code, expected)
 
     def test_confirmed_result_bypasses_reviewer(self):
         proof = ValidationProof(

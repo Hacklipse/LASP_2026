@@ -28,7 +28,7 @@ from hacklipse.ports.llm import LlmClient, LlmUsage
 
 from .llm_parameter_names import alias_parameter_names
 from .llm_validation_review import LlmValidationReviewer
-from .reason_coded_validation import ReasonCodedValidationAgent
+from .validation import ValidationAgent
 from .validation_review_contract import (
     CONTRACT_VERSION,
     ValidationOutcomeClass,
@@ -211,7 +211,7 @@ def build_llm_reviewing_validation_agent(
     if llm_client is None:
         raise LlmCredentialsMissing("validation reviewer requires an explicit LlmClient")
     return ReviewingValidationAgent(
-        validator=ReasonCodedValidationAgent(
+        validator=ValidationAgent(
             candidate_store=candidate_store,
             evidence_store=evidence_store,
             surface_store=surface_store,
