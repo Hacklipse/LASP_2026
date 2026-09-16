@@ -92,14 +92,6 @@ class _FakeLlmClient:
     def complete(self, request: LlmRequest) -> LlmResponse:
         self.calls.append(request)
         properties = (request.response_schema or {}).get("properties", {})
-        if "outcome_class" in properties:
-            return LlmResponse(
-                payload={
-                    "outcome_class": "signal_not_observed",
-                    "reason": "이번 session의 재현 요청에서 취약점 신호를 관측하지 못함",
-                },
-                model="fake",
-            )
         if "reflections" in properties:
             payload = {
                 "reflections": [
@@ -122,12 +114,10 @@ class _FakeLlmClient:
         return LlmResponse(payload=payload, model="fake")
 
 
-def _run(*, llm_client=None, validation_review=False):
+def _run(*, llm_client=None):
     runtime = _ReflectingRuntime()
     app = build_local_application({}, runtime=runtime, router=standard_router())
-    profile = register_standard_agents(
-        app, llm_client=llm_client, validation_review=validation_review
-    )
+    profile = register_standard_agents(app, llm_client=llm_client)
     run = app.orchestrator.start(
         RunRequest(
             target_url=_TARGET,
@@ -201,37 +191,6 @@ class LlmWiringEndToEndTests(unittest.TestCase):
         # 맥락 축은 LLM 구성에만 있다.
         self.assertNotIn("context", _reflections(base_app, base_run)[0].observation)
         self.assertIn("context", _reflections(llm_app, llm_run)[0].observation)
-
-    def test_validation_review_claim_reaches_the_run_without_touching_the_verdict(self) -> None:
-        """Review Claim은 Run Evidence로만 병합되고 판정·재현·외부 요청을 건드리지 않는다."""
-
-        plain_app, plain_run, plain_runtime, _ = _run(llm_client=_FakeLlmClient())
-        app, run, runtime, _ = _run(llm_client=_FakeLlmClient(), validation_review=True)
-
-        claims = [
-            item
-            for item in app.stores.evidence.list_by_run(run.run_id)
-            if item.observation.get("type") == "llm_validation_review"
-        ]
-        self.assertTrue(claims, "비확정 Validation마다 Review Claim이 남는다")
-        for claim in claims:
-            self.assertEqual(claim.evidence_type, "claim")
-            self.assertEqual(claim.created_by, "llm_validation_reviewer")
-            self.assertIn(claim.evidence_id, run.evidence_ids)
-            # Claim은 proof가 아니다 — 재현 Evidence로도 Candidate 근거로도 새지 않는다.
-            for candidate in app.stores.candidates.list_by_run(run.run_id):
-                self.assertNotIn(claim.evidence_id, candidate.evidence_ids)
-
-        # Reviewer가 붙어도 결정적 판정과 중앙 실행 요청은 그대로다.
-        self.assertEqual(
-            [i.envelope.agent_type for i in app.stores.tasks.list_by_run(run.run_id)],
-            [i.envelope.agent_type for i in plain_app.stores.tasks.list_by_run(plain_run.run_id)],
-        )
-        self.assertEqual(len(runtime.requests), len(plain_runtime.requests))
-        self.assertEqual(
-            app.stores.findings.list_by_run(run.run_id),
-            plain_app.stores.findings.list_by_run(plain_run.run_id),
-        )
 
     def test_no_finding_without_a_validation_proof(self) -> None:
         """반사를 찾아도 proof가 없으면 Finding으로 승격되지 않는다(마일스톤 A 성질)."""
