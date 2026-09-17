@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -15,12 +16,16 @@ from hacklipse.domain import (
 from hacklipse.ports import (
     BudgetManager, CandidateStore, EvidenceStore, FindingStore, RunStore, SurfaceStore,
 )
-from hacklipse.ports.errors import RecordNotFound
+from hacklipse.ports.errors import LlmCredentialsMissing, RecordNotFound
 
+from .llm_report_narrative import ReportNarrative, ReportNarrator, deterministic_fallback
 from .report_contract import (
     CONTRACT_VERSION, FindingReportFact, RunReportFacts, finding_fact_id,
     report_facts_hash, surface_path_hint,
 )
+
+
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,8 +47,13 @@ def _code(value: str) -> str:
 
 def render_report_v2(
     facts: RunReportFacts, *, references: tuple[FindingReportReferences, ...] = (),
+    narrative: ReportNarrative | None = None,
 ) -> str:
-    """같은 facts/참조에서 같은 bytes를 생성하는 offline renderer."""
+    """같은 facts/참조에서 같은 bytes를 생성하는 offline renderer.
+
+    narrative는 맨 아래에만 덧붙는다. narrative=None이면 위 사실 블록과 완전히 같은
+    bytes가 나온다 — LLM을 껐을 때와 붙였을 때의 사실이 같은지 비교하는 근거다.
+    """
 
     by_id = {reference.finding_id: reference for reference in references}
     if len(by_id) != len(references) or not set(by_id) <= {f.finding_id for f in facts.findings}:
@@ -109,7 +119,35 @@ def render_report_v2(
                 f"- Evidence: {', '.join(_code(item) for item in sorted(set(reference.evidence_ids)))}",
             ])
         lines.append("")
+    lines.extend(_narrative_lines(facts, narrative))
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _narrative_lines(
+    facts: RunReportFacts, narrative: ReportNarrative | None,
+) -> list[str]:
+    """LLM 문장은 위 사실을 대체하지 않는다. 항상 비권위적이라고 먼저 밝힌다."""
+
+    if narrative is None:
+        return []
+    lines = [
+        "## 요약 (비권위적)", "",
+        "아래 문장은 위 사실 블록을 LLM이 요약한 것입니다. 판정·증명·심각도의 근거가 아니며,",
+        "위 사실과 다르면 위 사실이 우선합니다.", "",
+        f"- 생성 상태: `{narrative.status}`",
+        f"- 출처: `{narrative.source}`", "",
+    ]
+    if narrative.source != "llm":
+        lines.extend([narrative.run_summary, ""])
+        return lines
+    if narrative.run_summary:
+        lines.extend([narrative.run_summary, ""])
+    labels = {fact.finding_id: fact.vulnerability_type for fact in facts.findings}
+    for finding_id, summary in narrative.finding_summaries:
+        lines.extend([f"### {labels[finding_id]} — 요약", "", summary, ""])
+    if narrative.rejected:
+        lines.append(f"검증을 통과하지 못해 제외한 문장: {len(narrative.rejected)}개.")
+    return lines
 
 
 class MarkdownReportAgent:
@@ -126,9 +164,13 @@ class MarkdownReportAgent:
         surface_store: SurfaceStore | None = None,
         run_store: RunStore | None = None,
         budget_manager: BudgetManager | None = None,
+        narrator: ReportNarrator | None = None,
     ) -> None:
         if format_version not in ("v1", "v2"):
             raise ValueError("unsupported report format version")
+        if narrator is not None and format_version != "v2":
+            # v1에는 사실 블록이 없어서 요약이 무엇을 근거로 했는지 보일 수 없다.
+            raise ValueError("report narrator requires format v2")
         if format_version == "v2" and any(
             store is None for store in (candidate_store, surface_store, run_store)
         ):
@@ -141,6 +183,7 @@ class MarkdownReportAgent:
         self._surfaces = surface_store
         self._runs = run_store
         self._budget = budget_manager
+        self._narrator = narrator
 
     def collect_facts(self, task: TaskEnvelope) -> RunReportFacts:
         """Store 사실을 수집한다. Evidence 본문은 facts로 복사하지 않는다."""
@@ -194,14 +237,16 @@ class MarkdownReportAgent:
 
         findings = self._load_findings(task)
         if self._format_version == "v2":
+            facts = self._collect_facts(task, findings)
             content = render_report_v2(
-                self._collect_facts(task, findings),
+                facts,
                 references=tuple(
                     FindingReportReferences(
                         finding_id=f.finding_id, surface_id=f.surface_id,
                         validation_id=f.validation_id, evidence_ids=f.evidence_ids,
                     ) for f in findings
                 ),
+                narrative=self._narrate(facts),
             )
         else:
             content = self._render_v1(task, findings)
@@ -216,6 +261,20 @@ class MarkdownReportAgent:
             status=AgentResultStatus.COMPLETED,
             reports=(report,),
         )
+
+    def _narrate(self, facts: RunReportFacts) -> ReportNarrative | None:
+        """Narrator가 어떻게 실패하든 v2 보고서 자체는 반드시 생성한다."""
+
+        if self._narrator is None:
+            return None
+        try:
+            return self._narrator.narrate(facts)
+        except LlmCredentialsMissing:
+            # 배선 실수는 숨기지 않는다. 켠 줄 알고 결정적 보고서를 받는 편이 더 나쁘다.
+            raise
+        except Exception:  # noqa: BLE001 - Report 실패는 Run 전체를 FAILED로 만든다
+            _LOG.exception("report narrator failed")
+            return deterministic_fallback("internal_error")
 
     @staticmethod
     def _render_v1(task: TaskEnvelope, findings: Sequence[Finding]) -> str:
