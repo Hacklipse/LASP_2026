@@ -31,6 +31,7 @@ from hacklipse.adapters.validation_review_contract import (
     ValidationOutcomeClass, ValidationReview, ValidationReviewContext,
 )
 from hacklipse.bootstrap import build_local_application, register_standard_agents
+from hacklipse.application.orchestrator import VALIDATION_ROUNDS_EXHAUSTED_REASON
 from hacklipse.domain import (
     AgentResult, AgentResultStatus, Candidate, CandidateStatus, Evidence, Run,
     RunExecutionProfile, RunScope, Surface, TaskEnvelope, ValidationReasonCode,
@@ -274,6 +275,21 @@ class DecoratorTests(unittest.TestCase):
         self.assertFalse(result.new_evidence_ids)
         self.assertFalse(llm.requests)
 
+    def test_suspected_result_is_reviewed_and_reused(self):
+        agent, llm, validation = self.agent(
+            verdict=ValidationVerdict.SUSPECTED,
+            reason_code=ValidationReasonCode.ACCESS_PLAN_MISSING,
+        )
+        first = agent.handle(self.task)
+        second = agent.handle(self.task)
+        claim = self.evidence.get("run-1", first.new_evidence_ids[0])
+
+        self.assertIs(first.validation, validation)
+        self.assertEqual(first.new_evidence_ids, second.new_evidence_ids)
+        self.assertEqual(len(llm.requests), 1)
+        self.assertEqual(claim.observation["verdict"], "suspected")
+        self.assertEqual(claim.observation["status"], "completed")
+
     def test_malformed_stored_claim_is_not_reused(self):
         agent, llm, _ = self.agent()
         first = agent.handle(self.task)
@@ -360,10 +376,14 @@ class DecoratorTests(unittest.TestCase):
             {"outcome_class": "signal_not_observed", "reason": "이번 probe에서 신호 미관측"},
             usage=LlmUsage(input_tokens=12, output_tokens=5),
         )
-        agent, _, _ = self.agent(llm=llm)
+        agent, _, _ = self.agent(
+            verdict=ValidationVerdict.SUSPECTED,
+            reason_code=ValidationReasonCode.ACCESS_PLAN_MISSING,
+            llm=llm,
+        )
         result = agent.handle(self.task)
         self.candidates.save(self.candidates.get("run-1", "candidate-1").set_status(
-            CandidateStatus.REJECTED
+            CandidateStatus.SUSPECTED
         ))
         for suffix, status in (
             ("rounds", CandidateStatus.SUSPECTED),
@@ -375,6 +395,10 @@ class DecoratorTests(unittest.TestCase):
                 surface_id="surface-1", vulnerability_type="SQLi",
                 hypothesis="candidate", assigned_agent="sqli_analyzer",
                 evidence_ids=(), status=status,
+                last_error=(
+                    VALIDATION_ROUNDS_EXHAUSTED_REASON
+                    if suffix == "rounds" else None
+                ),
             ))
         run = Run(
             run_id="run-1", target_url="http://target.test/",
@@ -404,6 +428,7 @@ class DecoratorTests(unittest.TestCase):
         self.assertEqual(summary["outcome_class_counts"], {"signal_not_observed": 1})
         self.assertEqual(summary["claims"][0]["candidate_id"], "candidate-1")
         self.assertEqual(summary["claims"][0]["status"], "completed")
+        self.assertEqual(summary["claims"][0]["verdict"], "suspected")
         self.assertEqual(summary["llm_calls"], 1)
         self.assertEqual(summary["usage_available_count"], 1)
         self.assertEqual(summary["input_tokens_observed"], 12)

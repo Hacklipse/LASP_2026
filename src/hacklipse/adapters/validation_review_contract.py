@@ -65,7 +65,9 @@ def valid_review_claim_observation(
         or not observation["candidate_id"]
         or type(observation["verdict"]) is not str
         or observation["verdict"] not in {
-            ValidationVerdict.REJECTED.value, ValidationVerdict.BLOCKED.value
+            verdict.value
+            for verdict in ValidationVerdict
+            if verdict is not ValidationVerdict.CONFIRMED
         }
         or type(observation["reason_code"]) is not str
         or observation["reason_code"] not in {code.value for code in ValidationReasonCode}

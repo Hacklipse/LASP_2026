@@ -66,6 +66,8 @@ _PROOF_TYPE_BY_VULNERABILITY = {
     "SSTI": ValidationProofType.SSTI_EXECUTION,
 }
 
+VALIDATION_ROUNDS_EXHAUSTED_REASON = "validation rounds exhausted"
+
 
 @dataclass(frozen=True, slots=True)
 class OrchestratorConfig:
@@ -937,7 +939,10 @@ class Orchestrator:
 
         if validation is None:
             # 반복 상한 안에 판정을 얻지 못하면 Finding으로 승격하지 않는다.
-            candidate = candidate.set_status(CandidateStatus.SUSPECTED)
+            candidate = candidate.set_status(
+                CandidateStatus.SUSPECTED,
+                reason=VALIDATION_ROUNDS_EXHAUSTED_REASON,
+            )
             self._candidates.save(candidate)
             return current, None
 

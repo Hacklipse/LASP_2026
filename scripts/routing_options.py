@@ -8,6 +8,7 @@ from collections.abc import Collection
 
 from hacklipse.adapters.routing_audit import JsonlRoutingAuditLog, surface_key
 from hacklipse.adapters.validation_review_contract import valid_review_claim_observation
+from hacklipse.application.orchestrator import VALIDATION_ROUNDS_EXHAUSTED_REASON
 from hacklipse.bootstrap import standard_router
 from hacklipse.domain import RunExecutionProfile
 from hacklipse.ports import LlmClient, VulnerabilityRouter
@@ -239,9 +240,18 @@ def _validation_review_summary(app, run, candidates) -> dict[str, object]:
         })
 
     status_counts = Counter(candidate.status.value for candidate in candidates)
+    rounds_exhausted_ids = {
+        candidate.candidate_id for candidate in candidates
+        if candidate.status.value == "suspected"
+        and candidate.last_error == VALIDATION_ROUNDS_EXHAUSTED_REASON
+    }
     eligible_ids = {
         candidate.candidate_id for candidate in candidates
         if candidate.status.value in {"rejected", "blocked"}
+        or (
+            candidate.status.value == "suspected"
+            and candidate.candidate_id not in rounds_exhausted_ids
+        )
     }
     return {
         "schema_version": 1,
@@ -266,7 +276,7 @@ def _validation_review_summary(app, run, candidates) -> dict[str, object]:
         "usage_unavailable_count": usage_unavailable,
         "elapsed_ms_observed": round(elapsed_ms, 3),
         "elapsed_available_count": elapsed_count,
-        "validation_rounds_exhausted_count": status_counts["suspected"],
+        "validation_rounds_exhausted_count": len(rounds_exhausted_ids),
         "skipped_budget_candidate_count": status_counts["skipped_budget"],
         "failed_candidate_count": status_counts["failed"],
     }
