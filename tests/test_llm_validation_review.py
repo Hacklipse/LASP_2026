@@ -7,47 +7,55 @@ Dependencies: hacklipse adapters/domain/memory stores, Python unittest.
 from __future__ import annotations
 
 import ast
+import argparse
 import inspect
 import json
+import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 from hacklipse.adapters import SQLiteStoreBundle
 from hacklipse.adapters.llm_validation_review import LlmValidationReviewer
 from hacklipse.adapters.memory import (
-    InMemoryCandidateStore, InMemoryEvidenceStore, InMemorySurfaceStore,
+    InMemoryCandidateStore, InMemoryEvidenceStore, InMemoryFindingStore,
+    InMemorySurfaceStore,
 )
 from hacklipse.adapters.reviewing_validation import (
     ReviewingValidationAgent, build_llm_reviewing_validation_agent,
 )
 from hacklipse.adapters.validation import ValidationAgent
 from hacklipse.adapters.validation_review_contract import (
-    ValidationOutcomeClass, ValidationReviewContext,
+    ValidationOutcomeClass, ValidationReview, ValidationReviewContext,
 )
 from hacklipse.bootstrap import build_local_application, register_standard_agents
 from hacklipse.domain import (
-    AgentResult, AgentResultStatus, Candidate, Evidence, Surface, TaskEnvelope,
-    ValidationReasonCode, ValidationResult, ValidationVerdict,
+    AgentResult, AgentResultStatus, Candidate, CandidateStatus, Evidence, Run,
+    RunExecutionProfile, RunScope, Surface, TaskEnvelope, ValidationReasonCode,
+    ValidationResult, ValidationVerdict,
     ValidationProof, ValidationProofType,
 )
 from hacklipse.ports.errors import LlmCredentialsMissing, LlmTimeout
-from hacklipse.ports.llm import LlmResponse
+from hacklipse.ports.llm import LlmResponse, LlmUsage
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from routing_options import append_run_result  # noqa: E402
 
 
 class FakeLlm:
-    def __init__(self, payload=None, error=None):
+    def __init__(self, payload=None, error=None, usage=None):
         self.payload = payload
         self.error = error
+        self.usage = usage or LlmUsage()
         self.requests = []
 
     def complete(self, request):
         self.requests.append(request)
         if self.error:
             raise self.error
-        return LlmResponse(payload=self.payload, model="fake-model")
+        return LlmResponse(payload=self.payload, usage=self.usage, model="fake-model")
 
 
 class FakeValidator:
@@ -127,6 +135,7 @@ class ReviewerContractTests(unittest.TestCase):
         }))
         review = LlmValidationReviewer(llm_client=llm).review(context(), timeout_seconds=2)
         self.assertEqual(review.source, "llm")
+        self.assertFalse(review.usage_available)
 
 
 class DecoratorTests(unittest.TestCase):
@@ -280,6 +289,130 @@ class DecoratorTests(unittest.TestCase):
         second = agent.handle(self.task)
         self.assertEqual(len(llm.requests), 2)
         self.assertNotEqual(first.new_evidence_ids, second.new_evidence_ids)
+
+    def test_inconsistent_stored_claim_fields_are_not_reused(self):
+        for field, value in (
+            ("verdict", "blocked"),
+            ("reason_code", "unspecified"),
+            ("status", "timeout"),
+            ("usage", {"input_tokens": -1, "output_tokens": 0}),
+            ("usage_available", False),
+            ("elapsed_ms", -1),
+            ("elapsed_ms", None),
+        ):
+            with self.subTest(field=field):
+                self.setUp()
+                llm = FakeLlm(
+                    {"outcome_class": "signal_not_observed", "reason": "이번 probe에서 신호 미관측"},
+                    usage=LlmUsage(input_tokens=2, output_tokens=1),
+                )
+                agent, llm, _ = self.agent(llm=llm)
+                first = agent.handle(self.task)
+                claim = self.evidence.get("run-1", first.new_evidence_ids[0])
+                self.evidence._items[claim.evidence_id] = Evidence(
+                    evidence_id=claim.evidence_id, run_id=claim.run_id,
+                    surface_id=claim.surface_id, validation_id=claim.validation_id,
+                    source_task_id=claim.source_task_id, created_by=claim.created_by,
+                    evidence_type=claim.evidence_type,
+                    observation={**claim.observation, field: value},
+                )
+                agent._id_factory = lambda: "next"
+                second = agent.handle(self.task)
+                self.assertEqual(len(llm.requests), 2)
+                self.assertNotEqual(first.new_evidence_ids, second.new_evidence_ids)
+
+    def test_unexpected_reviewer_error_creates_internal_error_claim(self):
+        class BrokenReviewer:
+            def review(self, context, *, timeout_seconds):
+                raise RuntimeError("private response detail")
+
+        agent, _, validation = self.agent()
+        agent._reviewer = BrokenReviewer()
+        result = agent.handle(self.task)
+        self.assertIs(result.validation, validation)
+        claim = self.evidence.get("run-1", result.new_evidence_ids[0])
+        self.assertEqual(claim.observation["status"], "internal_error")
+        self.assertEqual(claim.observation["outcome_class"], "unknown")
+        self.assertEqual(claim.observation["selection_source"], "deterministic_fallback")
+        self.assertEqual(claim.observation["llm_calls"], 0)
+        self.assertNotIn("private response detail", str(claim.observation))
+        self.assertEqual(agent.handle(self.task).new_evidence_ids, result.new_evidence_ids)
+
+    def test_inconsistent_reviewer_result_creates_internal_error_claim(self):
+        class InconsistentReviewer:
+            def review(self, context, *, timeout_seconds):
+                return ValidationReview(
+                    outcome_class=ValidationOutcomeClass.REQUEST_REJECTED,
+                    reason="요청이 거부됨", source="llm", status="timeout",
+                    llm_calls=1, usage_available=True,
+                )
+
+        agent, _, validation = self.agent()
+        agent._reviewer = InconsistentReviewer()
+        result = agent.handle(self.task)
+        self.assertIs(result.validation, validation)
+        claim = self.evidence.get("run-1", result.new_evidence_ids[0])
+        self.assertEqual(claim.observation["status"], "internal_error")
+        self.assertEqual(claim.observation["outcome_class"], "unknown")
+
+    def test_memory_review_measurements_survive_as_jsonl_summary(self):
+        llm = FakeLlm(
+            {"outcome_class": "signal_not_observed", "reason": "이번 probe에서 신호 미관측"},
+            usage=LlmUsage(input_tokens=12, output_tokens=5),
+        )
+        agent, _, _ = self.agent(llm=llm)
+        result = agent.handle(self.task)
+        self.candidates.save(self.candidates.get("run-1", "candidate-1").set_status(
+            CandidateStatus.REJECTED
+        ))
+        for suffix, status in (
+            ("rounds", CandidateStatus.SUSPECTED),
+            ("budget", CandidateStatus.SKIPPED_BUDGET),
+            ("failure", CandidateStatus.FAILED),
+        ):
+            self.candidates.add(Candidate(
+                candidate_id=f"candidate-{suffix}", run_id="run-1",
+                surface_id="surface-1", vulnerability_type="SQLi",
+                hypothesis="candidate", assigned_agent="sqli_analyzer",
+                evidence_ids=(), status=status,
+            ))
+        run = Run(
+            run_id="run-1", target_url="http://target.test/",
+            scope=RunScope(allowed_hosts=frozenset({"target.test"})),
+            policy_profile="safe", request_budget=20,
+            execution_profile=RunExecutionProfile(
+                analysis_profile="llm", validation_mode="llm",
+                llm_provider="fake", llm_model="fake-model",
+            ),
+            evidence_ids=result.new_evidence_ids,
+        )
+        app = SimpleNamespace(
+            stores=SimpleNamespace(
+                candidates=self.candidates, surfaces=self.surfaces,
+                evidence=self.evidence, findings=InMemoryFindingStore(),
+            ),
+            budget_manager=SimpleNamespace(remaining=lambda run_id: 10),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "runs.jsonl"
+            append_run_result(argparse.Namespace(routing_log=log_path), app, run)
+            record = json.loads(log_path.read_text().splitlines()[0])
+        summary = record["validation_review"]
+        self.assertEqual(record["schema_version"], 2)
+        self.assertEqual(summary["eligible_candidate_count"], 1)
+        self.assertEqual(summary["reviewed_candidate_count"], 1)
+        self.assertEqual(summary["outcome_class_counts"], {"signal_not_observed": 1})
+        self.assertEqual(summary["claims"][0]["candidate_id"], "candidate-1")
+        self.assertEqual(summary["claims"][0]["status"], "completed")
+        self.assertEqual(summary["llm_calls"], 1)
+        self.assertEqual(summary["usage_available_count"], 1)
+        self.assertEqual(summary["input_tokens_observed"], 12)
+        self.assertEqual(summary["output_tokens_observed"], 5)
+        self.assertEqual(summary["validation_rounds_exhausted_count"], 1)
+        self.assertEqual(summary["skipped_budget_candidate_count"], 1)
+        self.assertEqual(summary["failed_candidate_count"], 1)
+        self.assertNotIn("reason", summary["claims"][0])
+        self.assertNotIn("이번 probe에서 신호 미관측", json.dumps(summary))
 
     def test_opt_in_factory_runs_real_validator_without_common_wiring(self):
         llm = FakeLlm({

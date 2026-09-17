@@ -101,7 +101,9 @@ class LlmValidationReviewer:
             status="completed",
             llm_calls=1,
             usage=response.usage,
-            usage_available=True,
+            usage_available=bool(
+                response.usage.input_tokens or response.usage.output_tokens
+            ),
             model=response.model,
             elapsed_ms=(time.monotonic() - started) * 1000,
         )

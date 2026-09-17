@@ -7,6 +7,7 @@ from collections import Counter
 from collections.abc import Collection
 
 from hacklipse.adapters.routing_audit import JsonlRoutingAuditLog, surface_key
+from hacklipse.adapters.validation_review_contract import valid_review_claim_observation
 from hacklipse.bootstrap import standard_router
 from hacklipse.domain import RunExecutionProfile
 from hacklipse.ports import LlmClient, VulnerabilityRouter
@@ -124,12 +125,13 @@ def append_run_result(args, app, run) -> None:
     """실제 Analysis/Validation 결과를 같은 Run ID로 연결한다. 증적 원문은 저장하지 않는다."""
     candidates = app.stores.candidates.list_by_run(run.run_id)
     profile = run.execution_profile
+    review = _validation_review_summary(app, run, candidates)
     keys = {
         surface.surface_id: surface_key(surface)
         for surface in app.stores.surfaces.list_by_run(run.run_id)
     }
     JsonlRoutingAuditLog(args.routing_log).append({
-        "schema_version": 1, "event": "run_result", "run_id": run.run_id,
+        "schema_version": 2, "event": "run_result", "run_id": run.run_id,
         "execution_profile_recorded": profile.recorded,
         "router_mode": profile.router_mode,
         "router_review": profile.router_review,
@@ -151,6 +153,7 @@ def append_run_result(args, app, run) -> None:
         "budget_candidate_weights": list(run.budget_candidate_weights),
         "phase": run.phase.value,
         "candidate_status_counts": dict(Counter(c.status.value for c in candidates)),
+        "validation_review": review,
         "finding_count": len(app.stores.findings.list_by_run(run.run_id)),
         "request_budget": run.request_budget,
         "requests_used": run.request_budget - app.budget_manager.remaining(run.run_id),
@@ -161,3 +164,109 @@ def append_run_result(args, app, run) -> None:
             "exploration_parameters": list(c.exploration_parameters),
         } for c in candidates],
     })
+
+
+def _validation_review_summary(app, run, candidates) -> dict[str, object]:
+    """Persist bounded review measurements without reasons, URLs, or raw evidence."""
+
+    by_id = {candidate.candidate_id: candidate for candidate in candidates}
+    attached_ids = set(run.evidence_ids)
+    outcomes: Counter[str] = Counter()
+    fallbacks: Counter[str] = Counter()
+    sources: Counter[str] = Counter()
+    reviewed_candidates: set[str] = set()
+    claim_records: list[dict[str, object]] = []
+    claim_count = invalid_count = llm_calls = input_tokens = output_tokens = 0
+    usage_available = usage_unavailable = elapsed_count = 0
+    elapsed_ms = 0.0
+    for item in app.stores.evidence.list_by_run(run.run_id):
+        if item.created_by != "llm_validation_reviewer" or item.evidence_type != "claim":
+            continue
+        obs = item.observation
+        if item.validation_id is None or not valid_review_claim_observation(
+            obs, identifiers=(run.run_id, item.validation_id or ""),
+        ):
+            invalid_count += 1
+            continue
+        candidate = by_id.get(obs["candidate_id"])
+        if (
+            item.evidence_id not in attached_ids
+            or candidate is None
+            or item.surface_id != candidate.surface_id
+            or candidate.status.value != obs.get("verdict")
+            or not valid_review_claim_observation(
+                obs, identifiers=(run.run_id, candidate.candidate_id, item.validation_id),
+            )
+        ):
+            invalid_count += 1
+            continue
+        claim_count += 1
+        reviewed_candidates.add(candidate.candidate_id)
+        outcomes[obs["outcome_class"]] += 1
+        sources[obs["selection_source"]] += 1
+        if obs["selection_source"] == "deterministic_fallback":
+            fallbacks[obs["status"]] += 1
+        llm_calls += obs["llm_calls"]
+        if obs["usage_available"]:
+            usage_available += 1
+            input_tokens += obs["usage"]["input_tokens"]
+            output_tokens += obs["usage"]["output_tokens"]
+        elif obs["llm_calls"] or obs["status"] == "internal_error":
+            usage_unavailable += 1
+        if obs["elapsed_ms"] is not None:
+            elapsed_count += 1
+            elapsed_ms += obs["elapsed_ms"]
+        claim_records.append({
+            "candidate_id": candidate.candidate_id,
+            "validation_id": item.validation_id,
+            "verdict": obs["verdict"],
+            "reason_code": obs["reason_code"],
+            "outcome_class": obs["outcome_class"],
+            "selection_source": obs["selection_source"],
+            "status": obs["status"],
+            "llm_calls": obs["llm_calls"],
+            "llm_call_count_known": obs["status"] != "internal_error",
+            "usage_available": obs["usage_available"],
+            "input_tokens": (
+                obs["usage"]["input_tokens"] if obs["usage_available"] else None
+            ),
+            "output_tokens": (
+                obs["usage"]["output_tokens"] if obs["usage_available"] else None
+            ),
+            "elapsed_ms": (
+                round(obs["elapsed_ms"], 3) if obs["elapsed_ms"] is not None else None
+            ),
+        })
+
+    status_counts = Counter(candidate.status.value for candidate in candidates)
+    eligible_ids = {
+        candidate.candidate_id for candidate in candidates
+        if candidate.status.value in {"rejected", "blocked"}
+    }
+    return {
+        "schema_version": 1,
+        "enabled": run.execution_profile.validation_mode == "llm",
+        "eligible_candidate_count": len(eligible_ids),
+        "reviewed_candidate_count": len(reviewed_candidates),
+        "missing_review_candidate_count": (
+            len(eligible_ids - reviewed_candidates)
+            if run.execution_profile.validation_mode == "llm" else 0
+        ),
+        "claim_count": claim_count,
+        "claims": claim_records,
+        "invalid_claim_count": invalid_count,
+        "outcome_class_counts": dict(outcomes),
+        "selection_source_counts": dict(sources),
+        "fallback_status_counts": dict(fallbacks),
+        "llm_calls": llm_calls,
+        "unknown_llm_call_count": fallbacks["internal_error"],
+        "input_tokens_observed": input_tokens,
+        "output_tokens_observed": output_tokens,
+        "usage_available_count": usage_available,
+        "usage_unavailable_count": usage_unavailable,
+        "elapsed_ms_observed": round(elapsed_ms, 3),
+        "elapsed_available_count": elapsed_count,
+        "validation_rounds_exhausted_count": status_counts["suspected"],
+        "skipped_budget_candidate_count": status_counts["skipped_budget"],
+        "failed_candidate_count": status_counts["failed"],
+    }

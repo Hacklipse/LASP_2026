@@ -7,7 +7,9 @@ Dependencies: Validation Agent/Reviewer contracts, repository ports, standard li
 from __future__ import annotations
 
 import logging
+import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Callable
 from urllib.parse import urlsplit
@@ -36,6 +38,7 @@ from .validation_review_contract import (
     ValidationReviewContext,
     ValidationReviewer,
     safe_review_reason,
+    valid_review_claim_observation,
 )
 
 _LOG = logging.getLogger(__name__)
@@ -85,19 +88,45 @@ class ReviewingValidationAgent:
             claim = self._find_claim(context, surface_id, fingerprint)
             if claim is not None:
                 return replace(result, new_evidence_ids=result.new_evidence_ids + (claim.evidence_id,))
+        except Exception as error:
+            _LOG.warning("validation review context unavailable: %s", type(error).__name__)
+            return result
 
-            if context.reason_code is ValidationReasonCode.UNSPECIFIED:
-                review = self._fallback("reason_code_unspecified")
-            else:
+        started = time.monotonic()
+        if context.reason_code is ValidationReasonCode.UNSPECIFIED:
+            review = self._fallback("reason_code_unspecified")
+        else:
+            try:
                 review = self._reviewer.review(
                     context, timeout_seconds=min(self._timeout, task.timeout_seconds / 2)
                 )
-            if not isinstance(review, ValidationReview):
-                raise ValueError("reviewer returned an invalid claim")
-            if not safe_review_reason(
-                review.reason, (context.run_id, context.candidate_id, context.validation_id)
+                if not isinstance(review, ValidationReview) or not safe_review_reason(
+                    review.reason, (context.run_id, context.candidate_id, context.validation_id)
+                ):
+                    raise ValueError("reviewer returned an invalid or unsafe claim")
+            except Exception as error:
+                _LOG.warning("validation review internal fallback: %s", type(error).__name__)
+                review = self._fallback(
+                    "internal_error",
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                )
+
+        try:
+            observation = self._claim_observation(context, fingerprint, review)
+            if not valid_review_claim_observation(
+                observation,
+                identifiers=(context.run_id, context.candidate_id, context.validation_id),
             ):
-                raise ValueError("reviewer returned an unsafe reason")
+                raise ValueError("reviewer returned an inconsistent claim")
+        except Exception as error:
+            _LOG.warning("validation review contract fallback: %s", type(error).__name__)
+            review = self._fallback(
+                "internal_error",
+                elapsed_ms=(time.monotonic() - started) * 1000,
+            )
+            observation = self._claim_observation(context, fingerprint, review)
+
+        try:
             claim = Evidence(
                 evidence_id=f"validation-review-{self._id_factory()}",
                 run_id=task.run_id,
@@ -106,34 +135,40 @@ class ReviewingValidationAgent:
                 validation_id=context.validation_id,
                 created_by="llm_validation_reviewer",
                 evidence_type="claim",
-                observation={
-                    "type": "llm_validation_review",
-                    "contract_version": CONTRACT_VERSION,
-                    "candidate_id": context.candidate_id,
-                    "verdict": context.verdict.value,
-                    "reason_code": context.reason_code.value,
-                    "outcome_class": review.outcome_class.value,
-                    "selection_source": review.source,
-                    "status": review.status,
-                    "input_fingerprint": fingerprint,
-                    "offered_classes": [item.value for item in ValidationOutcomeClass],
-                    "llm_calls": review.llm_calls,
-                    "usage": {
-                        "input_tokens": review.usage.input_tokens,
-                        "output_tokens": review.usage.output_tokens,
-                    },
-                    "usage_available": review.usage_available,
-                    "model": review.model,
-                    "elapsed_ms": review.elapsed_ms,
-                    "reason": review.reason,
-                },
+                observation=observation,
             )
             self._evidence.append(claim)
             return replace(result, new_evidence_ids=result.new_evidence_ids + (claim.evidence_id,))
         except Exception as error:
-            # Review failure is isolated from the deterministic Validation verdict.
-            _LOG.warning("validation review integration fallback: %s", type(error).__name__)
+            # A broken Evidence store cannot record a claim; preserve the verdict.
+            _LOG.warning("validation review claim storage failed: %s", type(error).__name__)
             return result
+
+    @staticmethod
+    def _claim_observation(
+        context: ValidationReviewContext, fingerprint: str, review: ValidationReview,
+    ) -> dict[str, object]:
+        return {
+            "type": "llm_validation_review",
+            "contract_version": CONTRACT_VERSION,
+            "candidate_id": context.candidate_id,
+            "verdict": context.verdict.value,
+            "reason_code": context.reason_code.value,
+            "outcome_class": review.outcome_class.value,
+            "selection_source": review.source,
+            "status": review.status,
+            "input_fingerprint": fingerprint,
+            "offered_classes": [item.value for item in ValidationOutcomeClass],
+            "llm_calls": review.llm_calls,
+            "usage": {
+                "input_tokens": review.usage.input_tokens,
+                "output_tokens": review.usage.output_tokens,
+            },
+            "usage_available": review.usage_available,
+            "model": review.model,
+            "elapsed_ms": review.elapsed_ms,
+            "reason": review.reason,
+        }
 
     def _context(self, task: TaskEnvelope, result: AgentResult) -> tuple[ValidationReviewContext, str]:
         validation = result.validation
@@ -172,32 +207,35 @@ class ReviewingValidationAgent:
         # add a fingerprint index only if measured resume latency warrants it.
         for item in self._evidence.list_by_run(context.run_id):
             obs = item.observation
-            if (item.evidence_type == "claim" and item.created_by == "llm_validation_reviewer"
+            if not isinstance(obs, Mapping):
+                continue
+            if (item.run_id == context.run_id
+                    and item.evidence_type == "claim" and item.created_by == "llm_validation_reviewer"
                     and item.validation_id == context.validation_id
                     and item.surface_id == surface_id
-                    and obs.get("type") == "llm_validation_review"
-                    and obs.get("contract_version") == CONTRACT_VERSION
                     and obs.get("candidate_id") == context.candidate_id
                     and obs.get("input_fingerprint") == fingerprint
-                    and obs.get("outcome_class") in {value.value for value in ValidationOutcomeClass}
-                    and obs.get("selection_source") in {"llm", "deterministic_fallback"}):
-                if not safe_review_reason(
-                    obs.get("reason"),
-                    (context.run_id, context.candidate_id, context.validation_id),
-                ):
-                    continue
+                    and obs.get("verdict") == context.verdict.value
+                    and obs.get("reason_code") == context.reason_code.value
+                    and valid_review_claim_observation(
+                        obs,
+                        identifiers=(context.run_id, context.candidate_id, context.validation_id),
+                    )):
                 return item
         return None
 
     @staticmethod
-    def _fallback(status: str) -> ValidationReview:
+    def _fallback(
+        status: str, *, llm_calls: int = 0, elapsed_ms: float | None = None,
+    ) -> ValidationReview:
         return ValidationReview(
             outcome_class=ValidationOutcomeClass.UNKNOWN,
-            reason="이번 Validation session의 결정적 reason code가 없어 분류를 보류함",
+            reason="이번 Validation session의 제한된 facts만으로 결과를 분류할 수 없음",
             source="deterministic_fallback",
             status=status,
-            llm_calls=0,
+            llm_calls=llm_calls,
             usage=LlmUsage(),
+            elapsed_ms=elapsed_ms,
         )
 
 

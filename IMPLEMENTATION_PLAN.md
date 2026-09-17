@@ -7,9 +7,9 @@
 
 ## 1. 현재 상태
 
-> 갱신 기준: 2026-09-17, `dev/dmswls` HEAD `279a275`와 현재 작업 트리.
-> 로컬 전체 테스트 593개 통과. 기존 Juice Shop 수치는 당시 실행 기록이며 이 HEAD의 재실측이 아니다.
-> Validation LLM review는 `279a275`에서 복원됐다. 비확정 판정의 분류 Claim만 추가하며 결정적 proof와 Finding 판정은 유지한다.
+> 갱신 기준: 2026-09-17, `fix/validation-review-measurement`의 `c079f6e` 기반 작업 트리.
+> 로컬 전체 테스트 597개 통과. 기존 Juice Shop 수치는 당시 실행 기록이며 이 작업 트리의 재실측이 아니다.
+> Validation LLM review는 `3270167`에서 복원됐다. 비확정 판정의 분류 Claim만 추가하며 결정적 proof와 Finding 판정은 유지한다.
 
 Phase 1~9의 공통 실행 기반과 **5종(XSS·SQLi·Path Traversal·Access Control·SSTI)
 Analysis Agent의 휴리스틱·LLM 경로, Validation Agent의 결정적 재현·proof 경로**가 완료됐다.
@@ -421,6 +421,7 @@ CLI 진행 로그에 기록된다. LLM의 빈 선택이나 일부 선택은 Reco
 **현재 LLM 상태** 독립 재현·차이 비교·proof 생성은 Python이 수행한다.
 `--profile llm --validation-review`에서 비확정 결과의 제한된 facts를 LLM이 분류하고,
 그 결과를 별도 Claim으로 저장한다. 최종 proof 불변식과 Finding 승격 권한은 결정적 코드에 남는다.
+실행 후 JSONL `run_result` 스키마 2에는 원문 설명 없이 Review Claim별 분류·fallback 상태·관측된 token·시간과 집계가 남는다. `suspected`(Validation 반복 상한), `skipped_budget`, `failed`도 별도 집계한다. Reviewer 예외는 `internal_error` Claim으로 남기고 실제 LLM 호출 여부가 불명확하면 호출 수를 미확인으로 표시한다. 저장된 Claim은 현재 verdict·reason code와 상태·사용량 계약까지 확인한 뒤 재사용한다. 정식 A/B 반복 측정은 아직 수행하지 않았다.
 
 **연결되는 기능** Notion §10(독립 검증), §11(증적 부족 루프). §11 루프는 `orchestrator.py:200-231`에 이미 구현되어 있고, **이 Agent가 그 루프를 처음으로 실제 작동시킨다.**
 
@@ -879,7 +880,7 @@ Evidence 테이블에는 **UPDATE 문을 쓰지 않는다.** `EvidenceStore` Pro
 | ✅ | `tests/test_router_pipeline.py`, `tests/test_llm_router_advisor.py` 등 — 안전 계약·감사·비교 테스트 |
 | ✅ | P-3 `src/hacklipse/domain/models.py`, `src/hacklipse/domain/__init__.py` — Validation reason code와 Finding proof facts (현 브랜치 병합) |
 | ✅ | P-3 `src/hacklipse/adapters/sqlite_store.py`, `src/hacklipse/application/orchestrator.py` — 기존 Finding 복원 호환과 Validation·Report Evidence ID 병합 |
-| ✅ | P-3 `tests/test_invariants.py`, `tests/test_sqlite_store.py`, `tests/test_p3_shared_contracts.py` — 계약 회귀 포함 현재 전체 593개 테스트 통과 |
+| ✅ | P-3 `tests/test_invariants.py`, `tests/test_sqlite_store.py`, `tests/test_p3_shared_contracts.py` — 계약 회귀 포함 현재 전체 597개 테스트 통과 |
 | ⏳ | Report facts 계약 — P-3 병합 후 확정 |
 | ⏳ | `src/hacklipse/adapters/cost_budget.py` — 토큰·비용 기반 예산 |
 | ✅ | Orchestrator 추가 Recon·예산 배분의 선택적 LLM Advisor |
@@ -897,7 +898,7 @@ Evidence 테이블에는 **UPDATE 문을 쓰지 않는다.** `EvidenceStore` Pro
 - `src/hacklipse/adapters`: Recon·Hybrid Router·5종 Analysis·결정적 Validation/Report·HTTP/브라우저 Runtime·SQLite/Knowledge
 - `src/hacklipse/bootstrap.py`: 구현 조립 및 표준 Agent 등록
 - `scripts/run_juice_shop_baseline.py`: Juice Shop 실행 옵션과 결과 출력
-- `tests/`: 2026-09-17 현재 로컬 전체 593개 통과
+- `tests/`: 2026-09-17 현재 로컬 전체 597개 통과
 
 ## 5. 체크리스트
 
@@ -967,6 +968,8 @@ Phase 10 [x] 제한된 Recon LLM Planner와 fallback
          [x] P-2 Run 실행 조건 영속화·구 DB 호환·JSONL 일관성
          [x] P-1 adaptive/deterministic Surface 수집 분리·실행 조건 영속화
          [x] 비확정 Validation LLM review·reason code·실행 옵션·기록 배선
+         [x] Review Claim 계측 JSONL·internal_error fallback·저장 Claim 재사용 검증
+         [ ] Validation review on/off 정식 반복 A/B 측정
          [ ] Report facts 계약과 Report LLM 보조
          [ ] P-2 조건 필터를 적용한 Surface manifest 정식 반복 비교
          [ ] 비용 예산 / 보고서 포맷 / severity
