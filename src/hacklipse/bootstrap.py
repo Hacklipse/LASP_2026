@@ -39,6 +39,7 @@ from hacklipse.adapters import (
 )
 from hacklipse.adapters.llm_router_advisor import AnalyzerChoice, LlmRouterAdvisor
 from hacklipse.adapters.reserved_budget import ReservedBudgetManager
+from hacklipse.adapters.reviewing_validation import build_llm_reviewing_validation_agent
 from hacklipse.adapters.routing import (
     DEFAULT_RULES,
     DEFAULT_SURFACE_RULES,
@@ -454,6 +455,7 @@ def register_standard_agents(
     recon_seed_urls: tuple[str, ...] = (),
     actor_object_id: str | None = None,
     owner_object_id: str | None = None,
+    validation_review: bool = False,
 ) -> str:
     """Recon/Analysis/Validation을 표준 배선으로 등록하고 구성 이름을 돌려준다.
 
@@ -579,13 +581,24 @@ def register_standard_agents(
         ssti_analyzer,
         allowed_tools=("ssti_probe",),
     )
-    app.dispatcher.register(
-        "validation",
-        ValidationAgent(
+    # Validation verdict와 proof는 어느 구성에서나 결정적 Validator가 만든다.
+    # validation_review는 그 위에 LLM 분류 Claim을 덧붙일 뿐이고, 기본값이 off인
+    # 이유는 대조군/LLM 두 구성의 LLM 호출 수를 비교 가능하게 유지하기 위해서다.
+    validation_agent: Agent = ValidationAgent(
+        candidate_store=app.stores.candidates,
+        evidence_store=app.stores.evidence,
+        surface_store=app.stores.surfaces,
+    )
+    if validation_review and llm_client is not None:
+        validation_agent = build_llm_reviewing_validation_agent(
+            llm_client=llm_client,
             candidate_store=app.stores.candidates,
             evidence_store=app.stores.evidence,
             surface_store=app.stores.surfaces,
-        ),
+        )
+    app.dispatcher.register(
+        "validation",
+        validation_agent,
         allowed_tools=(
             "http_get",
             "browser_xss",
