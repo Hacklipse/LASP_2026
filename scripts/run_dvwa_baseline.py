@@ -486,6 +486,9 @@ def main(argv: list[str]) -> int:
         help="LLM에 보낸 prompt와 받은 구조화 JSON도 출력",
     )
     args = parser.parse_args(argv[1:])
+    if args.validation_review and args.profile != "llm":
+        print("거부: --validation-review는 --profile llm과 함께 사용해야 합니다.")
+        return 2
     debug_enabled = args.debug or args.debug_llm_content
     progress = _DebugProgress(debug_enabled)
 

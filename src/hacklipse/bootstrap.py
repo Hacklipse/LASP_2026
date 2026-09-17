@@ -464,6 +464,11 @@ def register_standard_agents(
     이 함수 하나로 제한한다.
     """
 
+    if validation_review and llm_client is None:
+        raise LlmCredentialsMissing(
+            "validation review requires an explicit LlmClient"
+        )
+
     app.dispatcher.register(
         "recon",
         ReconAgent(
@@ -589,7 +594,7 @@ def register_standard_agents(
         evidence_store=app.stores.evidence,
         surface_store=app.stores.surfaces,
     )
-    if validation_review and llm_client is not None:
+    if validation_review:
         validation_agent = build_llm_reviewing_validation_agent(
             llm_client=llm_client,
             candidate_store=app.stores.candidates,

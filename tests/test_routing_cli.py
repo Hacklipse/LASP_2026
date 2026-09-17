@@ -19,6 +19,7 @@ from hacklipse.adapters import HeuristicSqliAnalyzer, LlmSqliAnalyzer, RuleBased
 from hacklipse.adapters.routing_audit import AuditedVulnerabilityRouter
 from hacklipse.adapters.paired_routing import PairedVulnerabilityRouter
 from hacklipse.adapters.llm_recon_planner import LlmReconPlanner
+from hacklipse.adapters.reviewing_validation import ReviewingValidationAgent
 from hacklipse.application import Orchestrator
 from hacklipse.bootstrap import build_local_application, register_standard_agents
 from hacklipse.ports.errors import LlmCredentialsMissing
@@ -34,6 +35,46 @@ class _NoCallsLlm:
 
 
 class RoutingCliTests(unittest.TestCase):
+    def test_validation_review_rejects_heuristic_profile_before_setup(self):
+        for runner in (dvwa, juice):
+            with self.subTest(runner=runner.__name__):
+                with (
+                    patch.object(runner, "build_gemini_llm_client_from_env") as llm_builder,
+                    patch.object(runner, "build_local_application") as assemble,
+                    patch("builtins.input") as prompt,
+                    contextlib.redirect_stdout(io.StringIO()) as output,
+                ):
+                    status = runner.main([
+                        "runner", "http://localhost:3000/", "--validation-review",
+                    ])
+                self.assertEqual(status, 2)
+                self.assertIn("--profile llm", output.getvalue())
+                llm_builder.assert_not_called()
+                assemble.assert_not_called()
+                prompt.assert_not_called()
+
+    def test_validation_review_is_registered_and_recorded_in_llm_profile(self):
+        for runner in (dvwa, juice):
+            with self.subTest(runner=runner.__name__), tempfile.TemporaryDirectory() as directory:
+                with (
+                    patch.object(runner, "build_gemini_llm_client_from_env", return_value=_NoCallsLlm()),
+                    patch.object(runner, "register_standard_agents", wraps=register_standard_agents) as register,
+                    patch.object(Orchestrator, "start", side_effect=_StopBeforeExecution) as start,
+                    patch("builtins.input", return_value="y"),
+                    patch.object(runner.getpass, "getpass", return_value="fixture-password"),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    with self.assertRaises(_StopBeforeExecution):
+                        runner.main([
+                            "runner", "http://localhost:3000/", "--vuln", "sqli",
+                            "--profile", "llm", "--validation-review",
+                            "--routing-log", str(Path(directory) / "routing.jsonl"),
+                        ])
+                app = register.call_args.args[0]
+                self.assertIsInstance(app.dispatcher._agents["validation"], ReviewingValidationAgent)
+                request = start.call_args.args[0]
+                self.assertEqual(request.execution_profile.validation_mode, "llm")
+
     def test_all_profile_router_combinations_keep_analysis_selection_independent(self):
         for runner in (dvwa, juice):
             for profile in ("heuristic", "llm"):

@@ -34,6 +34,10 @@ _EMAIL = re.compile(
 _PHONE = re.compile(
     r"(?<!\d)(?:\+?82[- ]?0?|0)1[016789][- ]?\d{3,4}[- ]?\d{4}(?!\d)"
 )
+# Review text is optional, so reject plausible international numbers too. This
+# broader check is not used to sanitize runtime Evidence, where false positives
+# could remove a signal needed for validation.
+_REVIEW_PHONE = re.compile(r"(?<![A-Za-z0-9])\+?(?:\d[\s().-]*){9,19}(?![A-Za-z0-9])")
 _KOREAN_RRN = re.compile(r"(?<!\d)\d{6}[- ]?[1-4]\d{6}(?!\d)")
 _FORM_SECRET = re.compile(
     r"(?i)(\b(?:password|passwd|csrf|token|secret|session(?:id)?)\b[^=&\r\n]{0,40}=)([^&\s<>\"']+)"
@@ -60,6 +64,15 @@ _SENSITIVE_FIELD_HINTS = (
     "secret",
     "session",
 )
+
+
+def contains_personal_data(value: str) -> bool:
+    """Detect personal data before storing free-form LLM review text."""
+
+    return any(
+        pattern.search(value)
+        for pattern in (_EMAIL, _PHONE, _REVIEW_PHONE, _KOREAN_RRN)
+    )
 
 
 class InMemoryCredentialResolver:

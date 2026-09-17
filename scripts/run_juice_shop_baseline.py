@@ -745,6 +745,9 @@ def main(argv: list[str]) -> int:
         help="LLM prompt와 구조화 응답 출력",
     )
     args = parser.parse_args(argv[1:])
+    if args.validation_review and args.profile != "llm":
+        print("거부: --validation-review는 --profile llm과 함께 사용해야 합니다.")
+        return 2
     if args.router_advisor:
         # 팀원 PR에서 사용하던 옵션을 새 실험 축의 명칭으로 호환한다.
         args.router = "hybrid"

@@ -16,6 +16,8 @@ from typing import Literal, Protocol
 from hacklipse.domain import ValidationReasonCode, ValidationVerdict
 from hacklipse.ports.llm import LlmUsage
 
+from .security import contains_personal_data
+
 CONTRACT_VERSION = "validation-review-v1"
 _UNSAFE_REASON = re.compile(
     r"(?i)(?:https?://|www\.|\b(?:token|secret|cookie|authorization|password|apikey|api_key)\b|"
@@ -29,6 +31,7 @@ def safe_review_reason(reason: object, identifiers: tuple[str, ...] = ()) -> boo
         and 0 < len(reason.strip()) <= 300
         and all(character.isprintable() for character in reason)
         and not _UNSAFE_REASON.search(reason)
+        and not contains_personal_data(reason)
         and all(identifier not in reason for identifier in identifiers if identifier)
     )
 

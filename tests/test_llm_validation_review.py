@@ -27,6 +27,7 @@ from hacklipse.adapters.validation import ValidationAgent
 from hacklipse.adapters.validation_review_contract import (
     ValidationOutcomeClass, ValidationReviewContext,
 )
+from hacklipse.bootstrap import build_local_application, register_standard_agents
 from hacklipse.domain import (
     AgentResult, AgentResultStatus, Candidate, Evidence, Surface, TaskEnvelope,
     ValidationReasonCode, ValidationResult, ValidationVerdict,
@@ -103,6 +104,9 @@ class ReviewerContractTests(unittest.TestCase):
             {"outcome_class": "request_rejected", "reason": "blocked", "verdict": "confirmed"},
             {"outcome_class": "not_offered", "reason": "unknown"},
             {"outcome_class": "request_rejected", "reason": "see https://target.test"},
+            {"outcome_class": "request_rejected", "reason": "contact test@example.invalid"},
+            {"outcome_class": "request_rejected", "reason": "phone 010-1234-5678"},
+            {"outcome_class": "request_rejected", "reason": "phone +1 (415) 555-0199"},
         ):
             with self.subTest(payload=payload):
                 review = LlmValidationReviewer(llm_client=FakeLlm(payload)).review(
@@ -298,6 +302,12 @@ class DecoratorTests(unittest.TestCase):
                 llm_client=None, candidate_store=self.candidates,
                 evidence_store=self.evidence, surface_store=self.surfaces,
             )
+
+    def test_standard_registration_rejects_review_without_client(self):
+        app = build_local_application({})
+        with self.assertRaises(LlmCredentialsMissing):
+            register_standard_agents(app, validation_review=True)
+        self.assertNotIn("validation", app.dispatcher._agents)
 
     def test_sqlite_claim_survives_reopen_and_reuses_review(self):
         llm = FakeLlm({

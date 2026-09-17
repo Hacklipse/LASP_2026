@@ -66,6 +66,7 @@ def needs_llm(args: argparse.Namespace) -> bool:
         or args.recon == "hybrid" or args.compare_routers
         or getattr(args, "orchestrator", "heuristic") == "hybrid"
         or getattr(args, "budget_allocation", "off") == "hybrid"
+        or getattr(args, "validation_review", False)
     )
 
 
@@ -86,7 +87,9 @@ def execution_profile_from_args(
         compare_routers=getattr(args, "compare_routers", False),
         orchestrator_mode=getattr(args, "orchestrator", "heuristic"),
         budget_allocation_mode=getattr(args, "budget_allocation", "off"),
-        validation_mode=getattr(args, "validation", "heuristic"),
+        validation_mode=(
+            "llm" if getattr(args, "validation_review", False) else "heuristic"
+        ),
         report_mode=getattr(args, "report", "heuristic"),
         llm_provider=getattr(args, "llm_provider", "") if selected_model else "",
         llm_model=selected_model,
