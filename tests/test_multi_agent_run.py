@@ -1259,5 +1259,55 @@ class ProgressTimingTests(unittest.TestCase):
             self.assertEqual(events[0].elapsed_ms, 0)
 
 
+class ReportV2WorkflowTests(unittest.TestCase):
+    def test_confirmed_rejected_and_budget_skipped_runs_generate_v2(self) -> None:
+        from hacklipse.adapters import InMemoryBudgetManager, MemoryStoreBundle
+        from hacklipse.adapters.reporting import MarkdownReportAgent
+        from hacklipse.bootstrap import build_local_application
+        from hacklipse.domain import RunRequest, RunScope
+
+        for scenario in ("confirmed", "rejected", "skipped_budget"):
+            with self.subTest(scenario=scenario):
+                stores = MemoryStoreBundle()
+                budget = InMemoryBudgetManager()
+                reporter = MarkdownReportAgent(
+                    finding_store=stores.findings, evidence_store=stores.evidence,
+                    candidate_store=stores.candidates, surface_store=stores.surfaces,
+                    run_store=stores.runs, budget_manager=budget, format_version="v2",
+                )
+                app = build_local_application(
+                    {"report": reporter}, stores=stores, budget_manager=budget, runtime=_FixtureRuntime(),
+                )
+                recon = (_DrainingReconAgent(stores.surfaces, budget, units=4)
+                         if scenario == "skipped_budget" else _SurfaceOnlyReconAgent(stores.surfaces))
+                app.dispatcher.register("recon", recon, allowed_tools=("http_get",))
+                for name in ("xss_analyzer", "sqli_analyzer"):
+                    app.dispatcher.register(name, _EvidenceSeekingAnalyzer(name), allowed_tools=("http_get",))
+                validator = (_EvidenceSeekingConfirmingValidator(stores.candidates, stores.evidence)
+                             if scenario == "confirmed" else _RejectingValidator())
+                app.dispatcher.register("validation", validator, allowed_tools=("http_get",))
+                run = app.orchestrator.start(RunRequest(
+                    target_url="http://localhost/", scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+                    request_budget=4 if scenario == "skipped_budget" else 20,
+                ))
+                self.assertEqual(run.phase.value, "done")
+                report = stores.reports.list_by_run(run.run_id)[0]
+                self.assertIn("# Security assessment report (v2)", report.content)
+                self.assertIn(f"| {scenario} | 2 |", report.content)
+                self.assertEqual(len(stores.findings.list_by_run(run.run_id)), 2 if scenario == "confirmed" else 0)
+                if scenario == "confirmed":
+                    self.assertIn("Proof type: `xss_execution`", report.content)
+                    self.assertIn("Proof type: `sqli_effect`", report.content)
+                    self.assertIn("사용 요청 예산: 4", report.content)
+                elif scenario == "skipped_budget":
+                    self.assertIn("예산 부족으로 검사를 완료하지 못한 Candidate: 2개", report.content)
+                else:
+                    self.assertIn("검증에서 기각: 2개", report.content)
+                evidence_before = tuple(stores.evidence.list_by_run(run.run_id))
+                self.assertEqual(app.orchestrator.resume(run.run_id), run)
+                self.assertEqual(tuple(stores.reports.list_by_run(run.run_id)), (report,))
+                self.assertEqual(tuple(stores.evidence.list_by_run(run.run_id)), evidence_before)
+
+
 if __name__ == "__main__":
     unittest.main()

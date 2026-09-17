@@ -358,5 +358,92 @@ class ProgressLogSelectionTests(unittest.TestCase):
                 budget.close()
 
 
+class ReportV2PersistenceTests(unittest.TestCase):
+    def test_report_resumes_with_persisted_proof_and_budget_and_is_reused(self) -> None:
+        import json
+        import sqlite3
+
+        from hacklipse.adapters.reporting import MarkdownReportAgent
+        from hacklipse.adapters.report_contract import serialize_report_facts
+        from hacklipse.domain import Candidate, CandidateStatus, Evidence, Finding, Surface, ValidationProofType
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "report-v2.sqlite3"
+            stores = SQLiteStoreBundle(database_path)
+            budget = SQLiteBudgetManager(database_path)
+            run = Run(
+                run_id="run-report-v2", target_url="http://localhost/search",
+                scope=RunScope(allowed_hosts=frozenset({"localhost"})), policy_profile="safe",
+                request_budget=20, phase=RunPhase.REPORT,
+                finding_ids=("finding-proof", "finding-legacy"),
+                candidate_ids=("candidate-proof", "candidate-legacy"),
+                surface_ids=("surface-search",), evidence_ids=("evi-proof", "evi-legacy"),
+            )
+            try:
+                stores.runs.add(run)
+                budget.open_run(run.run_id, 20)
+                budget.consume(run.run_id, 7)
+                stores.surfaces.add(Surface(surface_id="surface-search", run_id=run.run_id, url=run.target_url, method="GET", parameters=("q",)))
+                for label in ("proof", "legacy"):
+                    stores.candidates.add(Candidate(
+                        candidate_id=f"candidate-{label}", run_id=run.run_id,
+                        surface_id="surface-search", vulnerability_type="XSS", hypothesis="fixture",
+                        assigned_agent="xss_analyzer", evidence_ids=(f"evi-{label}",), status=CandidateStatus.CONFIRMED,
+                    ))
+                    stores.evidence.append(Evidence(
+                        evidence_id=f"evi-{label}", run_id=run.run_id, surface_id="surface-search",
+                        created_by="fixture", evidence_type="http_response", observation={"body": "private-body"},
+                    ))
+                    stores.findings.add(Finding(
+                        finding_id=f"finding-{label}", run_id=run.run_id, candidate_id=f"candidate-{label}",
+                        validation_id=f"validation-{label}", vulnerability_type="XSS", surface_id="surface-search",
+                        evidence_ids=(f"evi-{label}",),
+                        proof_type=ValidationProofType.XSS_EXECUTION if label == "proof" else None,
+                        reproduction_count=2 if label == "proof" else 0,
+                    ))
+            finally:
+                stores.close()
+                budget.close()
+
+            # P-3 이전 레코드처럼 proof 필드가 아예 없는 데이터도 그대로 읽는다.
+            with sqlite3.connect(database_path) as connection:
+                data = json.loads(connection.execute("SELECT data FROM findings WHERE finding_id = ?", ("finding-legacy",)).fetchone()[0])
+                data.pop("proof_type")
+                data.pop("reproduction_count")
+                connection.execute("UPDATE findings SET data = ? WHERE finding_id = ?", (json.dumps(data), "finding-legacy"))
+
+            previous_report = None
+            previous_facts = None
+            for restart in range(2):
+                stores = SQLiteStoreBundle(database_path)
+                budget = SQLiteBudgetManager(database_path)
+                try:
+                    reporter = MarkdownReportAgent(
+                        finding_store=stores.findings, evidence_store=stores.evidence,
+                        candidate_store=stores.candidates, surface_store=stores.surfaces,
+                        run_store=stores.runs, budget_manager=budget, format_version="v2",
+                    )
+                    app = build_local_application({"report": reporter}, stores=stores, budget_manager=budget)
+                    resumed = app.orchestrator.resume(run.run_id)
+                    self.assertIs(resumed.phase, RunPhase.DONE)
+                    reports = stores.reports.list_by_run(run.run_id)
+                    self.assertEqual(len(reports), 1)
+                    report = reports[0]
+                    task = TaskEnvelope(task_id="offline", run_id=run.run_id, agent_type="report", finding_ids=run.finding_ids)
+                    facts = serialize_report_facts(reporter.collect_facts(task))
+                    self.assertIn("재현 횟수: 2", report.content)
+                    self.assertIn("검증 상세를 사용할 수 없음", report.content)
+                    self.assertIn("사용 요청 예산: 7", report.content)
+                    self.assertNotIn("private-body", report.content + facts)
+                    self.assertEqual(len(stores.tasks.list_by_run(run.run_id)), 1)
+                    if restart:
+                        self.assertEqual(report, previous_report)
+                        self.assertEqual(facts, previous_facts)
+                    previous_report, previous_facts = report, facts
+                finally:
+                    stores.close()
+                    budget.close()
+
+
 if __name__ == "__main__":
     unittest.main()
