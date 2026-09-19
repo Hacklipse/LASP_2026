@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Callable, Collection, Mapping, Protocol, Sequence
+from typing import Callable, Collection, Literal, Mapping, Protocol, Sequence
 
 from hacklipse.adapters import (
     AllowlistPolicyGate,
@@ -30,8 +30,10 @@ from hacklipse.adapters import (
     LlmXssAnalyzer,
     LlmBrowserXssAnalyzer,
     LocalTaskDispatcher,
+    LlmReportNarrator,
     MarkdownReportAgent,
     MemoryStoreBundle,
+    NarratorFingerprintConfig,
     ReconAgent,
     RuleBasedVulnerabilityRouter,
     SensitiveDataSanitizer,
@@ -179,6 +181,9 @@ def build_local_application(
     knowledge_base: KnowledgeBase | None = None,
     orchestration_advisor: OrchestrationAdvisor | None = None,
     budget_allocation_advisor: BudgetAllocationAdvisor | None = None,
+    report_format_version: Literal["v1", "v2"] = "v1",
+    report_llm_client: LlmClient | None = None,
+    report_llm_model: str = "",
 ) -> LocalApplication:
     """기본적으로 네트워크를 활성화하지 않는 로컬 시스템을 조립한다."""
 
@@ -219,11 +224,33 @@ def build_local_application(
 
     if selected_config.report_agent_type not in agents:
         # 별도 Report Agent가 없으면 판정을 바꾸지 않는 기본 Markdown 구현을 사용한다.
+        narrator_config = None
+        narrator = None
+        if report_llm_client is not None:
+            if report_format_version != "v2" or not report_llm_model:
+                raise ValueError("LLM report requires v2 format and a model identifier")
+            narrator_config = NarratorFingerprintConfig(
+                model=report_llm_model,
+                prompt_version="llm-report-narrative-v1",
+            )
+            narrator = LlmReportNarrator(
+                llm_client=report_llm_client,
+                config=narrator_config,
+            )
+        elif report_llm_model:
+            raise ValueError("report model requires an LLM client")
         dispatcher.register(
             selected_config.report_agent_type,
             MarkdownReportAgent(
                 finding_store=selected_stores.findings,
                 evidence_store=selected_stores.evidence,
+                candidate_store=selected_stores.candidates,
+                surface_store=selected_stores.surfaces,
+                run_store=selected_stores.runs,
+                budget_manager=selected_budget,
+                format_version=report_format_version,
+                narrator=narrator,
+                narrator_config=narrator_config,
             ),
             allowed_tools=(),
         )

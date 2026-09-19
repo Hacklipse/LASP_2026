@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 
 from hacklipse.adapters.routing_audit import JsonlRoutingAuditLog, surface_key
 from hacklipse.adapters.validation_review_contract import valid_review_claim_observation
@@ -31,6 +31,10 @@ def add_routing_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--router", choices=("heuristic", "hybrid"), default="heuristic",
         help="routing mode, independent of --profile (default: heuristic)",
+    )
+    parser.add_argument(
+        "--report", choices=("heuristic", "llm"), default="heuristic",
+        help="deterministic v2 report or v2 with a bounded LLM narrative",
     )
     parser.add_argument(
         "--routing-log", default="artifacts/routing-decisions.jsonl",
@@ -69,6 +73,7 @@ def needs_llm(args: argparse.Namespace) -> bool:
         or getattr(args, "orchestrator", "heuristic") == "hybrid"
         or getattr(args, "budget_allocation", "off") == "hybrid"
         or getattr(args, "validation_review", False)
+        or getattr(args, "report", "heuristic") == "llm"
     )
 
 
@@ -127,12 +132,13 @@ def append_run_result(args, app, run) -> None:
     candidates = app.stores.candidates.list_by_run(run.run_id)
     profile = run.execution_profile
     review = _validation_review_summary(app, run, candidates)
+    report_narrative = _report_narrative_summary(app, run)
     keys = {
         surface.surface_id: surface_key(surface)
         for surface in app.stores.surfaces.list_by_run(run.run_id)
     }
     JsonlRoutingAuditLog(args.routing_log).append({
-        "schema_version": 2, "event": "run_result", "run_id": run.run_id,
+        "schema_version": 3, "event": "run_result", "run_id": run.run_id,
         "execution_profile_recorded": profile.recorded,
         "router_mode": profile.router_mode,
         "router_review": profile.router_review,
@@ -155,6 +161,7 @@ def append_run_result(args, app, run) -> None:
         "phase": run.phase.value,
         "candidate_status_counts": dict(Counter(c.status.value for c in candidates)),
         "validation_review": review,
+        "report_narrative": report_narrative,
         "finding_count": len(app.stores.findings.list_by_run(run.run_id)),
         "request_budget": run.request_budget,
         "requests_used": run.request_budget - app.budget_manager.remaining(run.run_id),
@@ -165,6 +172,80 @@ def append_run_result(args, app, run) -> None:
             "exploration_parameters": list(c.exploration_parameters),
         } for c in candidates],
     })
+
+
+def _report_narrative_summary(app, run) -> dict[str, object]:
+    """Persist bounded Narrator measurements without generated prose or offered IDs."""
+
+    attached_ids = set(run.evidence_ids)
+    statuses: Counter[str] = Counter()
+    sources: Counter[str] = Counter()
+    claim_count = invalid_count = llm_calls = rejected_count = 0
+    input_tokens = output_tokens = usage_available = usage_unavailable = 0
+    elapsed_count = 0
+    elapsed_ms = 0.0
+    for item in app.stores.evidence.list_by_run(run.run_id):
+        if item.created_by != "llm_report_narrator" or item.evidence_type != "claim":
+            continue
+        obs = item.observation
+        usage = obs.get("usage") if isinstance(obs, Mapping) else None
+        valid = (
+            item.evidence_id in attached_ids
+            and item.surface_id is None
+            and isinstance(obs, Mapping)
+            and obs.get("type") == "llm_report_narrative"
+            and obs.get("selection_source") in {"llm", "deterministic_fallback"}
+            and isinstance(obs.get("status"), str)
+            and type(obs.get("llm_calls")) is int
+            and obs["llm_calls"] >= 0
+            and isinstance(obs.get("usage_available"), bool)
+            and isinstance(usage, Mapping)
+            and all(
+                type(usage.get(key)) is int and usage[key] >= 0
+                for key in ("input_tokens", "output_tokens")
+            )
+            and (
+                obs.get("elapsed_ms") is None
+                or (
+                    type(obs["elapsed_ms"]) in (int, float)
+                    and obs["elapsed_ms"] >= 0
+                )
+            )
+            and isinstance(obs.get("rejected"), list)
+        )
+        if not valid:
+            invalid_count += 1
+            continue
+        claim_count += 1
+        statuses[obs["status"]] += 1
+        sources[obs["selection_source"]] += 1
+        llm_calls += obs["llm_calls"]
+        rejected_count += len(obs["rejected"])
+        if obs["usage_available"]:
+            usage_available += 1
+            input_tokens += usage["input_tokens"]
+            output_tokens += usage["output_tokens"]
+        elif obs["llm_calls"]:
+            usage_unavailable += 1
+        if obs["elapsed_ms"] is not None:
+            elapsed_count += 1
+            elapsed_ms += obs["elapsed_ms"]
+    return {
+        "schema_version": 1,
+        "enabled": run.execution_profile.report_mode == "llm",
+        "claim_count": claim_count,
+        "invalid_claim_count": invalid_count,
+        "selection_source_counts": dict(sources),
+        "status_counts": dict(statuses),
+        "rejected_sentence_count": rejected_count,
+        "llm_calls": llm_calls,
+        "input_tokens_observed": input_tokens,
+        "output_tokens_observed": output_tokens,
+        "usage_available_count": usage_available,
+        "usage_unavailable_count": usage_unavailable,
+        "elapsed_available_count": elapsed_count,
+        "elapsed_ms_observed": round(elapsed_ms, 3),
+    }
 
 
 def _validation_review_summary(app, run, candidates) -> dict[str, object]:

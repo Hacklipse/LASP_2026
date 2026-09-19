@@ -31,6 +31,8 @@ from .recon import ReconAgent
 from .sqli_analysis import HeuristicSqliAnalyzer
 from .ssti_analysis import HeuristicSstiAnalyzer
 from .reporting import MarkdownReportAgent
+from .llm_report_narrative import LlmReportNarrator, ReportNarrator
+from .report_contract import NarratorFingerprintConfig
 from .retry import BoundedRetryPolicy
 from .routing import (
     RouteSuggestion,
@@ -88,6 +90,9 @@ __all__ = [
     "LlmXssAnalyzer",
     "LocalTaskDispatcher",
     "MarkdownReportAgent",
+    "LlmReportNarrator",
+    "ReportNarrator",
+    "NarratorFingerprintConfig",
     "MemoryStoreBundle",
     "PlaywrightBrowserRuntime",
     "ReconAgent",

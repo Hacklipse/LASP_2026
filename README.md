@@ -32,3 +32,9 @@ same-scope GET page for an extra Recon visit. The application checks the
 selected surface and remaining request budget, persists the choice for resume,
 and continues normally when the model fails or returns an invalid choice. The
 default `--orchestrator heuristic` keeps the existing one-pass workflow.
+
+Both local runners also accept `--report {heuristic,llm}`. The default renders
+the deterministic v2 facts report; `llm` appends a bounded, non-authoritative
+narrative and falls back to the same facts when the model fails. Narrative
+calls, tokens, elapsed time, fallback status, and rejected sentences are
+recorded without generated prose in the run-result JSONL.

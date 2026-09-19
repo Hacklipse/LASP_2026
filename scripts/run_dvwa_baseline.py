@@ -450,7 +450,7 @@ def main(argv: list[str]) -> int:
         "--llm-provider",
         choices=("gemini", "anthropic"),
         default="gemini",
-        help="LLM provider for Analysis, Recon, Router or paired comparison (default: gemini)",
+        help="LLM provider for Analysis, Recon, Router, Report or paired comparison (default: gemini)",
     )
     parser.add_argument(
         "--llm-model",
@@ -638,6 +638,9 @@ def main(argv: list[str]) -> int:
     app = build_local_application(
         {},
         runtime=runtime,
+        report_format_version="v2",
+        report_llm_client=llm_client if args.report == "llm" else None,
+        report_llm_model=selected_model if args.report == "llm" else "",
         router=router,
         credential_resolver=resolver,
         approval_gate=StaticApprovalGate((_APPROVAL_REF,)),

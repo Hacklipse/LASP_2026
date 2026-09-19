@@ -7,8 +7,8 @@
 
 ## 1. 현재 상태
 
-> 갱신 기준: 2026-09-17, `fix/validation-review-suspected`의 `dfe9e5a` 기반 작업 트리.
-> 로컬 전체 테스트 598개 통과. 기존 Juice Shop 수치는 당시 실행 기록이며 이 작업 트리의 재실측이 아니다.
+> 갱신 기준: 2026-09-19, `fix/report-dev-integration`의 `fd24868` 기반 작업 트리.
+> 로컬 전체 테스트 676개 통과. 기존 Juice Shop 수치는 당시 실행 기록이며 별도 표기가 없는 한 이 작업 트리의 재실측이 아니다.
 > Validation LLM review는 `3270167`에서 복원됐다. 비확정 판정의 분류 Claim만 추가하며 결정적 proof와 Finding 판정은 유지한다.
 
 Phase 1~9의 공통 실행 기반과 **5종(XSS·SQLi·Path Traversal·Access Control·SSTI)
@@ -44,7 +44,8 @@ Validation·Report 모드와 LLM provider/model/RPM을 `RunExecutionProfile`로 
 통과**했다. P-1은 기본 `adaptive`와 비교용 `deterministic` Surface 수집을
 분리하고, 후자에서는 Planner 결과를 감사 기록으로는 남기되 crawl 집합·순서에는
 반영하지 않도록 구현했다. 제한된 Validation LLM Reviewer는 선택적으로 연결됐고,
-Report Narrator와 비용 기반 예산은 아직 구현되지 않았다.
+Report v2 facts와 제한된 LLM Narrator는 실행 옵션·Claim·JSONL 계측·재개까지 연결됐다.
+비용 기반 예산과 정식 Report off/on 평가는 아직 구현되지 않았다.
 
 Phase 9에서는 확정 Finding을 민감정보가 제거된 `KnowledgeCase`로 일반화하는 Factory와
 append-only InMemory·SQLite KnowledgeBase를 구현하고, Run 완료 후 자동 발행까지
@@ -151,7 +152,7 @@ Path Traversal Finding 6개는 독립 curl 기준과 대조해 확인했다. `/f
 | Analysis Agent | ✅ 5종 모두 휴리스틱·Gemini/Anthropic 공용 LLM 경로 구현 |
 | Validation Agent | ✅ 5종 독립 proof와 Finding 승격 구현 |
 | Report·Validation P-3 공용 계약 | ✅ `dev/dmswls`에 병합. reason code·proof facts·Evidence ID 병합 구현 |
-| Pipeline LLM | ⚠️ Recon Planner·Hybrid Router Advisor·5종 Analysis·Orchestrator 추가 Recon·예산 배분·비확정 Validation review에 선택적으로 연결. Report는 결정적 구현 |
+| Pipeline LLM | ✅ Recon Planner·Hybrid Router Advisor·5종 Analysis·Orchestrator 추가 Recon·예산 배분·비확정 Validation review·Report Narrator에 선택적으로 연결. proof·facts는 결정적 코드 유지 |
 | Juice Shop 단일 Run | ✅ XSS·SQLi·Path Traversal 동시 라우팅, SSTI는 인증 시 포함. Access Control은 전용 Run |
 | KnowledgeBase | ✅ 발행·재시도·의미 dedupe·구조화 검색·Analysis 재사용을 실제 `all` Run에서 확인. 비교 평가 전 |
 | 안전 통제 | ✅ Phase 8 baseline 구현 완료 |
@@ -625,7 +626,7 @@ Evidence는 "이번 대상에서 직접 관찰한 사실", Knowledge는 "민감�
 
 **상태: ⚠️ 제한된 Recon Planner·Hybrid Router Advisor·Orchestrator 추가 Recon·
 요청 횟수 기반 예산 배분·브라우저 XSS Runtime·P-1·P-2·P-3 구현.
-비확정 Validation LLM review는 선택적으로 연결됐고, Report LLM 보조와 토큰·비용 기반 예산·severity 확장은 미구현.**
+비확정 Validation LLM review와 Report LLM 보조는 선택적으로 연결됐고, 토큰·비용 기반 예산·severity 확장은 미구현.**
 
 아래 표의 "현재" 열까지만 구현 상태로 본다.
 
@@ -638,7 +639,7 @@ Evidence는 "이번 대상에서 직접 관찰한 사실", Knowledge는 "민감�
 | P-3 공용 계약 | Validation reason code·Finding proof facts·Validation/Report Evidence ID 병합 구현 및 main·dev 병합 | Report·Validation의 0단계 계약에서 소비 |
 | `ValidationAgent` | 5종 결정적 재현·proof 판정 + 비확정 결과의 선택적 LLM 분류 Claim | 분류 효과의 정식 비교, proof gate는 코드 유지 |
 | `BoundedRetryPolicy(max_attempts=1)` | 사실상 재시도 없음 | 백오프 + 실패 유형별 정책 |
-| `MarkdownReportAgent` | 결정적 Markdown만 | LLM 서술 보조 + JSON / HTML / PDF / Dashboard (Notion §13) |
+| `MarkdownReportAgent` | 결정적 v2 facts + 선택적 LLM 서술·fallback·Claim 계측 | JSON / HTML / PDF / Dashboard (Notion §13) |
 | `Finding.severity` | 항상 `"unrated"` | CVSS 등 산정 로직 |
 | `RouteDecision.priority` | 정렬 + Candidate 예산 가중치 배분에 사용 | 비용 기반 예산에서도 동일 우선순위 계약 유지 |
 | `AllowlistPolicyGate` | `safe` 프로필 하나 | 프로필별 정책 분리 |
@@ -652,9 +653,14 @@ Evidence는 "이번 대상에서 직접 관찰한 사실", Knowledge는 "민감�
 3. P-2 Run 실행 조건 영속화를 완료해 정식 off/on 비교의 선행 조건을 만족한다.
 4. 비확정 Validation Reviewer가 복원됐다. 실행 옵션·기록·민감정보 검사 계약을 확인한 뒤
    같은 조건의 기능/비용 비교를 진행한다. 최종 proof와 Finding 승격은 결정적 코드가 유지한다.
-5. Report facts 계약과 LLM 서술 보조를 별도로 설계·검증한다.
+5. Report facts 계약과 LLM 서술 보조를 구현하고 표준 실행기에 연결했다. 정식 off/on 평가는 남아 있다.
 6. P-1 Surface 비결정성 통제를 구현했다. 성능·탐지 기여 주장은 P-2로
    저장된 조건을 기준으로 정식 반복 비교한 후에만 한다.
+
+2026-09-19 npm Juice Shop SQLi 기능 E2E에서 heuristic Analysis와 `--report llm`을
+분리 실행했다. Finding 1개와 요청 5회를 유지하면서 `gemini-3.5-flash-lite` Narrator가
+1회 호출됐고 입력 673·출력 360 token, `completed`, invalid Claim 0건이 JSONL schema 3에
+기록됐다. 이는 배선·계측 확인이며 Report 품질이나 비용 효율의 반복 평가 결과는 아니다.
 
 #### P-1 Surface 비결정성 통제
 
@@ -881,11 +887,11 @@ Evidence 테이블에는 **UPDATE 문을 쓰지 않는다.** `EvidenceStore` Pro
 | ✅ | P-3 `src/hacklipse/domain/models.py`, `src/hacklipse/domain/__init__.py` — Validation reason code와 Finding proof facts (현 브랜치 병합) |
 | ✅ | P-3 `src/hacklipse/adapters/sqlite_store.py`, `src/hacklipse/application/orchestrator.py` — 기존 Finding 복원 호환과 Validation·Report Evidence ID 병합 |
 | ✅ | P-3 `tests/test_invariants.py`, `tests/test_sqlite_store.py`, `tests/test_p3_shared_contracts.py` — 계약 회귀 포함 현재 전체 598개 테스트 통과 |
-| ⏳ | Report facts 계약 — P-3 병합 후 확정 |
+| ✅ | `src/hacklipse/adapters/report_contract.py`, `reporting.py` — Report v2 facts·결정적 렌더링·Claim 저장 |
 | ⏳ | `src/hacklipse/adapters/cost_budget.py` — 토큰·비용 기반 예산 |
 | ✅ | Orchestrator 추가 Recon·예산 배분의 선택적 LLM Advisor |
 | ✅ | 비확정 Validation LLM 분류 Claim Adapter·계약과 실행 옵션·기록 배선 |
-| ⏳ | Report LLM 보조 Adapter/계약 |
+| ✅ | `src/hacklipse/adapters/llm_report_narrative.py` — 제한된 LLM 서술·검증·fallback·계측 |
 | ⏳ | `src/hacklipse/adapters/reporting_json.py` — JSON/HTML 보고서 |
 | ⏳ | `src/hacklipse/adapters/severity.py` — `Finding.severity` 산정 |
 | ✅ | `src/hacklipse/adapters/browser_runtime.py` — XSS proof 범위에서 Phase 8에 선행 구현 |
@@ -970,7 +976,8 @@ Phase 10 [x] 제한된 Recon LLM Planner와 fallback
          [x] 비확정 Validation LLM review·reason code·실행 옵션·기록 배선
          [x] Review Claim 계측 JSONL·internal_error fallback·저장 Claim 재사용 검증
          [ ] Validation review on/off 정식 반복 A/B 측정
-         [ ] Report facts 계약과 Report LLM 보조
+         [x] Report facts 계약과 Report LLM 보조·실행 옵션·Claim/JSONL 계측
+         [ ] Report narrator off/on 정식 반복 A/B 측정
          [ ] P-2 조건 필터를 적용한 Surface manifest 정식 반복 비교
          [ ] 비용 예산 / 보고서 포맷 / severity
          [x] XSS proof 범위의 브라우저 Runtime은 Phase 8에서 선행 구현

@@ -15,7 +15,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import run_dvwa_baseline as dvwa
 import run_juice_shop_baseline as juice
-from hacklipse.adapters import HeuristicSqliAnalyzer, LlmSqliAnalyzer, RuleBasedVulnerabilityRouter
+from hacklipse.adapters import (
+    HeuristicSqliAnalyzer, LlmReportNarrator, LlmSqliAnalyzer,
+    RuleBasedVulnerabilityRouter,
+)
 from hacklipse.adapters.routing_audit import AuditedVulnerabilityRouter
 from hacklipse.adapters.paired_routing import PairedVulnerabilityRouter
 from hacklipse.adapters.llm_recon_planner import LlmReconPlanner
@@ -74,6 +77,38 @@ class RoutingCliTests(unittest.TestCase):
                 self.assertIsInstance(app.dispatcher._agents["validation"], ReviewingValidationAgent)
                 request = start.call_args.args[0]
                 self.assertEqual(request.execution_profile.validation_mode, "llm")
+
+    def test_llm_report_is_registered_and_recorded_independently(self):
+        for runner in (dvwa, juice):
+            with self.subTest(runner=runner.__name__), tempfile.TemporaryDirectory() as directory:
+                built_apps = []
+
+                def assemble_app(*args, **kwargs):
+                    app = build_local_application(*args, **kwargs)
+                    built_apps.append(app)
+                    return app
+
+                with (
+                    patch.object(runner, "build_gemini_llm_client_from_env", return_value=_NoCallsLlm()),
+                    patch.object(runner, "build_local_application", side_effect=assemble_app),
+                    patch.object(Orchestrator, "start", side_effect=_StopBeforeExecution) as start,
+                    patch("builtins.input", return_value="y"),
+                    patch.object(runner.getpass, "getpass", return_value="fixture-password"),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    with self.assertRaises(_StopBeforeExecution):
+                        runner.main([
+                            "runner", "http://localhost:3000/", "--vuln", "sqli",
+                            "--report", "llm", "--llm-model", "fixture-model",
+                            "--routing-log", str(Path(directory) / "routing.jsonl"),
+                        ])
+                app = built_apps[0]
+                reporter = app.dispatcher._agents["report"]
+                self.assertEqual(reporter._format_version, "v2")
+                self.assertIsInstance(reporter._narrator, LlmReportNarrator)
+                request = start.call_args.args[0]
+                self.assertEqual(request.execution_profile.report_mode, "llm")
+                self.assertEqual(request.execution_profile.analysis_profile, "heuristic")
 
     def test_all_profile_router_combinations_keep_analysis_selection_independent(self):
         for runner in (dvwa, juice):
@@ -168,6 +203,7 @@ class RoutingCliTests(unittest.TestCase):
                 )
                 self.assertIn("--compare-routers", output.getvalue())
                 self.assertIn("--router-review", output.getvalue())
+                self.assertIn("--report {heuristic,llm}", output.getvalue())
 
 
 if __name__ == "__main__":

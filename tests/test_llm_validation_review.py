@@ -422,7 +422,7 @@ class DecoratorTests(unittest.TestCase):
             append_run_result(argparse.Namespace(routing_log=log_path), app, run)
             record = json.loads(log_path.read_text().splitlines()[0])
         summary = record["validation_review"]
-        self.assertEqual(record["schema_version"], 2)
+        self.assertEqual(record["schema_version"], 3)
         self.assertEqual(summary["eligible_candidate_count"], 1)
         self.assertEqual(summary["reviewed_candidate_count"], 1)
         self.assertEqual(summary["outcome_class_counts"], {"signal_not_observed": 1})

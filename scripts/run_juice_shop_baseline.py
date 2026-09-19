@@ -175,6 +175,7 @@ def _print_execution_preview(
     print(f"  Surface 수집    {getattr(args, 'surface_collection', 'adaptive')}")
     print(f"  Router          {args.router} · review {args.router_review}")
     print(f"  Orchestrator    {getattr(args, 'orchestrator', 'heuristic')}")
+    print(f"  Report          {getattr(args, 'report', 'heuristic')}")
     print(f"  예산 배분       {getattr(args, 'budget_allocation', 'off')}")
     print(f"  Router 비교     {'켬' if args.compare_routers else '끔'}")
     if needs_llm(args):
@@ -712,7 +713,7 @@ def main(argv: list[str]) -> int:
         "--llm-provider",
         choices=("gemini", "anthropic"),
         default="gemini",
-        help="LLM provider for Analysis, Recon, Router, Orchestrator or allocation (default: gemini)",
+        help="LLM provider for Analysis, Recon, Router, Orchestrator, allocation or Report (default: gemini)",
     )
     parser.add_argument("--llm-model", help="provider model id")
     parser.add_argument(
@@ -966,6 +967,9 @@ def main(argv: list[str]) -> int:
             if args.budget_allocation == "hybrid" and llm_client is not None
             else None
         ),
+        report_format_version="v2",
+        report_llm_client=llm_client if args.report == "llm" else None,
+        report_llm_model=selected_model if args.report == "llm" else "",
         # 전체 모드는 유형을 제한하지 않는다. Router가 Surface별로 관련 Candidate만 만든다.
         router=router,
         credential_resolver=resolver,
