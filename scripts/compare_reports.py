@@ -344,6 +344,7 @@ def _side_from_record(record):
     return {
         "run_id": record.get("run_id"),
         "report_facts_hash": record.get("report_facts_hash"),
+        "comparable_hash": record.get("report_facts_comparable_hash"),
         "finding_count": record.get("finding_count"),
         "candidate_status_counts": record.get("candidate_status_counts", {}),
         "requests_used": record.get("requests_used"),
@@ -393,8 +394,10 @@ def compare_logs(args):
     records = _run_results([args.baseline_log, args.narrative_log])
     off, on = latest_run(records, "heuristic"), latest_run(records, "llm")
     left, right = _side_from_record(off), _side_from_record(on)
-    hashes_known = bool(left["report_facts_hash"] and right["report_facts_hash"])
-    same_facts = hashes_known and left["report_facts_hash"] == right["report_facts_hash"]
+    # 서로 다른 Run이므로 run-scoped 해시는 절대 같아지지 않는다. 생성 ID를 뺀
+    # 해시로 비교해야 "같은 사실 위에서 돌았는가"를 물을 수 있다.
+    hashes_known = bool(left["comparable_hash"] and right["comparable_hash"])
+    same_facts = hashes_known and left["comparable_hash"] == right["comparable_hash"]
     return {
         "schema_version": 1, "event": "report_comparison", "source": "logs",
         "off_run_id": left["run_id"], "on_run_id": right["run_id"],
@@ -403,6 +406,9 @@ def compare_logs(args):
         "same_report_facts": same_facts if hashes_known else None,
         "report_facts_hash": {
             "off": left["report_facts_hash"], "on": right["report_facts_hash"],
+        },
+        "comparable_facts_hash": {
+            "off": left["comparable_hash"], "on": right["comparable_hash"],
         },
         "finding_counts": {"off": left["finding_count"], "on": right["finding_count"]},
         "candidate_status_counts": {
@@ -421,12 +427,12 @@ def compare_logs(args):
             "on": aggregate_rates(records, "llm"),
         },
         "comparison_warning": (
-            "Older records carry no report_facts_hash; fact preservation is unverified."
+            "Older records carry no report_facts_comparable_hash; fact preservation is unverified."
             if not hashes_known else
             "Report facts differ between the two runs; differences are not a narrator ablation."
             if not same_facts else
-            "Separate target runs. Matching facts hashes mean the same report input, "
-            "not that the narrator caused any remaining difference."
+            "Separate target runs. Matching comparable hashes mean the same facts apart "
+            "from per-run identifiers, not that the narrator caused any remaining difference."
         ),
     }
 

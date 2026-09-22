@@ -247,8 +247,54 @@ def serialize_report_facts(facts: RunReportFacts) -> str:
 
 
 def report_facts_hash(facts: RunReportFacts) -> str:
-    """Narrator 설정과 무관하게 사실 보존을 검사하는 SHA-256."""
+    """Narrator 설정과 무관하게 사실 보존을 검사하는 SHA-256.
+
+    한 Run 안에서 요약을 껐을 때와 켰을 때를 비교하는 값이다. run_id와 Finding ID가
+    들어 있어 서로 다른 Run 사이에서는 절대 같아지지 않는다 - 그 비교에는
+    comparable_report_facts_hash를 쓴다.
+    """
     return sha256(serialize_report_facts(facts).encode("utf-8")).hexdigest()
+
+
+def _comparable_payload(facts: RunReportFacts) -> dict[str, object]:
+    """Run마다 새로 생기는 식별자를 뺀 사실.
+
+    run_id와 finding_id/fact_id는 Run마다 새로 만들어진다. 그대로 두면 같은 대상을
+    같은 조건으로 두 번 검사해도 해시가 절대 같아지지 않아, 두 Run을 비교하는 축이
+    항상 "사실이 다르다"로 읽힌다. Router 비교가 생성 ID를 제외한 정규화 manifest를
+    쓰는 것과 같은 이유다.
+
+    Finding은 ID 없이도 순서가 정해져야 하므로 내용으로 정렬한다.
+    """
+
+    findings = [
+        {
+            "vulnerability_type": finding.vulnerability_type,
+            "surface_path_hint": finding.surface_path_hint,
+            "proof_type": finding.proof_type.value if finding.proof_type else None,
+            "proof_description": finding.proof_description,
+            "reproduction_count": finding.reproduction_count,
+        }
+        for finding in facts.findings
+    ]
+    return {
+        "contract_version": CONTRACT_VERSION,
+        "format_version": facts.format_version,
+        "candidate_counts": [(status.value, count) for status, count in facts.candidate_counts],
+        "findings": sorted(findings, key=_json),
+        "request_budget_total": facts.request_budget_total,
+        "request_budget_used": facts.request_budget_used,
+        "surface_count": facts.surface_count,
+        "parameter_count": facts.parameter_count,
+        "llm_calls": facts.llm_calls,
+        "llm_input_tokens": facts.llm_input_tokens,
+        "llm_output_tokens": facts.llm_output_tokens,
+    }
+
+
+def comparable_report_facts_hash(facts: RunReportFacts) -> str:
+    """생성 ID를 뺀 사실 해시. 서로 다른 두 Run의 사실이 같은지 비교한다."""
+    return sha256(_json(_comparable_payload(facts)).encode("utf-8")).hexdigest()
 
 
 def report_input_fingerprint(

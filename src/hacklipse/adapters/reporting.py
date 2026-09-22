@@ -22,7 +22,8 @@ from hacklipse.ports.errors import LlmCredentialsMissing, RecordNotFound
 from .llm_report_narrative import ReportNarrative, ReportNarrator, deterministic_fallback
 from .report_contract import (
     CONTRACT_VERSION, FindingReportFact, NarratorFingerprintConfig, RunReportFacts,
-    finding_fact_id, report_facts_hash, report_input_fingerprint, surface_path_hint,
+    comparable_report_facts_hash, finding_fact_id, report_facts_hash,
+    report_input_fingerprint, surface_path_hint,
 )
 
 
@@ -121,7 +122,10 @@ def render_report_v2(
         f"Run: {_code(facts.run_id)}", "",
         "- 보고서 버전: `v2`",
         f"- Facts 계약: `{CONTRACT_VERSION}`",
-        f"- Facts SHA-256: `{report_facts_hash(facts)}`", "",
+        f"- Facts SHA-256: `{report_facts_hash(facts)}`",
+        # 두 Run을 비교할 때 쓰는 값. 위 해시에는 Run마다 새로 생기는 ID가 들어 있어
+        # 같은 대상을 같은 조건으로 두 번 검사해도 절대 같아지지 않는다.
+        f"- Facts SHA-256 (생성 ID 제외): `{comparable_report_facts_hash(facts)}`", "",
         *_execution_lines(execution),
         "## 검사 범위 및 요청 예산", "",
         f"- 발견 Surface: {number(facts.surface_count)}",

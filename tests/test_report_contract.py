@@ -7,7 +7,8 @@ import unittest
 from hacklipse.adapters.report_contract import (
     CONTRACT_VERSION, MAX_PATH_HINT_LENGTH, PROOF_DESCRIPTIONS,
     FindingReportFact, NarratorFingerprintConfig, RunReportFacts,
-    finding_fact_id, report_facts_hash, report_input_fingerprint,
+    comparable_report_facts_hash, finding_fact_id, report_facts_hash,
+    report_input_fingerprint,
     serialize_report_facts, surface_path_hint,
 )
 from hacklipse.domain import CandidateStatus, ValidationProofType
@@ -150,6 +151,57 @@ class ReportContractTests(unittest.TestCase):
         for update in ({"llm_calls": -1}, {"llm_input_tokens": True}):
             with self.assertRaises(ValueError):
                 replace(facts, **update)
+
+    def test_comparable_hash_ignores_per_run_identifiers(self):
+        """실제 Run 둘은 run_id도 Finding ID도 다르다. 그래도 사실은 같을 수 있다."""
+
+        facts = example_facts()
+        renamed = replace(
+            facts, run_id="run-2",
+            findings=(replace(
+                facts.findings[0], finding_id="finding-9", fact_id=finding_fact_id("finding-9"),
+            ),),
+        )
+        self.assertNotEqual(report_facts_hash(facts), report_facts_hash(renamed))
+        self.assertEqual(
+            comparable_report_facts_hash(facts), comparable_report_facts_hash(renamed),
+        )
+
+    def test_comparable_hash_still_moves_with_every_real_fact(self):
+        facts = example_facts()
+        changes = [
+            replace(facts, request_budget_total=21), replace(facts, request_budget_used=4),
+            replace(facts, surface_count=2), replace(facts, parameter_count=2),
+            replace(facts, llm_calls=5), replace(facts, llm_input_tokens=1201),
+            replace(facts, llm_output_tokens=181),
+            replace(facts, llm_calls=None, llm_input_tokens=None, llm_output_tokens=None),
+            replace(facts, candidate_counts=tuple(
+                (s, c + int(s is CandidateStatus.FAILED)) for s, c in facts.candidate_counts
+            )),
+        ]
+        for update in (
+            {"vulnerability_type": "SQLi"}, {"surface_path_hint": "/search"},
+            {"proof_type": ValidationProofType.SQLI_EFFECT}, {"reproduction_count": 3},
+            {"proof_type": None, "reproduction_count": 0},
+        ):
+            changes.append(replace(facts, findings=(replace(facts.findings[0], **update),)))
+        for changed in changes:
+            with self.subTest(changed=changed):
+                self.assertNotEqual(
+                    comparable_report_facts_hash(facts), comparable_report_facts_hash(changed),
+                )
+
+    def test_comparable_hash_does_not_depend_on_finding_order(self):
+        facts = example_facts()
+        other = replace(
+            facts.findings[0], finding_id="finding-2", fact_id=finding_fact_id("finding-2"),
+            vulnerability_type="SQLi", proof_type=ValidationProofType.SQLI_EFFECT,
+        )
+        forward = replace(facts, findings=(*facts.findings, other))
+        reverse = replace(facts, findings=(other, *facts.findings))
+        self.assertEqual(
+            comparable_report_facts_hash(forward), comparable_report_facts_hash(reverse),
+        )
 
     def test_llm_usage_has_its_own_offered_fact(self):
         self.assertIn("run:llm-usage", example_facts().fact_ids)

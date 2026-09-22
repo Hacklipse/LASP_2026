@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import re
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Collection, Mapping
 
@@ -18,6 +19,24 @@ from hacklipse.ports import LlmClient, VulnerabilityRouter
 # render_report_v2가 v2 사실 블록에 적는 줄. 64자리 hex라 형식이 바뀌면 조용히
 # 틀린 값을 집어오지 않고 아예 찾지 못한다.
 _FACTS_HASH_LINE = re.compile(r"^- Facts SHA-256: `([0-9a-f]{64})`$", re.MULTILINE)
+_COMPARABLE_HASH_LINE = re.compile(
+    r"^- Facts SHA-256 \(생성 ID 제외\): `([0-9a-f]{64})`$", re.MULTILINE
+)
+
+
+@dataclass(frozen=True, slots=True)
+class NoLlmUsage:
+    """LLM을 아예 구성하지 않은 Run의 사용량.
+
+    모르는 것이 아니라 0이다. 실행기는 client를 만들었는지 아닌지를 알고 있으므로,
+    만들지 않았다면 그 Run의 LLM 호출은 0회가 확실하다. 이것을 "정보 없음"으로
+    두면 요약을 껐을 때와 켰을 때의 사실이 사용량 때문에 달라져, 두 Run을 비교하는
+    축이 성립하지 않는다.
+    """
+
+    calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 def add_routing_arguments(parser: argparse.ArgumentParser) -> None:
@@ -149,7 +168,9 @@ def append_run_result(args, app, run) -> None:
     }
     JsonlRoutingAuditLog(args.routing_log).append({
         "schema_version": 4, "event": "run_result", "run_id": run.run_id,
-        "report_facts_hash": _report_facts_hash(app, run),
+        "report_facts_hash": _report_facts_hash(app, run, _FACTS_HASH_LINE),
+        # 서로 다른 Run의 사실을 비교하는 축. 생성 ID가 빠져 있다.
+        "report_facts_comparable_hash": _report_facts_hash(app, run, _COMPARABLE_HASH_LINE),
         "execution_profile_recorded": profile.recorded,
         "router_mode": profile.router_mode,
         "router_review": profile.router_review,
@@ -185,7 +206,7 @@ def append_run_result(args, app, run) -> None:
     })
 
 
-def _report_facts_hash(app, run) -> str | None:
+def _report_facts_hash(app, run, pattern=None) -> str | None:
     """보고서가 실제로 쓴 사실 해시. 다시 계산하지 않고 산출물에서 읽는다.
 
     여기에서 다시 모으면 안 된다. 사실에는 Run의 LLM 사용량이 들어 있고, 그 값은
@@ -202,7 +223,7 @@ def _report_facts_hash(app, run) -> str | None:
     except Exception:  # noqa: BLE001 - 계측 실패가 실행 기록 전체를 막으면 안 된다
         return None
     for report in reversed(reports):
-        found = _FACTS_HASH_LINE.search(getattr(report, "content", "") or "")
+        found = (pattern or _FACTS_HASH_LINE).search(getattr(report, "content", "") or "")
         if found is not None:
             return found.group(1)
     return None

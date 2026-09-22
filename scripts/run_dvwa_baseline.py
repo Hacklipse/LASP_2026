@@ -62,6 +62,7 @@ from hacklipse.ports.errors import LlmCredentialsMissing  # noqa: E402
 from progress_view import RunProgressView  # noqa: E402
 from routing_options import (  # noqa: E402
     add_routing_arguments,
+    NoLlmUsage,
     append_run_result,
     build_run_router,
     write_report_artifact,
@@ -649,8 +650,9 @@ def main(argv: list[str]) -> int:
         report_llm_client=llm_client,
         report_llm_model=selected_model,
         # 살아 있는 계측기를 넘긴다. 조립 시점에는 아직 0이고, Report가 만들어질 때
-        # 그 Run이 실제로 쓴 누적값을 읽는다.
-        report_llm_usage=llm_meter,
+        # 그 Run이 실제로 쓴 누적값을 읽는다. client를 만들지 않았다면 사용량을 모르는
+        # 것이 아니라 0회다 - 모른다고 적으면 요약 on/off의 사실이 서로 달라진다.
+        report_llm_usage=llm_meter if llm_meter is not None else NoLlmUsage(),
         router=router,
         credential_resolver=resolver,
         approval_gate=StaticApprovalGate((_APPROVAL_REF,)),

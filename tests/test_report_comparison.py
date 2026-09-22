@@ -37,12 +37,21 @@ def replay_args(failure="none", output="artifacts/unused.jsonl"):
     return argparse.Namespace(fixture=str(FIXTURE), failure=failure, output=output)
 
 
-def run_result(run_id, mode, *, facts_hash, findings=2, narrative=None, requests_used=100):
-    """실행기가 남기는 run_result 레코드의 비교 관련 필드만 재현한다."""
+_UNSET = object()
+
+
+def run_result(run_id, mode, *, facts_hash, comparable=_UNSET, findings=2, narrative=None,
+               requests_used=100):
+    """실행기가 남기는 run_result 레코드의 비교 관련 필드만 재현한다.
+
+    facts_hash는 run_id와 Finding ID가 들어간 Run 전용 값이고, comparable은 그 ID를
+    뺀 값이다. 실제 Run 둘은 facts_hash가 절대 같지 않으므로 기본값을 따로 둔다.
+    """
 
     return {
         "schema_version": 4, "event": "run_result", "run_id": run_id,
         "report_mode": mode, "report_facts_hash": facts_hash,
+        "report_facts_comparable_hash": facts_hash if comparable is _UNSET else comparable,
         "finding_count": findings, "requests_used": requests_used,
         "candidate_status_counts": {"confirmed": findings, "skipped_budget": 3},
         "report_narrative": narrative if narrative is not None else {
@@ -215,20 +224,33 @@ class LogsTests(unittest.TestCase):
                 output=str(Path(directory) / "out.jsonl"),
             ))
 
-    def test_matching_hashes_are_reported_as_the_same_report_input(self):
+    def test_separate_runs_match_on_the_id_free_hash(self):
+        """실제 Run 둘은 run-scoped 해시가 절대 같지 않다.
+
+        run_id와 Finding ID가 Run마다 새로 생기기 때문이다. 그 값으로 비교하면 같은
+        대상을 같은 조건으로 두 번 검사해도 언제나 "사실이 다르다"로 읽힌다.
+        """
+
         comparison = self.logs([
-            run_result("run-off", "heuristic", facts_hash="a" * 64),
-            run_result("run-on", "llm", facts_hash="a" * 64),
+            run_result("run-off", "heuristic", facts_hash="a" * 64, comparable="c" * 64),
+            run_result("run-on", "llm", facts_hash="b" * 64, comparable="c" * 64),
         ])
         self.assertTrue(comparison["report_facts_hash_available"])
         self.assertTrue(comparison["same_report_facts"])
+        self.assertNotEqual(
+            comparison["report_facts_hash"]["off"], comparison["report_facts_hash"]["on"],
+        )
+        self.assertEqual(
+            comparison["comparable_facts_hash"]["off"],
+            comparison["comparable_facts_hash"]["on"],
+        )
         self.assertFalse(comparison["paired_run"])
         self.assertIn("not that the narrator caused", comparison["comparison_warning"])
 
     def test_differing_hashes_are_not_an_ablation(self):
         comparison = self.logs([
-            run_result("run-off", "heuristic", facts_hash="a" * 64),
-            run_result("run-on", "llm", facts_hash="b" * 64),
+            run_result("run-off", "heuristic", facts_hash="a" * 64, comparable="c" * 64),
+            run_result("run-on", "llm", facts_hash="b" * 64, comparable="d" * 64),
         ])
         self.assertFalse(comparison["same_report_facts"])
         self.assertIn("not a narrator ablation", comparison["comparison_warning"])
@@ -236,8 +258,8 @@ class LogsTests(unittest.TestCase):
     def test_records_without_a_hash_are_unverified_not_equal(self):
         # 구버전 로그를 "사실이 같다"로 읽으면 없는 근거를 만들어 내는 것이다.
         comparison = self.logs([
-            run_result("run-off", "heuristic", facts_hash=None),
-            run_result("run-on", "llm", facts_hash=None),
+            run_result("run-off", "heuristic", facts_hash="a" * 64, comparable=None),
+            run_result("run-on", "llm", facts_hash="b" * 64, comparable=None),
         ])
         self.assertFalse(comparison["report_facts_hash_available"])
         self.assertIsNone(comparison["same_report_facts"])
@@ -275,8 +297,8 @@ class LogsTests(unittest.TestCase):
     def test_a_rewritten_run_is_counted_once_at_its_latest_state(self):
         comparison = self.logs([
             run_result("run-off", "heuristic", facts_hash="a" * 64),
-            run_result("run-on", "llm", facts_hash="b" * 64, findings=1),
-            run_result("run-on", "llm", facts_hash="a" * 64, findings=9),
+            run_result("run-on", "llm", facts_hash="b" * 64, comparable="d" * 64, findings=1),
+            run_result("run-on", "llm", facts_hash="c" * 64, comparable="a" * 64, findings=9),
         ])
         self.assertEqual(comparison["rates"]["on"]["run_count"], 1)
         self.assertEqual(comparison["finding_counts"]["on"], 9)
