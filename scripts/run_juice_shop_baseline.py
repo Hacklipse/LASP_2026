@@ -968,8 +968,9 @@ def main(argv: list[str]) -> int:
             else None
         ),
         report_format_version="v2",
-        report_llm_client=llm_client if args.report == "llm" else None,
-        report_llm_model=selected_model if args.report == "llm" else "",
+        report_mode=args.report,
+        report_llm_client=llm_client,
+        report_llm_model=selected_model,
         # 전체 모드는 유형을 제한하지 않는다. Router가 Surface별로 관련 Candidate만 만든다.
         router=router,
         credential_resolver=resolver,

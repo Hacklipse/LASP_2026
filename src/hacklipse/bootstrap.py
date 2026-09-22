@@ -182,6 +182,7 @@ def build_local_application(
     orchestration_advisor: OrchestrationAdvisor | None = None,
     budget_allocation_advisor: BudgetAllocationAdvisor | None = None,
     report_format_version: Literal["v1", "v2"] = "v1",
+    report_mode: Literal["heuristic", "llm"] = "heuristic",
     report_llm_client: LlmClient | None = None,
     report_llm_model: str = "",
 ) -> LocalApplication:
@@ -224,21 +225,12 @@ def build_local_application(
 
     if selected_config.report_agent_type not in agents:
         # 별도 Report Agent가 없으면 판정을 바꾸지 않는 기본 Markdown 구현을 사용한다.
-        narrator_config = None
-        narrator = None
-        if report_llm_client is not None:
-            if report_format_version != "v2" or not report_llm_model:
-                raise ValueError("LLM report requires v2 format and a model identifier")
-            narrator_config = NarratorFingerprintConfig(
-                model=report_llm_model,
-                prompt_version="llm-report-narrative-v1",
-            )
-            narrator = LlmReportNarrator(
-                llm_client=report_llm_client,
-                config=narrator_config,
-            )
-        elif report_llm_model:
-            raise ValueError("report model requires an LLM client")
+        narrator, narrator_config = _build_report_narrator(
+            mode=report_mode,
+            llm_client=report_llm_client,
+            model=report_llm_model,
+            format_version=report_format_version,
+        )
         dispatcher.register(
             selected_config.report_agent_type,
             MarkdownReportAgent(
@@ -426,6 +418,48 @@ def standard_router(
             ),
         )
     return router
+
+
+def _build_report_narrator(
+    *,
+    mode: str,
+    llm_client: LlmClient | None,
+    model: str,
+    format_version: str,
+) -> tuple[LlmReportNarrator | None, NarratorFingerprintConfig | None]:
+    """Narrator를 요청받았을 때만 만들고, 만들 수 없으면 조용히 넘어가지 않는다.
+
+    Router advisor·hybrid recon·validation review와 같은 규칙이다. Report Agent는
+    어떤 LLM 실패도 결정적 v2 보고서로 흡수하므로(REPORT -> DONE 전이에서 예외가 새면
+    Run 전체가 FAILED가 된다), 여기에서 막지 않으면 키가 없다는 사실이 어디에서도
+    드러나지 않는다. "LLM 요약을 켰다"고 생각한 사람이 결정적 보고서를 받고도 눈치채지
+    못하는 편이, 배선 시점에 실패하는 것보다 나쁘다.
+
+    narrator와 config를 함께 돌려준다. config는 Claim의 input_fingerprint에 들어가므로
+    Narrator와 같은 값이어야 하고, 둘 중 하나만 있으면 MarkdownReportAgent가 거부한다.
+    """
+
+    if mode not in ("heuristic", "llm"):
+        raise ValueError("report mode must be heuristic or llm")
+    if mode == "heuristic":
+        # 요청하지 않았으면 client가 있어도 쓰지 않는다. Router advisor와 같다.
+        return None, None
+    if llm_client is None:
+        raise LlmCredentialsMissing(
+            "report narrative was requested without an LlmClient; "
+            "pass one or drop the report narrative option"
+        )
+    if format_version != "v2":
+        # v1에는 사실 블록이 없어서 요약이 무엇을 근거로 했는지 보일 수 없다.
+        raise ValueError("report narrative requires format v2")
+    if not model:
+        # 모델 이름은 fingerprint와 비용 계측의 입력이라 빈 값으로 둘 수 없다.
+        raise ValueError("report narrative requires a model identifier")
+    config = NarratorFingerprintConfig(
+        model=model,
+        prompt_version="llm-report-narrative-v1",
+    )
+    return LlmReportNarrator(llm_client=llm_client, config=config), config
 
 
 def _build_router_advisor(
