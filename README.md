@@ -41,6 +41,14 @@ recorded without generated prose in the run-result JSONL, alongside the
 `report_facts_hash` the report itself printed, which identifies the facts both
 modes rendered.
 
+The v2 report opens with the run's non-sensitive execution conditions -- analysis
+profile, recon, router, orchestrator, validation and report modes, and the LLM
+provider and model -- read from the `RunExecutionProfile` persisted with the run.
+A run restored from a database written before those conditions were recorded says
+so instead of printing the defaults. These conditions are rendered only; they are
+never added to the narrator's facts, because the allowed narrator inputs are a
+closed list that does not include them.
+
 The v2 facts also carry the run's LLM call count and token totals as measured up
 to the moment the report is built. The narrative's own call is deliberately not
 counted: the facts are collected before the narrator runs, which is what keeps

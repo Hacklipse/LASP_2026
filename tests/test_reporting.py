@@ -98,7 +98,10 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(first.content.encode(), second.content.encode())
         facts = reporter.collect_facts(self.task)
         references = (FindingReportReferences("finding-1", "surface-1", "validation-1", ("evi-1",)),)
-        self.assertEqual(first.content.encode(), render_report_v2(facts, references=references).encode())
+        execution = self.stores.runs.get("run-1").execution_profile
+        self.assertEqual(first.content.encode(), render_report_v2(
+            facts, references=references, execution=execution,
+        ).encode())
 
     def test_legacy_finding_has_no_invented_reproduction(self):
         self.stores.findings.add(replace(self.finding, finding_id="legacy", proof_type=None, reproduction_count=0))
@@ -129,6 +132,77 @@ class ReportingTests(unittest.TestCase):
             reporter = self.reporter(budget_manager=manager)
             self.assertIsNone(reporter.collect_facts(self.task).request_budget_used)
             self.assertIn("사용 요청 예산: 정보 없음", reporter.handle(self.task).reports[0].content)
+
+    def execution(self, **changes):
+        """Run에 영속된 실행 조건을 바꾼 뒤 보고서를 다시 만든다."""
+
+        run = self.stores.runs.get("run-1")
+        self.stores.runs.save(run.with_updates(
+            execution_profile=replace(run.execution_profile, **changes),
+        ))
+        return self.reporter().handle(self.task).reports[0].content
+
+    def test_recorded_execution_conditions_are_shown(self):
+        # 보고서만 보고 이 실행이 어떤 모드·모델로 돌았는지 알 수 있어야 한다.
+        content = self.execution(
+            analysis_profile="llm", recon_mode="hybrid", router_mode="hybrid",
+            router_review="ambiguous", orchestrator_mode="hybrid",
+            budget_allocation_mode="heuristic", validation_mode="llm", report_mode="llm",
+            llm_provider="gemini", llm_model="gemini-3.5-flash-lite", llm_rpm_limit=14,
+        )
+        self.assertIn("## 실행 조건", content)
+        for line in (
+            "- Analysis: `llm`", "- Recon: `hybrid` · Surface 수집 `adaptive`",
+            "- Router: `hybrid` · review `ambiguous`",
+            "- Orchestrator: `hybrid` · 예산 배분 `heuristic`",
+            "- Validation: `llm`", "- Report: `llm`",
+            "- LLM: `gemini` / `gemini-3.5-flash-lite`",
+            "- LLM 분당 호출 제한: 14",
+        ):
+            self.assertIn(line, content)
+        # §2.2 순서 - 식별자와 구성이 검사 범위보다 먼저다.
+        self.assertLess(content.index("## 실행 조건"), content.index("## 검사 범위"))
+
+    def test_a_run_without_llm_says_so_instead_of_naming_a_model(self):
+        content = self.execution(llm_provider="", llm_model="")
+        self.assertIn("- LLM: 사용 안 함", content)
+        self.assertNotIn("LLM 분당 호출 제한", content)
+
+    def test_unrecorded_conditions_are_withheld_not_guessed(self):
+        # 구버전 DB의 기본값을 적으면 측정하지 않은 조건을 사실로 말하게 된다.
+        content = self.execution(
+            recorded=False, analysis_profile="llm",
+            llm_provider="gemini", llm_model="x-1",
+        )
+        self.assertIn("## 실행 조건", content)
+        self.assertIn("실제\n실행 조건으로 해석할 수 없어 표시하지 않습니다", content)
+        self.assertNotIn("- Analysis:", content)
+        self.assertNotIn("x-1", content)
+
+    def test_execution_conditions_never_enter_the_narrator_facts(self):
+        # §3.2의 허용 입력 목록은 닫혀 있고 실행 프로파일은 거기에 없다.
+        self.execution(
+            report_mode="llm", llm_provider="gemini", llm_model="secret-model-name",
+        )
+        serialized = serialize_report_facts(self.reporter().collect_facts(self.task))
+        self.assertNotIn("secret-model-name", serialized)
+        self.assertNotIn("analysis_profile", serialized)
+
+    def test_an_unreadable_run_drops_the_section_instead_of_guessing(self):
+        class Exploding:
+            def get(self, run_id):
+                raise RuntimeError("run store blew up")
+
+            def list_by_run(self, run_id):
+                return ()
+
+        reporter = self.reporter()
+        facts = reporter.collect_facts(self.task)
+        reporter._runs = Exploding()
+        with self.assertLogs("hacklipse.adapters.reporting", level="WARNING") as logs:
+            content = render_report_v2(facts, execution=reporter._execution_profile(self.task))
+        self.assertNotIn("## 실행 조건", content)
+        self.assertNotIn("run store blew up", "\n".join(logs.output))
 
     def test_llm_usage_is_read_when_the_report_is_made_not_when_wired(self):
         # 조립 시점의 계측기는 0이다. 그때 읽으면 모든 보고서가 "LLM 0회"가 된다.

@@ -107,6 +107,27 @@ class ReportAgentTest(unittest.TestCase):
     def test_narrator_none_is_byte_for_byte_identical(self):
         self.assertEqual(self.report(), self.report(narrator=None))
 
+    def test_the_execution_section_is_identical_with_and_without_the_narrator(self):
+        """실행 조건 절도 결정적 블록의 일부다. narrator 유무로 달라지면 안 된다.
+
+        profile.report_mode가 배선과 어긋나도 여기에서 바로잡지 않는 이유다. 바로잡으면
+        narrator를 붙였을 때만 절의 내용이 달라져 off/on 비교가 성립하지 않는다.
+        """
+
+        narrator = LlmReportNarrator(
+            llm_client=FakeLlm(payload(self.reporter().collect_facts(self.task))),
+            config=CONFIG,
+        )
+        off = self.report()
+        on = self.report(narrator=narrator)
+        head = "## 실행 조건"
+        self.assertIn(head, off)
+        self.assertEqual(
+            off[off.index(head):off.index("## 검사 범위")],
+            on[on.index(head):on.index("## 검사 범위")],
+        )
+        self.assertTrue(on.startswith(off.rstrip() + "\n"))
+
     def test_the_narrators_own_call_is_not_counted_in_the_facts(self):
         """사실은 narrate 이전에 모인다. 이래야 요약 on/off의 facts가 같다.
 

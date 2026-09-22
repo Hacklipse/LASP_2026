@@ -7,14 +7,18 @@ Evidence나 Validation proof로 섞지 않는 경계도 함께 고정한다.
 from __future__ import annotations
 
 import io
+import json
 import sys
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from hacklipse.adapters import InMemoryKnowledgeBase, RuleBasedVulnerabilityRouter
+from hacklipse.adapters import (
+    InMemoryKnowledgeBase, KnowledgeCaseFactory, RuleBasedVulnerabilityRouter,
+)
 from hacklipse.bootstrap import build_local_application
+from hacklipse.ports.llm import LlmResponse
 from hacklipse.domain import (
     AgentResult,
     ProgressEvent,
@@ -215,12 +219,38 @@ class _SearchFailingKnowledgeBase:
         raise RuntimeError("knowledge search is unavailable")
 
 
-def _application(knowledge_base=None):
+class _NarratingLlm:
+    """제공된 facts만 인용하는 최소 응답. 실제 provider에는 나가지 않는다."""
+
+    def complete(self, request):
+        # prompt 두 번째 줄이 구조화 facts JSON이다(build_narrative_prompt).
+        facts = json.loads(request.messages[0].content.splitlines()[1])
+        return LlmResponse(
+            payload={
+                "run_summary": {
+                    "fact_ids": ["run:scope"],
+                    "text": "확정된 항목과 확인하지 못한 범위를 요약한 문장입니다.",
+                },
+                "findings": [
+                    {
+                        "finding_id": item["finding_id"],
+                        "fact_ids": [item["fact_id"]],
+                        "summary": "고정 probe 비교에서 확인된 신호를 요약한 문장입니다.",
+                    }
+                    for item in facts["findings"]
+                ],
+            },
+            model="fake-narrator-model",
+        )
+
+
+def _application(knowledge_base=None, **changes):
     app = build_local_application(
         {},
         runtime=_LocalRuntime(),
         router=RuleBasedVulnerabilityRouter(surface_rules=()),
         knowledge_base=knowledge_base,
+        **changes,
     )
     app.dispatcher.register(
         "recon",
@@ -262,6 +292,84 @@ class KnowledgePublicationTests(unittest.TestCase):
         self.assertIn(f"run:{run.run_id}", case.provenance_refs)
         self.assertIn(f"finding:{findings[0].finding_id}", case.provenance_refs)
         self.assertEqual(case.metadata["proof_type"], "xss_execution")
+
+    def _narrating_application(self, knowledge):
+        return _application(
+            knowledge,
+            report_format_version="v2", report_mode="llm",
+            report_llm_client=_NarratingLlm(), report_llm_model="fake-narrator-model",
+        )
+
+    def test_narrative_claim_never_reaches_the_knowledge_plane(self) -> None:
+        """§6 - narrative claim은 Finding·proof뿐 아니라 Knowledge 입력에도 없어야 한다.
+
+        Evidence Store에는 남지만 어느 Candidate의 evidence_ids에도 들어가지 않는다.
+        Orchestrator가 Knowledge에 넘기는 것은 candidate.evidence_ids뿐이다.
+        """
+
+        knowledge = InMemoryKnowledgeBase()
+        app = self._narrating_application(knowledge)
+
+        run = app.orchestrator.start(_request())
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        claims = [
+            item for item in app.stores.evidence.list_by_run(run.run_id)
+            if item.created_by == "llm_report_narrator"
+        ]
+        self.assertEqual(len(claims), 1)
+        claim = claims[0]
+        # fallback으로 조용히 바뀌면 배제를 검사할 LLM 문장 자체가 없어진다.
+        self.assertEqual(claim.observation["selection_source"], "llm")
+        self.assertEqual(claim.observation["status"], "completed")
+        self.assertTrue(claim.observation["accepted_fact_ids"])
+        # Run에는 붙지만 Candidate에는 붙지 않는다. 이 차이가 배제의 근거다.
+        self.assertIn(claim.evidence_id, run.evidence_ids)
+        for candidate in app.stores.candidates.list_by_run(run.run_id):
+            self.assertNotIn(claim.evidence_id, candidate.evidence_ids)
+        for finding in app.stores.findings.list_by_run(run.run_id):
+            self.assertNotIn(claim.evidence_id, finding.evidence_ids)
+
+        case = knowledge.search(KnowledgeQuery(category="XSS", text=""))[0]
+        blob = " ".join((
+            case.case_id, case.summary, *case.metadata.values(), *case.provenance_refs,
+        ))
+        for leaked in ("llm_report_narrator", "llm_report_narrative", claim.evidence_id,
+                       "fake-narrator-model", "요약"):
+            self.assertNotIn(leaked, blob)
+
+    def test_the_published_case_is_the_same_with_and_without_the_narrator(self) -> None:
+        # 가장 강한 형태의 배제 증거다. 요약이 Knowledge에 조금이라도 닿으면 달라진다.
+        plain, narrated = InMemoryKnowledgeBase(), InMemoryKnowledgeBase()
+        _application(plain).orchestrator.start(_request())
+        self._narrating_application(narrated).orchestrator.start(_request())
+
+        left = plain.search(KnowledgeQuery(category="XSS", text=""))[0]
+        right = narrated.search(KnowledgeQuery(category="XSS", text=""))[0]
+        self.assertEqual(left.case_id, right.case_id)
+        self.assertEqual(left.summary, right.summary)
+        self.assertEqual(left.metadata, right.metadata)
+
+    def test_a_narrative_claim_handed_to_the_factory_contributes_nothing(self) -> None:
+        """Orchestrator가 실수로 넘기더라도 Factory가 다시 막는다."""
+
+        knowledge = InMemoryKnowledgeBase()
+        app = self._narrating_application(knowledge)
+        run = app.orchestrator.start(_request())
+        finding = app.stores.findings.list_by_run(run.run_id)[0]
+        candidate = app.stores.candidates.get(run.run_id, finding.candidate_id)
+        surface = app.stores.surfaces.get(run.run_id, finding.surface_id)
+        evidence = app.stores.evidence.get_many(run.run_id, candidate.evidence_ids)
+        claim = next(
+            item for item in app.stores.evidence.list_by_run(run.run_id)
+            if item.created_by == "llm_report_narrator"
+        )
+
+        factory = KnowledgeCaseFactory()
+        expected = factory.from_finding(finding, candidate, surface, evidence)
+        forced = factory.from_finding(finding, candidate, surface, (claim, *evidence))
+        self.assertEqual(forced.case_id, expected.case_id)
+        self.assertEqual(forced.metadata, expected.metadata)
 
     def test_case_carries_no_target_specific_values(self) -> None:
         """Knowledge Plane 은 재사용 지식만 담는다. 대상 고유 정보는 남지 않는다."""

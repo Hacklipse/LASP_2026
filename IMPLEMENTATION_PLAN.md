@@ -982,6 +982,7 @@ Phase 10 [x] 제한된 Recon LLM Planner와 fallback
          [x] Report facts 계약과 Report LLM 보조·실행 옵션·Claim/JSONL 계측
          [x] Report narrator off/on 비교 도구와 고정 fixture·비율 집계
          [x] Report v2 사실에 Run LLM 사용량 반영(`report-facts-v2`)
+         [x] Report v2에 Run 비민감 실행 조건 표시와 narrative claim의 Knowledge 배제 검증
          [ ] Report narrator off/on 정식 반복 A/B 측정 실행과 사람 blind 평가
          [ ] P-2 조건 필터를 적용한 Surface manifest 정식 반복 비교
          [ ] 비용 예산 / 보고서 포맷 / severity

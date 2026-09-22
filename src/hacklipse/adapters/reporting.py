@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from hacklipse.domain import (
     AgentResult, AgentResultStatus, CandidateStatus, Evidence, Finding, ReportArtifact,
-    TaskEnvelope,
+    RunExecutionProfile, TaskEnvelope,
 )
 from hacklipse.ports import (
     BudgetManager, CandidateStore, EvidenceStore, FindingStore, RunStore, SurfaceStore,
@@ -59,8 +59,50 @@ def _code(value: str) -> str:
     return f"`{text}`"
 
 
+def _execution_lines(execution: RunExecutionProfile | None) -> list[str]:
+    """Run과 함께 영속된 비민감 실행 조건. Narrator facts에는 넣지 않는다.
+
+    §3.2의 허용 입력 목록은 닫혀 있고 실행 프로파일은 거기에 없다. facts에 넣으면
+    prompt로 흘러가므로 FindingReportReferences와 같은 자리에 둔다. 보고서에만
+    보이면 되고, 요약이 인용할 사실은 아니다.
+    """
+
+    if execution is None:
+        return []
+    lines = ["## 실행 조건", ""]
+    if not execution.recorded:
+        # 구버전 DB에서 복원한 Run이다. 기본값이 들어 있을 뿐 측정된 조건이 아니므로
+        # 값을 적으면 없는 사실을 말하게 된다.
+        lines.extend([
+            "이 Run은 실행 조건을 기록하기 전 버전에서 저장됐습니다. 아래 값을 실제",
+            "실행 조건으로 해석할 수 없어 표시하지 않습니다.", "",
+        ])
+        return lines
+    # provider와 model은 도메인에서 함께 저장되도록 강제된다(models.py). 한쪽만 있는
+    # 상태는 만들어지지 않으므로 model 유무만 본다.
+    model = (
+        f"{_code(execution.llm_provider)} / {_code(execution.llm_model)}"
+        if execution.llm_model else "사용 안 함"
+    )
+    lines.extend([
+        f"- Analysis: {_code(execution.analysis_profile)}",
+        f"- Recon: {_code(execution.recon_mode)} · Surface 수집 {_code(execution.surface_collection_mode)}",
+        f"- Router: {_code(execution.router_mode)} · review {_code(execution.router_review)}"
+        + (" · 두 Router 비교" if execution.compare_routers else ""),
+        f"- Orchestrator: {_code(execution.orchestrator_mode)} · 예산 배분 {_code(execution.budget_allocation_mode)}",
+        f"- Validation: {_code(execution.validation_mode)}",
+        f"- Report: {_code(execution.report_mode)}",
+        f"- LLM: {model}",
+    ])
+    if execution.llm_rpm_limit is not None:
+        lines.append(f"- LLM 분당 호출 제한: {execution.llm_rpm_limit}")
+    lines.append("")
+    return lines
+
+
 def render_report_v2(
     facts: RunReportFacts, *, references: tuple[FindingReportReferences, ...] = (),
+    execution: RunExecutionProfile | None = None,
     narrative: ReportNarrative | None = None,
 ) -> str:
     """같은 facts/참조에서 같은 bytes를 생성하는 offline renderer.
@@ -80,6 +122,7 @@ def render_report_v2(
         "- 보고서 버전: `v2`",
         f"- Facts 계약: `{CONTRACT_VERSION}`",
         f"- Facts SHA-256: `{report_facts_hash(facts)}`", "",
+        *_execution_lines(execution),
         "## 검사 범위 및 요청 예산", "",
         f"- 발견 Surface: {number(facts.surface_count)}",
         f"- 발견 파라미터 수 (Surface별 중복 제거): {number(facts.parameter_count)}",
@@ -261,6 +304,22 @@ class MarkdownReportAgent:
             llm_output_tokens=usage[2],
         )
 
+    def _execution_profile(self, task: TaskEnvelope) -> RunExecutionProfile | None:
+        """읽지 못하면 절을 통째로 비운다. 추측한 조건을 적는 것보다 낫다."""
+
+        if self._runs is None:
+            return None
+        try:
+            profile = self._runs.get(task.run_id).execution_profile
+        except Exception:  # noqa: BLE001 - 표시용 정보가 보고서를 막으면 안 된다
+            _LOG.warning("report execution profile unavailable")
+            return None
+        # Narrator 배선과 profile.report_mode가 어긋나도 여기에서 고치지 않는다.
+        # 고치려면 narrator 유무에 따라 이 절의 내용이 달라져야 하는데, 그러면 결정적
+        # 블록이 요약 on/off에서 서로 달라진다 - §2.3과 §7이 요구하는 "같은 facts"
+        # 비교가 성립하지 않는다. 실행 조건은 호출자가 Run에 영속한 값 그대로 싣는다.
+        return profile if isinstance(profile, RunExecutionProfile) else None
+
     def _read_llm_usage(self) -> tuple[int | None, int | None, int | None]:
         """계측기가 없거나 읽히지 않으면 0이 아니라 "모름"으로 남긴다.
 
@@ -301,6 +360,7 @@ class MarkdownReportAgent:
                         validation_id=f.validation_id, evidence_ids=f.evidence_ids,
                     ) for f in findings
                 ),
+                execution=self._execution_profile(task),
                 narrative=narrative,
             )
             if narrative is not None:
