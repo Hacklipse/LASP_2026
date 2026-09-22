@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import re
 from collections import Counter
 from collections.abc import Collection, Mapping
 
-from hacklipse.adapters.report_contract import report_facts_hash
-from hacklipse.adapters.reporting import MarkdownReportAgent
 from hacklipse.adapters.routing_audit import JsonlRoutingAuditLog, surface_key
 from hacklipse.adapters.validation_review_contract import valid_review_claim_observation
 from hacklipse.application.orchestrator import VALIDATION_ROUNDS_EXHAUSTED_REASON
 from hacklipse.bootstrap import standard_router
-from hacklipse.domain import RunExecutionProfile, TaskEnvelope
+from hacklipse.domain import RunExecutionProfile
 from hacklipse.ports import LlmClient, VulnerabilityRouter
+
+# render_report_v2가 v2 사실 블록에 적는 줄. 64자리 hex라 형식이 바뀌면 조용히
+# 틀린 값을 집어오지 않고 아예 찾지 못한다.
+_FACTS_HASH_LINE = re.compile(r"^- Facts SHA-256: `([0-9a-f]{64})`$", re.MULTILINE)
 
 
 def add_routing_arguments(parser: argparse.ArgumentParser) -> None:
@@ -178,32 +181,26 @@ def append_run_result(args, app, run) -> None:
 
 
 def _report_facts_hash(app, run) -> str | None:
-    """narrator off/on이 같은 사실 위에서 돌았는지 비교할 수 있는 단 하나의 값.
+    """보고서가 실제로 쓴 사실 해시. 다시 계산하지 않고 산출물에서 읽는다.
 
-    보고서 본문에서 파싱하지 않고 Store에서 다시 모은다. 본문 파싱은 렌더링 형식이
-    바뀌면 조용히 깨지고, 그때 "사실이 같다"는 잘못된 비교 결과가 나온다.
+    여기에서 다시 모으면 안 된다. 사실에는 Run의 LLM 사용량이 들어 있고, 그 값은
+    Report 시점 이후로도 늘어난다 - 최소한 Narrator 자신의 호출이 그 사이에 끼어든다.
+    다시 계산한 해시를 적으면 보고서가 쓴 사실과 다른 값이 기록되고, narrator off/on
+    비교가 "사실이 다르다"고 잘못 말하게 된다.
 
-    Narrator를 붙이지 않은 Agent로 수집하므로 LLM 호출도, 판정 변경도 없다. Report가
-    아직 돌지 않은 Run이나 v2 사실을 모을 수 없는 구버전 Run은 None으로 남긴다 —
-    0이나 빈 문자열로 적으면 비교에서 "같다"로 읽힌다.
+    형식을 찾지 못하거나 Report가 아직 없으면 None이다. 0이나 빈 문자열로 적으면
+    비교에서 서로 "같다"로 읽힌다. 틀린 값보다 모른다고 적는 편이 낫다.
     """
 
     try:
-        facts = MarkdownReportAgent(
-            finding_store=app.stores.findings,
-            evidence_store=app.stores.evidence,
-            candidate_store=app.stores.candidates,
-            surface_store=app.stores.surfaces,
-            run_store=app.stores.runs,
-            budget_manager=app.budget_manager,
-            format_version="v2",
-        ).collect_facts(TaskEnvelope(
-            task_id=f"{run.run_id}-facts-hash", run_id=run.run_id,
-            agent_type="report", finding_ids=run.finding_ids,
-        ))
+        reports = tuple(app.stores.reports.list_by_run(run.run_id))
     except Exception:  # noqa: BLE001 - 계측 실패가 실행 기록 전체를 막으면 안 된다
         return None
-    return report_facts_hash(facts)
+    for report in reversed(reports):
+        found = _FACTS_HASH_LINE.search(getattr(report, "content", "") or "")
+        if found is not None:
+            return found.group(1)
+    return None
 
 
 def _report_narrative_summary(app, run) -> dict[str, object]:

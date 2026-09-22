@@ -15,6 +15,7 @@ import json
 import sys
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -154,10 +155,14 @@ def _render(fixture, *, narrator=None):
     """Store를 새로 심고 보고서를 한 번 만든다. 두 쪽이 서로의 상태를 보지 않게 한다."""
 
     stores, budget, task = _seed(fixture)
+    # 계측기는 fixture 값을 그대로 읽는 대역이다. narrate 이전에 읽히므로 요약을
+    # 켜든 끄든 같은 값이 facts에 들어간다.
+    usage = fixture["run"].get("llm_usage")
     reporter = MarkdownReportAgent(
         finding_store=stores.findings, evidence_store=stores.evidence,
         candidate_store=stores.candidates, surface_store=stores.surfaces,
         run_store=stores.runs, budget_manager=budget, format_version="v2",
+        llm_usage=SimpleNamespace(**usage) if usage else None,
         narrator=narrator, narrator_config=CONFIG if narrator is not None else None,
     )
     facts = reporter.collect_facts(task)

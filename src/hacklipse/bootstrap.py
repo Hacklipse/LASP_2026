@@ -40,6 +40,7 @@ from hacklipse.adapters import (
     ValidationAgent,
 )
 from hacklipse.adapters.llm_router_advisor import AnalyzerChoice, LlmRouterAdvisor
+from hacklipse.adapters.reporting import RunLlmUsageSource
 from hacklipse.adapters.reserved_budget import ReservedBudgetManager
 from hacklipse.adapters.reviewing_validation import build_llm_reviewing_validation_agent
 from hacklipse.adapters.routing import (
@@ -185,6 +186,7 @@ def build_local_application(
     report_mode: Literal["heuristic", "llm"] = "heuristic",
     report_llm_client: LlmClient | None = None,
     report_llm_model: str = "",
+    report_llm_usage: RunLlmUsageSource | None = None,
 ) -> LocalApplication:
     """기본적으로 네트워크를 활성화하지 않는 로컬 시스템을 조립한다."""
 
@@ -240,6 +242,7 @@ def build_local_application(
                 surface_store=selected_stores.surfaces,
                 run_store=selected_stores.runs,
                 budget_manager=selected_budget,
+                llm_usage=report_llm_usage,
                 format_version=report_format_version,
                 narrator=narrator,
                 narrator_config=narrator_config,

@@ -23,6 +23,7 @@ def example_facts() -> RunReportFacts:
             reproduction_count=2,
         ),),
         request_budget_total=20, request_budget_used=3, surface_count=1, parameter_count=1,
+        llm_calls=4, llm_input_tokens=1200, llm_output_tokens=180,
     )
 
 
@@ -30,10 +31,10 @@ class ReportContractTests(unittest.TestCase):
     def test_serialization_contract_has_explicit_fields_and_order(self):
         facts = example_facts()
         payload = json.loads(serialize_report_facts(facts))
-        self.assertEqual(CONTRACT_VERSION, "report-facts-v1")
+        self.assertEqual(CONTRACT_VERSION, "report-facts-v2")
         self.assertEqual(payload, {
-            "contract_version": "report-facts-v1", "run_id": "run-1", "format_version": "v2",
-            "fact_ids": ["run:scope", "run:request-budget",
+            "contract_version": "report-facts-v2", "run_id": "run-1", "format_version": "v2",
+            "fact_ids": ["run:scope", "run:request-budget", "run:llm-usage",
                          "run:candidates:routed", "run:candidates:analyzed",
                          "run:candidates:confirmed", "run:candidates:suspected",
                          "run:candidates:rejected", "run:candidates:blocked",
@@ -49,11 +50,12 @@ class ReportContractTests(unittest.TestCase):
             }],
             "request_budget_total": 20, "request_budget_used": 3,
             "surface_count": 1, "parameter_count": 1,
+            "llm_calls": 4, "llm_input_tokens": 1200, "llm_output_tokens": 180,
         })
         self.assertEqual(serialize_report_facts(facts), json.dumps(
             payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
-        self.assertEqual(report_facts_hash(facts), "bab3904f0ed279e884428b67fe3add3ce9692129ab6af3812b6c17c7495059c2")
-        self.assertEqual(report_input_fingerprint(facts), "88624c4254a0440d31eb439d7968b91a3e39dd4e2923dd6fa8c829e3d58251e5")
+        self.assertEqual(report_facts_hash(facts), "91bc996fabcb1ead2c10f600c6d63f86bb7b17fa3e4c16092cb28b840bf7d936")
+        self.assertEqual(report_input_fingerprint(facts), "2449077085310ae071c2b8897c0c3be1fc900ddb0348bd3fde6e8209ac40573d")
 
     def test_input_order_does_not_change_json_or_fingerprint(self):
         facts = example_facts()
@@ -71,6 +73,9 @@ class ReportContractTests(unittest.TestCase):
             replace(facts, run_id="run-2"), replace(facts, request_budget_total=21),
             replace(facts, request_budget_used=4), replace(facts, request_budget_used=None),
             replace(facts, surface_count=2), replace(facts, parameter_count=2),
+            replace(facts, llm_calls=5), replace(facts, llm_input_tokens=1201),
+            replace(facts, llm_output_tokens=181),
+            replace(facts, llm_calls=None, llm_input_tokens=None, llm_output_tokens=None),
             replace(facts, candidate_counts=tuple((s, c + int(s is CandidateStatus.FAILED)) for s, c in facts.candidate_counts)),
         ]
         for update in (
@@ -117,6 +122,37 @@ class ReportContractTests(unittest.TestCase):
                        {"surface_count": True}, {"findings": facts.findings * 2}):
             with self.assertRaises(ValueError):
                 replace(facts, **update)
+
+    def test_llm_usage_is_measured_together_or_not_at_all(self):
+        # 일부만 센 사용량은 "적게 썼다"로 읽힌다. 모르면 셋 다 모르는 것이다.
+        facts = example_facts()
+        for update in (
+            {"llm_calls": None}, {"llm_input_tokens": None}, {"llm_output_tokens": None},
+            {"llm_calls": None, "llm_input_tokens": None},
+        ):
+            with self.assertRaises(ValueError):
+                replace(facts, **update)
+        unknown = replace(
+            facts, llm_calls=None, llm_input_tokens=None, llm_output_tokens=None,
+        )
+        self.assertIsNone(unknown.llm_calls)
+
+    def test_llm_usage_cannot_report_tokens_without_a_call(self):
+        facts = example_facts()
+        for update in (
+            {"llm_calls": 0}, {"llm_calls": 0, "llm_input_tokens": 0},
+            {"llm_calls": 0, "llm_output_tokens": 0},
+        ):
+            with self.assertRaises(ValueError):
+                replace(facts, **update)
+        silent = replace(facts, llm_calls=0, llm_input_tokens=0, llm_output_tokens=0)
+        self.assertEqual(silent.llm_calls, 0)
+        for update in ({"llm_calls": -1}, {"llm_input_tokens": True}):
+            with self.assertRaises(ValueError):
+                replace(facts, **update)
+
+    def test_llm_usage_has_its_own_offered_fact(self):
+        self.assertIn("run:llm-usage", example_facts().fact_ids)
 
     def test_legacy_proof_does_not_claim_reproduction(self):
         finding = example_facts().findings[0]

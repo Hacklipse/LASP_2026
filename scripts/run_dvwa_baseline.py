@@ -506,6 +506,7 @@ def main(argv: list[str]) -> int:
         return 2
 
     llm_client = None
+    llm_meter: _LlmUsageMeter | None = None
     selected_model = ""
     rpm_limit: int | None = None
     if needs_llm(args):
@@ -539,6 +540,10 @@ def main(argv: list[str]) -> int:
                 progress=progress,
                 show_content=args.debug_llm_content,
             )
+        # 계측기를 가장 바깥에 둔다. 안쪽에 두면 rate limit 대기나 디버그 래퍼를
+        # 거친 호출 일부가 집계에서 빠진다.
+        llm_meter = _LlmUsageMeter(llm_client)
+        llm_client = llm_meter
         progress.log(
             f"LLM 구성 완료: provider={_safe_log_value(args.llm_provider)}, "
             f"model={_safe_log_value(selected_model)}"
@@ -642,6 +647,9 @@ def main(argv: list[str]) -> int:
         report_mode=args.report,
         report_llm_client=llm_client,
         report_llm_model=selected_model,
+        # 살아 있는 계측기를 넘긴다. 조립 시점에는 아직 0이고, Report가 만들어질 때
+        # 그 Run이 실제로 쓴 누적값을 읽는다.
+        report_llm_usage=llm_meter,
         router=router,
         credential_resolver=resolver,
         approval_gate=StaticApprovalGate((_APPROVAL_REF,)),

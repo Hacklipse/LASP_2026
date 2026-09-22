@@ -329,8 +329,19 @@ class PromptTest(unittest.TestCase):
         for fact_id in facts.fact_ids:
             self.assertIn(fact_id, prompt)
         self.assertNotIn("?", prompt)
-        for secret in ("cookie", "token", "authorization", "password"):
+        for secret in ("cookie", "authorization", "password", "credential", "api_key"):
             self.assertNotIn(secret, prompt.lower())
+
+    def test_the_word_token_appears_only_as_a_usage_count(self):
+        """사용량 필드 이름 말고 "token"이 더 나오면 값이 실려 온 것이다."""
+
+        facts = replace(
+            example_facts(), llm_calls=4, llm_input_tokens=1200, llm_output_tokens=180,
+        )
+        prompt = build_narrative_prompt(facts)
+        self.assertIn('"llm_input_tokens":1200', prompt)
+        self.assertIn('"llm_output_tokens":180', prompt)
+        self.assertEqual(prompt.lower().count("token"), 2)
 
 
 if __name__ == "__main__":

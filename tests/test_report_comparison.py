@@ -347,31 +347,82 @@ class RateTests(unittest.TestCase):
 class RunResultHashTests(unittest.TestCase):
     """logs 비교의 사실 보존 검사는 run_result에 적힌 이 해시 하나에 걸려 있다."""
 
-    def app(self, stores, budget=None):
-        return SimpleNamespace(stores=stores, budget_manager=budget)
+    def app(self, stores):
+        return SimpleNamespace(stores=stores)
 
-    def test_recorded_hash_matches_the_report_agent(self):
-        fixture = load_fixture()
+    def stored(self, fixture, *, narrator=None):
+        """보고서를 실제로 만들어 Store에 넣는다. 실행기와 같은 상태를 재현한다."""
+
         stores, budget, task = _seed(fixture)
-        run = stores.runs.get(task.run_id).with_updates(finding_ids=task.finding_ids)
-        self.assertEqual(
-            _report_facts_hash(self.app(stores, budget), run), _render(fixture)["facts_hash"],
+        usage = fixture["run"].get("llm_usage")
+        reporter = tool.MarkdownReportAgent(
+            finding_store=stores.findings, evidence_store=stores.evidence,
+            candidate_store=stores.candidates, surface_store=stores.surfaces,
+            run_store=stores.runs, budget_manager=budget, format_version="v2",
+            llm_usage=SimpleNamespace(**usage) if usage else None,
+            narrator=narrator, narrator_config=tool.CONFIG if narrator is not None else None,
         )
-
-    def test_the_hash_is_not_read_out_of_the_rendered_markdown(self):
-        # 본문 파싱이면 렌더링 형식이 바뀔 때 조용히 깨진다. Store에서 다시 모아야 한다.
-        fixture = load_fixture()
-        stores, budget, task = _seed(fixture)
+        expected = tool.report_facts_hash(reporter.collect_facts(task))
+        for report in reporter.handle(task).reports:
+            stores.reports.add(report)
         run = stores.runs.get(task.run_id).with_updates(finding_ids=task.finding_ids)
-        self.assertEqual(len(stores.reports.list_by_run(task.run_id)), 0)
-        self.assertIsNotNone(_report_facts_hash(self.app(stores, budget), run))
+        return stores, run, expected
 
-    def test_an_uncollectable_run_is_unknown_not_empty(self):
-        # None이어야 logs 비교가 "확인하지 못함"으로 읽는다. ""는 서로 같아 보인다.
+    def test_recorded_hash_is_the_one_the_report_actually_used(self):
         fixture = load_fixture()
-        _, budget, task = _seed(fixture)
+        stores, run, expected = self.stored(fixture)
+        self.assertEqual(_report_facts_hash(self.app(stores), run), expected)
+        self.assertEqual(_report_facts_hash(self.app(stores), run), _render(fixture)["facts_hash"])
+
+    def test_usage_that_grew_after_the_report_does_not_change_the_record(self):
+        """사실에는 LLM 사용량이 들어 있고 그 값은 Report 이후에도 늘어난다.
+
+        여기에서 사실을 다시 모으면 보고서가 쓴 것과 다른 해시가 기록되고, off/on
+        비교가 "사실이 다르다"고 잘못 말한다.
+        """
+
+        fixture = load_fixture()
+        meter = SimpleNamespace(**fixture["run"]["llm_usage"])
+        stores, budget, task = _seed(fixture)
+        reporter = tool.MarkdownReportAgent(
+            finding_store=stores.findings, evidence_store=stores.evidence,
+            candidate_store=stores.candidates, surface_store=stores.surfaces,
+            run_store=stores.runs, budget_manager=budget, format_version="v2",
+            llm_usage=meter,
+        )
+        expected = tool.report_facts_hash(reporter.collect_facts(task))
+        for report in reporter.handle(task).reports:
+            stores.reports.add(report)
+        # Narrator 호출과 이후 작업으로 계측기가 더 올라간 상태를 만든다.
+        meter.calls += 3
+        meter.input_tokens += 2500
+        run = stores.runs.get(task.run_id).with_updates(finding_ids=task.finding_ids)
+        self.assertEqual(_report_facts_hash(self.app(stores), run), expected)
+
+    def test_a_run_without_a_report_is_unknown_not_empty(self):
+        # None이어야 logs 비교가 "확인하지 못함"으로 읽는다. ""는 서로 같아 보인다.
+        _, _, task = _seed(load_fixture())
         run = SimpleNamespace(run_id=task.run_id, finding_ids=task.finding_ids)
-        self.assertIsNone(_report_facts_hash(self.app(MemoryStoreBundle(), budget), run))
+        self.assertIsNone(_report_facts_hash(self.app(MemoryStoreBundle()), run))
+
+    def test_a_v1_report_carries_no_facts_hash(self):
+        stores, _, task = _seed(load_fixture())
+        reporter = tool.MarkdownReportAgent(
+            finding_store=stores.findings, evidence_store=stores.evidence,
+        )
+        for report in reporter.handle(task).reports:
+            stores.reports.add(report)
+        run = stores.runs.get(task.run_id).with_updates(finding_ids=task.finding_ids)
+        self.assertIsNone(_report_facts_hash(self.app(stores), run))
+
+    def test_an_unreadable_report_store_is_unknown(self):
+        class Exploding:
+            def list_by_run(self, run_id):
+                raise RuntimeError("store blew up")
+
+        run = SimpleNamespace(run_id="run-1", finding_ids=())
+        app = SimpleNamespace(stores=SimpleNamespace(reports=Exploding()))
+        self.assertIsNone(_report_facts_hash(app, run))
 
 
 class CliTests(unittest.TestCase):

@@ -2,43 +2,133 @@
   "run": {
     "run_id": "report-comparison-fixture",
     "target_url": "http://localhost/",
-    "allowed_hosts": ["localhost"],
+    "allowed_hosts": [
+      "localhost"
+    ],
     "request_budget": 500,
-    "requests_consumed": 487
+    "requests_consumed": 487,
+    "llm_usage": {
+      "calls": 9,
+      "input_tokens": 5400,
+      "output_tokens": 820
+    }
   },
   "surfaces": [
-    {"surface_id": "surface-search", "url": "http://localhost/rest/products/search", "method": "GET", "parameters": ["q"]},
-    {"surface_id": "surface-login", "url": "http://localhost/rest/user/login", "method": "POST", "parameters": ["email", "password"]},
-    {"surface_id": "surface-basket", "url": "http://localhost/rest/basket/9182", "method": "GET", "parameters": []},
-    {"surface_id": "surface-legacy", "url": "http://localhost/ftp", "method": "GET", "parameters": ["file"]}
+    {
+      "surface_id": "surface-search",
+      "url": "http://localhost/rest/products/search",
+      "method": "GET",
+      "parameters": [
+        "q"
+      ]
+    },
+    {
+      "surface_id": "surface-login",
+      "url": "http://localhost/rest/user/login",
+      "method": "POST",
+      "parameters": [
+        "email",
+        "password"
+      ]
+    },
+    {
+      "surface_id": "surface-basket",
+      "url": "http://localhost/rest/basket/9182",
+      "method": "GET",
+      "parameters": []
+    },
+    {
+      "surface_id": "surface-legacy",
+      "url": "http://localhost/ftp",
+      "method": "GET",
+      "parameters": [
+        "file"
+      ]
+    }
   ],
   "evidence": [
-    {"evidence_id": "evi-search", "surface_id": "surface-search", "observation": {"type": "reflection", "parameter": "q"}},
-    {"evidence_id": "evi-login", "surface_id": "surface-login", "observation": {"type": "sql_error", "parameter": "email"}},
-    {"evidence_id": "evi-basket", "surface_id": "surface-basket", "observation": {"type": "object_access", "parameter": "id"}},
-    {"evidence_id": "evi-legacy", "surface_id": "surface-legacy", "observation": {"type": "file_read", "parameter": "file"}}
+    {
+      "evidence_id": "evi-search",
+      "surface_id": "surface-search",
+      "observation": {
+        "type": "reflection",
+        "parameter": "q"
+      }
+    },
+    {
+      "evidence_id": "evi-login",
+      "surface_id": "surface-login",
+      "observation": {
+        "type": "sql_error",
+        "parameter": "email"
+      }
+    },
+    {
+      "evidence_id": "evi-basket",
+      "surface_id": "surface-basket",
+      "observation": {
+        "type": "object_access",
+        "parameter": "id"
+      }
+    },
+    {
+      "evidence_id": "evi-legacy",
+      "surface_id": "surface-legacy",
+      "observation": {
+        "type": "file_read",
+        "parameter": "file"
+      }
+    }
   ],
   "findings": [
     {
-      "finding_id": "finding-xss", "candidate_id": "candidate-xss", "validation_id": "validation-xss",
-      "vulnerability_type": "XSS", "surface_id": "surface-search", "evidence_ids": ["evi-search"],
-      "proof_type": "xss_execution", "reproduction_count": 3
+      "finding_id": "finding-xss",
+      "candidate_id": "candidate-xss",
+      "validation_id": "validation-xss",
+      "vulnerability_type": "XSS",
+      "surface_id": "surface-search",
+      "evidence_ids": [
+        "evi-search"
+      ],
+      "proof_type": "xss_execution",
+      "reproduction_count": 3
     },
     {
-      "finding_id": "finding-sqli", "candidate_id": "candidate-sqli", "validation_id": "validation-sqli",
-      "vulnerability_type": "SQLi", "surface_id": "surface-login", "evidence_ids": ["evi-login"],
-      "proof_type": "sqli_effect", "reproduction_count": 2
+      "finding_id": "finding-sqli",
+      "candidate_id": "candidate-sqli",
+      "validation_id": "validation-sqli",
+      "vulnerability_type": "SQLi",
+      "surface_id": "surface-login",
+      "evidence_ids": [
+        "evi-login"
+      ],
+      "proof_type": "sqli_effect",
+      "reproduction_count": 2
     },
     {
-      "finding_id": "finding-access", "candidate_id": "candidate-access", "validation_id": "validation-access",
-      "vulnerability_type": "Access Control", "surface_id": "surface-basket", "evidence_ids": ["evi-basket"],
-      "proof_type": "unauthorized_object_access", "reproduction_count": 2
+      "finding_id": "finding-access",
+      "candidate_id": "candidate-access",
+      "validation_id": "validation-access",
+      "vulnerability_type": "Access Control",
+      "surface_id": "surface-basket",
+      "evidence_ids": [
+        "evi-basket"
+      ],
+      "proof_type": "unauthorized_object_access",
+      "reproduction_count": 2
     },
     {
       "_comment": "proof_type 없는 과거 Finding. 재현 사실을 지어내지 않는지 확인한다.",
-      "finding_id": "finding-legacy", "candidate_id": "candidate-legacy", "validation_id": "validation-legacy",
-      "vulnerability_type": "Path Traversal", "surface_id": "surface-legacy", "evidence_ids": ["evi-legacy"],
-      "proof_type": null, "reproduction_count": 0
+      "finding_id": "finding-legacy",
+      "candidate_id": "candidate-legacy",
+      "validation_id": "validation-legacy",
+      "vulnerability_type": "Path Traversal",
+      "surface_id": "surface-legacy",
+      "evidence_ids": [
+        "evi-legacy"
+      ],
+      "proof_type": null,
+      "reproduction_count": 0
     }
   ],
   "candidate_counts": {
@@ -54,29 +144,42 @@
   "llm_response": {
     "_comment": "@self는 그 Finding의 fact_id로 치환된다. @finding:<id>는 다른 Finding의 fact_id다.",
     "run_summary": {
-      "fact_ids": ["run:scope", "run:request-budget", "run:candidates:skipped_budget"],
+      "fact_ids": [
+        "run:scope",
+        "run:request-budget",
+        "run:candidates:skipped_budget",
+        "run:llm-usage"
+      ],
       "text": "이 실행은 발견한 범위에서 네 건을 확정했고, 다섯 건은 요청 예산이 모자라 검사를 마치지 못했습니다. 확정되지 않은 Candidate가 안전하다는 뜻은 아닙니다."
     },
     "findings": [
       {
         "finding_id": "finding-xss",
-        "fact_ids": ["@self"],
+        "fact_ids": [
+          "@self"
+        ],
         "summary": "검색 경로의 입력이 응답에 반영되어, 독립 browser 비교에서 probe 실행 신호가 세 번 확인됐습니다."
       },
       {
         "finding_id": "finding-sqli",
-        "fact_ids": ["@self"],
+        "fact_ids": [
+          "@self"
+        ],
         "summary": "로그인 경로에서 독립 control/probe 비교의 SQL 오류 차이가 두 번 재현됐습니다."
       },
       {
         "finding_id": "finding-access",
-        "fact_ids": ["@self"],
+        "fact_ids": [
+          "@self"
+        ],
         "summary": "분리된 주체 세션에서 다른 소유자의 객체에 접근되는 것이 두 번 확인됐습니다."
       },
       {
         "_comment": "다른 Finding의 fact를 인용한다. foreign_fact로 통째로 버려져야 한다.",
         "finding_id": "finding-legacy",
-        "fact_ids": ["@finding:finding-xss"],
+        "fact_ids": [
+          "@finding:finding-xss"
+        ],
         "summary": "검증 상세가 없는데도 재현됐다고 말하는 문장. 거부돼야 한다."
       }
     ]

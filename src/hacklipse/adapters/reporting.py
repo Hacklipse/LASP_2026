@@ -7,7 +7,7 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from html import escape
-from typing import Literal
+from typing import Literal, Protocol
 from uuid import uuid4
 
 from hacklipse.domain import (
@@ -27,6 +27,19 @@ from .report_contract import (
 
 
 _LOG = logging.getLogger(__name__)
+
+
+class RunLlmUsageSource(Protocol):
+    """Report 시점까지 누적된 Run 전체의 LLM 사용량.
+
+    실행기의 계측 client가 그대로 맞는다. Report는 숫자를 읽기만 하고 호출도 변경도
+    하지 않는다. 보고서를 만들 때 읽어야 하므로 값이 아니라 살아 있는 계측기를 받는다 -
+    Application을 조립하는 시점에는 아직 0이다.
+    """
+
+    calls: int
+    input_tokens: int
+    output_tokens: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,8 +86,13 @@ def render_report_v2(
         f"- 전체 Candidate: {sum(counts.values())}",
         f"- 확정 Finding: {len(facts.findings)}",
         f"- 총 요청 예산: {number(facts.request_budget_total)}",
-        f"- 사용 요청 예산: {number(facts.request_budget_used)}", "",
-        "발견된 범위의 집계이며, 대상 전체를 빠짐없이 검사했다는 의미는 아닙니다.", "",
+        f"- 사용 요청 예산: {number(facts.request_budget_used)}",
+        f"- LLM 호출: {number(facts.llm_calls)}",
+        f"- LLM 입력 token: {number(facts.llm_input_tokens)}",
+        f"- LLM 출력 token: {number(facts.llm_output_tokens)}", "",
+        "발견된 범위의 집계이며, 대상 전체를 빠짐없이 검사했다는 의미는 아닙니다.",
+        "LLM 사용량은 이 보고서를 만들기 직전까지의 Run 누적값입니다. 아래 요약을 만든",
+        "호출은 포함되지 않으며, 그래서 요약을 켜고 끄더라도 위 사실은 같습니다.", "",
         "## Candidate 상태", "",
         "| 상태 | 개수 |", "|---|---:|",
         *(f"| {status.value} | {count} |" for status, count in facts.candidate_counts), "",
@@ -165,6 +183,7 @@ class MarkdownReportAgent:
         surface_store: SurfaceStore | None = None,
         run_store: RunStore | None = None,
         budget_manager: BudgetManager | None = None,
+        llm_usage: RunLlmUsageSource | None = None,
         narrator: ReportNarrator | None = None,
         narrator_config: NarratorFingerprintConfig | None = None,
     ) -> None:
@@ -187,6 +206,7 @@ class MarkdownReportAgent:
         self._surfaces = surface_store
         self._runs = run_store
         self._budget = budget_manager
+        self._llm_usage = llm_usage
         self._narrator = narrator
         self._narrator_config = narrator_config
 
@@ -214,6 +234,7 @@ class MarkdownReportAgent:
             except RecordNotFound:
                 # 예전 Run에 계측 기록이 없으면 0으로 추정하지 않는다.
                 pass
+        usage = self._read_llm_usage()
         return RunReportFacts(
             run_id=task.run_id,
             format_version="v2",
@@ -235,7 +256,33 @@ class MarkdownReportAgent:
             request_budget_used=used,
             surface_count=len(surfaces),
             parameter_count=sum(len(set(surface.parameters)) for surface in surfaces),
+            llm_calls=usage[0],
+            llm_input_tokens=usage[1],
+            llm_output_tokens=usage[2],
         )
+
+    def _read_llm_usage(self) -> tuple[int | None, int | None, int | None]:
+        """계측기가 없거나 읽히지 않으면 0이 아니라 "모름"으로 남긴다.
+
+        LLM을 껐을 때와 계측을 붙이지 않았을 때를 0으로 합치면, 보고서가 "이 실행은
+        LLM을 쓰지 않았다"는 없는 사실을 말하게 된다.
+        """
+
+        if self._llm_usage is None:
+            return None, None, None
+        try:
+            values = (
+                self._llm_usage.calls,
+                self._llm_usage.input_tokens,
+                self._llm_usage.output_tokens,
+            )
+        except Exception:  # noqa: BLE001 - 계측 실패가 보고서를 막으면 안 된다
+            _LOG.warning("report llm usage unavailable")
+            return None, None, None
+        if any(type(value) is not int or value < 0 for value in values):
+            _LOG.warning("report llm usage is not a bounded count")
+            return None, None, None
+        return values
 
     def handle(self, task: TaskEnvelope) -> AgentResult:
         """Task에 지정된 Finding을 조회해 하나의 Markdown 산출물을 만든다."""

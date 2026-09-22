@@ -971,6 +971,9 @@ def main(argv: list[str]) -> int:
         report_mode=args.report,
         report_llm_client=llm_client,
         report_llm_model=selected_model,
+        # 살아 있는 계측기를 넘긴다. 조립 시점에는 아직 0이고, Report가 만들어질 때
+        # 그 Run이 실제로 쓴 누적값을 읽는다.
+        report_llm_usage=llm_meter,
         # 전체 모드는 유형을 제한하지 않는다. Router가 Surface별로 관련 Candidate만 만든다.
         router=router,
         credential_resolver=resolver,

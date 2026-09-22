@@ -107,6 +107,32 @@ class ReportAgentTest(unittest.TestCase):
     def test_narrator_none_is_byte_for_byte_identical(self):
         self.assertEqual(self.report(), self.report(narrator=None))
 
+    def test_the_narrators_own_call_is_not_counted_in_the_facts(self):
+        """사실은 narrate 이전에 모인다. 이래야 요약 on/off의 facts가 같다.
+
+        포함하려면 narrate 이후에 다시 모아야 하고, 그러면 §2.3·§7이 요구하는
+        "narrator off/on의 facts 동일"이 구조적으로 성립하지 않는다.
+        """
+
+        meter = SimpleNamespace(calls=5, input_tokens=100, output_tokens=20)
+
+        class Counting:
+            def __init__(self, source):
+                self.source = source
+
+            def narrate(self, facts, *, timeout_seconds=60.0):
+                self.source.calls += 1
+                self.source.input_tokens += 900
+                return deterministic_fallback("internal_error")
+
+        narrator = Counting(meter)
+        reporter = self.reporter(llm_usage=meter, narrator=narrator, narrator_config=CONFIG)
+        content = reporter.handle(self.task).reports[0].content
+        self.assertIn("- LLM 호출: 5", content)
+        self.assertIn("- LLM 입력 token: 100", content)
+        self.assertEqual(meter.calls, 6)
+        self.assertIn("요약을 켜고 끄더라도 위 사실은 같습니다", content)
+
     def test_attaching_a_narrator_only_appends(self):
         facts = self.reporter().collect_facts(self.task)
         narrator = LlmReportNarrator(llm_client=FakeLlm(payload(facts)), config=CONFIG)

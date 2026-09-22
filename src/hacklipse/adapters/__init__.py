@@ -30,7 +30,7 @@ from .llm_access_control_analysis import LlmAccessControlAnalyzer
 from .recon import ReconAgent
 from .sqli_analysis import HeuristicSqliAnalyzer
 from .ssti_analysis import HeuristicSstiAnalyzer
-from .reporting import MarkdownReportAgent
+from .reporting import MarkdownReportAgent, RunLlmUsageSource
 from .llm_report_narrative import LlmReportNarrator, ReportNarrator
 from .report_contract import NarratorFingerprintConfig
 from .retry import BoundedRetryPolicy
@@ -90,6 +90,7 @@ __all__ = [
     "LlmXssAnalyzer",
     "LocalTaskDispatcher",
     "MarkdownReportAgent",
+    "RunLlmUsageSource",
     "LlmReportNarrator",
     "ReportNarrator",
     "NarratorFingerprintConfig",

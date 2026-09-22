@@ -19,7 +19,9 @@ from urllib.parse import urlsplit
 from hacklipse.domain import CandidateStatus, ValidationProofType
 
 
-CONTRACT_VERSION = "report-facts-v1"
+# v2: run LLM 사용량 세 값과 run:llm-usage fact를 계약에 넣었다. fact_ids 순서가
+# 바뀌므로 이전 버전의 fingerprint와 섞이지 않게 버전을 올린다.
+CONTRACT_VERSION = "report-facts-v2"
 MAX_PATH_HINT_LENGTH = 160
 PROOF_DESCRIPTIONS = MappingProxyType({
     ValidationProofType.XSS_EXECUTION:
@@ -132,6 +134,11 @@ class RunReportFacts:
     # 실제 발견 범위의 수치만 추가한다. URL/파라미터 원문은 계약에 넣지 않는다.
     surface_count: int | None = None
     parameter_count: int | None = None
+    # Run 전체의 LLM 사용량. prompt/응답 원문이 아니라 세 숫자만 담는다. 셋은 한
+    # 계측기에서 같이 나오므로 전부 있거나 전부 없어야 한다.
+    llm_calls: int | None = None
+    llm_input_tokens: int | None = None
+    llm_output_tokens: int | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.run_id)
@@ -156,20 +163,26 @@ class RunReportFacts:
             ids = [getattr(item, field) for item in self.findings]
             if len(ids) != len(set(ids)):
                 raise ValueError("duplicate report finding or fact identifier")
+        usage = (self.llm_calls, self.llm_input_tokens, self.llm_output_tokens)
         for value in (self.request_budget_total, self.request_budget_used,
-                      self.surface_count, self.parameter_count):
+                      self.surface_count, self.parameter_count, *usage):
             if value is not None:
                 _count(value)
         if (self.request_budget_total is not None and self.request_budget_used is not None
                 and self.request_budget_used > self.request_budget_total):
             raise ValueError("used request budget exceeds total")
+        if len({value is None for value in usage}) != 1:
+            # 일부만 센 사용량은 "적게 썼다"로 읽힌다. 모르면 셋 다 모르는 것이다.
+            raise ValueError("llm usage facts must be measured together or not at all")
+        if self.llm_calls == 0 and any(usage[1:]):
+            raise ValueError("llm usage cannot report tokens without a call")
         object.__setattr__(self, "candidate_counts", tuple((s, counts[s]) for s in CandidateStatus))
         object.__setattr__(self, "findings", tuple(sorted(self.findings, key=lambda f: f.finding_id)))
 
     @property
     def fact_ids(self) -> tuple[str, ...]:
         return (
-            "run:scope", "run:request-budget",
+            "run:scope", "run:request-budget", "run:llm-usage",
             *(f"run:candidates:{status.value}" for status in CandidateStatus),
             *(finding.fact_id for finding in self.findings),
         )
@@ -218,6 +231,9 @@ def _facts_payload(facts: RunReportFacts) -> dict[str, object]:
         "request_budget_used": facts.request_budget_used,
         "surface_count": facts.surface_count,
         "parameter_count": facts.parameter_count,
+        "llm_calls": facts.llm_calls,
+        "llm_input_tokens": facts.llm_input_tokens,
+        "llm_output_tokens": facts.llm_output_tokens,
     }
 
 

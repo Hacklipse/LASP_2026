@@ -890,7 +890,7 @@ Evidence 테이블에는 **UPDATE 문을 쓰지 않는다.** `EvidenceStore` Pro
 | ✅ | P-3 `src/hacklipse/domain/models.py`, `src/hacklipse/domain/__init__.py` — Validation reason code와 Finding proof facts (현 브랜치 병합) |
 | ✅ | P-3 `src/hacklipse/adapters/sqlite_store.py`, `src/hacklipse/application/orchestrator.py` — 기존 Finding 복원 호환과 Validation·Report Evidence ID 병합 |
 | ✅ | P-3 `tests/test_invariants.py`, `tests/test_sqlite_store.py`, `tests/test_p3_shared_contracts.py` — 계약 회귀 포함 현재 전체 598개 테스트 통과 |
-| ✅ | `src/hacklipse/adapters/report_contract.py`, `reporting.py` — Report v2 facts·결정적 렌더링·Claim 저장 |
+| ✅ | `src/hacklipse/adapters/report_contract.py`, `reporting.py` — Report v2 facts(`report-facts-v2`, LLM 사용량 포함)·결정적 렌더링·Claim 저장 |
 | ⏳ | `src/hacklipse/adapters/cost_budget.py` — 토큰·비용 기반 예산 |
 | ✅ | Orchestrator 추가 Recon·예산 배분의 선택적 LLM Advisor |
 | ✅ | 비확정 Validation LLM 분류 Claim Adapter·계약과 실행 옵션·기록 배선 |
@@ -981,6 +981,7 @@ Phase 10 [x] 제한된 Recon LLM Planner와 fallback
          [ ] Validation review on/off 정식 반복 A/B 측정
          [x] Report facts 계약과 Report LLM 보조·실행 옵션·Claim/JSONL 계측
          [x] Report narrator off/on 비교 도구와 고정 fixture·비율 집계
+         [x] Report v2 사실에 Run LLM 사용량 반영(`report-facts-v2`)
          [ ] Report narrator off/on 정식 반복 A/B 측정 실행과 사람 blind 평가
          [ ] P-2 조건 필터를 적용한 Surface manifest 정식 반복 비교
          [ ] 비용 예산 / 보고서 포맷 / severity

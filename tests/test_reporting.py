@@ -1,6 +1,7 @@
 """v1 bytes 보존과 v2의 Store 기반 사실/민감정보 경계를 검증한다."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 import unittest
 
 from hacklipse.adapters import InMemoryBudgetManager, MemoryStoreBundle
@@ -128,6 +129,58 @@ class ReportingTests(unittest.TestCase):
             reporter = self.reporter(budget_manager=manager)
             self.assertIsNone(reporter.collect_facts(self.task).request_budget_used)
             self.assertIn("사용 요청 예산: 정보 없음", reporter.handle(self.task).reports[0].content)
+
+    def test_llm_usage_is_read_when_the_report_is_made_not_when_wired(self):
+        # 조립 시점의 계측기는 0이다. 그때 읽으면 모든 보고서가 "LLM 0회"가 된다.
+        meter = SimpleNamespace(calls=0, input_tokens=0, output_tokens=0)
+        reporter = self.reporter(llm_usage=meter)
+        meter.calls, meter.input_tokens, meter.output_tokens = 7, 4200, 610
+        facts = reporter.collect_facts(self.task)
+        self.assertEqual(
+            (facts.llm_calls, facts.llm_input_tokens, facts.llm_output_tokens),
+            (7, 4200, 610),
+        )
+        content = reporter.handle(self.task).reports[0].content
+        for line in ("- LLM 호출: 7", "- LLM 입력 token: 4,200".replace(",", ""),
+                     "- LLM 출력 token: 610"):
+            self.assertIn(line, content)
+        self.assertIn("보고서를 만들기 직전까지의 Run 누적값", content)
+
+    def test_missing_usage_meter_is_unknown_not_zero(self):
+        # LLM을 껐을 때와 계측을 안 붙였을 때를 0으로 합치면 없는 사실을 말하게 된다.
+        reporter = self.reporter()
+        facts = reporter.collect_facts(self.task)
+        self.assertEqual(
+            (facts.llm_calls, facts.llm_input_tokens, facts.llm_output_tokens),
+            (None, None, None),
+        )
+        self.assertIn("- LLM 호출: 정보 없음", reporter.handle(self.task).reports[0].content)
+
+    def test_an_unusable_meter_is_unknown_and_never_blocks_the_report(self):
+        class Exploding:
+            @property
+            def calls(self):
+                raise RuntimeError("meter blew up")
+            input_tokens = 0
+            output_tokens = 0
+
+        for meter in (Exploding(), SimpleNamespace(calls=-1, input_tokens=0, output_tokens=0),
+                      SimpleNamespace(calls=True, input_tokens=0, output_tokens=0),
+                      SimpleNamespace(calls="7", input_tokens=0, output_tokens=0)):
+            with self.subTest(meter=type(meter).__name__):
+                reporter = self.reporter(llm_usage=meter)
+                with self.assertLogs("hacklipse.adapters.reporting", level="WARNING") as logs:
+                    facts = reporter.collect_facts(self.task)
+                self.assertIsNone(facts.llm_calls)
+                self.assertNotIn("meter blew up", "\n".join(logs.output))
+                self.assertIn("LLM 호출: 정보 없음", reporter.handle(self.task).reports[0].content)
+
+    def test_a_silent_llm_run_is_zero_not_unknown(self):
+        reporter = self.reporter(
+            llm_usage=SimpleNamespace(calls=0, input_tokens=0, output_tokens=0),
+        )
+        self.assertEqual(reporter.collect_facts(self.task).llm_calls, 0)
+        self.assertIn("- LLM 호출: 0", reporter.handle(self.task).reports[0].content)
 
     def test_secrets_never_enter_facts_or_report(self):
         reporter = self.reporter()
