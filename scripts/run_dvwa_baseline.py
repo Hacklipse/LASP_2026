@@ -64,6 +64,7 @@ from routing_options import (  # noqa: E402
     add_routing_arguments,
     append_run_result,
     build_run_router,
+    write_report_artifact,
     execution_profile_from_args,
     needs_llm,
 )
@@ -704,6 +705,7 @@ def main(argv: list[str]) -> int:
         print(f"Run 실패: {error}")
         return 1
     append_run_result(args, app, run)
+    write_report_artifact(app, run, args.report_out)
     progress.log(f"Run 완료: phase={_safe_log_value(run.phase.value)}")
 
     if progress_view is not None:

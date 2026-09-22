@@ -21,3 +21,4 @@ CLAUDE.md.bak
 AGENTS.md
 .codex/
 .gitattributes
+/artifacts/*.md

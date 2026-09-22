@@ -91,6 +91,7 @@ from routing_options import (  # noqa: E402
     add_routing_arguments,
     append_run_result,
     build_run_router,
+    write_report_artifact,
     execution_profile_from_args,
     needs_llm,
 )
@@ -1098,6 +1099,7 @@ def main(argv: list[str]) -> int:
         return 1
     if run is not None:
         append_run_result(args, app, run)
+        write_report_artifact(app, run, args.report_out)
     if cleanup_error is not None:
         print(f"Run은 완료됐지만 임시 계정 정리에 실패했습니다: {cleanup_error}")
         return 1

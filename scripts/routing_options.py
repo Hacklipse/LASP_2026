@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import re
 from collections import Counter
+from pathlib import Path
 from collections.abc import Collection, Mapping
 
 from hacklipse.adapters.routing_audit import JsonlRoutingAuditLog, surface_key
@@ -40,6 +41,10 @@ def add_routing_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--report", choices=("heuristic", "llm"), default="heuristic",
         help="deterministic v2 report or v2 with a bounded LLM narrative",
+    )
+    parser.add_argument(
+        "--report-out",
+        help="생성된 Markdown 보고서를 저장할 경로 (기본: 저장하지 않음)",
     )
     parser.add_argument(
         "--routing-log", default="artifacts/routing-decisions.jsonl",
@@ -390,3 +395,31 @@ def _validation_review_summary(app, run, candidates) -> dict[str, object]:
         "skipped_budget_candidate_count": status_counts["skipped_budget"],
         "failed_candidate_count": status_counts["failed"],
     }
+
+
+def write_report_artifact(app, run, path: str | None) -> str | None:
+    """생성된 Markdown 보고서를 파일로 남긴다. 없으면 조용히 넘어간다.
+
+    Report Agent는 산출물을 ReportStore에만 넣는데 실행기는 메모리 Store를 쓰므로,
+    적어두지 않으면 방금 만든 보고서를 아무도 읽을 수 없다.
+    """
+
+    if not path:
+        return None
+    reports = [
+        item for item in app.stores.reports.list_by_run(run.run_id)
+        if item.format == "markdown"
+    ]
+    if not reports:
+        print("보고서가 생성되지 않아 저장하지 않았습니다.")
+        return None
+    target = Path(path)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(reports[-1].content, encoding="utf-8")
+    except OSError as error:
+        # 보고서를 못 적는 것이 완료된 Run을 실패로 만들면 안 된다.
+        print(f"보고서를 저장하지 못했습니다: {type(error).__name__}")
+        return None
+    print(f"보고서를 저장했습니다: {target}")
+    return str(target)
