@@ -37,4 +37,15 @@ Both local runners also accept `--report {heuristic,llm}`. The default renders
 the deterministic v2 facts report; `llm` appends a bounded, non-authoritative
 narrative and falls back to the same facts when the model fails. Narrative
 calls, tokens, elapsed time, fallback status, and rejected sentences are
-recorded without generated prose in the run-result JSONL.
+recorded without generated prose in the run-result JSONL, alongside a
+`report_facts_hash` that identifies the facts both modes rendered.
+
+`scripts/compare_reports.py` measures the narrator off/on axis. `replay` renders
+both reports from a fixed fixture without contacting a target or a provider, and
+`--failure` injects each narrator failure to measure the fallback path. `logs`
+compares the latest recorded run of each mode and aggregates the fallback and
+rejected-sentence rates across every run in the given JSONL files. Both report
+fact preservation, offered-set citation containment, status representation, and
+narrator cost. Neither establishes semantic accuracy: the fixed-fixture human
+blind review that the measurement contract also requires is not part of this
+tool.

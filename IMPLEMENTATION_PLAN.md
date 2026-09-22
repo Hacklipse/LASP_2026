@@ -44,8 +44,9 @@ Validation·Report 모드와 LLM provider/model/RPM을 `RunExecutionProfile`로 
 통과**했다. P-1은 기본 `adaptive`와 비교용 `deterministic` Surface 수집을
 분리하고, 후자에서는 Planner 결과를 감사 기록으로는 남기되 crawl 집합·순서에는
 반영하지 않도록 구현했다. 제한된 Validation LLM Reviewer는 선택적으로 연결됐고,
-Report v2 facts와 제한된 LLM Narrator는 실행 옵션·Claim·JSONL 계측·재개까지 연결됐다.
-비용 기반 예산과 정식 Report off/on 평가는 아직 구현되지 않았다.
+Report v2 facts와 제한된 LLM Narrator는 실행 옵션·Claim·JSONL 계측·재개까지 연결됐고,
+narrator off/on 비교 도구도 갖췄다. 비용 기반 예산, 정식 반복 측정 실행, 사람 blind 평가는
+아직 남아 있다.
 
 Phase 9에서는 확정 Finding을 민감정보가 제거된 `KnowledgeCase`로 일반화하는 Factory와
 append-only InMemory·SQLite KnowledgeBase를 구현하고, Run 완료 후 자동 발행까지
@@ -653,7 +654,9 @@ Evidence는 "이번 대상에서 직접 관찰한 사실", Knowledge는 "민감�
 3. P-2 Run 실행 조건 영속화를 완료해 정식 off/on 비교의 선행 조건을 만족한다.
 4. 비확정 Validation Reviewer가 복원됐다. 실행 옵션·기록·민감정보 검사 계약을 확인한 뒤
    같은 조건의 기능/비용 비교를 진행한다. 최종 proof와 Finding 승격은 결정적 코드가 유지한다.
-5. Report facts 계약과 LLM 서술 보조를 구현하고 표준 실행기에 연결했다. 정식 off/on 평가는 남아 있다.
+5. Report facts 계약과 LLM 서술 보조를 구현하고 표준 실행기에 연결했다. `scripts/compare_reports.py`로
+   off/on 비교 축(사실 보존·인용 정합성·상태 표현·비용·fallback 비율)을 잴 수 있게 됐고,
+   정식 반복 측정 실행과 사람 blind 평가는 남아 있다.
 6. P-1 Surface 비결정성 통제를 구현했다. 성능·탐지 기여 주장은 P-2로
    저장된 조건을 기준으로 정식 반복 비교한 후에만 한다.
 
@@ -977,7 +980,8 @@ Phase 10 [x] 제한된 Recon LLM Planner와 fallback
          [x] Review Claim 계측 JSONL·internal_error fallback·저장 Claim 재사용 검증
          [ ] Validation review on/off 정식 반복 A/B 측정
          [x] Report facts 계약과 Report LLM 보조·실행 옵션·Claim/JSONL 계측
-         [ ] Report narrator off/on 정식 반복 A/B 측정
+         [x] Report narrator off/on 비교 도구와 고정 fixture·비율 집계
+         [ ] Report narrator off/on 정식 반복 A/B 측정 실행과 사람 blind 평가
          [ ] P-2 조건 필터를 적용한 Surface manifest 정식 반복 비교
          [ ] 비용 예산 / 보고서 포맷 / severity
          [x] XSS proof 범위의 브라우저 Runtime은 Phase 8에서 선행 구현

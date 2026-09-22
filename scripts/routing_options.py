@@ -6,11 +6,13 @@ import argparse
 from collections import Counter
 from collections.abc import Collection, Mapping
 
+from hacklipse.adapters.report_contract import report_facts_hash
+from hacklipse.adapters.reporting import MarkdownReportAgent
 from hacklipse.adapters.routing_audit import JsonlRoutingAuditLog, surface_key
 from hacklipse.adapters.validation_review_contract import valid_review_claim_observation
 from hacklipse.application.orchestrator import VALIDATION_ROUNDS_EXHAUSTED_REASON
 from hacklipse.bootstrap import standard_router
-from hacklipse.domain import RunExecutionProfile
+from hacklipse.domain import RunExecutionProfile, TaskEnvelope
 from hacklipse.ports import LlmClient, VulnerabilityRouter
 
 
@@ -138,7 +140,8 @@ def append_run_result(args, app, run) -> None:
         for surface in app.stores.surfaces.list_by_run(run.run_id)
     }
     JsonlRoutingAuditLog(args.routing_log).append({
-        "schema_version": 3, "event": "run_result", "run_id": run.run_id,
+        "schema_version": 4, "event": "run_result", "run_id": run.run_id,
+        "report_facts_hash": _report_facts_hash(app, run),
         "execution_profile_recorded": profile.recorded,
         "router_mode": profile.router_mode,
         "router_review": profile.router_review,
@@ -172,6 +175,35 @@ def append_run_result(args, app, run) -> None:
             "exploration_parameters": list(c.exploration_parameters),
         } for c in candidates],
     })
+
+
+def _report_facts_hash(app, run) -> str | None:
+    """narrator off/on이 같은 사실 위에서 돌았는지 비교할 수 있는 단 하나의 값.
+
+    보고서 본문에서 파싱하지 않고 Store에서 다시 모은다. 본문 파싱은 렌더링 형식이
+    바뀌면 조용히 깨지고, 그때 "사실이 같다"는 잘못된 비교 결과가 나온다.
+
+    Narrator를 붙이지 않은 Agent로 수집하므로 LLM 호출도, 판정 변경도 없다. Report가
+    아직 돌지 않은 Run이나 v2 사실을 모을 수 없는 구버전 Run은 None으로 남긴다 —
+    0이나 빈 문자열로 적으면 비교에서 "같다"로 읽힌다.
+    """
+
+    try:
+        facts = MarkdownReportAgent(
+            finding_store=app.stores.findings,
+            evidence_store=app.stores.evidence,
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            run_store=app.stores.runs,
+            budget_manager=app.budget_manager,
+            format_version="v2",
+        ).collect_facts(TaskEnvelope(
+            task_id=f"{run.run_id}-facts-hash", run_id=run.run_id,
+            agent_type="report", finding_ids=run.finding_ids,
+        ))
+    except Exception:  # noqa: BLE001 - 계측 실패가 실행 기록 전체를 막으면 안 된다
+        return None
+    return report_facts_hash(facts)
 
 
 def _report_narrative_summary(app, run) -> dict[str, object]:
