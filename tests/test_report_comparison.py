@@ -41,13 +41,26 @@ _UNSET = object()
 
 
 def run_result(run_id, mode, *, facts_hash, comparable=_UNSET, findings=2, narrative=None,
-               requests_used=100):
+               requests_used=100, conditions=None):
     """실행기가 남기는 run_result 레코드의 비교 관련 필드만 재현한다.
 
     facts_hash는 run_id와 Finding ID가 들어간 Run 전용 값이고, comparable은 그 ID를
     뺀 값이다. 실제 Run 둘은 facts_hash가 절대 같지 않으므로 기본값을 따로 둔다.
     """
 
+    profile = {
+        "execution_profile_recorded": True,
+        "analysis_profile": "heuristic", "recon_mode": "heuristic",
+        "surface_collection_mode": "deterministic", "router_mode": "heuristic",
+        "router_review": "weak", "compare_routers": False,
+        "orchestrator_mode": "heuristic", "budget_allocation_mode": "off",
+        "validation_mode": "heuristic", "request_budget": 100,
+        "llm_provider": "gemini" if mode == "llm" else "",
+        "llm_model": "gemini-3.5-flash-lite" if mode == "llm" else "",
+        "llm_rpm_limit": 14 if mode == "llm" else None,
+        "phase": "done",
+    }
+    profile.update(conditions or {})
     return {
         "schema_version": 4, "event": "run_result", "run_id": run_id,
         "report_mode": mode, "report_facts_hash": facts_hash,
@@ -62,6 +75,7 @@ def run_result(run_id, mode, *, facts_hash, comparable=_UNSET, findings=2, narra
             "usage_unavailable_count": 0, "elapsed_available_count": 0,
             "elapsed_ms_observed": 0,
         },
+        **profile,
     }
 
 
@@ -277,6 +291,52 @@ class LogsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.logs([run_result("run-off", "heuristic", facts_hash="a" * 64)])
 
+    def test_different_non_report_conditions_are_refused(self):
+        for changed in (
+            {"analysis_profile": "llm"},
+            {"recon_mode": "hybrid"},
+            {"surface_collection_mode": "adaptive"},
+            {"router_mode": "hybrid"},
+            {"router_review": "ambiguous"},
+            {"compare_routers": True},
+            {"orchestrator_mode": "hybrid"},
+            {"budget_allocation_mode": "heuristic"},
+            {"validation_mode": "llm"},
+            {"request_budget": 200},
+        ):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                self.logs([
+                    run_result("run-off", "heuristic", facts_hash="a" * 64),
+                    run_result("run-on", "llm", facts_hash="a" * 64, conditions=changed),
+                ])
+
+    def test_unrecorded_or_incomplete_conditions_are_refused(self):
+        for changed in ({"execution_profile_recorded": False}, {"phase": "failed"}):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                self.logs([
+                    run_result("run-off", "heuristic", facts_hash="a" * 64),
+                    run_result("run-on", "llm", facts_hash="a" * 64, conditions=changed),
+                ])
+        old = run_result("run-off", "heuristic", facts_hash="a" * 64)
+        del old["router_mode"]
+        with self.assertRaises(ValueError):
+            self.logs([old, run_result("run-on", "llm", facts_hash="a" * 64)])
+
+    def test_report_only_llm_setup_is_allowed_but_other_llm_setup_must_match(self):
+        self.assertTrue(self.logs([
+            run_result("run-off", "heuristic", facts_hash="a" * 64),
+            run_result("run-on", "llm", facts_hash="a" * 64),
+        ])["same_report_facts"])
+        other_llm = {"analysis_profile": "llm", "llm_provider": "gemini",
+                     "llm_model": "gemini-3.5-flash-lite", "llm_rpm_limit": 14}
+        with self.assertRaises(ValueError):
+            self.logs([
+                run_result("run-off", "heuristic", facts_hash="a" * 64,
+                           conditions=other_llm),
+                run_result("run-on", "llm", facts_hash="a" * 64,
+                           conditions=dict(other_llm, llm_model="different-model")),
+            ])
+
     def test_two_separate_files_are_read_together(self):
         comparison = self.logs(
             [run_result("run-off", "heuristic", facts_hash="a" * 64)],
@@ -317,6 +377,18 @@ class LogsTests(unittest.TestCase):
         self.assertEqual(comparison["cost_delta"]["llm_calls"], 3)
         self.assertEqual(comparison["cost_delta"]["input_tokens"], 900)
         self.assertEqual(comparison["cost_delta"]["elapsed_ms"], 450.5)
+
+    def test_rates_exclude_other_conditions_and_report_models(self):
+        comparison = self.logs([
+            run_result("other-router", "llm", facts_hash="a" * 64,
+                       conditions={"router_mode": "hybrid"}),
+            run_result("other-model", "llm", facts_hash="a" * 64,
+                       conditions={"llm_model": "different-model"}),
+            run_result("run-off", "heuristic", facts_hash="a" * 64),
+            run_result("run-on", "llm", facts_hash="a" * 64),
+        ])
+        self.assertEqual(comparison["rates"]["off"]["run_count"], 1)
+        self.assertEqual(comparison["rates"]["on"]["run_count"], 1)
 
 
 class RateTests(unittest.TestCase):

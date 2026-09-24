@@ -59,9 +59,10 @@ meter reports the counts as unknown rather than zero, so "the LLM was off" and
 `scripts/compare_reports.py` measures the narrator off/on axis. `replay` renders
 both reports from a fixed fixture without contacting a target or a provider, and
 `--failure` injects each narrator failure to measure the fallback path. `logs`
-compares the latest recorded run of each mode and aggregates the fallback and
-rejected-sentence rates across every run in the given JSONL files. Both report
+compares the latest completed run of each mode only when the recorded non-report
+execution conditions and request budget match. Its fallback and rejected-sentence
+rates include only runs with matching conditions and the same report model. Both report
 fact preservation, offered-set citation containment, status representation, and
 narrator cost. Neither establishes semantic accuracy: the fixed-fixture human
 blind review that the measurement contract also requires is not part of this
-tool.
+tool. Keep the target and its state fixed when collecting the runs.

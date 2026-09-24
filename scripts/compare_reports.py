@@ -1,8 +1,8 @@
 """같은 사실 위에서 Report narrator를 껐을 때와 켰을 때를 비교한다. 대상 HTTP 실행은 하지 않는다.
 
 replay는 고정 fixture로 두 보고서를 offline 생성해 사실 보존·인용 정합성·비용을 재는다.
-logs는 이미 기록된 run_result JSONL에서 같은 축을 재고, 여러 Run에 걸친 fallback 비율과
-rejected 비율을 집계한다.
+logs는 이미 기록된 run_result JSONL에서 P-2 실행 조건이 같은 완료 Run만 비교하고,
+같은 조건·모델의 여러 Run에 걸친 fallback 비율과 rejected 비율을 집계한다.
 
 지시서 §7이 요구하는 "사람 blind 평가"는 여기에서 다루지 않는다. 이 도구가 재는 것은
 기계적으로 확인 가능한 축뿐이고, 문장의 의미적 정확성은 ID 검증만으로 증명되지 않는다.
@@ -40,6 +40,13 @@ from hacklipse.ports.llm import LlmResponse, LlmUsage  # noqa: E402
 
 FIXTURE_MODEL = "fixture-not-a-real-model"
 CONFIG = NarratorFingerprintConfig(model=FIXTURE_MODEL, prompt_version="llm-report-narrative-v1")
+_COMPARISON_FIELDS = (
+    "analysis_profile", "recon_mode", "surface_collection_mode",
+    "router_mode", "router_review", "compare_routers",
+    "orchestrator_mode", "budget_allocation_mode", "validation_mode",
+    "request_budget",
+)
+_LLM_FIELDS = ("llm_provider", "llm_model", "llm_rpm_limit")
 _FAILURES = {
     "timeout": LlmTimeout,
     "transport_error": LlmTransportError,
@@ -334,6 +341,52 @@ def latest_run(records, mode):
     return matching[-1]
 
 
+def _check_execution_conditions(off, on):
+    """Report 모드만 다른 완료 Run인지 P-2 기록으로 확인한다."""
+
+    required = (*_COMPARISON_FIELDS, "execution_profile_recorded", "phase", *_LLM_FIELDS)
+    missing = [field for field in required if field not in off or field not in on]
+    if missing:
+        raise ValueError(f"missing execution conditions: {', '.join(missing)}")
+    if off["execution_profile_recorded"] is not True or on["execution_profile_recorded"] is not True:
+        raise ValueError("unrecorded execution conditions cannot be compared")
+    if off["phase"] != "done" or on["phase"] != "done":
+        raise ValueError("report comparison requires completed runs")
+    different = [field for field in _COMPARISON_FIELDS if off[field] != on[field]]
+    if different:
+        raise ValueError(f"different execution conditions: {', '.join(different)}")
+    if not on["llm_provider"] or not on["llm_model"]:
+        raise ValueError("LLM report run is missing its provider or model")
+    # Report가 유일한 LLM 축이면 off Run에는 provider/model이 없는 것이 정상이다.
+    # 다른 축에서도 LLM을 썼다면 두 Run의 모델과 rate limit까지 같아야 한다.
+    other_llm = (
+        off["analysis_profile"] == "llm" or off["recon_mode"] == "hybrid"
+        or off["router_mode"] == "hybrid" or off["compare_routers"]
+        or off["orchestrator_mode"] == "hybrid"
+        or off["budget_allocation_mode"] == "hybrid"
+        or off["validation_mode"] == "llm"
+    )
+    if other_llm and (
+        not off["llm_provider"] or not off["llm_model"]
+        or any(off[field] != on[field] for field in _LLM_FIELDS)
+    ):
+        raise ValueError("different non-report LLM configuration")
+    if not other_llm and (off["llm_provider"] or off["llm_model"]
+                          or off["llm_rpm_limit"] is not None):
+        raise ValueError("baseline has an unexpected LLM configuration")
+
+
+def _same_run_conditions(record, reference):
+    """비율 집계에 넣을 같은 모드·조건의 완료 Run만 고른다."""
+
+    fields = (*_COMPARISON_FIELDS, *_LLM_FIELDS, "report_mode")
+    return (
+        record.get("execution_profile_recorded") is True
+        and record.get("phase") == "done"
+        and all(field in record and record[field] == reference[field] for field in fields)
+    )
+
+
 def _side_from_record(record):
     """기록된 run_result를 replay와 같은 축으로 읽는다. 사실 원문은 로그에 없다."""
 
@@ -393,6 +446,7 @@ def aggregate_rates(records, mode):
 def compare_logs(args):
     records = _run_results([args.baseline_log, args.narrative_log])
     off, on = latest_run(records, "heuristic"), latest_run(records, "llm")
+    _check_execution_conditions(off, on)
     left, right = _side_from_record(off), _side_from_record(on)
     # 서로 다른 Run이므로 run-scoped 해시는 절대 같아지지 않는다. 생성 ID를 뺀
     # 해시로 비교해야 "같은 사실 위에서 돌았는가"를 물을 수 있다.
@@ -423,8 +477,14 @@ def compare_logs(args):
             "note": "Report narrator telemetry only, not total run cost.",
         },
         "rates": {
-            "off": aggregate_rates(records, "heuristic"),
-            "on": aggregate_rates(records, "llm"),
+            "off": aggregate_rates(
+                [record for record in records if _same_run_conditions(record, off)],
+                "heuristic",
+            ),
+            "on": aggregate_rates(
+                [record for record in records if _same_run_conditions(record, on)],
+                "llm",
+            ),
         },
         "comparison_warning": (
             "Older records carry no report_facts_comparable_hash; fact preservation is unverified."
