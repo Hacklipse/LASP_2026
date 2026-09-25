@@ -66,7 +66,7 @@ if _MISSING_DEPENDENCY is not None:
     raise SystemExit(2)
 
 
-from hacklipse.adapters import HttpExecutionRuntime  # noqa: E402
+from hacklipse.adapters import HttpExecutionRuntime, SlidingWindowLlmClient  # noqa: E402
 from hacklipse.adapters.memory import CallbackProgressLog  # noqa: E402
 from hacklipse.application import build_progress_snapshot  # noqa: E402
 from hacklipse.application.errors import WorkflowExecutionError  # noqa: E402
@@ -79,7 +79,8 @@ from hacklipse.bootstrap import (  # noqa: E402
     register_standard_agents,
     standard_router,
 )
-from hacklipse.domain import RunRequest, RunScope  # noqa: E402
+from hacklipse.domain import RunExecutionProfile, RunRequest, RunScope  # noqa: E402
+from hacklipse.ports import LlmRequest, LlmResponse  # noqa: E402
 from hacklipse.bootstrap import (  # noqa: E402
     ANTHROPIC_API_KEY_ENV,
     GEMINI_API_KEY_ENV,
@@ -112,6 +113,10 @@ REPORT_BY_ID = {report["id"]: report for report in REPORTS}
 MAX_BUDGET = 500
 # 컨테이너 안에서만 루프백 밖 바인딩을 허용하는 열쇠. compose 가 설정한다.
 CONTAINER_BIND_ENV = "HACKLIPSE_DASHBOARD_CONTAINER"
+# 공급자 상한 15 RPM 을 꽉 채우지 않고 한 슬롯을 남긴다. 이 프로세스 밖의 호출이나
+# 공급자 집계 경계의 오차로 마지막 하나가 429 가 되는 일을 줄인다.
+# run_juice_shop_baseline.py 의 _DEFAULT_GEMINI_RPM_LIMIT 와 같은 값이다.
+DEFAULT_GEMINI_RPM_LIMIT = 14
 
 DEFAULT_BIND = "127.0.0.1"
 DEFAULT_PORT = 8899
@@ -135,7 +140,39 @@ def _empty_snapshot(budget_total: int) -> dict:
         "budget_used": 0,
         "budget_total": budget_total,
         "llm_calls": 0,
+        "llm_input_tokens": 0,
+        "llm_output_tokens": 0,
     }
+
+
+class NoLlmUsage:
+    """LLM 을 쓰지 않은 Run 의 사용량. "모른다(정보 없음)"와 "0이다"는 다르다."""
+
+    calls = 0
+    input_tokens = 0
+    output_tokens = 0
+
+
+class LlmUsageMeter:
+    """LLM 호출 수와 token 만 세는 얇은 래퍼. prompt·응답 본문은 보관하지 않는다.
+
+    Report Agent 는 값이 아니라 살아 있는 계측기를 받는다 — 조립 시점에는 0이고
+    보고서를 만들 때 읽어야 하기 때문이다(RunLlmUsageSource).
+    """
+
+    def __init__(self, delegate) -> None:
+        self._delegate = delegate
+        self.calls = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+
+    def complete(self, request: LlmRequest) -> LlmResponse:
+        response = self._delegate.complete(request)
+        self.calls += 1
+        usage = response.usage
+        self.input_tokens += usage.input_tokens + usage.cache_read_input_tokens
+        self.output_tokens += usage.output_tokens
+        return response
 
 
 class DashboardState:
@@ -236,6 +273,7 @@ class RunSupervisor:
         self.state = DashboardState(budget=options.budget, target=options.target)
         self._thread: threading.Thread | None = None
         self._current_agent: str | None = None
+        self._usage: LlmUsageMeter | None = None
 
     def validate_target(self, target: str) -> str | None:
         """거부 사유를 문자열로 돌려준다. 통과하면 None."""
@@ -293,21 +331,37 @@ class RunSupervisor:
 
     def _build_llm_client(self, engine: dict):
         if engine["provider"] is None:
-            return None
+            return None, None
+
         if engine["provider"] == "gemini":
-            return build_gemini_llm_client_from_env(
+            client = build_gemini_llm_client_from_env(
                 model=self._options.llm_model or DEFAULT_GEMINI_LLM_MODEL
             )
-        return build_llm_client_from_env(
-            model=self._options.llm_model or DEFAULT_ANTHROPIC_LLM_MODEL
-        )
+        else:
+            client = build_llm_client_from_env(
+                model=self._options.llm_model or DEFAULT_ANTHROPIC_LLM_MODEL
+            )
+
+        # 한 Run 이 Recon 계획·Analysis·Validation·Report 요약까지 LLM 을 여러 번
+        # 부른다. 무료 등급 Gemini 는 분당 15회라 제한 없이 돌리면 Run 중간에 429 로
+        # 죽는다. 기존 실행기와 같은 sliding window 를 씌운다.
+        limit = self._options.llm_rpm_limit
+        if limit is None and engine["provider"] == "gemini":
+            limit = DEFAULT_GEMINI_RPM_LIMIT
+        if limit:
+            client = SlidingWindowLlmClient(client, max_calls=limit)
+        # 계측은 제한 바깥에 둔다. 제한 때문에 대기한 호출도 한 번의 호출이다.
+        return LlmUsageMeter(client), limit
 
     def _run(self, target: str, engine: dict, budget: int, report: dict) -> None:
         try:
-            llm_client = self._build_llm_client(engine)
+            llm_client, rpm_limit = self._build_llm_client(engine)
         except LlmCredentialsMissing as error:
             self.state.finish(status="failed", error=str(error))
             return
+        # 보고서에는 항상 사용량 원천을 준다. 결정적 Run 은 0으로 확정된 값이다.
+        self._usage = llm_client
+        report_usage = llm_client if llm_client is not None else NoLlmUsage()
 
         app = build_local_application(
             {},
@@ -317,6 +371,7 @@ class RunSupervisor:
             # 조립 시점에 거부하므로 "켠 줄 알았는데 결정적 보고서"가 나오지 않는다.
             report_llm_client=llm_client if report["mode"] == "llm" else None,
             report_llm_model=self._resolved_model(engine) if report["mode"] == "llm" else "",
+            report_llm_usage=report_usage,
             runtime=HttpExecutionRuntime(),
             # Router mode 는 Analysis 프로필과 독립적인 축이다. 기존 실행기와 같이
             # 결정적 Router 를 쓰고, LLM 엔진은 Analyzer 만 교체한다.
@@ -332,6 +387,24 @@ class RunSupervisor:
                     target_url=target,
                     scope=RunScope(allowed_hosts=self._allowed_hosts),
                     request_budget=budget,
+                    # 실제 배선을 그대로 기록한다. 이 값이 보고서의 "실행 조건"이 되고
+                    # Facts 해시에 들어가므로, 비워두면 heuristic Run 과 LLM Run 이
+                    # 같은 조건으로 기록되어 A/B 비교가 성립하지 않는다.
+                    execution_profile=RunExecutionProfile(
+                        analysis_profile="llm" if engine["provider"] else "heuristic",
+                        # Router·Recon·Orchestrator 는 아직 결정적 구성만 배선한다.
+                        recon_mode="heuristic",
+                        surface_collection_mode="adaptive",
+                        router_mode="heuristic",
+                        router_review="weak",
+                        orchestrator_mode="heuristic",
+                        budget_allocation_mode="off",
+                        validation_mode="heuristic",
+                        report_mode=report["mode"],
+                        llm_provider=engine["provider"] or "",
+                        llm_model=self._resolved_model(engine) if engine["provider"] else "",
+                        llm_rpm_limit=rpm_limit,
+                    ),
                 )
             )
         except WorkflowExecutionError as error:
@@ -375,8 +448,15 @@ class RunSupervisor:
         except RecordNotFound:
             return
 
+        usage = self._usage
         snapshot = build_progress_snapshot(
-            run, stores=app.stores, budget=app.budget_manager
+            run,
+            stores=app.stores,
+            budget=app.budget_manager,
+            # Store 에 남지 않는 값이라 계측기에서 직접 읽어 넘긴다.
+            llm_calls=usage.calls if usage else 0,
+            llm_input_tokens=usage.input_tokens if usage else 0,
+            llm_output_tokens=usage.output_tokens if usage else 0,
         )
         surfaces = {item.surface_id: item for item in app.stores.surfaces.list_by_run(run_id)}
         findings = {item.candidate_id: item for item in app.stores.findings.list_by_run(run_id)}
@@ -413,6 +493,8 @@ class RunSupervisor:
                 "budget_used": snapshot.budget_used,
                 "budget_total": snapshot.budget_total,
                 "llm_calls": snapshot.llm_calls,
+                "llm_input_tokens": snapshot.llm_input_tokens,
+                "llm_output_tokens": snapshot.llm_output_tokens,
             },
         )
 
@@ -582,6 +664,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="화면에 미리 선택해둘 보고서 구성. 실제 선택은 브라우저에서 한다.",
     )
     parser.add_argument("--llm-model", default=None, help="기본 모델 대신 쓸 모델 이름")
+    parser.add_argument(
+        "--llm-rpm-limit",
+        type=int,
+        default=None,
+        help=f"분당 LLM 호출 상한. 미지정 시 Gemini 는 {DEFAULT_GEMINI_RPM_LIMIT}, 그 외는 제한 없음.",
+    )
     parser.add_argument("--verbose", action="store_true", help="HTTP 접근 로그를 모두 출력한다")
     return parser.parse_args(argv)
 
