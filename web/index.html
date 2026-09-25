@@ -59,7 +59,13 @@
        .field-grid 가 그래서 hidden 이어도 보였다. 여기서 한 번에 막는다. */
     [hidden]{display:none!important}
     .setup{margin-bottom:18px}
-    .setup-body{padding:20px 25px 25px}
+    .setup>.panel-heading{padding-bottom:23px}
+    .setup-body{padding:20px 25px 25px;border-top:1px solid var(--soft)}
+    .panel-toggle{display:inline-flex;align-items:center;gap:8px;flex:none;padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--muted);font:inherit;font-size:9px;font-weight:800;letter-spacing:.08em;cursor:pointer}
+    .panel-toggle:hover{border-color:#5e864a;color:var(--lime)}
+    .panel-toggle:focus-visible,.finding-group-toggle:focus-visible{outline:2px solid var(--lime);outline-offset:2px}
+    .panel-toggle-icon,.finding-group-chevron{display:inline-block;color:var(--dim);font-size:13px;line-height:1;transition:transform .18s ease}
+    .panel-toggle[aria-expanded="true"] .panel-toggle-icon,.finding-group-toggle[aria-expanded="true"] .finding-group-chevron{transform:rotate(180deg)}
     .field-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(178px,1fr));gap:13px}
     .field-grid+.field-grid{margin-top:15px}
     .field-grid.checks{grid-template-columns:repeat(auto-fit,minmax(158px,1fr))}
@@ -90,10 +96,27 @@
     .error-banner{display:none;margin-bottom:18px;padding:13px 18px;border:1px solid #65483e;border-radius:9px;background:#382925;color:#f0b4ae;font-size:11px;line-height:1.5}
     .error-banner.show{display:block}
     .findings-count.none{border-color:var(--line);background:var(--panel2);color:var(--dim)}
+    .findings-groups{display:grid;margin-top:20px;border-top:1px solid var(--soft)}
+    .finding-group{border-bottom:1px solid var(--soft)}
+    .finding-group:last-child{border-bottom:0}
+    .finding-group-toggle{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:12px;width:100%;padding:15px 25px;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer}
+    .finding-group-toggle:hover{background:#182329}
+    .finding-group-name{display:flex;align-items:center;gap:9px;min-width:0;color:#e5efec;font-size:12px;font-weight:760}
+    .finding-group-count{display:grid;place-items:center;min-width:23px;height:21px;padding:0 6px;border:1px solid var(--line);border-radius:5px;background:var(--panel2);color:var(--cyan);font-size:9px;font-variant-numeric:tabular-nums}
+    .finding-group-summary{overflow:hidden;color:var(--dim);font-size:9px;text-overflow:ellipsis;white-space:nowrap}
+    .finding-group-body{border-top:1px solid var(--soft);background:#111a20}
+    .finding-group-body .findings-table{margin-top:0}
+    .finding-group-body .findings-table th{padding-top:12px}
+    .findings-empty{padding:30px 25px;color:var(--dim);font-size:11px;text-align:center}
     @media(max-width:1180px){
       .scan-bar{flex-wrap:wrap;row-gap:15px}
       .target{flex-basis:100%;padding-right:0}
       .scan-bar>.scan-meta:first-of-type{padding-left:0;border-left:0}
+    }
+    @media(max-width:680px){
+      .finding-group-toggle{grid-template-columns:minmax(0,1fr) auto;padding:14px}
+      .finding-group-summary{grid-column:1 / -1;grid-row:2}
+      .finding-group-chevron{grid-column:2;grid-row:1}
     }
     @media(max-width:680px){.scan-actions{flex-basis:100%;padding:12px 0 0;border-left:0}.start-btn{width:100%}.target{padding-right:0}}
   </style>
@@ -141,18 +164,20 @@
       <div class="scan-meta tight"><span class="meta-label">Budget</span><input class="control-input" id="budget-input" type="number" min="1" max="500" placeholder="auto" aria-label="Request budget"></div>
       <div class="scan-meta tight"><span class="meta-label">Run ID</span><span class="meta-value" id="run-id">—</span></div>
       <div class="scan-meta tight"><span class="meta-label">Agent</span><span class="meta-value" id="current-agent">—</span></div>
-      <div class="scan-actions"><button class="ghost-btn" id="setup-toggle" type="button" aria-expanded="false" aria-controls="setup-panel">SETUP</button><button class="start-btn" id="start-btn" type="button">START SCAN</button></div>
+      <div class="scan-actions"><button class="ghost-btn" id="setup-toggle" type="button" aria-expanded="false" aria-controls="setup-body">SETUP</button><button class="start-btn" id="start-btn" type="button">START SCAN</button></div>
     </section>
 
-    <section class="panel setup" id="setup-panel" aria-labelledby="setup-title" hidden>
+    <section class="panel setup" id="setup-panel" aria-labelledby="setup-title">
       <div class="panel-heading">
         <div>
           <p class="panel-kicker">Run configuration</p>
           <h2 class="panel-title" id="setup-title">실행 조건</h2>
-          <p class="panel-desc">여기서 고른 값이 그대로 Agent 배선과 보고서의 실행 조건 기록이 된다.</p>
         </div>
+        <button class="panel-toggle" id="setup-panel-toggle" type="button" aria-expanded="false" aria-controls="setup-body" aria-label="실행 조건 펼치기">
+          <span class="panel-toggle-icon" aria-hidden="true">⌄</span>
+        </button>
       </div>
-      <div class="setup-body">
+      <div class="setup-body" id="setup-body" hidden>
         <div class="field-grid" id="advanced-grid"></div>
         <div class="field-grid" id="llm-grid" hidden></div>
         <div class="field-grid checks" id="boolean-grid"></div>
@@ -218,10 +243,9 @@
           </div>
           <span class="findings-count none" id="findings-count" aria-label="finding count">00</span>
         </div>
-        <table class="findings-table">
-          <thead><tr><th scope="col">Finding</th><th scope="col">Severity</th><th scope="col">Status</th></tr></thead>
-          <tbody id="findings-body"><tr class="empty-row"><td colspan="3">No candidates yet.</td></tr></tbody>
-        </table>
+        <div class="findings-groups" id="findings-groups" aria-live="polite">
+          <div class="findings-empty">No candidates yet.</div>
+        </div>
         <div class="findings-footer" id="findings-footer">Waiting for a run to start</div>
       </section>
 

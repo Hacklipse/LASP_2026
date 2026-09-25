@@ -74,6 +74,7 @@ let lastSequence = 0;
 let activity = [];
 let running = false;
 let timer = null;
+const expandedFindingGroups = new Set();
 
 /* ------------------------------------------------------------------ 포맷터 */
 
@@ -324,34 +325,86 @@ function renderFindings(state) {
       a.vulnerability_type.localeCompare(b.vulnerability_type)
   );
 
-  const body = $('findings-body');
+  const groups = $('findings-groups');
   if (!rows.length) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="3">${
+    expandedFindingGroups.clear();
+    groups.innerHTML = `<div class="findings-empty">${
       state.status === 'idle' ? 'No candidates yet.' : 'No candidates raised so far.'
-    }</td></tr>`;
+    }</div>`;
   } else {
-    body.innerHTML = rows
-      .slice(0, 12)
-      .map((item) => {
-        const severity = severityOf(item);
-        const [label, klass] = STATUS_LABELS[item.status] || [item.status, ''];
+    const grouped = new Map();
+    for (const item of rows) {
+      const type = item.vulnerability_type || 'Unknown';
+      if (!grouped.has(type)) grouped.set(type, []);
+      grouped.get(type).push(item);
+    }
+    const entries = [...grouped.entries()];
+    const activeTypes = new Set(grouped.keys());
+    for (const type of expandedFindingGroups) {
+      if (!activeTypes.has(type)) expandedFindingGroups.delete(type);
+    }
+
+    groups.innerHTML = entries
+      .map(([type, items], index) => {
+        const expanded = expandedFindingGroups.has(type);
+        const statusCounts = new Map();
+        for (const item of items) {
+          statusCounts.set(item.status, (statusCounts.get(item.status) || 0) + 1);
+        }
+        const summary = Object.keys(STATUS_ORDER)
+          .filter((status) => statusCounts.has(status))
+          .map((status) => {
+            const [label] = STATUS_LABELS[status] || [status];
+            return `${statusCounts.get(status)} ${label}`;
+          })
+          .join(' · ');
+        const buttonId = `finding-group-toggle-${index}`;
+        const bodyId = `finding-group-body-${index}`;
+        const itemRows = items
+          .map((item) => {
+            const severity = severityOf(item);
+            const [label, klass] = STATUS_LABELS[item.status] || [item.status, ''];
+            return (
+              '<tr>' +
+              `<td><span class="finding-name">${escapeHtml(type)}</span>` +
+              `<span class="finding-path">${escapeHtml(surfaceLabel(item))}</span></td>` +
+              `<td><span class="severity ${severity}">${severity[0].toUpperCase()}${severity.slice(1)}</span></td>` +
+              `<td><span class="finding-status ${klass}">${escapeHtml(label)}</span></td>` +
+              '</tr>'
+            );
+          })
+          .join('');
         return (
-          '<tr>' +
-          `<td><span class="finding-name">${escapeHtml(item.vulnerability_type)}</span>` +
-          `<span class="finding-path">${escapeHtml(surfaceLabel(item))}</span></td>` +
-          `<td><span class="severity ${severity}">${severity[0].toUpperCase()}${severity.slice(1)}</span></td>` +
-          `<td><span class="finding-status ${klass}">${escapeHtml(label)}</span></td>` +
-          '</tr>'
+          '<section class="finding-group">' +
+          `<button class="finding-group-toggle" id="${buttonId}" type="button" ` +
+          `data-group-index="${index}" aria-expanded="${expanded}" aria-controls="${bodyId}">` +
+          `<span class="finding-group-name">${escapeHtml(type)} <span class="finding-group-count">${items.length}</span></span>` +
+          `<span class="finding-group-summary">${escapeHtml(summary)}</span>` +
+          '<span class="finding-group-chevron" aria-hidden="true">⌄</span></button>' +
+          `<div class="finding-group-body" id="${bodyId}" role="region" aria-labelledby="${buttonId}"${expanded ? '' : ' hidden'}>` +
+          '<table class="findings-table"><thead><tr><th scope="col">Finding</th><th scope="col">Severity</th><th scope="col">Status</th></tr></thead>' +
+          `<tbody>${itemRows}</tbody></table></div></section>`
         );
       })
       .join('');
+
+    for (const button of groups.querySelectorAll('.finding-group-toggle')) {
+      button.addEventListener('click', () => {
+        const [type] = entries[Number(button.dataset.groupIndex)];
+        const expanded = button.getAttribute('aria-expanded') !== 'true';
+        button.setAttribute('aria-expanded', String(expanded));
+        document.getElementById(button.getAttribute('aria-controls')).hidden = !expanded;
+        if (expanded) expandedFindingGroups.add(type);
+        else expandedFindingGroups.delete(type);
+      });
+    }
   }
 
   const count = $('findings-count');
   count.textContent = pad2(state.findings_total);
   count.classList.toggle('none', state.findings_total === 0);
   $('findings-footer').textContent = rows.length
-    ? `Showing ${Math.min(rows.length, 12)} of ${rows.length} candidates from this run`
+    ? `${rows.length} candidates grouped by ${new Set(rows.map((item) => item.vulnerability_type)).size} vulnerability types`
     : 'Waiting for the router to raise candidates';
 }
 
@@ -463,6 +516,7 @@ async function start() {
   /* 새 Run 이므로 이전 Run 의 활동 로그와 순번을 버린다. */
   lastSequence = 0;
   activity = [];
+  expandedFindingGroups.clear();
   try {
     const payload = {
       target,
@@ -639,18 +693,26 @@ function syncMode() {
 
 /* 브라우저 검증은 Juice Shop 모드에서 유형이 정한다(CLI 와 같은 규칙). 수동 선택을
  * 막아 화면 표시와 실제 배선을 일치시킨다. */
+function setSetupExpanded(expanded) {
+  $('setup-body').hidden = !expanded;
+  for (const id of ['setup-toggle', 'setup-panel-toggle']) {
+    $(id).setAttribute('aria-expanded', String(expanded));
+  }
+  $('setup-panel-toggle').setAttribute(
+    'aria-label',
+    expanded ? '실행 조건 접기' : '실행 조건 펼치기'
+  );
+}
+
 function openSetup() {
-  const panel = $('setup-panel');
-  if (!panel.hidden) return;
-  panel.hidden = false;
-  $('setup-toggle').setAttribute('aria-expanded', 'true');
+  setSetupExpanded(true);
 }
 
 /* 비어 있는 필수 입력이 남아 있으면 SETUP 버튼에 표시한다. 패널을 닫아둔 채로도
  * 무엇이 막고 있는지 알 수 있어야 한다. */
 function markSetupNeeded() {
   const pending = [...document.querySelectorAll('[data-secret]')].some(
-    (input) => input.offsetParent !== null && !input.value.trim()
+    (input) => !input.value.trim()
   );
   $('setup-toggle').classList.toggle('needs-input', pending);
 }
@@ -694,11 +756,9 @@ async function boot() {
   tickClock();
   setInterval(tickClock, 30000);
   $('start-btn').addEventListener('click', start);
-  $('setup-toggle').addEventListener('click', () => {
-    const panel = $('setup-panel');
-    panel.hidden = !panel.hidden;
-    $('setup-toggle').setAttribute('aria-expanded', String(!panel.hidden));
-  });
+  const toggleSetup = () => setSetupExpanded($('setup-body').hidden);
+  $('setup-toggle').addEventListener('click', toggleSetup);
+  $('setup-panel-toggle').addEventListener('click', toggleSetup);
   $('copy-report').addEventListener('click', async () => {
     await navigator.clipboard.writeText($('report-body').textContent);
     const button = $('copy-report');
