@@ -48,6 +48,28 @@ def _defaults() -> RunOptions:
     return RunOptions(target="http://127.0.0.1:3000/")
 
 
+class DashboardMarkupTests(unittest.TestCase):
+    """접기 UI의 정적 계약이 HTML과 JavaScript 양쪽에서 유지된다."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.html = (_ROOT / "web" / "index.html").read_text(encoding="utf-8")
+        cls.javascript = (_ROOT / "web" / "app.js").read_text(encoding="utf-8")
+
+    def test_run_conditions_have_two_controls_for_the_same_collapsible_body(self) -> None:
+        self.assertIn('id="setup-body" hidden', self.html)
+        self.assertEqual(self.html.count('aria-controls="setup-body"'), 2)
+        self.assertIn('id="setup-panel-toggle"', self.html)
+        self.assertIn("function setSetupExpanded(expanded)", self.javascript)
+
+    def test_findings_use_per_type_accordions_instead_of_one_flat_body(self) -> None:
+        self.assertIn('id="findings-groups"', self.html)
+        self.assertNotIn('id="findings-body"', self.html)
+        self.assertIn('class="finding-group-toggle"', self.javascript)
+        self.assertIn('aria-expanded="${expanded}"', self.javascript)
+        self.assertIn("const expandedFindingGroups = new Set();", self.javascript)
+
+
 class PayloadValidationTests(unittest.TestCase):
     """계약을 벗어난 입력은 Run 으로 넘어가기 전에 막힌다."""
 
