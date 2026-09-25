@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#0b1014">
+  <title>Hacklipse — Security Overview</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0b1014;--side:#0f171c;--panel:#141e24;--panel2:#19252b;--line:#293840;--soft:#202d34;--text:#edf4f2;--muted:#91a2a7;--dim:#65777e;--lime:#b8f373;--cyan:#81d9dc;--amber:#f0c17a;--red:#f28b83}
+    *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;min-width:320px;background:var(--bg);color:var(--text);font-family:Inter,Pretendard,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}a{color:inherit;text-decoration:none}a:focus-visible{outline:2px solid var(--lime);outline-offset:3px}svg{display:block}
+    .app{display:grid;grid-template-columns:232px minmax(0,1fr);min-height:100vh}.sidebar{position:sticky;top:0;height:100vh;display:flex;flex-direction:column;padding:29px 15px 20px;border-right:1px solid var(--soft);background:var(--side)}.brand{display:flex;align-items:center;gap:11px;padding:0 10px}.brand-mark{display:grid;place-items:center;width:37px;height:37px;border:1px solid #5e864a;border-radius:10px;background:linear-gradient(145deg,#29432a,#14251e);color:var(--lime);font-size:21px;font-weight:900;letter-spacing:-3px;padding-right:3px;box-shadow:0 0 24px #b8f37318}.brand-name{font-size:14px;font-weight:800;letter-spacing:.12em}.brand-caption{display:block;margin-top:4px;color:var(--dim);font-size:9px;font-weight:750;letter-spacing:.14em}.side-label{margin:48px 13px 13px;color:var(--dim);font-size:10px;font-weight:800;letter-spacing:.16em;text-transform:uppercase}.nav{display:grid;gap:4px}.nav-link{display:flex;align-items:center;gap:12px;min-height:43px;padding:0 13px;border:1px solid transparent;border-radius:9px;color:#95a7ac;font-size:12px;font-weight:650;transition:background .2s,color .2s}.nav-link svg{width:17px;height:17px;flex:none;stroke-width:1.7}.nav-link:hover{color:var(--text);background:#1b292f}.nav-link.active{border-color:#3e5a3e;background:#223427;color:var(--lime)}.nav-count{margin-left:auto;padding:3px 6px;border-radius:5px;background:#3a3025;color:var(--amber);font-size:10px}.side-footer{display:flex;align-items:center;gap:10px;margin-top:auto;padding:17px 11px 0;border-top:1px solid var(--soft)}.team-mark{display:grid;place-items:center;width:33px;height:33px;border:1px solid #39585c;border-radius:8px;background:#1d3337;color:var(--cyan);font-size:11px;font-weight:800}.team-name{display:block;font-size:11px;font-weight:750}.team-role{display:block;margin-top:3px;color:var(--dim);font-size:10px}
+    main{min-width:0;padding:0 clamp(22px,3.6vw,58px) 60px}.content{max-width:1460px;margin:auto}.topbar{display:flex;align-items:center;justify-content:space-between;min-height:72px;border-bottom:1px solid var(--soft)}.crumb{display:flex;gap:11px;color:var(--dim);font-size:11px;font-weight:650}.crumb strong{color:#cedbd9}.top-right{display:flex;align-items:center;gap:17px;color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}.avatar{display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:#2a3f40;color:#d0e2e0;font-size:10px;font-weight:800}.page-heading{display:flex;justify-content:space-between;align-items:end;gap:16px;padding:36px 0 29px}.eyebrow{margin:0 0 11px;color:var(--lime);font-size:10px;font-weight:800;letter-spacing:.19em;text-transform:uppercase}h1{margin:0;font-size:clamp(28px,3vw,37px);font-weight:740;letter-spacing:-.055em;line-height:1.12}.title-dot{color:var(--lime)}.subtitle{margin:11px 0 0;color:var(--muted);font-size:12px;line-height:1.5}.run-status{display:inline-flex;align-items:center;gap:9px;padding:10px 12px;border:1px solid #446343;border-radius:7px;background:#1c2e20;color:var(--lime);font-size:10px;font-weight:800;letter-spacing:.07em;white-space:nowrap}.status-dot{width:7px;height:7px;border-radius:50%;background:var(--lime);box-shadow:0 0 0 4px #b8f3731a;animation:pulse 2s infinite}@keyframes pulse{50%{box-shadow:0 0 0 8px #b8f37300}}
+    .scan-bar{display:flex;align-items:center;min-height:72px;margin-bottom:18px;padding:13px 21px;border:1px solid var(--line);border-radius:11px;background:#151f25}.target{display:flex;align-items:center;gap:11px;min-width:0;margin-right:auto}.target-icon{display:grid;place-items:center;width:35px;height:35px;flex:none;border:1px solid #3a5759;border-radius:8px;background:#203538;color:var(--cyan);font-size:18px}.meta-label{display:block;color:var(--dim);font-size:9px;font-weight:750;letter-spacing:.12em;text-transform:uppercase}.meta-value{display:block;margin-top:5px;color:#dce8e5;font-size:11px;font-weight:750;white-space:nowrap}.target .meta-value{font-size:12px;overflow:hidden;text-overflow:ellipsis}.scan-meta{min-width:121px;padding:0 20px;border-left:1px solid var(--line)}
+    .metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:18px}.metric,.panel{border:1px solid var(--line);border-radius:11px;background:var(--panel)}.metric{min-height:132px;padding:20px 21px 17px}.metric-top{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:11px;font-weight:650}.metric-symbol{color:var(--dim);font-size:17px;line-height:1}.metric-number{margin-top:15px;font-size:31px;font-weight:740;letter-spacing:-.06em;line-height:1;font-variant-numeric:tabular-nums}.metric-number.highlight{color:var(--lime)}.metric-number small{font-size:18px;color:var(--muted)}.metric-foot{margin-top:11px;color:var(--dim);font-size:10px}.metric-foot strong{color:var(--cyan);font-weight:700}
+    .panel-heading{display:flex;justify-content:space-between;align-items:start;gap:16px;padding:23px 25px 0}.panel-kicker{margin:0 0 8px;color:var(--dim);font-size:9px;font-weight:800;letter-spacing:.18em;text-transform:uppercase}.panel-title{margin:0;font-size:16px;font-weight:730;letter-spacing:-.025em}.panel-desc{margin:6px 0 0;color:var(--muted);font-size:11px;line-height:1.5}.pipeline{position:relative;overflow:hidden;margin-bottom:18px}.pipeline:before{position:absolute;top:-150px;right:-100px;width:420px;height:420px;border:1px solid #b8f37311;border-radius:50%;box-shadow:0 0 0 58px #b8f37306,0 0 0 116px #b8f37304;pointer-events:none;content:""}.pipeline>*{position:relative}.step-counter{color:var(--lime);font-size:26px;font-weight:750;letter-spacing:-.05em;font-variant-numeric:tabular-nums}.step-counter small{color:var(--dim);font-size:13px;font-weight:500}.pipeline-body{padding:28px 25px 25px}.steps{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.step{position:relative;min-height:121px;padding:15px 14px;border:1px solid var(--line);border-radius:9px;background:#111a20}.step:after{position:absolute;top:27px;left:calc(100% + 1px);width:10px;border-top:1px dashed #647769;content:""}.step:last-child:after{display:none}.step.done{border-color:#385747;background:#18271f}.step.current{border-color:#94bd67;background:linear-gradient(145deg,#2a4028,#1b2b22);box-shadow:inset 0 0 0 1px #b8f3731b,0 12px 36px #0003}.step-top{display:flex;justify-content:space-between;align-items:center;color:var(--dim);font-size:10px;font-weight:750}.done .step-top,.current .step-top{color:var(--lime)}.step-check{display:grid;place-items:center;width:21px;height:21px;border:1px solid var(--line);border-radius:50%;color:var(--dim);font-size:11px}.done .step-check{border-color:#648351;background:#2d472b;color:var(--lime)}.current .step-check{border-color:var(--lime);background:var(--lime);color:#172317}.step-name{margin-top:21px;font-size:11px;font-weight:800;letter-spacing:.04em;white-space:nowrap}.step-caption{margin-top:5px;color:var(--muted);font-size:10px;white-space:nowrap}.current .step-caption{color:var(--lime)}.progress-copy{display:flex;justify-content:space-between;margin-top:24px;color:var(--muted);font-size:10px}.progress-copy strong{color:var(--lime);font-size:11px}.progress-track{height:5px;overflow:hidden;margin-top:10px;border-radius:99px;background:#29383c}.progress-fill{width:68%;height:100%;border-radius:inherit;background:linear-gradient(90deg,#6fc27e,var(--lime));box-shadow:0 0 15px #b8f37366}
+    .details{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(320px,.85fr);gap:18px;align-items:start}.findings{overflow:hidden}.findings-count{display:grid;place-items:center;min-width:26px;height:24px;border:1px solid #65483e;border-radius:6px;background:#382925;color:var(--red);font-size:11px;font-weight:800}.findings-table{width:100%;margin-top:21px;border-collapse:collapse;text-align:left}.findings-table th{padding:0 25px 12px;border-bottom:1px solid var(--line);color:var(--dim);font-size:9px;font-weight:800;letter-spacing:.11em;text-transform:uppercase}.findings-table td{padding:18px 25px;border-bottom:1px solid var(--soft);font-size:11px;vertical-align:middle}.findings-table tr:last-child td{border-bottom:0}.finding-name{color:#e5efec;font-size:12px;font-weight:730;white-space:nowrap}.finding-path{display:block;margin-top:5px;color:var(--dim);font-family:"SFMono-Regular",Consolas,monospace;font-size:10px;white-space:nowrap}.severity{display:inline-flex;align-items:center;gap:6px;font-size:10px;font-weight:800;white-space:nowrap}.severity:before{width:6px;height:6px;border-radius:50%;background:currentColor;content:""}.critical{color:var(--red)}.high{color:var(--amber)}.medium{color:var(--cyan)}.finding-status{color:var(--muted);font-size:10px;white-space:nowrap}.finding-status:before{display:inline-block;width:5px;height:5px;margin-right:7px;border-radius:50%;background:var(--cyan);vertical-align:middle;content:""}.findings-footer{padding:15px 25px;border-top:1px solid var(--soft);color:var(--dim);font-size:10px}.side-panels{display:grid;gap:18px}.validation-body{padding:20px 25px 24px}.validation-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.validation-item{min-height:75px;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--panel2)}.validation-item strong{display:block;font-size:22px;font-weight:740;line-height:1}.validation-item span{display:block;margin-top:9px;color:var(--muted);font-size:9px;line-height:1.2}.validation-item:first-child strong{color:var(--lime)}.validation-item:nth-child(2) strong{color:var(--amber)}.validation-note{display:flex;justify-content:space-between;gap:12px;margin-top:18px;color:var(--muted);font-size:10px}.validation-note strong{color:#dce7e3}.validation-meter{display:flex;gap:3px;height:4px;overflow:hidden;margin-top:10px;border-radius:4px}.validation-meter span:nth-child(1){width:58.33%;background:var(--lime)}.validation-meter span:nth-child(2){width:25%;background:var(--amber)}.validation-meter span:nth-child(3){flex:1;background:#677a80}.activity-list{display:grid;gap:0;margin:20px 25px 24px;padding:0 0 0 13px;border-left:1px solid #3b5052;list-style:none}.activity-item{position:relative;padding:0 0 16px 15px}.activity-item:last-child{padding-bottom:0}.activity-item:before{position:absolute;top:4px;left:-17px;width:7px;height:7px;border:2px solid var(--panel);border-radius:50%;background:#6c8587;content:""}.activity-item.active:before{background:var(--lime);box-shadow:0 0 0 3px #b8f37322}.activity-item.alert:before{background:var(--amber)}.activity-time{display:block;color:var(--dim);font-family:"SFMono-Regular",Consolas,monospace;font-size:9px}.activity-message{display:block;margin-top:4px;color:#cedad7;font-size:10px;line-height:1.45}.activity-item.active .activity-message{color:var(--lime)}
+    .panel-heading>div:first-child{min-width:0}.step-counter{flex:none;white-space:nowrap}.swipe-hint{display:none}
+    @media(max-width:1180px){.app{grid-template-columns:70px minmax(0,1fr)}.sidebar{align-items:center;padding:24px 10px 18px}.brand{padding:0}.brand-text,.side-label,.nav-text,.nav-count,.team-name,.team-role{display:none}.nav{margin-top:45px}.nav-link{justify-content:center;width:45px;padding:0}.side-footer{padding:16px 0 0}.details{grid-template-columns:minmax(0,1.2fr) minmax(290px,.8fr)}}
+    @media(max-width:900px){.details{grid-template-columns:1fr}.side-panels{grid-template-columns:repeat(2,minmax(0,1fr))}.scan-meta{min-width:100px;padding:0 14px}.metric{padding:17px}}
+    @media(max-width:680px){.app{display:block}.sidebar{position:relative;top:auto;width:100%;height:auto;flex-direction:row;justify-content:space-between;padding:13px 18px;border-right:0;border-bottom:1px solid var(--soft)}.nav{display:flex;gap:2px;margin:0}.nav-link{width:34px;min-height:34px}.nav-link svg{width:16px;height:16px}.side-footer{display:none}main{padding:0 16px 32px}.topbar{min-height:52px}.top-right{display:none}.page-heading{align-items:start;padding:27px 0 22px}.run-status{padding:8px;font-size:0}.status-dot{flex:none}.scan-bar{flex-wrap:wrap;gap:15px;padding:15px}.target{flex-basis:100%}.scan-meta{flex:1;min-width:0;padding:0 12px 0 0;border-left:0;border-right:1px solid var(--line)}.scan-meta:last-child{border-right:0}.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{min-height:120px}.pipeline-body{overflow-x:auto}.steps{min-width:690px}.swipe-hint{display:block;margin:12px 0 0;color:var(--dim);font-size:10px}.side-panels{grid-template-columns:1fr}.findings-table th,.findings-table td{padding-left:14px;padding-right:14px}.findings-table th:last-child,.findings-table td:last-child{display:none}}
+    @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.status-dot{animation:none}}
+
+    /* --- 실데이터 연결용 추가 규칙. 원본 디자인 토큰만 사용한다. --- */
+    /* 컨트롤이 늘어난 만큼 타겟 칸이 먼저 짓눌린다. 넉넉한 기준폭을 주고,
+       그래도 좁아지면 한 줄을 통째로 쓰게 한다 — 잘린 URL 은 확인이 안 된다. */
+    .target{flex:1 1 300px;min-width:0;padding-right:19px}
+    .target>span:last-of-type{flex:1;min-width:0}
+    .target-input{width:100%;min-width:0;margin-top:4px;padding:5px 8px;border:1px solid var(--line);border-radius:6px;background:#101a1f;color:#dce8e5;font-family:"SFMono-Regular",Consolas,monospace;font-size:11px;font-weight:600}
+    .target-input:focus-visible{outline:2px solid var(--lime);outline-offset:1px}
+    .control-input{width:100%;margin-top:4px;padding:5px 7px;border:1px solid var(--line);border-radius:6px;background:#101a1f;color:#dce8e5;font-family:inherit;font-size:11px;font-weight:700}
+    .control-input:focus-visible{outline:2px solid var(--lime);outline-offset:1px}
+    .control-input:disabled{color:var(--dim);cursor:not-allowed}
+    select.control-input{appearance:none;padding-right:18px;background-image:linear-gradient(45deg,transparent 50%,var(--dim) 50%),linear-gradient(135deg,var(--dim) 50%,transparent 50%);background-position:calc(100% - 11px) 12px,calc(100% - 7px) 12px;background-size:4px 4px;background-repeat:no-repeat;cursor:pointer}
+    select.control-input option:disabled{color:var(--dim)}
+    .scan-meta.wide{min-width:152px}
+    .scan-meta.tight{min-width:96px}
+    .details>.panel,.details>.side-panels{align-self:start}
+    .details{grid-template-areas:"findings side" "report side"}
+    .findings{grid-area:findings}.report{grid-area:report}.side-panels{grid-area:side}
+    .report-body{max-height:360px;overflow:auto;margin:19px 25px 24px;padding:15px 16px;border:1px solid var(--soft);border-radius:8px;background:#101a1f;color:#cedad7;font-family:"SFMono-Regular",Consolas,monospace;font-size:10px;line-height:1.65;white-space:pre-wrap;word-break:break-word}
+    .ghost-btn{flex:none;padding:7px 12px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--muted);font-size:9px;font-weight:800;letter-spacing:.1em;cursor:pointer}
+    .ghost-btn:hover:not(:disabled){border-color:#5e864a;color:var(--lime)}
+    .ghost-btn:disabled{color:var(--dim);cursor:not-allowed}
+    /* 단계는 끝났지만 실제로 검사한 것이 없을 때. 완료(✓)와 구분되어야 한다 —
+       "검사했는데 없었다"와 "검사하지 못했다"는 다른 결과다. */
+    .step.starved{border-color:#6b5733;background:#292115}
+    .starved .step-top{color:var(--amber)}
+    .starved .step-check{border-color:#8a6f3c;background:#3b2f18;color:var(--amber)}
+    .starved .step-caption{color:var(--amber)}
+    .progress-fill.starved{background:linear-gradient(90deg,#c89a4e,var(--amber));box-shadow:0 0 15px #f0c17a44}
+    .progress-copy strong.starved{color:var(--amber)}
+    .metric-number.warn{color:var(--amber)}
+    @media(max-width:900px){.details{grid-template-areas:"findings" "report" "side"}}
+    .scan-actions{padding-left:20px;border-left:1px solid var(--line)}
+    .start-btn{padding:11px 17px;border:1px solid #5e864a;border-radius:7px;background:#1c2e20;color:var(--lime);font-size:10px;font-weight:800;letter-spacing:.09em;white-space:nowrap;cursor:pointer}
+    .start-btn:hover:not(:disabled){background:#243a27}
+    .start-btn:disabled{border-color:var(--line);background:var(--panel2);color:var(--dim);cursor:not-allowed}
+    .run-status.idle{border-color:var(--line);background:var(--panel2);color:var(--muted)}
+    .run-status.idle .status-dot{background:var(--dim);box-shadow:none;animation:none}
+    .run-status.done{border-color:#3f5f61;background:#1a2b2d;color:var(--cyan)}
+    .run-status.done .status-dot{background:var(--cyan);box-shadow:none;animation:none}
+    .run-status.failed{border-color:#65483e;background:#382925;color:var(--red)}
+    .run-status.failed .status-dot{background:var(--red);box-shadow:none;animation:none}
+    .severity.low{color:#8fb39b}.severity.unrated{color:var(--dim)}
+    .finding-status.is-confirmed{color:var(--lime)}.finding-status.is-confirmed:before{background:var(--lime)}
+    .finding-status.is-rejected{color:var(--dim)}.finding-status.is-rejected:before{background:#677a80}
+    .finding-status.is-blocked{color:var(--amber)}.finding-status.is-blocked:before{background:var(--amber)}
+    .progress-fill{transition:width .45s ease}
+    .empty-row td{padding:30px 25px;color:var(--dim);font-size:11px;text-align:center}
+    .error-banner{display:none;margin-bottom:18px;padding:13px 18px;border:1px solid #65483e;border-radius:9px;background:#382925;color:#f0b4ae;font-size:11px;line-height:1.5}
+    .error-banner.show{display:block}
+    .findings-count.none{border-color:var(--line);background:var(--panel2);color:var(--dim)}
+    @media(max-width:1180px){
+      .scan-bar{flex-wrap:wrap;row-gap:15px}
+      .target{flex-basis:100%;padding-right:0}
+      .scan-bar>.scan-meta:first-of-type{padding-left:0;border-left:0}
+    }
+    @media(max-width:680px){.scan-actions{flex-basis:100%;padding:12px 0 0;border-left:0}.start-btn{width:100%}.target{padding-right:0}}
+  </style>
+  <script src="app.js" defer></script>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" aria-label="Sidebar">
+    <a class="brand" href="#overview" aria-label="Hacklipse overview"><span class="brand-mark" aria-hidden="true">H</span><span class="brand-text"><span class="brand-name">HACKLIPSE</span><span class="brand-caption">SECURITY PLATFORM</span></span></a>
+    <div class="side-label">Workspace</div>
+    <nav class="nav" aria-label="Main navigation">
+      <a class="nav-link active" href="#overview" aria-current="page" aria-label="Overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg><span class="nav-text">Overview</span></a>
+      <a class="nav-link" href="#pipeline" aria-label="Agent pipeline"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="4" cy="12" r="2"/><circle cx="12" cy="5" r="2"/><circle cx="20" cy="12" r="2"/><circle cx="12" cy="19" r="2"/><path d="M5.5 10.5 10.5 6.5M13.5 6.5l5 4M18.5 13.5l-5 4M10.5 17.5l-5-4"/></svg><span class="nav-text">Agent pipeline</span></a>
+      <a class="nav-link" href="#findings" aria-label="Findings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 2.5 20h19L12 3Z"/><path d="M12 9v5M12 17h.01"/></svg><span class="nav-text">Findings</span><span class="nav-count" id="nav-findings-count">0</span></a>
+      <a class="nav-link" href="#validation" aria-label="Validation"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2 4 5v6c0 5.1 3.2 9 8 11 4.8-2 8-5.9 8-11V5l-8-3Z"/><path d="m8.5 12 2.4 2.4 4.8-4.8"/></svg><span class="nav-text">Validation</span></a>
+      <a class="nav-link" href="#activity" aria-label="Activity log"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16M4 10h16M4 15h10M4 20h7"/></svg><span class="nav-text">Activity log</span></a>
+    </nav>
+    <div class="side-footer"><span class="team-mark">HL</span><span><span class="team-name">Hacklipse Team</span><span class="team-role">Security workspace</span></span></div>
+  </aside>
+
+  <main id="overview"><div class="content">
+    <div class="topbar"><div class="crumb"><span>Workspace</span><span>/</span><strong>Overview</strong></div><div class="top-right"><span id="clock">—</span><span class="avatar" aria-label="Hacklipse Team">HL</span></div></div>
+    <header class="page-heading">
+      <div>
+        <p class="eyebrow">Security operations / Active scan</p>
+        <h1>Security overview<span class="title-dot">.</span></h1>
+        <p class="subtitle">Monitor your attack surface, agent workflow, and verified findings.</p>
+      </div>
+      <span class="run-status idle" id="run-status"><span class="status-dot" aria-hidden="true"></span> <span id="run-status-text">IDLE</span></span>
+    </header>
+
+    <div class="error-banner" id="error-banner" role="alert"></div>
+
+    <section class="scan-bar" aria-label="Current scan details">
+      <div class="target">
+        <span class="target-icon" aria-hidden="true">◎</span>
+        <span>
+          <span class="meta-label">Target</span>
+          <input class="target-input" id="target-input" type="text" spellcheck="false" autocomplete="off" aria-label="Target URL">
+        </span>
+      </div>
+      <div class="scan-meta wide"><span class="meta-label">Engine</span><select class="control-input" id="engine-select" aria-label="Analysis engine"></select></div>
+      <div class="scan-meta wide"><span class="meta-label">Report</span><select class="control-input" id="report-select" aria-label="Report format"></select></div>
+      <div class="scan-meta tight"><span class="meta-label">Budget</span><input class="control-input" id="budget-input" type="number" min="1" max="500" step="10" aria-label="Request budget"></div>
+      <div class="scan-meta tight"><span class="meta-label">Run ID</span><span class="meta-value" id="run-id">—</span></div>
+      <div class="scan-meta tight"><span class="meta-label">Agent</span><span class="meta-value" id="current-agent">—</span></div>
+      <div class="scan-actions"><button class="start-btn" id="start-btn" type="button">START SCAN</button></div>
+    </section>
+
+    <section class="metrics" aria-label="Scan metrics">
+      <div class="metric">
+        <div class="metric-top"><span>Discovered surfaces</span><span class="metric-symbol" aria-hidden="true">⌁</span></div>
+        <div class="metric-number" id="m-surfaces">00</div>
+        <div class="metric-foot"><strong id="m-parameters">0 parameters</strong> identified</div>
+      </div>
+      <div class="metric">
+        <div class="metric-top"><span>Requests used</span><span class="metric-symbol" aria-hidden="true">♧</span></div>
+        <div class="metric-number" id="m-budget-used">00</div>
+        <div class="metric-foot">of <strong id="m-budget-total">0 budget</strong></div>
+      </div>
+      <div class="metric">
+        <div class="metric-top"><span>Confirmed findings</span><span class="metric-symbol" aria-hidden="true">◇</span></div>
+        <div class="metric-number highlight" id="m-findings">00</div>
+        <div class="metric-foot"><strong id="m-awaiting">0</strong> awaiting validation</div>
+      </div>
+      <div class="metric">
+        <div class="metric-top"><span>Candidates verified</span><span class="metric-symbol" aria-hidden="true">◉</span></div>
+        <div class="metric-number" id="m-coverage">0<small>%</small></div>
+        <div class="metric-foot" id="m-stage">Not started</div>
+      </div>
+    </section>
+
+    <section class="panel pipeline" id="pipeline" aria-labelledby="pipeline-title">
+      <div class="panel-heading">
+        <div>
+          <p class="panel-kicker">01 / Workflow</p>
+          <h2 class="panel-title" id="pipeline-title">Agent pipeline</h2>
+          <p class="panel-desc">Autonomous analysis from discovery to report.</p>
+        </div>
+        <div class="step-counter" id="step-counter" aria-label="Pipeline stage">00 <small>/ 05</small></div>
+      </div>
+      <div class="pipeline-body">
+        <div class="steps" id="steps"></div>
+        <p class="swipe-hint">Swipe to see all stages →</p>
+        <div class="progress-copy"><span id="progress-caption">Candidates verified</span><strong id="progress-label">0%</strong></div>
+        <div class="progress-track" role="progressbar" aria-label="Candidates verified" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100" id="progress-track">
+          <div class="progress-fill" id="progress-fill" style="width:0%"></div>
+        </div>
+      </div>
+    </section>
+
+    <div class="details">
+      <section class="panel findings" id="findings" aria-labelledby="findings-title">
+        <div class="panel-heading">
+          <div>
+            <p class="panel-kicker">02 / Intelligence</p>
+            <h2 class="panel-title" id="findings-title">Recent findings</h2>
+            <p class="panel-desc">Candidates raised by the router and their verification state.</p>
+          </div>
+          <span class="findings-count none" id="findings-count" aria-label="finding count">00</span>
+        </div>
+        <table class="findings-table">
+          <thead><tr><th scope="col">Finding</th><th scope="col">Severity</th><th scope="col">Status</th></tr></thead>
+          <tbody id="findings-body"><tr class="empty-row"><td colspan="3">No candidates yet.</td></tr></tbody>
+        </table>
+        <div class="findings-footer" id="findings-footer">Waiting for a run to start</div>
+      </section>
+
+      <section class="panel report" id="report" aria-labelledby="report-title">
+        <div class="panel-heading">
+          <div>
+            <p class="panel-kicker">05 / Output</p>
+            <h2 class="panel-title" id="report-title">Report</h2>
+            <p class="panel-desc">Markdown report produced by the REPORT phase.</p>
+          </div>
+          <button class="ghost-btn" id="copy-report" type="button" disabled>COPY</button>
+        </div>
+        <pre class="report-body" id="report-body">Run이 끝나면 생성된 보고서가 여기에 나온다.</pre>
+      </section>
+
+      <div class="side-panels">
+        <section class="panel" id="validation" aria-labelledby="validation-title">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">03 / Verification</p>
+              <h2 class="panel-title" id="validation-title">Validation</h2>
+              <p class="panel-desc">Independent verification outcome per candidate.</p>
+            </div>
+          </div>
+          <div class="validation-body">
+            <div class="validation-grid">
+              <div class="validation-item"><strong id="v-confirmed">00</strong><span>Confirmed</span></div>
+              <div class="validation-item"><strong id="v-suspected">00</strong><span>Suspected</span></div>
+              <div class="validation-item"><strong id="v-rejected">00</strong><span>Rejected</span></div>
+            </div>
+            <div class="validation-note"><span>Candidates processed</span><strong id="v-total">0 total</strong></div>
+            <div class="validation-meter" aria-hidden="true">
+              <span id="v-bar-confirmed" style="width:0%"></span><span id="v-bar-suspected" style="width:0%"></span><span id="v-bar-rejected" style="flex:1"></span>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel" id="activity" aria-labelledby="activity-title">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">04 / Activity</p>
+              <h2 class="panel-title" id="activity-title">Live activity</h2>
+              <p class="panel-desc">Latest events from the agent stream.</p>
+            </div>
+          </div>
+          <ol class="activity-list" id="activity-list"><li class="activity-item"><span class="activity-message">Idle — start a scan to see agent events.</span></li></ol>
+        </section>
+      </div>
+    </div>
+  </div></main>
+</div>
+</body>
+</html>
