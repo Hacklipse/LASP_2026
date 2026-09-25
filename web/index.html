@@ -42,6 +42,8 @@
     .ghost-btn{flex:none;padding:7px 12px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--muted);font-size:9px;font-weight:800;letter-spacing:.1em;cursor:pointer}
     .ghost-btn:hover:not(:disabled){border-color:#5e864a;color:var(--lime)}
     .ghost-btn:disabled{color:var(--dim);cursor:not-allowed}
+    .ghost-btn.needs-input{border-color:#5e864a;color:var(--lime)}
+    .ghost-btn.needs-input:after{display:inline-block;width:5px;height:5px;margin-left:7px;border-radius:50%;background:var(--lime);vertical-align:middle;content:""}
     /* 단계는 끝났지만 실제로 검사한 것이 없을 때. 완료(✓)와 구분되어야 한다 —
        "검사했는데 없었다"와 "검사하지 못했다"는 다른 결과다. */
     .step.starved{border-color:#6b5733;background:#292115}
@@ -53,6 +55,9 @@
     .metric-number.warn{color:var(--amber)}
     @media(max-width:900px){.details{grid-template-areas:"findings" "report" "side"}}
     .scan-actions{display:flex;align-items:center;gap:9px}
+    /* display 를 지정한 요소는 UA 의 [hidden] 규칙(display:none)을 이긴다.
+       .field-grid 가 그래서 hidden 이어도 보였다. 여기서 한 번에 막는다. */
+    [hidden]{display:none!important}
     .setup{margin-bottom:18px}
     .setup-body{padding:20px 25px 25px}
     .field-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(178px,1fr));gap:13px}

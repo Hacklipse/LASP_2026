@@ -507,6 +507,15 @@ async function start() {
     $('error-banner').textContent = `Run을 시작하지 못했다: ${error.message}`;
     $('error-banner').classList.add('show');
     $('start-btn').disabled = false;
+    /* 무엇을 채워야 하는지 바로 보여준다. 사유만 띄우고 칸을 숨겨두지 않는다. */
+    const blank = [...document.querySelectorAll('[data-secret]')].find(
+      (input) => !input.value.trim()
+    );
+    if (blank) {
+      openSetup();
+      blank.focus();
+    }
+    markSetupNeeded();
   }
   schedule(100);
 }
@@ -586,6 +595,7 @@ function buildControls() {
     )
     .join('');
 
+  $('credential-grid').addEventListener('input', markSetupNeeded);
   $('mode-select').addEventListener('change', syncMode);
   $('vuln-select').addEventListener('change', syncMode);
   $('engine-select').addEventListener('change', syncEngine);
@@ -608,6 +618,9 @@ function syncMode() {
 
   $('credential-block').hidden = needed.length === 0;
   applyBrowserRule(juice, vuln);
+  /* 입력을 요구하면서 칸을 숨겨두지 않는다. 필요해지는 순간 패널을 연다. */
+  if (needed.length) openSetup();
+  markSetupNeeded();
 
   /* 이미 같은 구성이면 다시 그리지 않는다 — 입력해둔 값을 지우게 된다. */
   const signature = needed.join('|');
@@ -626,6 +639,22 @@ function syncMode() {
 
 /* 브라우저 검증은 Juice Shop 모드에서 유형이 정한다(CLI 와 같은 규칙). 수동 선택을
  * 막아 화면 표시와 실제 배선을 일치시킨다. */
+function openSetup() {
+  const panel = $('setup-panel');
+  if (!panel.hidden) return;
+  panel.hidden = false;
+  $('setup-toggle').setAttribute('aria-expanded', 'true');
+}
+
+/* 비어 있는 필수 입력이 남아 있으면 SETUP 버튼에 표시한다. 패널을 닫아둔 채로도
+ * 무엇이 막고 있는지 알 수 있어야 한다. */
+function markSetupNeeded() {
+  const pending = [...document.querySelectorAll('[data-secret]')].some(
+    (input) => input.offsetParent !== null && !input.value.trim()
+  );
+  $('setup-toggle').classList.toggle('needs-input', pending);
+}
+
 function applyBrowserRule(juice, vuln) {
   const box = document.querySelector('[data-field="browser"]');
   if (!box) return;
