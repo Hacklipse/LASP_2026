@@ -40,7 +40,7 @@ from hacklipse.domain import (
     TaskStatus,
 )
 from hacklipse.ports import FormLoginSpec, ResolvedHttpCredential
-from hacklipse.ports.errors import AgentToolNotAllowed, TaskTimeout
+from hacklipse.ports.errors import AgentToolNotAllowed, CredentialNotFound, TaskTimeout
 
 _USERNAME = "dvwa-user"
 _PASSWORD = "dvwa-password-secret"
@@ -538,6 +538,32 @@ class InMemoryCredentialResolverRegistrationTests(unittest.TestCase):
         resolver.add("temporary-actor", credential)
         with self.assertRaises(ValueError):
             resolver.add("temporary-actor", credential)
+
+    def test_origin_bound_credential_is_rejected_before_external_execution(self) -> None:
+        resolver = InMemoryCredentialResolver({})
+        resolver.add(
+            "temporary-actor",
+            ResolvedHttpCredential(authorization="Bearer temporary-token"),
+            allowed_origins=("https://target.example/",),
+        )
+        runtime = HttpExecutionRuntime(credential_resolver=resolver)
+        request = ExecutionRequest(
+            execution_id="exec-wrong-origin",
+            run_id="run-1",
+            task_id="task-1",
+            tool="http_get",
+            target_url="https://other.example/private",
+            surface_id=None,
+            purpose="verify credential origin boundary",
+            credential_ref="temporary-actor",
+            scope=RunScope(allowed_hosts=frozenset({"other.example"})),
+        )
+
+        with self.assertRaises(CredentialNotFound):
+            runtime.execute(request)
+
+        self.assertTrue(resolver.revoke("temporary-actor"))
+        self.assertFalse(resolver.revoke("temporary-actor"))
 
 
 if __name__ == "__main__":

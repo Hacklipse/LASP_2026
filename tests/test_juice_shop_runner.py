@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import sqlite3
 import sys
 import tempfile
@@ -15,15 +16,27 @@ _SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(_SCRIPTS))
 
 from run_juice_shop_baseline import (  # noqa: E402
+    _ACCESS_LOGIN_APPROVAL_REF,
+    _ACTOR_CREDENTIAL_REF,
+    _OWNER_CREDENTIAL_REF,
+    _AccessAccountInput,
     _ProvisionedAccount,
     _all_mode_recon_seeds,
+    _authenticate_access_control_accounts,
     _cleanup_provisioned_accounts,
     _knowledge_database_path,
     _print_execution_preview,
+    _prompt_access_control_accounts,
     _recon_planner_summary,
     _resolve_juice_shop_db,
 )
-from hacklipse.domain import Evidence
+from hacklipse.adapters import (  # noqa: E402
+    InMemoryCredentialResolver,
+    StaticApprovalGate,
+)
+from hacklipse.bootstrap import build_local_application  # noqa: E402
+from hacklipse.domain import Evidence, ExecutionResult  # noqa: E402
+from hacklipse.ports.errors import CredentialNotFound  # noqa: E402
 
 
 class JuiceShopAllModeTests(unittest.TestCase):
@@ -51,16 +64,18 @@ class JuiceShopAllModeTests(unittest.TestCase):
 
         rendered = output.getvalue()
         self.assertIn("[실행 구성]", rendered)
-        self.assertIn("검사 대상       통합 검사 (4종)", rendered)
+        self.assertIn("검사 대상       통합 검사 (5종)", rendered)
         self.assertIn("Router          hybrid · review weak", rendered)
         self.assertIn("Router 비교     끔", rendered)
         self.assertIn("LLM 호출 제한   14회 / rolling 60초", rendered)
         self.assertIn("Knowledge       knowledge/knowledge.sqlite", rendered)
         self.assertIn("[검사 범위]", rendered)
-        self.assertIn("XSS · SQLi · Path Traversal · SSTI", rendered)
-        self.assertIn("Access Control (--vuln access_control)", rendered)
+        self.assertIn("XSS · SQLi · Path Traversal · SSTI · Access Control", rendered)
         self.assertIn("[계정 및 정리]", rendered)
-        self.assertIn("종료 처리       임시 계정과 연결 데이터를 삭제", rendered)
+        self.assertIn(
+            "종료 처리       임시 계정 데이터 삭제 및 입력 credential 폐기",
+            rendered,
+        )
         self.assertNotIn("비교: False", rendered)
 
     def test_bare_knowledge_database_name_uses_dedicated_directory(self) -> None:
@@ -85,6 +100,17 @@ class JuiceShopAllModeTests(unittest.TestCase):
                 "http://127.0.0.1:3000/", include_ssti=False
             ),
             (),
+        )
+        self.assertEqual(
+            _all_mode_recon_seeds(
+                "http://127.0.0.1:3000/",
+                include_ssti=True,
+                access_control_object_id="7",
+            ),
+            (
+                "http://127.0.0.1:3000/profile",
+                "http://127.0.0.1:3000/rest/basket/7",
+            ),
         )
 
     def test_recon_planner_summary_reports_success_and_fallback(self) -> None:
@@ -111,6 +137,115 @@ class JuiceShopAllModeTests(unittest.TestCase):
             ),
             "fallback 사용 (timeout)",
         )
+
+
+class _AccessLoginRuntime:
+    def __init__(self) -> None:
+        self.requests = []
+
+    def execute(self, request):
+        self.requests.append(request)
+        payload = json.loads(request.body or "{}")
+        email = payload.get("email")
+        password = payload.get("password")
+        fixtures = {
+            "actor@example.test": ("actor-password", "actor-token", 7),
+            "owner@example.test": ("owner-password", "owner-token", 8),
+        }
+        expected_password, token, basket_id = fixtures[email]
+        if password != expected_password:
+            status, response = 401, {"error": "invalid credentials"}
+        else:
+            status, response = 200, {
+                # 저장 경계가 입력값과 응답 token을 모두 제거하는지도 함께 검증한다.
+                "echo": {"account": email, "note": password},
+                "authentication": {"token": token, "bid": basket_id},
+            }
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            evidence_type="http_response",
+            observation={
+                "type": "http_response",
+                "status": status,
+                "body": json.dumps(response),
+                "requested_url": request.resolved_url,
+            },
+        )
+
+
+class JuiceShopAccessCredentialBrokerTests(unittest.TestCase):
+    def test_prompt_hides_passwords_and_rejects_the_same_account(self) -> None:
+        emails = iter(("actor@example.test", "owner@example.test"))
+        passwords = iter(("actor-password", "owner-password"))
+
+        actor, owner = _prompt_access_control_accounts(
+            input_fn=lambda _: next(emails),
+            password_fn=lambda _: next(passwords),
+        )
+
+        rendered = repr((actor, owner))
+        self.assertNotIn("actor@example.test", rendered)
+        self.assertNotIn("actor-password", rendered)
+        self.assertEqual(actor.credential_ref, _ACTOR_CREDENTIAL_REF)
+        self.assertEqual(owner.credential_ref, _OWNER_CREDENTIAL_REF)
+
+        same_emails = iter(("same@example.test", "SAME@example.test"))
+        with self.assertRaises(ValueError):
+            _prompt_access_control_accounts(
+                input_fn=lambda _: next(same_emails),
+                password_fn=lambda _: "test-password",
+            )
+
+    def test_login_keeps_only_origin_bound_tokens_in_memory(self) -> None:
+        resolver = InMemoryCredentialResolver({})
+        runtime = _AccessLoginRuntime()
+        app = build_local_application(
+            {},
+            runtime=runtime,
+            credential_resolver=resolver,
+            approval_gate=StaticApprovalGate((_ACCESS_LOGIN_APPROVAL_REF,)),
+        )
+        accounts = (
+            _AccessAccountInput(
+                "actor", _ACTOR_CREDENTIAL_REF,
+                "actor@example.test", "actor-password",
+            ),
+            _AccessAccountInput(
+                "owner", _OWNER_CREDENTIAL_REF,
+                "owner@example.test", "owner-password",
+            ),
+        )
+
+        actor_id, owner_id, login_run_id = _authenticate_access_control_accounts(
+            app,
+            resolver,
+            accounts,
+            base_url="http://local.test/",
+            host="local.test",
+            allowed_path_prefix="/",
+        )
+
+        self.assertEqual((actor_id, owner_id), ("7", "8"))
+        actor_credential = resolver.resolve_for(
+            _ACTOR_CREDENTIAL_REF, target_url="http://local.test/rest/basket/7"
+        )
+        self.assertEqual(actor_credential.authorization, "Bearer actor-token")
+        with self.assertRaises(CredentialNotFound):
+            resolver.resolve_for(
+                _ACTOR_CREDENTIAL_REF, target_url="http://other.test/rest/basket/7"
+            )
+
+        stored = repr(app.stores.evidence.list_by_run(login_run_id))
+        for secret in (
+            "actor@example.test", "owner@example.test",
+            "actor-password", "owner-password", "actor-token", "owner-token",
+        ):
+            self.assertNotIn(secret, stored)
+        self.assertIn("<redacted>", stored)
+
+        resolver.clear()
+        with self.assertRaises(CredentialNotFound):
+            resolver.resolve(_ACTOR_CREDENTIAL_REF)
 
 
 class JuiceShopTemporaryAccountCleanupTests(unittest.TestCase):

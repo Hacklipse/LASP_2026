@@ -82,9 +82,10 @@ DVWA 실행기(`scripts/run_dvwa_baseline.py`)와 쿼리 파라미터 탈출 흐
 - Juice Shop 단일 Run의 `all` 모드가 XSS·SQLi·Path Traversal을 함께 라우팅한다.
   인증이 필요한 SSTI는 분리된 임시 계정 세션으로 합류한다. LLM 프로필에서도 네 유형이
   한 Run에서 Analysis·독립 Validation·Finding까지 완주하는 것을 확인했다.
-- Access Control은 임시 ACTOR/OWNER 계정 생성·검증·삭제 E2E가 구현됐지만 아직
-  `--vuln access_control` 전용 Run으로만 실행된다. 객체 ID는 크롤링으로 나오지 않고
-  임의로 만들면 열거가 되므로 `all` 모드에서 의도적으로 제외한다.
+- Access Control은 사용자가 제공한 전용 ACTOR/OWNER 테스트 계정을 숨김 입력으로
+  로그인하고, origin에 묶인 메모리 credential reference만 Run에 등록한다. Actor basket을
+  Recon seed로 전달해 `all`에도 합류하며, 입력값·token은 저장하지 않고 Run 종료 시
+  세션과 참조를 폐기한다.
 - HTTP Runtime의 기본 응답 본문 상한은 2 MiB로 올라가 Juice Shop의 큰 `main.js`를
   읽을 수 있으며, 그 결과 `/rest/products/search?q=` Surface와 SQLi Finding이 복구됐다.
 
@@ -154,7 +155,7 @@ Path Traversal Finding 6개는 독립 curl 기준과 대조해 확인했다. `/f
 | Validation Agent | ✅ 5종 독립 proof와 Finding 승격 구현 |
 | Report·Validation P-3 공용 계약 | ✅ `dev/dmswls`에 병합. reason code·proof facts·Evidence ID 병합 구현 |
 | Pipeline LLM | ✅ Recon Planner·Hybrid Router Advisor·5종 Analysis·Orchestrator 추가 Recon·예산 배분·비확정 Validation review·Report Narrator에 선택적으로 연결. proof·facts는 결정적 코드 유지 |
-| Juice Shop 단일 Run | ✅ XSS·SQLi·Path Traversal 동시 라우팅, SSTI는 인증 시 포함. Access Control은 전용 Run |
+| Juice Shop 단일 Run | ✅ XSS·SQLi·Path Traversal·SSTI·Access Control 5종 통합. Access Control 계정은 사용자 제공 |
 | KnowledgeBase | ✅ 발행·재시도·의미 dedupe·구조화 검색·Analysis 재사용을 실제 `all` Run에서 확인. 비교 평가 전 |
 | 안전 통제 | ✅ Phase 8 baseline 구현 완료 |
 
@@ -260,9 +261,8 @@ flowchart LR
 ```
 
 전체 단계는 5종 모두 단위·Fake Runtime E2E로 완주한다. 실제 로컬 대상은 Juice Shop
-하나로 고정했다. 한 Run에서 XSS·SQLi·Path Traversal이 Finding까지 완주하고 SSTI는 인증
-시 합류한다. Access Control만 전용 Run으로 남아 있어, Agent 구현 완료와 대상 통합 완료를
-아직 구분해서 본다.
+하나로 고정했다. `all`은 XSS·SQLi·Path Traversal·SSTI에 사용자 제공 2계정 기반
+Access Control을 함께 배선한다. 5종 통합의 정식 반복 실측은 별도로 남아 있다.
 
 ---
 
@@ -441,7 +441,8 @@ CLI 진행 로그에 기록된다. LLM의 빈 선택이나 일부 선택은 Reco
 
 **상태: ✅ 5종 Analysis Agent의 휴리스틱·LLM 구현과 독립 proof E2E 완료.
 ✅ 브라우저 XSS LLM과 Path Traversal의 parameterless GET·POST form 계약 보완 완료.
-⚠️ 고정 데이터셋 비교 실험과 Access Control을 포함한 Juice Shop 5종 단일 Run은 미완료.**
+✅ 사용자 제공 2계정 기반 Access Control을 Juice Shop `all`에 배선 완료.
+⚠️ 고정 데이터셋 비교 실험과 Juice Shop 5종 통합 반복 실측은 미완료.**
 
 현재 구현은 `adapters/llm_xss_analysis.py`, `adapters/llm_browser_xss_analysis.py`,
 `adapters/llm_sqli_analysis.py`,
@@ -470,7 +471,7 @@ Validation이 별도 재현을 수행해 `XSS_EXECUTION`, `SQLI_EFFECT`,
 |---|---:|---:|---:|
 | XSS | ✅ 서버 반사 / ✅ 브라우저 DOM 반사 | ✅ 서버 반사 / ✅ 브라우저 DOM 반사 | ✅ LLM `all`에서 Finding |
 | SQLi | ✅ | ✅ | ✅ Juice Shop `/rest/products/search` Finding |
-| Access Control | ✅ | ✅ | ✅ Fake E2E·Juice Shop 전용 Run Finding |
+| Access Control | ✅ | ✅ | ✅ Fake E2E·Juice Shop 2계정 `all` 배선 |
 | Path Traversal | ✅ 제한 확장자 우회·POST Local File Read | ✅ parameterless GET·POST Local File Read | ✅ 기본 LLM `all`에서 POST Local File Read Finding, 제한 확장자 우회는 선택 규칙 |
 | SSTI | ✅ | ✅ | ✅ Fake E2E·Juice Shop Finding |
 
@@ -495,8 +496,9 @@ LLM 프로필 --vuln all (2026-09-10 참고 실행)
   Finding 10  Run DONE
 ```
 
-Access Control은 안전한 객체 ID discovery가 일반 Recon에 연결되지 않아 이 실행에 포함하지
-않는다. 따라서 네 유형 `all` 완주와 다섯 유형 단일 Run 완료는 구분한다.
+이 과거 실행에는 Access Control이 포함되지 않았다. 현재는 사용자 제공 두 계정의 로그인
+응답에서 Actor basket ID를 얻어 Recon seed로 추가하므로 임의 ID discovery 없이 `all`에
+배선된다. 과거 네 유형 실측과 현재 5종 배선 완료는 구분한다.
 
 **왜 마지막인가** **연구의 본체이자 가장 비싼 부분이다.** Phase 1~5가 없으면 LLM에게 줄 입력(구조화된 Surface, 실제 응답 Evidence)이 없어서 프롬프트를 설계할 수 없다. 그리고 대조군이 먼저 있어야 "LLM이 실제로 나은가"를 측정할 수 있다.
 
@@ -506,8 +508,8 @@ Access Control은 안전한 객체 ID discovery가 일반 Recon에 연결되지 
 
 **완료 기준 — 🎯 마일스톤 B** 결정적 baseline과 LLM 버전의 탐지율·오탐률을 같은
 대상에서 비교할 수 있다. 5종의 두 실행 경로와 브라우저 XSS LLM 판단 경로는 존재하지만,
-고정 데이터셋·반복 실행을 이용한 정식 탐지율·오탐률 측정과 Access Control의 `all` 통합은
-남아 있으므로 마일스톤 B 전체는 완료로 표시하지 않는다.
+고정 데이터셋·반복 실행을 이용한 정식 탐지율·오탐률 측정이 남아 있으므로 마일스톤 B
+전체는 완료로 표시하지 않는다.
 
 ---
 
@@ -705,13 +707,14 @@ Router 결과만 사용한다. 판단과 Run 결과는 기본 `artifacts/routing
 | XSS | ✅ 휴리스틱·LLM 브라우저 DOM 반사 → 독립 실행 proof. LLM `all` Finding 확인 |
 | Path Traversal | ✅ parameterless GET·POST form의 휴리스틱·LLM 계약과 독립 proof. LLM `all` Finding 7개 확인 |
 | SSTI | ✅ token이 있으면 `/profile` seed·유형별 credential 사용, 정리 후 Finding |
-| Access Control | ⚠️ 전용 Run의 임시 2계정 E2E는 완료. `all` 통합은 의도적으로 보류 |
-| 단일 Run 완료 기준 | ⏳ 현재 네 유형 `all` 완주. Access Control까지 한 Run에 넣으면 완료 |
+| Access Control | ✅ 사용자 제공 2계정 로그인·역할 분리·Actor basket Recon seed를 `all`에 연결 |
+| 단일 Run 완료 기준 | ✅ 5종을 한 Run에 배선. 정식 반복 실측은 별도 과제 |
 
-Access Control만 `all`에서 빠져 있다. Recon이 만드는 것은 `/basket`(Angular 라우트)이지
-`/rest/basket/{id}`가 아니고, **객체 ID는 크롤링으로 나오지 않으며 임의로 만들면 열거가
-된다.** 계정만 만들고 Candidate는 생기지 않는 상황을 피하려고 전용 Run으로 남겼다.
-표면 발견 방법을 먼저 정해야 통합할 수 있다.
+Access Control은 사용자가 제공한 두 테스트 계정의 정상 로그인 응답에서 basket ID를
+얻는다. 임의 ID를 열거하지 않고 Actor의 `/rest/basket/{id}`를 명시적 Recon seed로
+추가하며, Analysis와 Validation은 ACTOR/OWNER 역할에 등록된 별도 세션으로 교차 검증한다.
+이 배선은 Juice Shop 계약이며 다른 대상은 별도의 로그인·owned-resource discovery 계약이
+필요하다.
 
 #### 남은 성능·비교 과제
 
@@ -936,11 +939,12 @@ Phase 5  [x] ValidationAgent (독립 재현 → 판정)
 Phase 6  [x] XSS 휴리스틱 / Gemini LLM Agent와 DVWA E2E
          [x] SQLi 휴리스틱 / LLM Agent와 DVWA·Juice Shop E2E
          [x] Path Traversal 휴리스틱 / LLM Agent와 독립 E2E
-         [x] Access Control 휴리스틱 / LLM Agent와 Juice Shop 전용 E2E
+         [x] Access Control 휴리스틱 / LLM Agent와 사용자 제공 2계정 `all` 배선
          [x] SSTI 휴리스틱 / LLM Agent와 Juice Shop E2E
          [x] 유형별 credential 분리와 Candidate/Validation session 격리
          [x] Juice Shop LLM all에서 XSS·SQLi·Path Traversal·SSTI 완주
-         [ ] Juice Shop 한 Run에서 5종 전체 완주
+         [x] Juice Shop 한 Run에 5종 배선
+         [ ] Juice Shop 한 Run에서 5종 정식 반복 완주·측정
          [x] 브라우저 XSS의 독립 LLM 판단 경로
          [ ] 🎯 마일스톤 B — baseline 대비 측정
 

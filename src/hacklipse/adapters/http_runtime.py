@@ -171,7 +171,9 @@ class HttpExecutionRuntime:
                 raise CredentialNotFound(
                     "execution references credentials but no resolver is configured"
                 )
-            credential = self._credentials.resolve(request.credential_ref)
+            credential = _resolve_credential(
+                self._credentials, request.credential_ref, request.resolved_url
+            )
             if credential.authorization:
                 # Agent는 Authorization을 만들 수 없고 중앙 Resolver만 이 위치에 주입한다.
                 headers["Authorization"] = credential.authorization
@@ -263,7 +265,9 @@ class HttpExecutionRuntime:
                 raise CredentialNotFound(
                     "execution references credentials but no resolver is configured"
                 )
-            credential = self._credentials.resolve(request.credential_ref)
+            credential = _resolve_credential(
+                self._credentials, request.credential_ref, request.resolved_url
+            )
             jar = self._session_jars[key]
             parsed = urllib.parse.urlsplit(request.resolved_url)
             hostname = parsed.hostname or ""
@@ -419,3 +423,14 @@ def _session_cookie(
         rest={"HttpOnly": None},
         rfc2109=False,
     )
+
+
+def _resolve_credential(
+    resolver: CredentialResolver, credential_ref: str, target_url: str
+):
+    """origin-aware Resolver를 우선 사용하고 기존 Resolver 계약도 지원한다."""
+
+    resolve_for = getattr(resolver, "resolve_for", None)
+    if callable(resolve_for):
+        return resolve_for(credential_ref, target_url=target_url)
+    return resolver.resolve(credential_ref)

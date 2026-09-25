@@ -5,7 +5,7 @@
     SQLi            인증 없음. 읽기 전용 GET. 정리할 상태가 없다.
     SSTI            실습 계정 token Cookie. username을 바꾸므로 고정값으로 되돌린다.
     Path Traversal  임시 계정으로 서버 렌더링 폼의 고정 safe-file 읽기를 검증한다.
-    Access Control  임시 계정 두 개를 만들고 검증 후 연결 데이터까지 삭제한다.
+    Access Control  사용자가 제공한 전용 테스트 계정 두 개로 소유 객체를 교차 검증한다.
     all             한 Run에서 여러 유형을 함께 검사한다. 유형별 자격증명은 Run에
                     따로 등록되고, 등록하지 않은 유형은 자격증명 없이 실행된다.
 
@@ -30,7 +30,7 @@ import secrets
 import sqlite3
 import sys
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
@@ -113,6 +113,7 @@ _PATH_TRAVERSAL_CREDENTIAL_REF = "temporary-local-juice-shop-path-traversal"
 _TEMP_SSTI_CREDENTIAL_REF = "temporary-local-juice-shop-ssti"
 _PROVISION_SESSION_REF = "temporary-local-juice-shop-provisioning-session"
 _PROVISION_APPROVAL_REF = "interactive-local-juice-shop-account-provisioning"
+_ACCESS_LOGIN_APPROVAL_REF = "interactive-local-juice-shop-access-login"
 _DEFAULT_BUDGET = 20
 # 전체 모드는 Recon 크롤링과 여러 Candidate 분석을 한 Run에서 감당해야 한다. 정확한
 # 배분은 Task 3(Budget·스케줄링)에서 다루고, 여기서는 우선 상한만 넉넉히 잡는다.
@@ -171,7 +172,7 @@ def _print_execution_preview(
     print("  Juice Shop 실행 전 확인")
     print("=" * 58)
     print("\n[실행 구성]")
-    print(f"  검사 대상       {'통합 검사 (4종)' if run_all else target_label}")
+    print(f"  검사 대상       {'통합 검사 (5종)' if run_all else target_label}")
     print(f"  Analysis        {analysis}")
     print(f"  Recon           {args.recon}")
     print(f"  Surface 수집    {getattr(args, 'surface_collection', 'adaptive')}")
@@ -191,14 +192,14 @@ def _print_execution_preview(
 
     if run_all:
         print("\n[검사 범위]")
-        print("  포함            XSS · SQLi · Path Traversal · SSTI")
-        print("  별도 실행       Access Control (--vuln access_control)")
+        print("  포함            XSS · SQLi · Path Traversal · SSTI · Access Control")
         print("\n[계정 및 정리]")
         print("  XSS · SQLi      인증 없이 실행")
         print("  Path Traversal  폐기 가능한 임시 계정과 분리 세션 사용")
         print("  SSTI            폐기 가능한 임시 계정과 분리 세션 사용")
         print(f"                  검증 후 username을 {SSTI_CLEANUP_VALUE!r}(으)로 복구")
-        print("  종료 처리       임시 계정과 연결 데이터를 삭제")
+        print("  Access Control  입력받은 전용 테스트 계정 두 개를 메모리에서만 사용")
+        print("  종료 처리       임시 계정 데이터 삭제 및 입력 credential 폐기")
     print("=" * 58)
 
 
@@ -245,20 +246,40 @@ class _ProvisionedAccount:
     basket_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _AccessAccountInput:
+    """Access Control 로그인에만 잠시 쓰는 사용자 입력. repr에는 비밀을 숨긴다."""
+
+    role: str
+    credential_ref: str
+    email: str = field(repr=False)
+    password: str = field(repr=False)
+
+
 def _format_counts(counts: Counter[str]) -> str:
     if not counts:
         return "없음"
     return ", ".join(f"{name} {count}개" for name, count in counts.items())
 
 
-def _all_mode_recon_seeds(base_url: str, *, include_ssti: bool) -> tuple[str, ...]:
+def _all_mode_recon_seeds(
+    base_url: str,
+    *,
+    include_ssti: bool,
+    access_control_object_id: str | None = None,
+) -> tuple[str, ...]:
     """전체 모드에서 SPA와 별도로 방문해야 하는 인증 Surface를 반환한다."""
 
-    if not include_ssti:
-        return ()
-    profile_path = _VULN_TARGETS["ssti"].seed_path
-    assert profile_path is not None
-    return (urljoin(base_url, profile_path),)
+    seeds: list[str] = []
+    if include_ssti:
+        profile_path = _VULN_TARGETS["ssti"].seed_path
+        assert profile_path is not None
+        seeds.append(urljoin(base_url, profile_path))
+    if access_control_object_id is not None:
+        if _OBJECT_ID.fullmatch(access_control_object_id) is None:
+            raise ValueError("Access Control Recon seed requires a numeric object ID")
+        seeds.append(urljoin(base_url, f"rest/basket/{access_control_object_id}"))
+    return tuple(seeds)
 
 
 def _response_json(result, *, operation: str, statuses: tuple[int, ...]) -> dict:
@@ -266,7 +287,7 @@ def _response_json(result, *, operation: str, statuses: tuple[int, ...]) -> dict
     body = result.observation.get("body")
     if status not in statuses or not isinstance(body, str):
         raise RuntimeError(
-            f"임시 계정 {operation} 응답이 예상한 형식이 아닙니다. "
+            f"Juice Shop {operation} 응답이 예상한 형식이 아닙니다. "
             f"(type={result.evidence_type!r}, status={status!r}, "
             f"error_kind={result.observation.get('error_kind')!r}, "
             f"body_type={type(body).__name__})"
@@ -274,9 +295,9 @@ def _response_json(result, *, operation: str, statuses: tuple[int, ...]) -> dict
     try:
         payload = json.loads(body)
     except (TypeError, ValueError) as error:
-        raise RuntimeError(f"임시 계정 {operation} 응답이 JSON이 아닙니다.") from error
+        raise RuntimeError(f"Juice Shop {operation} 응답이 JSON이 아닙니다.") from error
     if not isinstance(payload, dict):
-        raise RuntimeError(f"임시 계정 {operation} 응답이 객체가 아닙니다.")
+        raise RuntimeError(f"Juice Shop {operation} 응답이 객체가 아닙니다.")
     return payload
 
 
@@ -395,101 +416,84 @@ def _cleanup_provisioned_accounts(
         connection.close()
 
 
-def _provision_access_control_accounts(
+def _prompt_access_control_accounts(
+    *, input_fn=None, password_fn=None
+) -> tuple[_AccessAccountInput, _AccessAccountInput]:
+    """두 전용 테스트 계정을 대화형으로 입력받되 비밀번호를 화면에 표시하지 않는다."""
+
+    input_fn = input if input_fn is None else input_fn
+    password_fn = getpass.getpass if password_fn is None else password_fn
+    accounts: list[_AccessAccountInput] = []
+    for role, label, credential_ref in (
+        ("actor", "Actor(비소유자)", _ACTOR_CREDENTIAL_REF),
+        ("owner", "Owner(소유자)", _OWNER_CREDENTIAL_REF),
+    ):
+        email = input_fn(f"{label} 테스트 계정 이메일: ").strip()
+        password = password_fn(f"{label} 테스트 계정 비밀번호 (숨김 입력): ")
+        if not email or not password:
+            raise ValueError(f"{label} 테스트 계정 정보가 비어 있습니다.")
+        accounts.append(_AccessAccountInput(role, credential_ref, email, password))
+    actor, owner = accounts
+    if actor.email.casefold() == owner.email.casefold():
+        raise ValueError("Actor와 Owner는 서로 다른 테스트 계정이어야 합니다.")
+    return actor, owner
+
+
+def _authenticate_access_control_accounts(
     app,
     resolver: InMemoryCredentialResolver,
+    accounts: tuple[_AccessAccountInput, _AccessAccountInput],
     *,
     base_url: str,
     host: str,
     allowed_path_prefix: str,
-    cleanup_database: Path,
-) -> tuple[list[_ProvisionedAccount], str]:
-    """두 폐기 가능한 계정을 중앙 Runtime으로 생성·로그인하고 basket ID를 반환한다."""
+) -> tuple[str, str, str]:
+    """입력받은 계정을 로그인하고 token과 각 계정의 basket ID만 메모리에 둔다."""
 
-    provision_run_id = f"run-provision-{uuid4()}"
+    authentication_run_id = f"run-access-login-{uuid4()}"
     app.stores.runs.add(
         Run(
-            run_id=provision_run_id,
-            target_url=urljoin(base_url, "api/Users"),
+            run_id=authentication_run_id,
+            target_url=urljoin(base_url, "rest/user/login"),
             scope=RunScope(
                 allowed_hosts=frozenset({host}),
                 allowed_path_prefixes=(allowed_path_prefix,),
             ),
             policy_profile="safe",
-            request_budget=4,
+            request_budget=len(accounts),
         )
     )
-    app.budget_manager.open_run(provision_run_id, 4)
+    app.budget_manager.open_run(authentication_run_id, len(accounts))
 
-    accounts: list[_ProvisionedAccount] = []
+    object_ids: list[str] = []
     try:
-        for role, credential_ref in (
-            ("actor", _ACTOR_CREDENTIAL_REF),
-            ("owner", _OWNER_CREDENTIAL_REF),
-        ):
-            suffix = uuid4().hex
-            email = f"hacklipse-{role}-{suffix}@example.invalid"
-            password = secrets.token_urlsafe(18)
-            register_body = json.dumps(
-                {"email": email, "password": password}, separators=(",", ":")
-            )
-            _, registration = app.collector.collect_with_result(
-            provision_run_id,
-            urljoin(base_url, "api/Users"),
-            EvidenceRequest(
-                evidence_type="account_provisioning",
-                surface_id="juice-shop-account-provisioning",
-                reason=f"create disposable local Juice Shop {role} account",
-                suggested_tool="http_post",
-                http_request=HttpRequestSpec(
-                    method="POST",
-                    headers=(("Content-Type", "application/json"),),
-                    body=register_body,
-                ),
-                approval_ref=_PROVISION_APPROVAL_REF,
-            ),
-            task_id=f"provision-{role}-register",
-            approval_ref=_PROVISION_APPROVAL_REF,
-        )
-            registration_payload = _response_json(
-                registration, operation="생성", statuses=(201,)
-            )
-            registration_data = registration_payload.get("data")
-            user_id = (
-                registration_data.get("id")
-                if isinstance(registration_data, dict)
-                else None
-            )
-            if not isinstance(user_id, int) or user_id <= 0:
-                raise RuntimeError("임시 계정 생성 응답에 user ID가 없습니다.")
-            account = _ProvisionedAccount(role, credential_ref, user_id, email)
-            accounts.append(account)
-
+        for account in accounts:
             login_body = json.dumps(
-                {"email": email, "password": password}, separators=(",", ":")
+                {"email": account.email, "password": account.password},
+                separators=(",", ":"),
             )
             _, login = app.collector.collect_with_result(
-            provision_run_id,
-            urljoin(base_url, "rest/user/login"),
-            EvidenceRequest(
-                evidence_type="account_authentication",
-                surface_id="juice-shop-account-provisioning",
-                reason=f"log in disposable local Juice Shop {role} account",
-                suggested_tool="http_post",
-                http_request=HttpRequestSpec(
-                    method="POST",
-                    headers=(("Content-Type", "application/json"),),
-                    body=login_body,
+                authentication_run_id,
+                urljoin(base_url, "rest/user/login"),
+                EvidenceRequest(
+                    evidence_type="account_authentication",
+                    surface_id="juice-shop-access-login",
+                    reason=f"log in supplied Juice Shop {account.role} test account",
+                    suggested_tool="http_post",
+                    http_request=HttpRequestSpec(
+                        method="POST",
+                        headers=(("Content-Type", "application/json"),),
+                        body=login_body,
+                    ),
+                    approval_ref=_ACCESS_LOGIN_APPROVAL_REF,
                 ),
-                approval_ref=_PROVISION_APPROVAL_REF,
-            ),
-            task_id=f"provision-{role}-login",
-            approval_ref=_PROVISION_APPROVAL_REF,
-        )
+                task_id=f"access-login-{account.role}",
+                approval_ref=_ACCESS_LOGIN_APPROVAL_REF,
+            )
             payload = _response_json(login, operation="로그인", statuses=(200,))
             authentication = payload.get("authentication")
             if not isinstance(authentication, dict):
-                raise RuntimeError("임시 계정 로그인 응답에 authentication이 없습니다.")
+                raise RuntimeError("로그인 응답에 authentication이 없습니다.")
             token = authentication.get("token")
             basket_id = str(authentication.get("bid", ""))
             if (
@@ -497,23 +501,24 @@ def _provision_access_control_accounts(
                 or not token
                 or _OBJECT_ID.fullmatch(basket_id) is None
             ):
-                raise RuntimeError(
-                    "임시 계정 로그인 응답에 token 또는 basket ID가 없습니다."
-                )
-            account.basket_id = basket_id
+                raise RuntimeError("로그인 응답에 token 또는 basket ID가 없습니다.")
             resolver.add(
-                credential_ref,
+                account.credential_ref,
                 ResolvedHttpCredential(authorization=f"Bearer {token}"),
+                allowed_origins=(base_url,),
             )
+            object_ids.append(basket_id)
     except Exception:
-        _cleanup_provisioned_accounts(cleanup_database, accounts)
+        for account in accounts:
+            resolver.revoke(account.credential_ref)
         raise
 
-    actor_id, owner_id = (account.basket_id for account in accounts)
+    actor_id, owner_id = object_ids
     if actor_id == owner_id:
-        _cleanup_provisioned_accounts(cleanup_database, accounts)
-        raise RuntimeError("자동 생성된 두 계정의 basket ID가 같아 대조할 수 없습니다.")
-    return accounts, provision_run_id
+        for account in accounts:
+            resolver.revoke(account.credential_ref)
+        raise RuntimeError("두 테스트 계정의 basket ID가 같아 대조할 수 없습니다.")
+    return actor_id, owner_id, authentication_run_id
 
 
 def _provision_path_traversal_account(
@@ -720,7 +725,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--llm-model", help="provider model id")
     parser.add_argument(
         "--juice-shop-db",
-        help="임시 계정 정리에 사용할 Juice Shop juiceshop.sqlite 경로",
+        help=(
+            "Path Traversal용 임시 계정 정리에 사용할 Juice Shop "
+            "juiceshop.sqlite 경로"
+        ),
     )
     parser.add_argument(
         "--knowledge-db",
@@ -763,11 +771,11 @@ def main(argv: list[str]) -> int:
         return 2
     run_all = args.vuln == "all"
     vuln = None if run_all else _VULN_TARGETS[args.vuln]
-    access_control = args.vuln == "access_control"
+    access_control = args.vuln in {"access_control", "all"}
     needs_path_account = args.vuln in {"path_traversal", "all"}
     target_label = "전체" if run_all else vuln.label
     cleanup_database: Path | None = None
-    if access_control or needs_path_account:
+    if needs_path_account:
         try:
             cleanup_database = _resolve_juice_shop_db(args.juice_shop_db)
         except RuntimeError as error:
@@ -777,7 +785,7 @@ def main(argv: list[str]) -> int:
         # 전체 모드는 Recon이 시작 페이지에서 Surface를 찾아 유형별로 라우팅한다.
         target_url = base_url
     elif access_control:
-        # 시작 Surface가 임시 계정의 basket ID에 달려 있어 계정 준비 후에 정해진다.
+        # 시작 Surface가 입력받은 Actor 계정의 basket ID에 달려 있어 로그인 후 정해진다.
         pass
     else:
         assert vuln is not None
@@ -849,14 +857,12 @@ def main(argv: list[str]) -> int:
 
     agent_credentials: tuple[tuple[str, str], ...] = ()
     recon_seed_urls: tuple[str, ...] = ()
+    access_accounts: tuple[_AccessAccountInput, _AccessAccountInput] | None = None
     if run_all:
-        # 전체 모드가 다루는 것은 Recon이 시작 페이지에서 찾아낼 수 있는 유형뿐이다.
-        # Access Control은 /rest/basket/{id}처럼 구체적인 객체 ID가 있어야 성립하는데,
-        # 그 ID는 크롤링으로 나오지 않고 임의로 만들어내면 열거가 된다. 그래서 전용
-        # Run(--vuln access_control)으로 남긴다.
         credentials = {}
         approvals = (
             _PROVISION_APPROVAL_REF,
+            _ACCESS_LOGIN_APPROVAL_REF,
             PATH_TRAVERSAL_POST_APPROVAL_REF,
             SSTI_APPROVAL_REF,
         )
@@ -868,13 +874,17 @@ def main(argv: list[str]) -> int:
         owner_object_id = None
     elif access_control:
         print(
-            "이 검증은 로컬 Juice Shop에 폐기 가능한 임시 계정 두 개를 생성하고 "
-            "각 계정의 token과 basket ID를 메모리에서만 사용합니다.\n"
-            "계정 생성·로그인은 상태 변경 요청이며, 검증 종료 시 연결 데이터와 함께 삭제합니다."
+            "이 검증은 사용자가 제공한 Juice Shop 전용 테스트 계정 두 개로 로그인하고\n"
+            "각 계정의 token과 basket ID를 메모리에서만 사용합니다. 계정을 생성·삭제하거나\n"
+            "입력한 이메일·비밀번호를 Run, Evidence, SQLite, JSONL에 저장하지 않습니다."
         )
-        confirmation = "임시 계정 두 개를 생성하고 Access Control 검증을 실행할까요? [y/N] "
+        confirmation = "테스트 계정 두 개로 Access Control 검증을 실행할까요? [y/N] "
         credentials = {}
-        approvals: tuple[str, ...] = (_PROVISION_APPROVAL_REF,)
+        approvals: tuple[str, ...] = (_ACCESS_LOGIN_APPROVAL_REF,)
+        run_credential_ref = None
+        principal_credentials = ()
+        actor_object_id = None
+        owner_object_id = None
     elif args.vuln in ("xss", "path_traversal"):
         if args.vuln == "xss":
             print(
@@ -935,6 +945,12 @@ def main(argv: list[str]) -> int:
     if input(confirmation).strip().casefold() != "y":
         print("취소했습니다.")
         return 2
+    if access_control:
+        try:
+            access_accounts = _prompt_access_control_accounts()
+        except ValueError as error:
+            print(f"취소: {error}")
+            return 2
 
     progress_view = None if debug_enabled else RunProgressView()
     resolver = InMemoryCredentialResolver(credentials)
@@ -992,12 +1008,48 @@ def main(argv: list[str]) -> int:
         ),
     )
     base_path = parsed.path if parsed.path.endswith("/") else f"{parsed.path}/"
-    provision_run_id: str | None = None
+    preparation_run_ids: list[str] = []
     provisioned_accounts: list[_ProvisionedAccount] = []
+    if access_control:
+        assert access_accounts is not None
+        try:
+            actor_object_id, owner_object_id, authentication_run_id = (
+                _authenticate_access_control_accounts(
+                    app,
+                    resolver,
+                    access_accounts,
+                    base_url=base_url,
+                    host=host,
+                    allowed_path_prefix=base_path or "/",
+                )
+            )
+        except (RuntimeError, ValueError) as error:
+            access_accounts = None
+            resolver.clear()
+            print(f"Access Control 테스트 계정 로그인 실패: {error}")
+            return 1
+        access_accounts = None
+        preparation_run_ids.append(authentication_run_id)
+        access_surface_url = urljoin(base_url, f"rest/basket/{actor_object_id}")
+        principal_credentials = (
+            ("actor", _ACTOR_CREDENTIAL_REF),
+            ("owner", _OWNER_CREDENTIAL_REF),
+        )
+        if run_all:
+            recon_seed_urls = _all_mode_recon_seeds(
+                base_url,
+                include_ssti=True,
+                access_control_object_id=actor_object_id,
+            )
+        else:
+            target_url = access_surface_url
+            run_credential_ref = _ACTOR_CREDENTIAL_REF
+        progress.log("입력받은 ACTOR/OWNER 테스트 계정 로그인 완료")
+
     if needs_path_account:
         assert cleanup_database is not None
         try:
-            path_account, provision_run_id = _provision_path_traversal_account(
+            path_account, path_provision_run_id = _provision_path_traversal_account(
                 app,
                 resolver,
                 base_url=base_url,
@@ -1006,38 +1058,18 @@ def main(argv: list[str]) -> int:
                 cleanup_database=cleanup_database,
             )
         except (RuntimeError, ValueError) as error:
+            for run_id in preparation_run_ids:
+                http_runtime.close_session(run_id)
+            resolver.clear()
             print(f"임시 계정 준비 실패: {error}")
             return 1
+        preparation_run_ids.append(path_provision_run_id)
         provisioned_accounts = [path_account]
         run_credential_ref = _RECON_CREDENTIAL_REF
         agent_credentials = (("Path Traversal", _PATH_TRAVERSAL_CREDENTIAL_REF),)
         if run_all:
             agent_credentials += (("SSTI", _TEMP_SSTI_CREDENTIAL_REF),)
         progress.log("Path Traversal용 임시 계정 생성 및 보안 답변 등록 완료")
-    elif access_control:
-        assert cleanup_database is not None
-        try:
-            provisioned_accounts, provision_run_id = _provision_access_control_accounts(
-                app,
-                resolver,
-                base_url=base_url,
-                host=host,
-                allowed_path_prefix=base_path or "/",
-                cleanup_database=cleanup_database,
-            )
-        except (RuntimeError, ValueError) as error:
-            print(f"임시 계정 준비 실패: {error}")
-            return 1
-        actor_object_id = provisioned_accounts[0].basket_id
-        owner_object_id = provisioned_accounts[1].basket_id
-        assert actor_object_id is not None and owner_object_id is not None
-        target_url = urljoin(base_url, f"rest/basket/{actor_object_id}")
-        run_credential_ref = _ACTOR_CREDENTIAL_REF
-        principal_credentials = (
-            ("actor", _ACTOR_CREDENTIAL_REF),
-            ("owner", _OWNER_CREDENTIAL_REF),
-        )
-        progress.log("임시 ACTOR/OWNER 계정 생성 및 로그인 완료")
 
     needs_discovery = args.vuln in _BUNDLE_DISCOVERY_VULNS
     request_budget = args.request_budget or (
@@ -1092,6 +1124,13 @@ def main(argv: list[str]) -> int:
                 progress.log("임시 계정 및 연결 데이터 삭제 완료")
             except Exception as error:
                 cleanup_error = error
+        if run is not None:
+            http_runtime.close_session(run.run_id)
+        for preparation_run_id in preparation_run_ids:
+            http_runtime.close_session(preparation_run_id)
+        resolver.clear()
+        if access_control:
+            progress.log("입력받은 Access Control credential 메모리 참조 폐기 완료")
 
     if workflow_error is not None:
         append_run_result(args, app, app.stores.runs.get(workflow_error.run_id))
@@ -1163,8 +1202,11 @@ def main(argv: list[str]) -> int:
     )
     if recon_planner_summary is not None:
         print(f"  Recon Planner: {recon_planner_summary}")
-    if provision_run_id is not None:
-        print(f"  계정 준비 실행  {len(audit.list_by_run(provision_run_id))}회")
+    if preparation_run_ids:
+        preparation_executions = sum(
+            len(audit.list_by_run(run_id)) for run_id in preparation_run_ids
+        )
+        print(f"  계정 준비 실행  {preparation_executions}회")
     print()
     print("[분석 신호]")
     print(f"  Candidate       {_format_counts(candidate_counts)}")

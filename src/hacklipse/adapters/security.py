@@ -64,6 +64,7 @@ _SENSITIVE_FIELD_HINTS = (
     "secret",
     "session",
 )
+_REQUEST_SECRET_FIELD_HINTS = (*_SENSITIVE_FIELD_HINTS, "username", "email")
 
 
 def contains_personal_data(value: str) -> bool:
@@ -76,29 +77,96 @@ def contains_personal_data(value: str) -> bool:
 
 
 class InMemoryCredentialResolver:
-    """호출자가 명시적으로 주입한 참조만 해석하는 비영속 Credential Resolver."""
+    """호출자가 명시적으로 주입한 참조만 해석하는 비영속 Credential Resolver.
+
+    비밀 원문은 이 객체의 메모리에만 머물고 Store에는 참조만 기록한다. 선택적으로
+    credential을 HTTP origin에 묶을 수 있으며, Run 종료 시 ``revoke``로 참조를
+    제거한다. origin 제한은 Redirect를 포함해 다른 host로 인증정보가 재사용되는 것을
+    막는 Runtime의 마지막 방어선이다.
+    """
 
     def __init__(self, credentials: Mapping[str, ResolvedHttpCredential]) -> None:
-        self._credentials = dict(credentials)
+        self._credentials = {
+            reference: (credential, frozenset())
+            for reference, credential in credentials.items()
+        }
+        self._lock = threading.RLock()
 
     def resolve(self, credential_ref: str) -> ResolvedHttpCredential:
-        try:
-            return self._credentials[credential_ref]
-        except KeyError as error:
-            raise CredentialNotFound(
-                f"credential reference is not configured: {credential_ref}"
-            ) from error
+        with self._lock:
+            try:
+                credential, _ = self._credentials[credential_ref]
+            except KeyError as error:
+                raise CredentialNotFound(
+                    f"credential reference is not configured: {credential_ref}"
+                ) from error
+            return credential
+
+    def resolve_for(
+        self, credential_ref: str, *, target_url: str
+    ) -> ResolvedHttpCredential:
+        """대상 origin 제한을 확인한 뒤 credential을 반환한다."""
+
+        with self._lock:
+            try:
+                credential, allowed_origins = self._credentials[credential_ref]
+            except KeyError as error:
+                raise CredentialNotFound(
+                    f"credential reference is not configured: {credential_ref}"
+                ) from error
+            if allowed_origins and _credential_origin(target_url) not in allowed_origins:
+                raise CredentialNotFound(
+                    "credential reference is not available for the requested origin"
+                )
+            return credential
 
     def add(
-        self, credential_ref: str, credential: ResolvedHttpCredential
+        self,
+        credential_ref: str,
+        credential: ResolvedHttpCredential,
+        *,
+        allowed_origins: Sequence[str] = (),
     ) -> None:
         """중앙 인증 Worker가 발급받은 단기 자격증명을 메모리에만 등록한다."""
 
         if not credential_ref.strip():
             raise ValueError("credential reference cannot be blank")
-        if credential_ref in self._credentials:
-            raise ValueError(f"credential reference is already configured: {credential_ref}")
-        self._credentials[credential_ref] = credential
+        origins = frozenset(_credential_origin(value) for value in allowed_origins)
+        with self._lock:
+            if credential_ref in self._credentials:
+                raise ValueError(
+                    f"credential reference is already configured: {credential_ref}"
+                )
+            self._credentials[credential_ref] = (credential, origins)
+
+    def revoke(self, credential_ref: str) -> bool:
+        """단기 credential 참조를 폐기한다. 원문이나 존재 여부를 로그로 남기지 않는다."""
+
+        with self._lock:
+            return self._credentials.pop(credential_ref, None) is not None
+
+    def clear(self) -> None:
+        """이 Resolver가 보유한 모든 credential 참조를 폐기한다."""
+
+        with self._lock:
+            self._credentials.clear()
+
+
+def _credential_origin(url: str) -> str:
+    """HTTP URL을 scheme/host/effective-port origin으로 정규화한다."""
+
+    parsed = urlsplit(url)
+    scheme = parsed.scheme.casefold()
+    hostname = (parsed.hostname or "").casefold()
+    if scheme not in {"http", "https"} or not hostname:
+        raise ValueError("credential origin must be an absolute HTTP(S) URL")
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("credential origin contains an invalid port") from error
+    effective_port = port if port is not None else (443 if scheme == "https" else 80)
+    rendered_host = f"[{hostname}]" if ":" in hostname else hostname
+    return f"{scheme}://{rendered_host}:{effective_port}"
 
 
 class SensitiveDataSanitizer:
@@ -110,9 +178,13 @@ class SensitiveDataSanitizer:
     def sanitize(
         self, request: ExecutionRequest, result: ExecutionResult
     ) -> ExecutionResult:
-        secrets: tuple[str, ...] = ()
+        secrets: tuple[str, ...] = _request_secret_values(request)
         if request.credential_ref is not None and self._credentials is not None:
-            secrets = self._credentials.resolve(request.credential_ref).secret_values()
+            secrets = tuple(
+                dict.fromkeys(
+                    (*secrets, *self._credentials.resolve(request.credential_ref).secret_values())
+                )
+            )
         observation = self._sanitize_mapping(dict(result.observation), secrets)
         artifacts = {
             key: self._sanitize_text(value, secrets)
@@ -190,6 +262,42 @@ class SensitiveDataSanitizer:
             )
 
         return _sanitize_plain_text(value, secrets)
+
+
+def _request_secret_values(request: ExecutionRequest) -> tuple[str, ...]:
+    """로그인 요청의 민감 필드 값을 응답 마스킹용 일회성 목록으로 추출한다."""
+
+    body = request.body
+    if not body:
+        return ()
+    values: list[str] = []
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, Mapping):
+        _collect_sensitive_values(payload, values)
+    for name, value in parse_qsl(body, keep_blank_values=True):
+        if _is_sensitive_field(name) and value:
+            values.append(value)
+    return tuple(dict.fromkeys(values))
+
+
+def _collect_sensitive_values(value: object, output: list[str]) -> None:
+    if isinstance(value, Mapping):
+        for name, item in value.items():
+            if _is_sensitive_field(str(name)) and isinstance(item, str) and item:
+                output.append(item)
+            else:
+                _collect_sensitive_values(item, output)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _collect_sensitive_values(item, output)
+
+
+def _is_sensitive_field(name: str) -> bool:
+    normalized = name.casefold().replace("-", "_")
+    return any(hint in normalized for hint in _REQUEST_SECRET_FIELD_HINTS)
 
 
 def _sanitize_plain_text(value: str, secrets: Sequence[str]) -> str:
