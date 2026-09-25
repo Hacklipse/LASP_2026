@@ -35,7 +35,6 @@ services:
       --bind 0.0.0.0
       --allow-host host.docker.internal
       --target http://host.docker.internal:3000/
-      --budget 60
     # LLM 엔진을 쓸 때만 필요하다. 없으면 화면에서 해당 엔진이 "(키 없음)" 으로 잠긴다.
     environment:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
