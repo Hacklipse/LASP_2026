@@ -1,5 +1,13 @@
 # 대시보드만 컨테이너로 띄운다. 점검 대상은 각자 호스트에서 돌린다.
 #
+# 알려진 제약 — 컨테이너는 아직 CLI 동등성을 갖추지 못했다. 별도 항목으로 다룬다.
+#   · 브라우저 XSS: 이미지에 Playwright·Chromium 이 없다. Juice Shop 의 xss/all 을
+#     돌리려면 호스트에서 .venv 로 실행한다.
+#   · Path Traversal·SSTI 전체 모드: 임시 계정 정리가 호스트의 juiceshop.sqlite 를
+#     직접 열어야 하는데, Docker 로 띄운 Juice Shop 은 DB 가 컨테이너 안에 있다.
+#     npm start 로 띄운 Juice Shop + 호스트 실행 조합에서만 정리가 보장된다.
+#   범용 대상과 SQLi·Access Control 은 컨테이너에서도 동작한다.
+#
 #     docker compose up --build        # http://127.0.0.1:8899/
 #
 # 호스트에서 돌고 있는 대상은 화면에서 host.docker.internal 로 지정한다.

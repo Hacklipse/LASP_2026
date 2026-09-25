@@ -34,6 +34,7 @@
     select.control-input option:disabled{color:var(--dim)}
     .scan-meta.wide{min-width:152px}
     .scan-meta.tight{min-width:96px}
+    .scan-meta.mode{min-width:118px}
     .details>.panel,.details>.side-panels{align-self:start}
     .details{grid-template-areas:"findings side" "report side"}
     .findings{grid-area:findings}.report{grid-area:report}.side-panels{grid-area:side}
@@ -51,6 +52,20 @@
     .progress-copy strong.starved{color:var(--amber)}
     .metric-number.warn{color:var(--amber)}
     @media(max-width:900px){.details{grid-template-areas:"findings" "report" "side"}}
+    .scan-actions{display:flex;align-items:center;gap:9px}
+    .setup{margin-bottom:18px}
+    .setup-body{padding:20px 25px 25px}
+    .field-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(178px,1fr));gap:13px}
+    .field-grid+.field-grid{margin-top:15px}
+    .field-grid.checks{grid-template-columns:repeat(auto-fit,minmax(158px,1fr))}
+    .field{min-width:0}
+    .field>.meta-label{margin-bottom:5px}
+    .field.check{display:flex;align-items:center;gap:9px;min-height:36px;padding:0 12px;border:1px solid var(--line);border-radius:7px;background:var(--panel2)}
+    .field.check label{color:#cedad7;font-size:10px;font-weight:700;cursor:pointer}
+    .field.check input{accent-color:var(--lime);cursor:pointer}
+    .field.check.disabled{opacity:.45}
+    .field.check.disabled label,.field.check.disabled input{cursor:not-allowed}
+    .setup-note{margin:22px 0 13px;padding:11px 13px;border:1px solid #4a5f3c;border-radius:7px;background:#1a2418;color:#b9cfa8;font-size:10px;line-height:1.6}
     .scan-actions{padding-left:20px;border-left:1px solid var(--line)}
     .start-btn{padding:11px 17px;border:1px solid #5e864a;border-radius:7px;background:#1c2e20;color:var(--lime);font-size:10px;font-weight:800;letter-spacing:.09em;white-space:nowrap;cursor:pointer}
     .start-btn:hover:not(:disabled){background:#243a27}
@@ -115,12 +130,35 @@
           <input class="target-input" id="target-input" type="text" spellcheck="false" autocomplete="off" aria-label="Target URL">
         </span>
       </div>
+      <div class="scan-meta mode"><span class="meta-label">Mode</span><select class="control-input" id="mode-select" aria-label="Run mode"></select></div>
+      <div class="scan-meta tight" id="vuln-field" hidden><span class="meta-label">Vuln</span><select class="control-input" id="vuln-select" aria-label="Vulnerability type"></select></div>
       <div class="scan-meta wide"><span class="meta-label">Engine</span><select class="control-input" id="engine-select" aria-label="Analysis engine"></select></div>
-      <div class="scan-meta wide"><span class="meta-label">Report</span><select class="control-input" id="report-select" aria-label="Report format"></select></div>
-      <div class="scan-meta tight"><span class="meta-label">Budget</span><input class="control-input" id="budget-input" type="number" min="1" max="500" step="10" aria-label="Request budget"></div>
+      <div class="scan-meta tight"><span class="meta-label">Budget</span><input class="control-input" id="budget-input" type="number" min="1" max="500" placeholder="auto" aria-label="Request budget"></div>
       <div class="scan-meta tight"><span class="meta-label">Run ID</span><span class="meta-value" id="run-id">—</span></div>
       <div class="scan-meta tight"><span class="meta-label">Agent</span><span class="meta-value" id="current-agent">—</span></div>
-      <div class="scan-actions"><button class="start-btn" id="start-btn" type="button">START SCAN</button></div>
+      <div class="scan-actions"><button class="ghost-btn" id="setup-toggle" type="button" aria-expanded="false" aria-controls="setup-panel">SETUP</button><button class="start-btn" id="start-btn" type="button">START SCAN</button></div>
+    </section>
+
+    <section class="panel setup" id="setup-panel" aria-labelledby="setup-title" hidden>
+      <div class="panel-heading">
+        <div>
+          <p class="panel-kicker">Run configuration</p>
+          <h2 class="panel-title" id="setup-title">실행 조건</h2>
+          <p class="panel-desc">여기서 고른 값이 그대로 Agent 배선과 보고서의 실행 조건 기록이 된다.</p>
+        </div>
+      </div>
+      <div class="setup-body">
+        <div class="field-grid" id="advanced-grid"></div>
+        <div class="field-grid" id="llm-grid" hidden></div>
+        <div class="field-grid checks" id="boolean-grid"></div>
+        <div id="credential-block" hidden>
+          <p class="setup-note">
+            아래 값은 로그인에만 쓰고 Run·Evidence·보고서·활동 로그 어디에도 저장하지 않는다.
+            검증이 끝나면 메모리 참조를 버린다.
+          </p>
+          <div class="field-grid" id="credential-grid"></div>
+        </div>
+      </div>
     </section>
 
     <section class="metrics" aria-label="Scan metrics">

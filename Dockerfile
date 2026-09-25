@@ -4,9 +4,9 @@
 # 띄우고, 대시보드는 host.docker.internal 로 호스트의 대상에 닿는다.
 FROM python:3.12-slim
 
-# Playwright 는 일부러 넣지 않는다. 브라우저 바이너리가 이미지를 1GB 넘게 키우는데
-# 이 대시보드는 브라우저 Runtime 을 쓰지 않는다. browser XSS 검증을 켤 때 별도
-# 단계로 추가한다.
+# Playwright 는 아직 넣지 않는다. 브라우저 바이너리가 이미지를 1GB 넘게 키운다.
+# 그래서 이 이미지로는 브라우저 XSS 검증(Juice Shop 의 xss·all)을 돌릴 수 없다.
+# 해당 실행은 호스트의 .venv 로 한다. 컨테이너 동등성은 별도 항목이다.
 RUN pip install --no-cache-dir beautifulsoup4==4.15.0 lxml==6.1.3
 
 ENV PYTHONUNBUFFERED=1 \

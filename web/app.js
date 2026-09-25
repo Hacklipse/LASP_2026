@@ -69,6 +69,7 @@ const SHOWN_ACTIVITY = 12; // 화면에 그리는 개수
 
 const $ = (id) => document.getElementById(id);
 
+let config = {};
 let lastSequence = 0;
 let activity = [];
 let running = false;
@@ -162,8 +163,9 @@ function renderStatus(state) {
   button.disabled = busy;
   button.textContent = busy ? 'SCANNING…' : 'START SCAN';
   /* Run 중에 구성을 바꾸면 화면과 실제 실행이 어긋난다. 끝날 때까지 잠근다. */
-  for (const id of ['target-input', 'engine-select', 'report-select', 'budget-input'])
+  for (const id of ['target-input', 'mode-select', 'vuln-select', 'engine-select', 'budget-input'])
     $(id).disabled = busy;
+  applyLocks(busy);
 
   const banner = $('error-banner');
   if (state.error) {
@@ -462,18 +464,45 @@ async function start() {
   lastSequence = 0;
   activity = [];
   try {
+    const payload = {
+      target,
+      mode: $('mode-select').value,
+      vuln: $('vuln-select').value,
+      engine: $('engine-select').value,
+      budget: Number($('budget-input').value) || 0,
+      access_accounts: {},
+    };
+    for (const select of document.querySelectorAll('#advanced-grid select')) {
+      payload[select.dataset.field] = select.value;
+    }
+    for (const box of document.querySelectorAll('#boolean-grid input')) {
+      payload[box.dataset.field] = box.checked;
+    }
+    for (const input of document.querySelectorAll('[data-llm-field]')) {
+      const value = input.value.trim();
+      if (!value) continue;
+      payload[input.dataset.llmField] =
+        input.dataset.llmField === 'llm_rpm_limit' ? Number(value) : value;
+    }
+    for (const input of document.querySelectorAll('[data-secret]')) {
+      const name = input.dataset.secret;
+      if (name.startsWith('actor_') || name.startsWith('owner_')) {
+        payload.access_accounts[name] = input.value;
+      } else {
+        payload[name] = input.value;
+      }
+    }
+
     const response = await fetch('/api/run', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        target,
-        engine: $('engine-select').value,
-        report: $('report-select').value,
-        budget: Number($('budget-input').value),
-      }),
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Hacklipse-CSRF': config.csrf_token || '',
+      },
+      body: JSON.stringify(payload),
     });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
   } catch (error) {
     $('error-banner').textContent = `Run을 시작하지 못했다: ${error.message}`;
     $('error-banner').classList.add('show');
@@ -491,10 +520,156 @@ function tickClock() {
   $('clock').textContent = utc;
 }
 
+/* 자격증명 입력은 실행 모드가 요구할 때만 만든다. 필요 없는 화면에 비밀 입력칸을
+ * 띄워두지 않는다. type=password 는 어깨너머 노출과 브라우저 자동완성을 막는다. */
+const CREDENTIAL_FIELDS = {
+  access: [
+    ['actor_email', 'ACTOR 이메일', 'text'],
+    ['actor_password', 'ACTOR 비밀번호', 'password'],
+    ['owner_email', 'OWNER 이메일', 'text'],
+    ['owner_password', 'OWNER 비밀번호', 'password'],
+  ],
+  ssti: [['ssti_token', 'SSTI token Cookie', 'password']],
+  db: [['juice_shop_db', 'juiceshop.sqlite 경로', 'text']],
+};
+
+function buildControls() {
+  const fill = (select, items, selected) => {
+    select.innerHTML = items
+      .map(
+        (item) =>
+          `<option value="${escapeHtml(item.id)}"${item.available === false ? ' disabled' : ''}>${escapeHtml(
+            item.available === false ? `${item.label} (키 없음)` : item.label
+          )}</option>`
+      )
+      .join('');
+    if (selected) select.value = selected;
+  };
+
+  $('target-input').value = config.default_target || '';
+  $('target-input').title = `허용 호스트: ${(config.allowed_hosts || []).join(', ')}`;
+  $('budget-input').max = config.max_budget;
+
+  fill($('mode-select'), config.modes, 'generic');
+  fill($('vuln-select'), config.vulns, 'all');
+  fill($('engine-select'), config.engines, config.default_engine);
+  $('engine-select').title = (config.engines || [])
+    .filter((engine) => engine.key_env)
+    .map((engine) => `${engine.label}: ${engine.available ? '사용 가능' : engine.key_env + ' 미설정'}`)
+    .join('\n');
+
+  $('advanced-grid').innerHTML = (config.advanced || [])
+    .map(
+      (spec) =>
+        `<div class="field"><span class="meta-label">${escapeHtml(spec.label)}</span>` +
+        `<select class="control-input" data-field="${escapeHtml(spec.field)}" data-llm-only="${spec.llm_only.join(',')}">` +
+        spec.choices
+          .map((choice) => `<option value="${escapeHtml(choice)}">${escapeHtml(choice)}</option>`)
+          .join('') +
+        `</select></div>`
+    )
+    .join('');
+  $('llm-grid').innerHTML = (config.llm_fields || [])
+    .map(
+      (spec) =>
+        `<div class="field"><span class="meta-label">${escapeHtml(spec.label)}</span>` +
+        `<input class="control-input" data-llm-field="${escapeHtml(spec.field)}" ` +
+        `placeholder="${escapeHtml(spec.placeholder)}" autocomplete="off" spellcheck="false"></div>`
+    )
+    .join('');
+  $('boolean-grid').innerHTML = (config.booleans || [])
+    .map(
+      (spec) =>
+        `<div class="field check" data-check="${escapeHtml(spec.field)}">` +
+        `<input type="checkbox" id="chk-${escapeHtml(spec.field)}" data-field="${escapeHtml(spec.field)}" data-llm-only="${spec.llm_only}">` +
+        `<label for="chk-${escapeHtml(spec.field)}">${escapeHtml(spec.label)}</label></div>`
+    )
+    .join('');
+
+  $('mode-select').addEventListener('change', syncMode);
+  $('vuln-select').addEventListener('change', syncMode);
+  $('engine-select').addEventListener('change', syncEngine);
+  syncMode();
+  syncEngine();
+}
+
+/* 모드에 따라 필요한 입력만 남긴다. 화면이 서버 규칙을 미리 반영해 400 을 줄인다. */
+let credentialSignature = null;
+
+function syncMode() {
+  const juice = $('mode-select').value === 'juice-shop';
+  const vuln = $('vuln-select').value;
+  $('vuln-field').hidden = !juice;
+
+  const needed = [];
+  if (juice && ['access_control', 'all'].includes(vuln)) needed.push('access');
+  if (juice && vuln === 'ssti') needed.push('ssti');
+  if (juice && ['path_traversal', 'all'].includes(vuln)) needed.push('db');
+
+  $('credential-block').hidden = needed.length === 0;
+  applyBrowserRule(juice, vuln);
+
+  /* 이미 같은 구성이면 다시 그리지 않는다 — 입력해둔 값을 지우게 된다. */
+  const signature = needed.join('|');
+  if (signature === credentialSignature) return;
+  credentialSignature = signature;
+
+  const wanted = needed.flatMap((group) => CREDENTIAL_FIELDS[group]);
+  $('credential-grid').innerHTML = wanted
+    .map(
+      ([name, label, type]) =>
+        `<div class="field"><span class="meta-label">${escapeHtml(label)}</span>` +
+        `<input class="control-input" type="${type}" data-secret="${escapeHtml(name)}" autocomplete="off" spellcheck="false"></div>`
+    )
+    .join('');
+}
+
+/* 브라우저 검증은 Juice Shop 모드에서 유형이 정한다(CLI 와 같은 규칙). 수동 선택을
+ * 막아 화면 표시와 실제 배선을 일치시킨다. */
+function applyBrowserRule(juice, vuln) {
+  const box = document.querySelector('[data-field="browser"]');
+  if (!box) return;
+  box.dataset.ruleLocked = juice ? 'true' : 'false';
+  if (juice) box.checked = ['xss', 'all'].includes(vuln);
+  box.closest('.field').classList.toggle('disabled', juice);
+}
+
+/* LLM 이 필요한 선택지는 결정적 엔진에서 잠근다. 서버도 같은 규칙으로 거부한다. */
+function syncEngine() {
+  const llm = $('engine-select').value.startsWith('llm:');
+  /* 결정적 엔진에서는 모델·호출 상한이 의미가 없다. 칸 자체를 숨긴다. */
+  $('llm-grid').hidden = !llm;
+  for (const select of document.querySelectorAll('#advanced-grid select')) {
+    const llmOnly = (select.dataset.llmOnly || '').split(',').filter(Boolean);
+    for (const option of select.options) option.disabled = !llm && llmOnly.includes(option.value);
+    if (select.selectedOptions[0]?.disabled) select.selectedIndex = 0;
+  }
+  for (const box of document.querySelectorAll('#boolean-grid input')) {
+    if (box.dataset.field === 'browser') continue;
+    const locked = box.dataset.llmOnly === 'true' && !llm;
+    box.dataset.ruleLocked = locked ? 'true' : 'false';
+    if (locked) box.checked = false;
+    box.closest('.field').classList.toggle('disabled', locked);
+  }
+  applyLocks(false);
+}
+
+/* 실행 중 잠금과 규칙 잠금을 함께 적용한다. 둘 중 하나라도 걸리면 잠근다. */
+function applyLocks(busy) {
+  for (const control of document.querySelectorAll('#setup-panel select, #setup-panel input')) {
+    control.disabled = busy || control.dataset.ruleLocked === 'true';
+  }
+}
+
 async function boot() {
   tickClock();
   setInterval(tickClock, 30000);
   $('start-btn').addEventListener('click', start);
+  $('setup-toggle').addEventListener('click', () => {
+    const panel = $('setup-panel');
+    panel.hidden = !panel.hidden;
+    $('setup-toggle').setAttribute('aria-expanded', String(!panel.hidden));
+  });
   $('copy-report').addEventListener('click', async () => {
     await navigator.clipboard.writeText($('report-body').textContent);
     const button = $('copy-report');
@@ -505,54 +680,16 @@ async function boot() {
     if (event.key === 'Enter' && !$('start-btn').disabled) start();
   });
 
-  /* 허용 호스트·엔진·예산은 서버가 안다. 화면이 값을 지어내지 않는다. */
+  /* 허용 호스트·엔진·실행 조건 선택지는 서버가 안다. 화면이 값을 지어내지 않는다. */
   try {
     const response = await fetch('/api/config', { cache: 'no-store' });
-    const config = await response.json();
-
-    $('target-input').value = config.default_target || '';
-    $('target-input').title = `허용 호스트: ${(config.allowed_hosts || []).join(', ')}`;
-
-    const budget = $('budget-input');
-    budget.value = config.default_budget;
-    budget.max = config.max_budget;
-
-    /* 키가 없는 엔진은 숨기지 않고 잠근 채로 보여준다 — 왜 못 쓰는지가 화면에 남아야 한다. */
-    const select = $('engine-select');
-    select.innerHTML = (config.engines || [])
-      .map((engine) => {
-        const label = engine.available ? engine.label : `${engine.label} (키 없음)`;
-        return `<option value="${escapeHtml(engine.id)}"${engine.available ? '' : ' disabled'}>${escapeHtml(label)}</option>`;
-      })
-      .join('');
-    select.value = config.default_engine;
-
-    const reportSelect = $('report-select');
-    reportSelect.innerHTML = (config.reports || [])
-      .map(
-        (report) =>
-          `<option value="${escapeHtml(report.id)}" data-needs-llm="${report.needs_llm}">${escapeHtml(report.label)}</option>`
-      )
-      .join('');
-    reportSelect.value = config.default_report;
-    /* LLM 요약은 LLM 엔진에서만 만들어진다 — 서버와 같은 규칙을 화면에도 건다. */
-    const syncReportOptions = () => {
-      const llmEngine = select.value.startsWith('llm:');
-      for (const option of reportSelect.options) {
-        const needsLlm = option.dataset.needsLlm === 'true';
-        option.disabled = needsLlm && !llmEngine;
-      }
-      if (reportSelect.selectedOptions[0]?.disabled) reportSelect.value = 'v2';
-    };
-    select.addEventListener('change', syncReportOptions);
-    syncReportOptions();
-    select.title = (config.engines || [])
-      .filter((engine) => engine.key_env)
-      .map((engine) => `${engine.label}: ${engine.available ? '사용 가능' : engine.key_env + ' 미설정'}`)
-      .join('\n');
+    config = await response.json();
+    buildControls();
   } catch (error) {
-    /* 설정을 못 읽어도 폴링은 계속한다. 아래 poll()이 같은 오류를 화면에 띄운다. */
+    $('error-banner').textContent = `설정을 읽지 못했다: ${error.message}`;
+    $('error-banner').classList.add('show');
   }
+
   poll();
 }
 
