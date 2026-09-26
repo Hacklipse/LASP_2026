@@ -71,6 +71,7 @@ const $ = (id) => document.getElementById(id);
 
 let config = {};
 let lastSequence = 0;
+const seenNotes = new Set();
 let activity = [];
 let running = false;
 let timer = null;
@@ -481,8 +482,13 @@ function render(state) {
 
 function absorbEvents(events) {
   for (const event of events) {
-    if (event.sequence <= lastSequence) continue;
-    lastSequence = event.sequence;
+    if (event.sequence < 0) {
+      if (seenNotes.has(event.sequence)) continue;
+      seenNotes.add(event.sequence);
+    } else {
+      if (event.sequence <= lastSequence) continue;
+      lastSequence = event.sequence;
+    }
     const [message, tone] = describe(event);
     activity.unshift({ time: event.time, message, tone });
   }
@@ -515,6 +521,7 @@ async function start() {
   $('start-btn').disabled = true;
   /* 새 Run 이므로 이전 Run 의 활동 로그와 순번을 버린다. */
   lastSequence = 0;
+  seenNotes.clear();
   activity = [];
   expandedFindingGroups.clear();
   try {
@@ -557,6 +564,10 @@ async function start() {
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    for (const input of document.querySelectorAll('[data-secret]')) {
+      if (input.dataset.secret !== 'juice_shop_db') input.value = '';
+    }
+    markSetupNeeded();
   } catch (error) {
     $('error-banner').textContent = `Run을 시작하지 못했다: ${error.message}`;
     $('error-banner').classList.add('show');

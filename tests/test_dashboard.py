@@ -20,12 +20,14 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "src"))
@@ -366,6 +368,25 @@ class HttpBoundaryTests(unittest.TestCase):
 
 class FailureCleanupTests(unittest.TestCase):
     """실패해도 credential 참조와 세션은 반드시 정리된다."""
+
+    def test_setup_error_marks_the_run_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            options = RunOptions(
+                target="http://127.0.0.1:9/",
+                knowledge_db=directory,  # 디렉터리는 SQLite DB 파일로 열 수 없다.
+                routing_log=str(Path(directory) / "routing.jsonl"),
+            )
+            supervisor = RunSupervisor(
+                allowed_hosts=frozenset({"127.0.0.1"}), defaults=options
+            )
+            self.assertIsNone(supervisor.validate(options, RunSecrets()))
+            with patch("dashboard_core.traceback.print_exc"):
+                supervisor.start(options, RunSecrets())
+                supervisor._thread.join(timeout=5)
+            self.assertFalse(supervisor._thread.is_alive())
+            view = supervisor.state.read(0)
+            self.assertEqual(view["status"], "failed")
+            self.assertIn("OperationalError", view["error"])
 
     def test_a_failing_run_still_clears_credentials(self) -> None:
         supervisor = RunSupervisor(

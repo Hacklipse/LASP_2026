@@ -512,6 +512,16 @@ class RunSupervisor:
 
     def _run(self, options: RunOptions, secrets: RunSecrets) -> None:
         try:
+            self._execute_run(options, secrets)
+        except Exception as error:  # noqa: BLE001 - 백그라운드 스레드가 running에 멈추지 않게 한다
+            traceback.print_exc()
+            self.state.finish(
+                status="failed",
+                error=f"Run 처리 중 예상치 못한 오류 ({type(error).__name__}). 서버 로그를 확인하세요.",
+            )
+
+    def _execute_run(self, options: RunOptions, secrets: RunSecrets) -> None:
+        try:
             llm_client, rpm_limit = self._build_llm_client(options)
         except LlmCredentialsMissing as error:
             self.state.finish(status="failed", error=str(error))
