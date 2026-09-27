@@ -14,6 +14,9 @@ graphify-out/
 /knowledge/
 .DS_Store
 .venv/
+.env
+.env.*
+!.env.example
 PR_BODY.md
 CLAUDE.md
 CLAUDE.md.bak

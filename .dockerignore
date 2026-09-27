@@ -1,0 +1,16 @@
+.venv/
+.git/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+knowledge/
+artifacts/
+.DS_Store
+.claude/
+.serena/
+.codex/
+tests/
+*.md
