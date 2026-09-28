@@ -5,8 +5,10 @@ from __future__ import annotations
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import replace
 from threading import Lock
 
+from hacklipse.ports.errors import LlmTimeout
 from hacklipse.ports.llm import LlmClient, LlmRequest, LlmResponse
 
 
@@ -43,14 +45,20 @@ class SlidingWindowLlmClient:
         self._lock = Lock()
 
     def complete(self, request: LlmRequest) -> LlmResponse:
-        self._reserve_slot()
-        return self._delegate.complete(request)
+        deadline = self._clock() + request.timeout_seconds
+        self._reserve_slot(deadline)
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            raise LlmTimeout("llm request deadline expired before provider call")
+        return self._delegate.complete(replace(request, timeout_seconds=remaining))
 
-    def _reserve_slot(self) -> None:
+    def _reserve_slot(self, deadline: float) -> None:
         effective_window = self._window_seconds + self._boundary_margin_seconds
         with self._lock:
             while True:
                 now = self._clock()
+                if now >= deadline:
+                    raise LlmTimeout("llm request deadline expired while rate limited")
                 cutoff = now - effective_window
                 while self._starts and self._starts[0] <= cutoff:
                     self._starts.popleft()
@@ -58,4 +66,6 @@ class SlidingWindowLlmClient:
                     self._starts.append(now)
                     return
                 wait_seconds = self._starts[0] + effective_window - now
+                if wait_seconds >= deadline - now:
+                    raise LlmTimeout("llm request deadline expired while rate limited")
                 self._sleeper(max(wait_seconds, 0.0))

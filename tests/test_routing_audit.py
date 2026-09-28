@@ -192,6 +192,31 @@ class RoutingAuditTests(unittest.TestCase):
         self.assertEqual(record["rule_decisions"], record["final_decisions"])
         self.assertNotIn("private-error", json.dumps(record))
 
+    def test_agentic_parser_rejection_explains_fallback_in_audit(self):
+        log = _Log()
+        llm = _Llm({
+            "surface_id": "search", "vulnerability_type": "SQLi",
+            "basis_observation_ids": ["not-offered"],
+            "reason_code": "query_interpreter_risk",
+            "required_evidence_types": ["server_error_delta"],
+        })
+
+        result = standard_router(
+            mode="agentic", llm_client=llm, audit_log=log
+        ).route(_RUN, (_SURFACE,), ())
+
+        record = log.records[0]
+        self.assertEqual(record["rule_decisions"], record["final_decisions"])
+        self.assertEqual(len(result), 2)
+        self.assertEqual(record["llm"]["source"], "deterministic_fallback")
+        self.assertEqual(
+            record["llm"]["status"],
+            "agentic_fallback:all_rejected:unknown_observation",
+        )
+        self.assertEqual(record["llm"]["rejected_items"], [
+            {"index": 0, "index_scope": "raw_items", "reason": "unknown_observation"}
+        ])
+
     def test_unexpected_exception_preserves_rules_and_is_logged(self):
         log = _Log()
         router = standard_router(mode="hybrid", llm_client=_Llm(error=RuntimeError("private-error")), audit_log=log)

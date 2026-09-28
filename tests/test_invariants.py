@@ -294,6 +294,32 @@ class ArchitectureInvariantTests(unittest.TestCase):
         with self.assertRaises(PolicyViolation):
             AllowlistPolicyGate().validate_execution(run, request)
 
+    def test_safe_policy_checks_get_path_and_existing_action_value(self) -> None:
+        run = Run(
+            run_id="run-1",
+            target_url="https://local.test/",
+            scope=RunScope(allowed_hosts=frozenset({"local.test"})),
+            policy_profile="safe",
+            request_budget=3,
+        )
+        for url in (
+            "https://local.test/account/delete",
+            "https://local.test/account/%64elete",
+            "https://local.test/search?action=delete",
+            "https://local.test/search?action=%2564elete",
+        ):
+            with self.subTest(url=url), self.assertRaises(PolicyViolation):
+                AllowlistPolicyGate().validate_execution(run, ExecutionRequest(
+                    execution_id="exec-1", run_id=run.run_id, task_id="task-1",
+                    tool="http_get", target_url=url, surface_id="surface-1",
+                    purpose="GET safety fixture",
+                ))
+        AllowlistPolicyGate().validate_execution(run, ExecutionRequest(
+            execution_id="exec-2", run_id=run.run_id, task_id="task-1",
+            tool="http_get", target_url="https://local.test/search?q=delete",
+            surface_id="surface-1", purpose="benign search fixture",
+        ))
+
     def test_http_request_spec_rejects_runtime_controlled_or_injected_headers(self) -> None:
         """Agent가 Scope·전송 경계를 바꾸는 헤더를 주입하지 못해야 한다."""
 
@@ -303,6 +329,11 @@ class ArchitectureInvariantTests(unittest.TestCase):
             HttpRequestSpec(headers=(("X-Test", "ok\r\nX-Injected: yes"),))
         with self.assertRaises(DomainInvariantError):
             HttpRequestSpec(request_kind="probe")  # type: ignore[arg-type]
+        with self.assertRaises(DomainInvariantError):
+            HttpRequestSpec(
+                query_parameters=(("q", "' OR 1=1 --"),),
+                request_kind=HttpRequestKind.PROBE,
+            )
 
         spec = HttpRequestSpec(
             query_parameters=(("name", "hacklipse7331"),),

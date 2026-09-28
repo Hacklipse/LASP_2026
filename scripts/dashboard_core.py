@@ -711,6 +711,7 @@ class RunSupervisor:
                 actor_object_id=actor_object_id,
                 owner_object_id=owner_object_id,
                 validation_review=options.validation_review,
+                agentic_probe_enabled=options.router == "agentic",
             )
 
             try:

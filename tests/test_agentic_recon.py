@@ -124,9 +124,8 @@ class AgenticPlannerContractTests(unittest.TestCase):
         self.assertEqual(action.rejected_surface_ids, ("surface-outside-run",))
 
     def test_timeout_falls_back_without_exposing_the_exception(self) -> None:
-        planner = LlmIterativeReconPlanner(
-            llm_client=_FakeLlm(error=LlmTimeout("secret provider text"))
-        )
+        llm = _FakeLlm(error=LlmTimeout("secret provider text"))
+        planner = LlmIterativeReconPlanner(llm_client=llm)
 
         action = planner.decide(
             task=_TASK,
@@ -139,6 +138,7 @@ class AgenticPlannerContractTests(unittest.TestCase):
         self.assertEqual(action.surface_id, "surface-a")
         self.assertEqual(action.status, "fallback:timeout")
         self.assertNotIn("secret", action.status)
+        self.assertEqual(llm.requests[0].timeout_seconds, 15)
 
 
 class _Collector:
@@ -278,6 +278,39 @@ class _CaptureStopPlanner:
 
 
 class AgenticReconIntegrationTests(unittest.TestCase):
+    def test_provider_timeout_keeps_recon_running_without_repeated_llm_calls(self) -> None:
+        bodies = {
+            "http://localhost/": '<a href="/a">a</a><a href="/b">b</a>',
+            "http://localhost/a": "<p>a</p>",
+            "http://localhost/b": "<p>b</p>",
+        }
+        evidence_store = InMemoryEvidenceStore()
+        collector = _Collector(evidence_store, bodies)
+        llm = _FakeLlm(error=LlmTimeout("slow provider"))
+        agent = ReconAgent(
+            collector=collector,
+            evidence_store=evidence_store,
+            surface_store=InMemorySurfaceStore(),
+            iterative_planner=LlmIterativeReconPlanner(llm_client=llm),
+            max_pages=3,
+            id_factory=iter(map(str, range(1000))).__next__,
+        )
+
+        result = agent.handle(_TASK)
+
+        self.assertEqual(collector.calls, list(bodies))
+        self.assertEqual(len(llm.requests), 1)
+        self.assertEqual(result.message, "agentic_recon:fallback:timeout")
+        traces = [
+            item.observation for item in evidence_store.list_by_run(_TASK.run_id)
+            if item.observation.get("type") == "recon_action"
+        ]
+        self.assertEqual([item["status"] for item in traces], [
+            "fallback:timeout", "fallback:timeout",
+        ])
+        agent.handle(_TASK)
+        self.assertEqual(len(llm.requests), 1)
+
     def test_each_round_bounds_prompt_to_selectable_surfaces_and_recent_context(self) -> None:
         bundle = "\n".join(
             f'const endpoint{index} = "/api/items{index}?q=";'

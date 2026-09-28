@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 from hacklipse.adapters.llm_router_advisor import (
     AnalyzerChoice,
@@ -169,7 +170,7 @@ class AgenticHypothesisTests(unittest.TestCase):
                     {
                         "surface_id": "surface-import",
                         "vulnerability_type": "SQLi",
-                        "basis_observation_ids": ["evi-response"],
+                        "basis_observation_ids": ["o1"],
                         "reason_code": "query_interpreter_risk",
                         "required_evidence_types": [
                             "control_response",
@@ -212,11 +213,48 @@ class AgenticHypothesisTests(unittest.TestCase):
         request = llm.requests[0]
         prompt = request.messages[0].content
         self.assertIn(
-            "evi-response:http_response_500_application_json",
+            'observation_refs=[{"ref":"o1","kind":"http_response_500_application_json"}]',
             prompt,
         )
+        self.assertNotIn("evi-response", prompt)
         self.assertNotIn("SECRET_RESPONSE_MUST_NOT_REACH_LLM", prompt)
         self.assertNotIn("status=500", prompt)
+        self.assertIn("use basis_observation_ids=[]", request.system)
+
+    def test_observation_refs_are_local_to_each_surface_and_run(self) -> None:
+        llm = _FakeLlmClient({"suggestions": [
+            {
+                "surface_id": surface_id,
+                "vulnerability_type": "SQLi",
+                "basis_observation_ids": ["o1"],
+                "reason_code": "query_interpreter_risk",
+                "required_evidence_types": ["server_error_delta"],
+            }
+            for surface_id in ("surface-import", "surface-other")
+        ]})
+        first = Evidence(
+            evidence_id="evi-first", run_id="run-1", surface_id="surface-import",
+            created_by="fixture", evidence_type="http_response",
+            observation={"status": 200, "content_type": "application/json"},
+        )
+        second = replace(first, evidence_id="evi-second", surface_id="surface-other")
+        foreign = replace(first, evidence_id="evi-foreign", run_id="run-2")
+        advisor = LlmRouterAdvisor(
+            llm_client=llm, analyzers=ANALYZERS, hypothesis_mode=True
+        )
+
+        suggestions = advisor.advise(
+            _run(), (_surface(), _surface("surface-other")),
+            (foreign, first, second), frozenset(),
+        )
+
+        self.assertEqual(
+            {item.surface_id: item.basis_evidence_ids for item in suggestions},
+            {"surface-import": ("evi-first",), "surface-other": ("evi-second",)},
+        )
+        prompt = llm.requests[0].messages[0].content
+        self.assertEqual(prompt.count('observation_refs=[{"ref":"o1"'), 2)
+        self.assertNotIn("evi-foreign", prompt)
 
     def test_rejects_observation_id_from_outside_the_offered_surface(self) -> None:
         llm = _FakeLlmClient(

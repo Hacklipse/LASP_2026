@@ -24,6 +24,8 @@ from hacklipse.adapters.paired_routing import PairedVulnerabilityRouter
 from hacklipse.adapters.llm_recon_planner import LlmReconPlanner
 from hacklipse.adapters.llm_iterative_recon import LlmIterativeReconPlanner
 from hacklipse.adapters.reviewing_validation import ReviewingValidationAgent
+from hacklipse.adapters.agentic_probe import AgenticHttpProbeAgent
+from hacklipse.adapters.analysis_llm_fallback import FallbackAnalysisAgent
 from hacklipse.application import Orchestrator
 from hacklipse.bootstrap import build_local_application, register_standard_agents
 from hacklipse.ports.errors import LlmCredentialsMissing
@@ -244,7 +246,15 @@ class RoutingCliTests(unittest.TestCase):
                                 request.execution_profile.surface_collection_mode,
                                 "deterministic",
                             )
-                            self.assertIsInstance(app.dispatcher._agents["sqli_analyzer"], LlmSqliAnalyzer if profile == "llm" else HeuristicSqliAnalyzer)
+                            analyzer = app.dispatcher._agents["sqli_analyzer"]
+                            if mode == "agentic":
+                                self.assertIsInstance(analyzer, AgenticHttpProbeAgent)
+                                self.assertEqual(analyzer._llm is not None, profile == "llm")
+                                analyzer = analyzer._analyzer
+                            if profile == "llm":
+                                self.assertIsInstance(analyzer, FallbackAnalysisAgent)
+                                analyzer = analyzer._primary
+                            self.assertIsInstance(analyzer, LlmSqliAnalyzer if profile == "llm" else HeuristicSqliAnalyzer)
                             # 초기화만 했으며 Run/외부 HTTP/LLM 호출은 아직 시작하지 않았다.
                             self.assertEqual(path.read_text(), "")
 

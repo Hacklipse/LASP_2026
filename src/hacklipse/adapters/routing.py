@@ -425,7 +425,15 @@ class RuleBasedVulnerabilityRouter:
                 )
                 advisor_failed = status.startswith("advisor_failed:")
                 router_rejected_all = bool(self.last_advisor_suggestions) and not suggested
-                if adapter_fallback or advisor_failed or router_rejected_all:
+                if adapter_fallback:
+                    reasons = ",".join(dict.fromkeys(
+                        reason for _, reason in trace.rejected_items
+                    ))
+                    self.last_advisor_status = (
+                        f"agentic_fallback:{trace.status}"
+                        + (f":{reasons}" if reasons else "")
+                    )
+                elif advisor_failed or router_rejected_all:
                     self.last_advisor_status = f"agentic_fallback:{status}"
                 else:
                     self.last_advisor_status = f"agentic_primary:{status}"

@@ -494,6 +494,7 @@ class ReconAgent:
 
         if self._iterative_planner is not None and pending and not targeted:
             round_index = 0
+            provider_fallback_status: str | None = None
             while pending and len(fetched) < page_budget:
                 if self._surface_collection_mode == "deterministic":
                     pending[:] = _deterministic_pending(pending, navigation_pages)
@@ -519,7 +520,12 @@ class ReconAgent:
                     selectable_surface_ids,
                     remaining_budget,
                     round_index,
+                    provider_fallback_status=provider_fallback_status,
                 )
+                if action.status in {
+                    "fallback:timeout", "fallback:transport_error", "fallback:refused"
+                }:
+                    provider_fallback_status = action.status
                 evidence_ids.append(action_evidence_id)
                 planner_status = recon_action_status_detail(action)
                 if action.action == "stop" or executed_surface_id is None:
@@ -865,6 +871,8 @@ class ReconAgent:
         selectable_surface_ids: tuple[str, ...],
         remaining_budget: int,
         round_index: int,
+        *,
+        provider_fallback_status: str | None = None,
     ) -> tuple[ReconAction, str, str | None]:
         """Restore or persist exactly one policy-checked iterative Recon action."""
 
@@ -877,7 +885,7 @@ class ReconAgent:
         if stored is not None:
             return stored
 
-        if self._surface_collection_mode == "deterministic":
+        if self._surface_collection_mode == "deterministic" or provider_fallback_status:
             selected = selectable_surface_ids[0]
             basis = next(
                 (
@@ -891,9 +899,11 @@ class ReconAgent:
                 action="visit_surface",
                 surface_id=selected,
                 basis_observation_ids=basis,
-                reason_code="expand_coverage",
+                reason_code=(
+                    "planner_failure" if provider_fallback_status else "expand_coverage"
+                ),
                 source="deterministic_fallback",
-                status="fallback:deterministic_collection",
+                status=provider_fallback_status or "fallback:deterministic_collection",
             )
         else:
             action = _policy_checked_recon_action(

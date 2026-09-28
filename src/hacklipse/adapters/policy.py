@@ -8,7 +8,7 @@ from hacklipse.domain import ExecutionRequest, Run, RunRequest, RunScope
 from hacklipse.ports import ApprovalGate
 from hacklipse.ports.errors import ApprovalRequired, PolicyViolation
 
-from .request_safety import has_state_changing_parameters
+from .request_safety import has_state_changing_get
 from .security import DenyAllApprovalGate
 from .path_traversal_analysis import (
     PATH_TRAVERSAL_TOOL,
@@ -71,9 +71,7 @@ class AllowlistPolicyGate:
                 request.method.upper() not in self._safe_methods
                 or (
                     request.method.upper() == "GET"
-                    and has_state_changing_parameters(
-                        tuple(name for name, _ in request.query_parameters)
-                    )
+                    and has_state_changing_get(request.resolved_url)
                 )
             )
             and not self._approval.is_approved(run, request)

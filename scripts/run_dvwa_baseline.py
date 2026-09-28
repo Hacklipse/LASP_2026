@@ -678,6 +678,7 @@ def main(argv: list[str]) -> int:
         actor_object_id=args.actor_object_id,
         owner_object_id=args.owner_object_id,
         validation_review=args.validation_review,
+        agentic_probe_enabled=args.router == "agentic",
     )
     if profile == "llm":
         profile = f"llm/{args.llm_provider} ({_safe_log_value(selected_model)})"

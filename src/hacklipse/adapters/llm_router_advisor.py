@@ -143,10 +143,14 @@ _AGENTIC_SYSTEM = (
     "the structured surfaces and observations offered to you. Do not assume a known "
     "vulnerable endpoint, target-specific payload, expected finding, or ground truth. "
     "For each hypothesis, copy one offered surface_id, one allowed vulnerability type, "
-    "zero or more observation IDs belonging to that surface, one offered reason code, "
+    "zero or more short observation ref values (e.g. o1), not their kind labels, "
+    "belonging to that surface in basis_observation_ids, "
+    "one offered reason code, "
     "and the generic evidence types needed to test the hypothesis. Select only hypotheses "
-    "worth spending analysis budget on. Never invent an endpoint, parameter, observation "
-    "ID, vulnerability type, reason code, evidence type, payload, or credential. Return "
+    "worth spending analysis budget on. If a surface has observation_refs=[(none)], "
+    "use basis_observation_ids=[]; never borrow a ref from another surface. "
+    "Never invent an endpoint, parameter, observation "
+    "ref, vulnerability type, reason code, evidence type, payload, or credential. Return "
     "an empty list when the observations do not justify a hypothesis."
 )
 
@@ -175,7 +179,7 @@ class _OfferedSurface:
     client_route: bool
     parameter_names: tuple[str, ...]
     observation_types: tuple[str, ...]
-    observations: tuple[tuple[str, str], ...]
+    observations: tuple[tuple[str, str, str], ...]
     covered_types: tuple[str, ...]
     allowed_types: tuple[str, ...]
 
@@ -398,14 +402,14 @@ class LlmRouterAdvisor:
     @staticmethod
     def _observation_records_by_surface(
         run: Run, evidence: Sequence[Evidence]
-    ) -> dict[str, tuple[tuple[str, str], ...]]:
-        """LLM이 선택할 수 있는 현재 Surface 소속 Evidence ID와 안전한 유형.
+    ) -> dict[str, tuple[tuple[str, str, str], ...]]:
+        """LLM이 선택할 수 있는 Surface별 짧은 참조, Evidence ID와 안전한 유형.
 
         HTTP 본문·헤더·관측값은 전달하지 않는다. 응답은 status와 content-type만
         정규화한 label로 바꿔 API/HTML/인증 경계 정도만 판단할 수 있게 한다.
         """
 
-        collected: dict[str, list[tuple[str, str]]] = {}
+        collected: dict[str, list[tuple[str, str, str]]] = {}
         for item in evidence:
             if (
                 item.run_id != run.run_id
@@ -438,9 +442,8 @@ class LlmRouterAdvisor:
                     continue
             else:
                 continue
-            collected.setdefault(item.surface_id, []).append(
-                (item.evidence_id, observation_type)
-            )
+            records = collected.setdefault(item.surface_id, [])
+            records.append((f"o{len(records) + 1}", item.evidence_id, observation_type))
         return {key: tuple(value) for key, value in collected.items()}
 
     # ------------------------------------------------------------------
@@ -461,15 +464,15 @@ class LlmRouterAdvisor:
             allowed = ", ".join(item.allowed_types)
             location = "client_route" if item.client_route else "server_route"
             observation_records = ", ".join(
-                f"{evidence_id}:{kind}"
-                for evidence_id, kind in item.observations
+                f'{{"ref":"{ref}","kind":"{kind}"}}'
+                for ref, _, kind in item.observations
             ) or "(none)"
             lines.append(
                 f"- surface_id={item.surface_id} method={item.method} "
                 f"path={item.path} kind={location} parameters=[{parameters}] "
                 f"observations=[{observations}] "
                 + (
-                    f"observation_ids=[{observation_records}] "
+                    f"observation_refs=[{observation_records}] "
                     if self._hypothesis_mode
                     else ""
                 )
@@ -571,12 +574,12 @@ class LlmRouterAdvisor:
                     rejected.append((index, "invalid_hypothesis_contract"))
                     continue
                 allowed_observations = {
-                    evidence_id for evidence_id, _ in surface.observations
+                    ref: evidence_id for ref, evidence_id, _ in surface.observations
                 }
                 if any(item not in allowed_observations for item in raw_basis):
                     rejected.append((index, "unknown_observation"))
                     continue
-                basis_evidence_ids = tuple(raw_basis)
+                basis_evidence_ids = tuple(allowed_observations[item] for item in raw_basis)
                 reason_code = raw_reason_code
                 required_evidence_types = tuple(raw_required)
             accepted.append(

@@ -40,6 +40,11 @@ from hacklipse.adapters import (
     ValidationAgent,
 )
 from hacklipse.adapters.llm_router_advisor import AnalyzerChoice, LlmRouterAdvisor
+from hacklipse.adapters.agentic_probe import AgenticHttpProbeAgent
+from hacklipse.adapters.analysis_llm_fallback import (
+    BoundedAnalysisLlmClient,
+    FallbackAnalysisAgent,
+)
 from hacklipse.adapters.reporting import RunLlmUsageSource
 from hacklipse.adapters.reserved_budget import ReservedBudgetManager
 from hacklipse.adapters.reviewing_validation import build_llm_reviewing_validation_agent
@@ -534,6 +539,7 @@ def register_standard_agents(
     actor_object_id: str | None = None,
     owner_object_id: str | None = None,
     validation_review: bool = False,
+    agentic_probe_enabled: bool = False,
 ) -> str:
     """Recon/Analysis/Validation을 표준 배선으로 등록하고 구성 이름을 돌려준다.
 
@@ -605,26 +611,27 @@ def register_standard_agents(
         )
         profile = "heuristic"
     else:
+        analysis_llm_client = BoundedAnalysisLlmClient(llm_client)
         xss_analyzer = LlmXssAnalyzer(
-            llm_client=llm_client,
+            llm_client=analysis_llm_client,
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
         sqli_analyzer = LlmSqliAnalyzer(
-            llm_client=llm_client,
+            llm_client=analysis_llm_client,
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
         path_traversal_analyzer = LlmPathTraversalAnalyzer(
-            llm_client=llm_client,
+            llm_client=analysis_llm_client,
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
         access_control_analyzer = LlmAccessControlAnalyzer(
-            llm_client=llm_client,
+            llm_client=analysis_llm_client,
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
@@ -632,18 +639,89 @@ def register_standard_agents(
             owner_object_id=owner_object_id,
         )
         ssti_analyzer = LlmSstiAnalyzer(
-            llm_client=llm_client,
+            llm_client=analysis_llm_client,
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
         browser_xss_analyzer = LlmBrowserXssAnalyzer(
-            llm_client=llm_client,
+            llm_client=analysis_llm_client,
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
+        xss_analyzer = FallbackAnalysisAgent(
+            xss_analyzer,
+            HeuristicXssAnalyzer(
+                candidate_store=app.stores.candidates,
+                surface_store=app.stores.surfaces,
+                evidence_store=app.stores.evidence,
+            ),
+            app.stores.evidence,
+        )
+        sqli_analyzer = FallbackAnalysisAgent(
+            sqli_analyzer,
+            HeuristicSqliAnalyzer(
+                candidate_store=app.stores.candidates,
+                surface_store=app.stores.surfaces,
+                evidence_store=app.stores.evidence,
+            ),
+            app.stores.evidence,
+        )
+        path_traversal_analyzer = FallbackAnalysisAgent(
+            path_traversal_analyzer,
+            HeuristicPathTraversalAnalyzer(
+                candidate_store=app.stores.candidates,
+                surface_store=app.stores.surfaces,
+                evidence_store=app.stores.evidence,
+            ),
+            app.stores.evidence,
+        )
+        access_control_analyzer = FallbackAnalysisAgent(
+            access_control_analyzer,
+            HeuristicAccessControlAnalyzer(
+                candidate_store=app.stores.candidates,
+                surface_store=app.stores.surfaces,
+                evidence_store=app.stores.evidence,
+                actor_object_id=actor_object_id,
+                owner_object_id=owner_object_id,
+            ),
+            app.stores.evidence,
+        )
+        ssti_analyzer = FallbackAnalysisAgent(
+            ssti_analyzer,
+            HeuristicSstiAnalyzer(
+                candidate_store=app.stores.candidates,
+                surface_store=app.stores.surfaces,
+                evidence_store=app.stores.evidence,
+            ),
+            app.stores.evidence,
+        )
+        browser_xss_analyzer = FallbackAnalysisAgent(
+            browser_xss_analyzer,
+            BrowserXssAnalyzer(
+                candidate_store=app.stores.candidates,
+                surface_store=app.stores.surfaces,
+                evidence_store=app.stores.evidence,
+            ),
+            app.stores.evidence,
+        )
         profile = "llm"
+    if agentic_probe_enabled:
+        xss_analyzer = AgenticHttpProbeAgent(
+            analyzer=xss_analyzer,
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+            llm_client=analysis_llm_client if llm_client is not None else None,
+        )
+        sqli_analyzer = AgenticHttpProbeAgent(
+            analyzer=sqli_analyzer,
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+            llm_client=analysis_llm_client if llm_client is not None else None,
+        )
     app.dispatcher.register(
         "xss_analyzer", xss_analyzer, allowed_tools=("http_get",)
     )

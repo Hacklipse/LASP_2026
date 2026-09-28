@@ -39,6 +39,7 @@ _STORED_STATUSES = {
     "fallback:invalid_response",
     "fallback:deterministic_collection",
 }
+_MAX_LLM_CALL_SECONDS = 30.0
 
 _ACTION_SCHEMA = {
     "type": "object",
@@ -117,7 +118,9 @@ class LlmIterativeReconPlanner:
                     ),
                     system=_ACTION_SYSTEM,
                     response_schema=_ACTION_SCHEMA,
-                    timeout_seconds=task.timeout_seconds,
+                    # The Recon task has its own wall-clock deadline. Leave time for
+                    # this timeout to become a recorded deterministic fallback.
+                    timeout_seconds=min(task.timeout_seconds / 2, _MAX_LLM_CALL_SECONDS),
                 )
             )
         except (LlmTimeout, LlmTransportError, LlmResponseFormatError, LlmRefused) as exc:
