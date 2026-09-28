@@ -258,7 +258,73 @@ class _SelectPathPlanner:
         )
 
 
+class _CaptureStopPlanner:
+    def __init__(self) -> None:
+        self.calls: list[
+            tuple[tuple[ReconObservation, ...], tuple[str, ...]]
+        ] = []
+
+    def decide(self, *, observations, selectable_surface_ids, **kwargs):
+        del kwargs
+        self.calls.append((observations, selectable_surface_ids))
+        return ReconAction(
+            action="stop",
+            surface_id=None,
+            basis_observation_ids=(),
+            reason_code="budget_conservation",
+            source="llm",
+            status="llm_success",
+        )
+
+
 class AgenticReconIntegrationTests(unittest.TestCase):
+    def test_each_round_bounds_prompt_to_selectable_surfaces_and_recent_context(self) -> None:
+        bundle = "\n".join(
+            f'const endpoint{index} = "/api/items{index}?q=";'
+            for index in range(60)
+        )
+        bodies = {
+            "http://localhost/": '<script src="/main.js"></script>',
+            "http://localhost/main.js": bundle,
+        }
+        evidence_store = InMemoryEvidenceStore()
+        surface_store = InMemorySurfaceStore()
+        collector = _Collector(evidence_store, bodies)
+        planner = _CaptureStopPlanner()
+        ids = iter(range(1000))
+        agent = ReconAgent(
+            collector=collector,
+            evidence_store=evidence_store,
+            surface_store=surface_store,
+            iterative_planner=planner,
+            max_pages=5,
+            id_factory=lambda: str(next(ids)),
+        )
+        task = TaskEnvelope(
+            task_id="task-agentic-bounded-prompt",
+            run_id="run-agentic-bounded-prompt",
+            agent_type="recon",
+            target_url="http://localhost/",
+            allowed_tools=("http_get",),
+            request_budget=10,
+        )
+
+        agent.handle(task)
+
+        observations, selectable = planner.calls[0]
+        self.assertEqual(len(selectable), 32)
+        self.assertLessEqual(len(observations), 34)
+        observation_surface_ids = {item.surface_id for item in observations}
+        self.assertTrue(set(selectable).issubset(observation_surface_ids))
+        self.assertTrue(
+            any(item.path == "/" and item.state == "fetched" for item in observations)
+        )
+        self.assertGreaterEqual(
+            len(surface_store.list_by_run(task.run_id)),
+            61,
+            "prompt bound must not discard discovered Surfaces from the Run",
+        )
+
     def test_script_discovered_api_is_an_agentic_visit_option_without_a_seed(self) -> None:
         bodies = {
             "http://localhost/": '<script src="/main.js"></script>',
@@ -383,6 +449,13 @@ class AgenticReconIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(len(planner.calls), 3)
         self.assertIn("/new", {item.path for item in planner.calls[1]})
+        self.assertTrue(
+            any(
+                item.path == "/b" and item.state == "fetched"
+                for item in planner.calls[1]
+            ),
+            "the next round must retain the selected response as recent context",
+        )
         traces = [
             item.observation
             for item in evidence_store.list_by_run(task.run_id)

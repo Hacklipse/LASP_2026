@@ -148,8 +148,12 @@ _RESTRICTED_FILE_EXTENSIONS = (
 _UNLINKED_RENDER_PARAMETERS = ("layout",)
 
 _MAX_SCRIPT_BYTES = 4 * 1024 * 1024
-_MAX_AGENTIC_SELECTABLE = 50
-_MAX_AGENTIC_OBSERVATIONS = 100
+# 한 round에서 모델이 비교할 좌표를 제한한다. 선택된 좌표는 다음 round의 창으로
+# 이동하므로 이 값 밖의 Surface가 영구히 사라지는 것은 아니다. 응답 전체를 매번 다시
+# 보내지 않고 현재 선택지와 직전 실행 문맥만 전달해 반복 prompt 비용을 제한한다.
+_MAX_AGENTIC_SELECTABLE = 32
+_MAX_AGENTIC_CONTEXT = 2
+_MAX_AGENTIC_OBSERVATIONS = _MAX_AGENTIC_SELECTABLE + _MAX_AGENTIC_CONTEXT
 _PATH_OBJECT_ID = re.compile(r"^[0-9]{1,10}$")
 _PATH_RESOURCE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
 _SINGULAR_OBJECT_RESOURCES = frozenset(
@@ -332,6 +336,7 @@ class ReconAgent:
         # 뒤지지 않고 이 dict로 바로 대응시킨다.
         pending_surface_ids: dict[str, str] = {}
         surface_discovery_types: dict[str, set[str]] = {}
+        recently_fetched_surface_ids: list[str] = []
 
         def remember(
             url: str,
@@ -399,9 +404,16 @@ class ReconAgent:
                 )
                 evidence_id, evidence = self._fetch(task, url, surface_id)
                 evidence_ids.append(evidence_id)
+                recently_fetched_surface_ids.append(surface_id)
+                del recently_fetched_surface_ids[:-_MAX_AGENTIC_CONTEXT]
 
                 body = evidence.observation.get("body")
                 if not isinstance(body, str) or not body:
+                    continue
+                if not _is_html_response(evidence):
+                    # JSON/API 응답 안의 escaped HTML 조각을 실제 링크나 폼으로 오인하면
+                    # `/api/\"https:/...` 같은 실행 불가능한 Surface가 생긴다. API 본문은
+                    # status/content-type 관찰로 남기되 HTML parser에는 넣지 않는다.
                     continue
 
                 links, forms, sources = _parse_page(body, url)
@@ -499,6 +511,7 @@ class ReconAgent:
                     surface_discovery_types,
                     fetched,
                     selectable_surface_ids,
+                    context_surface_ids=tuple(recently_fetched_surface_ids),
                 )
                 action, action_evidence_id, executed_surface_id = self._next_action(
                     task,
@@ -760,8 +773,16 @@ class ReconAgent:
         discovery_types: dict[str, set[str]],
         fetched_urls: set[str],
         focus_surface_ids: tuple[str, ...],
+        *,
+        context_surface_ids: tuple[str, ...] = (),
     ) -> tuple[ReconObservation, ...]:
-        """Build the bounded, answer-blind view that the action planner may inspect."""
+        """Build the bounded answer-blind view for one action decision.
+
+        The model receives every currently selectable coordinate plus only the most recent
+        fetched coordinates. Older non-selectable observations remain in Evidence storage
+        and the replay trace, but repeating them in every prompt does not help choose the
+        next member of ``selectable_surface_ids``.
+        """
 
         response_metadata: dict[str, tuple[int | None, str | None]] = {}
         for item in self._evidence.list_by_run(run_id):
@@ -821,9 +842,16 @@ class ReconAgent:
                 )
             )
         focus = set(focus_surface_ids)
+        context = set(context_surface_ids)
+        observations = [
+            item
+            for item in observations
+            if item.surface_id in focus or item.surface_id in context
+        ]
         observations.sort(
             key=lambda item: (
                 item.surface_id not in focus,
+                item.surface_id not in context,
                 item.state != "fetched",
                 not bool(item.parameter_names),
             )
@@ -976,6 +1004,21 @@ class ReconAgent:
             if surface_id in url_by_surface_id and url_by_surface_id[surface_id] not in protected
         ]
         return [*protected_order, *ranked]
+
+
+def _is_html_response(evidence: Evidence) -> bool:
+    """Return whether a textual response is eligible for HTML structure parsing.
+
+    Missing content type stays compatible with simple runtimes and old fixtures. An
+    explicit non-HTML media type is authoritative: its body can still be observed, but
+    HTML-looking strings inside JSON or JavaScript are data rather than page structure.
+    """
+
+    content_type = evidence.observation.get("content_type")
+    if not isinstance(content_type, str) or not content_type.strip():
+        return True
+    media_type = content_type.split(";", 1)[0].strip().casefold()
+    return media_type in {"text/html", "application/xhtml+xml"}
 
 
 def _parse_page(
