@@ -41,12 +41,13 @@ from hacklipse.ports.llm import LlmResponse, LlmUsage  # noqa: E402
 FIXTURE_MODEL = "fixture-not-a-real-model"
 CONFIG = NarratorFingerprintConfig(model=FIXTURE_MODEL, prompt_version="llm-report-narrative-v1")
 _COMPARISON_FIELDS = (
-    "analysis_profile", "recon_mode", "surface_collection_mode",
+    "analysis_profile", "recon_mode", "recon_entry_mode", "surface_collection_mode",
     "router_mode", "router_review", "compare_routers",
     "orchestrator_mode", "budget_allocation_mode", "validation_mode",
     "request_budget",
 )
 _LLM_FIELDS = ("llm_provider", "llm_model", "llm_rpm_limit")
+_LEGACY_CONDITION_DEFAULTS = {"recon_entry_mode": "targeted"}
 _FAILURES = {
     "timeout": LlmTimeout,
     "transport_error": LlmTransportError,
@@ -345,14 +346,23 @@ def _check_execution_conditions(off, on):
     """Report 모드만 다른 완료 Run인지 P-2 기록으로 확인한다."""
 
     required = (*_COMPARISON_FIELDS, "execution_profile_recorded", "phase", *_LLM_FIELDS)
-    missing = [field for field in required if field not in off or field not in on]
+    missing = [
+        field
+        for field in required
+        if field not in _LEGACY_CONDITION_DEFAULTS
+        and (field not in off or field not in on)
+    ]
     if missing:
         raise ValueError(f"missing execution conditions: {', '.join(missing)}")
     if off["execution_profile_recorded"] is not True or on["execution_profile_recorded"] is not True:
         raise ValueError("unrecorded execution conditions cannot be compared")
     if off["phase"] != "done" or on["phase"] != "done":
         raise ValueError("report comparison requires completed runs")
-    different = [field for field in _COMPARISON_FIELDS if off[field] != on[field]]
+    different = [
+        field
+        for field in _COMPARISON_FIELDS
+        if _condition_value(off, field) != _condition_value(on, field)
+    ]
     if different:
         raise ValueError(f"different execution conditions: {', '.join(different)}")
     if not on["llm_provider"] or not on["llm_model"]:
@@ -383,8 +393,19 @@ def _same_run_conditions(record, reference):
     return (
         record.get("execution_profile_recorded") is True
         and record.get("phase") == "done"
-        and all(field in record and record[field] == reference[field] for field in fields)
+        and all(
+            (
+                field in _LEGACY_CONDITION_DEFAULTS
+                or (field in record and field in reference)
+            )
+            and _condition_value(record, field) == _condition_value(reference, field)
+            for field in fields
+        )
     )
+
+
+def _condition_value(record, field):
+    return record.get(field, _LEGACY_CONDITION_DEFAULTS.get(field))
 
 
 def _side_from_record(record):

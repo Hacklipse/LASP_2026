@@ -235,7 +235,72 @@ class _ForeignSurfacePlanner:
         )
 
 
+class _SelectPathPlanner:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.calls: list[tuple[ReconObservation, ...]] = []
+
+    def decide(self, *, observations, selectable_surface_ids, **kwargs):
+        del kwargs
+        self.calls.append(observations)
+        selected = next(
+            item
+            for item in observations
+            if item.path == self.path and item.surface_id in selectable_surface_ids
+        )
+        return ReconAction(
+            action="visit_surface",
+            surface_id=selected.surface_id,
+            basis_observation_ids=(selected.observation_id,),
+            reason_code="inspect_api_surface",
+            source="llm",
+            status="llm_success",
+        )
+
+
 class AgenticReconIntegrationTests(unittest.TestCase):
+    def test_script_discovered_api_is_an_agentic_visit_option_without_a_seed(self) -> None:
+        bodies = {
+            "http://localhost/": '<script src="/main.js"></script>',
+            "http://localhost/main.js": 'const endpoint = "/api/search?q=";',
+            "http://localhost/api/search": "[]",
+        }
+        evidence_store = InMemoryEvidenceStore()
+        surface_store = InMemorySurfaceStore()
+        collector = _Collector(evidence_store, bodies)
+        planner = _SelectPathPlanner("/api/search")
+        ids = iter(range(1000))
+        agent = ReconAgent(
+            collector=collector,
+            evidence_store=evidence_store,
+            surface_store=surface_store,
+            iterative_planner=planner,
+            max_pages=5,
+            id_factory=lambda: str(next(ids)),
+        )
+        task = TaskEnvelope(
+            task_id="task-agentic-script-api",
+            run_id="run-agentic-script-api",
+            agent_type="recon",
+            target_url="http://localhost/",
+            allowed_tools=("http_get",),
+            request_budget=10,
+        )
+
+        agent.handle(task)
+
+        self.assertEqual(
+            collector.calls,
+            [
+                "http://localhost/",
+                "http://localhost/main.js",
+                "http://localhost/api/search",
+            ],
+        )
+        api = next(item for item in planner.calls[0] if item.path == "/api/search")
+        self.assertEqual(api.parameter_names, ("q",))
+        self.assertEqual(api.discovery_types, ("script_literal",))
+
     def test_recon_agent_independently_blocks_a_foreign_surface_id(self) -> None:
         bodies = {
             "http://localhost/": '<a href="/a">a</a>',

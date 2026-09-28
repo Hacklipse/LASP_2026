@@ -104,6 +104,7 @@ ENGINE_BY_ID = {engine["id"]: engine for engine in ENGINES}
 # 고급 실행 조건. 화면·검증·기본값이 모두 이 표 하나에서 나온다.
 ADVANCED_CHOICES = (
     {"field": "recon", "label": "Recon", "choices": ("heuristic", "hybrid", "agentic"), "llm": ("hybrid", "agentic")},
+    {"field": "recon_entry", "label": "Recon 시작", "choices": ("targeted", "base-url"), "llm": ()},
     {"field": "surface_collection", "label": "Surface 수집", "choices": ("adaptive", "deterministic"), "llm": ()},
     {"field": "router", "label": "Router", "choices": ("heuristic", "hybrid"), "llm": ("hybrid",)},
     {"field": "router_review", "label": "Router review", "choices": ("weak", "ambiguous"), "llm": ()},
@@ -330,7 +331,16 @@ def make_handler(supervisor: RunSupervisor, options: argparse.Namespace, csrf_to
                     {"id": MODE_JUICE_SHOP, "label": "Juice Shop"},
                 ],
                 "vulns": [
-                    {"id": name, "label": ("전체 5종" if name == "all" else name)}
+                    {
+                        "id": name,
+                        "label": (
+                            "전체 5종"
+                            if name == "all"
+                            else "자동 탐색 (정답 비노출)"
+                            if name == "auto"
+                            else name
+                        ),
+                    }
                     for name in VULN_CHOICES
                 ],
                 # 키 "값"은 내보내지 않는다. 고를 수 있는지 여부와 왜 못 고르는지만.

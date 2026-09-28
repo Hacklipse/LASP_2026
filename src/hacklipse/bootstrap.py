@@ -519,6 +519,7 @@ def register_standard_agents(
     recon_max_pages: int = DEFAULT_MAX_PAGES,
     recon_surface_collection_mode: str = "adaptive",
     recon_seed_urls: tuple[str, ...] = (),
+    recon_infer_unlinked_render_parameters: bool = True,
     actor_object_id: str | None = None,
     owner_object_id: str | None = None,
     validation_review: bool = False,
@@ -544,6 +545,7 @@ def register_standard_agents(
             max_pages=recon_max_pages,
             surface_collection_mode=recon_surface_collection_mode,
             seed_urls=recon_seed_urls,
+            infer_unlinked_render_parameters=recon_infer_unlinked_render_parameters,
             planner=(
                 None
                 if callable(getattr(recon_planner, "decide", None))

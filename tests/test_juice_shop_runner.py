@@ -27,6 +27,7 @@ from run_juice_shop_baseline import (  # noqa: E402
     _knowledge_database_path,
     _print_execution_preview,
     _prompt_access_control_accounts,
+    _recon_entry_points,
     _recon_planner_summary,
     _resolve_juice_shop_db,
 )
@@ -40,6 +41,31 @@ from hacklipse.ports.errors import CredentialNotFound  # noqa: E402
 
 
 class JuiceShopAllModeTests(unittest.TestCase):
+    def test_base_url_entry_discards_target_specific_start_urls_and_seeds(self) -> None:
+        target, seeds = _recon_entry_points(
+            "http://127.0.0.1:3000/",
+            "http://127.0.0.1:3000/rest/products/search?q=seed",
+            (
+                "http://127.0.0.1:3000/profile",
+                "http://127.0.0.1:3000/rest/basket/7",
+            ),
+            mode="base-url",
+        )
+
+        self.assertEqual(target, "http://127.0.0.1:3000/")
+        self.assertEqual(seeds, ())
+
+    def test_targeted_entry_preserves_existing_start_policy(self) -> None:
+        target, seeds = _recon_entry_points(
+            "http://127.0.0.1:3000/",
+            "http://127.0.0.1:3000/profile",
+            ("http://127.0.0.1:3000/profile",),
+            mode="targeted",
+        )
+
+        self.assertEqual(target, "http://127.0.0.1:3000/profile")
+        self.assertEqual(seeds, ("http://127.0.0.1:3000/profile",))
+
     def test_execution_preview_groups_configuration_scope_and_cleanup(self) -> None:
         args = SimpleNamespace(
             vuln="all",

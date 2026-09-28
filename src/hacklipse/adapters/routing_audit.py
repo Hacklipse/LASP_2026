@@ -75,7 +75,8 @@ class AuditedVulnerabilityRouter:
             key: _text(value) for key, value in (metadata or {}).items()
             if key in {
                 "analysis_profile", "llm_provider", "llm_model", "vulnerability_types",
-                "recon_mode", "router_review",
+                "recon_mode", "recon_entry_mode", "surface_collection_mode",
+                "router_review",
             }
         }
 

@@ -152,7 +152,8 @@ class ReportingTests(unittest.TestCase):
         )
         self.assertIn("## 실행 조건", content)
         for line in (
-            "- Analysis: `llm`", "- Recon: `hybrid` · Surface 수집 `adaptive`",
+            "- Analysis: `llm`",
+            "- Recon: `hybrid` · 시작 `targeted` · Surface 수집 `adaptive`",
             "- Router: `hybrid` · review `ambiguous`",
             "- Orchestrator: `hybrid` · 예산 배분 `heuristic`",
             "- Validation: `llm`", "- Report: `llm`",

@@ -244,6 +244,7 @@ class ReconAgent:
         max_scripts: int = DEFAULT_MAX_SCRIPTS,
         surface_collection_mode: str = "adaptive",
         seed_urls: Sequence[str] = (),
+        infer_unlinked_render_parameters: bool = True,
         id_factory: Callable[[], str] | None = None,
         planner: ReconPlanner | None = None,
         iterative_planner: IterativeReconPlanner | None = None,
@@ -261,6 +262,7 @@ class ReconAgent:
         self._max_scripts = max_scripts
         self._surface_collection_mode = surface_collection_mode
         self._seed_urls = tuple(dict.fromkeys(seed_urls))
+        self._infer_unlinked_render_parameters = infer_unlinked_render_parameters
         self._id_factory = id_factory or (lambda: str(uuid4()))
         # None이면(휴리스틱 프로필) 아래 두 번째 crawl() 직전 분기 자체가 실행되지
         # 않아 기존 결정적 동작과 한 줄도 다르지 않다.
@@ -407,7 +409,11 @@ class ReconAgent:
                     form_surface_id = remember(
                         form_url, method, names, discovery_types=("html_form",)
                     )
-                    if method == "POST" and url in document_pages:
+                    if (
+                        self._infer_unlinked_render_parameters
+                        and method == "POST"
+                        and url in document_pages
+                    ):
                         evidence_ids.extend(
                             self._flag_unlinked_render_parameters(
                                 task.run_id, form_surface_id
@@ -466,7 +472,12 @@ class ReconAgent:
                 # 디렉터리 추측과 달리 여기에 서버 렌더링 폼이 실제로 들어 있다.
                 if is_navigation:
                     navigation_pages.add(url)
-                if should_crawl and url not in fetched and url not in pending:
+                # 기존 heuristic/hybrid는 문서·디렉터리만 방문한다. Agentic 경로는
+                # 정답 seed 없이도 실제 JS/API 관찰에서 다음 GET을 고를 수 있어야
+                # 하므로, 동일 origin에서 발견한 모든 GET Surface를 frontier에 둔다.
+                if (
+                    should_crawl or self._iterative_planner is not None
+                ) and url not in fetched and url not in pending:
                     pending.append(url)
 
         if self._iterative_planner is not None and pending and not targeted:

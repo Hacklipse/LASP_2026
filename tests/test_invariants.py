@@ -42,6 +42,7 @@ class ArchitectureInvariantTests(unittest.TestCase):
         for changes in (
             {"router_mode": "freeform"},
             {"surface_collection_mode": "unbounded"},
+            {"recon_entry_mode": "known-answer"},
             {"compare_routers": 1},
             {"llm_rpm_limit": 0},
             {"analysis_profile": "llm"},

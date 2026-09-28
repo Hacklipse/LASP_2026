@@ -209,6 +209,7 @@ class RunExecutionProfile:
     recorded: bool = True
     analysis_profile: str = "heuristic"
     recon_mode: str = "heuristic"
+    recon_entry_mode: str = "targeted"
     surface_collection_mode: str = "adaptive"
     router_mode: str = "heuristic"
     router_review: str = "weak"
@@ -227,6 +228,10 @@ class RunExecutionProfile:
         modes = {
             "analysis profile": (self.analysis_profile, {"heuristic", "llm"}),
             "recon mode": (self.recon_mode, {"heuristic", "hybrid", "agentic"}),
+            "recon entry mode": (
+                self.recon_entry_mode,
+                {"targeted", "base-url"},
+            ),
             "surface collection mode": (
                 self.surface_collection_mode,
                 {"adaptive", "deterministic"},

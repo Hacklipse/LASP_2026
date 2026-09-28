@@ -39,6 +39,78 @@ class _NoCallsLlm:
 
 
 class RoutingCliTests(unittest.TestCase):
+    def test_juice_shop_auto_requires_answer_blind_base_url_entry(self):
+        with (
+            patch.object(juice, "build_local_application") as assemble,
+            patch("builtins.input") as prompt,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            status = juice.main([
+                "runner", "http://localhost:3000/", "--vuln", "auto",
+            ])
+
+        self.assertEqual(status, 2)
+        self.assertIn("--recon-entry base-url", output.getvalue())
+        assemble.assert_not_called()
+        prompt.assert_not_called()
+
+    def test_juice_shop_auto_uses_all_router_types_without_target_setup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(juice, "build_run_router", wraps=juice.build_run_router) as router,
+                patch.object(juice, "register_standard_agents", wraps=register_standard_agents) as register,
+                patch.object(juice, "_prompt_access_control_accounts") as access_prompt,
+                patch.object(juice, "_provision_path_traversal_account") as provision,
+                patch.object(Orchestrator, "start", side_effect=_StopBeforeExecution) as start,
+                patch.object(juice.getpass, "getpass") as secret_prompt,
+                patch("builtins.input", return_value="y"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaises(_StopBeforeExecution):
+                    juice.main([
+                        "runner", "http://localhost:3000/", "--vuln", "auto",
+                        "--recon-entry", "base-url",
+                        "--routing-log", str(Path(directory) / "routing.jsonl"),
+                    ])
+
+        self.assertIsNone(router.call_args.kwargs["vulnerability_types"])
+        request = start.call_args.args[0]
+        self.assertEqual(request.target_url, "http://localhost:3000/")
+        self.assertEqual(request.execution_profile.recon_entry_mode, "base-url")
+        self.assertEqual(register.call_args.kwargs["recon_seed_urls"], ())
+        self.assertFalse(
+            register.call_args.kwargs["recon_infer_unlinked_render_parameters"]
+        )
+        access_prompt.assert_not_called()
+        provision.assert_not_called()
+        secret_prompt.assert_not_called()
+
+    def test_juice_shop_base_url_entry_discards_type_specific_target_and_seeds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(juice, "build_gemini_llm_client_from_env", return_value=_NoCallsLlm()),
+                patch.object(juice, "register_standard_agents", wraps=register_standard_agents) as register,
+                patch.object(Orchestrator, "start", side_effect=_StopBeforeExecution) as start,
+                patch("builtins.input", return_value="y"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaises(_StopBeforeExecution):
+                    juice.main([
+                        "runner", "http://localhost:3000/", "--vuln", "sqli",
+                        "--recon", "agentic", "--recon-entry", "base-url",
+                        "--llm-model", "fixture-model",
+                        "--routing-log", str(Path(directory) / "routing.jsonl"),
+                    ])
+
+            request = start.call_args.args[0]
+            self.assertEqual(request.target_url, "http://localhost:3000/")
+            self.assertEqual(request.execution_profile.recon_entry_mode, "base-url")
+            self.assertEqual(register.call_args.kwargs["recon_seed_urls"], ())
+            self.assertFalse(
+                register.call_args.kwargs["recon_infer_unlinked_render_parameters"]
+            )
+            self.assertGreater(register.call_args.kwargs["recon_max_pages"], 1)
+
     def test_validation_review_rejects_heuristic_profile_before_setup(self):
         for runner in (dvwa, juice):
             with self.subTest(runner=runner.__name__):

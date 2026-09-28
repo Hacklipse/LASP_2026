@@ -75,6 +75,14 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
     same_profile = baseline["configuration"].get("analysis_profile") == hybrid["configuration"].get("analysis_profile")
     same_scope = baseline["configuration"].get("vulnerability_types") == hybrid["configuration"].get("vulnerability_types")
     same_recon = baseline["configuration"].get("recon_mode") == hybrid["configuration"].get("recon_mode")
+    same_recon_entry = (
+        baseline["configuration"].get("recon_entry_mode", "targeted")
+        == hybrid["configuration"].get("recon_entry_mode", "targeted")
+    )
+    same_surface_collection = (
+        baseline["configuration"].get("surface_collection_mode", "adaptive")
+        == hybrid["configuration"].get("surface_collection_mode", "adaptive")
+    )
     same_review = baseline["configuration"].get("router_review") == hybrid["configuration"].get("router_review")
     paired = baseline["run_id"] == hybrid["run_id"]
     return {
@@ -83,7 +91,10 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
         "same_router_input": same_input, "same_analysis_profile": same_profile,
         "same_raw_recon_input": same_raw_input,
         "same_vulnerability_scope": same_scope,
-        "same_recon_mode": same_recon, "same_review_policy": same_review,
+        "same_recon_mode": same_recon,
+        "same_recon_entry_mode": same_recon_entry,
+        "same_surface_collection_mode": same_surface_collection,
+        "same_review_policy": same_review,
         "paired_run": paired,
         "routing_completed": baseline["status"] == hybrid["status"] == "completed",
         "input_manifest_delta": _manifest_delta(
@@ -122,7 +133,10 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
         } if baseline_result and hybrid_result else None,
         "comparison_warning": (
             "Inputs/profiles differ; differences are not a controlled Router ablation."
-            if not all((same_input, same_profile, same_scope, same_recon, same_review)) else
+            if not all((
+                same_input, same_profile, same_scope, same_recon, same_recon_entry,
+                same_surface_collection, same_review,
+            )) else
             "Paired Router comparison uses one Recon input. Only the selected Router's candidates execute analyzers; this is not a two-branch analysis comparison."
             if paired else
             "Normalized Router inputs match. Analyzer results came from separate target runs; inspect same_raw_recon_input before causal interpretation."

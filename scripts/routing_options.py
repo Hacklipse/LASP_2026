@@ -120,6 +120,7 @@ def execution_profile_from_args(
     return RunExecutionProfile(
         analysis_profile=getattr(args, "profile", "heuristic"),
         recon_mode=getattr(args, "recon", "heuristic"),
+        recon_entry_mode=getattr(args, "recon_entry", "targeted"),
         surface_collection_mode=getattr(args, "surface_collection", "adaptive"),
         router_mode=getattr(args, "router", "heuristic"),
         router_review=getattr(args, "router_review", "weak"),
@@ -149,6 +150,7 @@ def build_run_router(
             "llm_provider": args.llm_provider if llm_client is not None else "",
             "llm_model": selected_model,
             "recon_mode": args.recon,
+            "recon_entry_mode": getattr(args, "recon_entry", "targeted"),
             "surface_collection_mode": getattr(
                 args, "surface_collection", "adaptive"
             ),
@@ -180,6 +182,7 @@ def append_run_result(args, app, run) -> None:
         "compare_routers": profile.compare_routers,
         "analysis_profile": profile.analysis_profile,
         "recon_mode": profile.recon_mode,
+        "recon_entry_mode": profile.recon_entry_mode,
         "surface_collection_mode": profile.surface_collection_mode,
         "orchestrator_mode": profile.orchestrator_mode,
         "extra_recon_rounds": run.extra_recon_rounds,

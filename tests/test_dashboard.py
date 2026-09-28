@@ -140,6 +140,7 @@ class ExecutionProfileFidelityTests(unittest.TestCase):
             target="http://127.0.0.1:3000/",
             profile="llm",
             recon="hybrid",
+            recon_entry="base-url",
             surface_collection="deterministic",
             router="hybrid",
             router_review="ambiguous",
@@ -157,6 +158,7 @@ class ExecutionProfileFidelityTests(unittest.TestCase):
         )
         self.assertEqual(profile.analysis_profile, "llm")
         self.assertEqual(profile.recon_mode, "hybrid")
+        self.assertEqual(profile.recon_entry_mode, "base-url")
         self.assertEqual(profile.surface_collection_mode, "deterministic")
         self.assertEqual(profile.router_mode, "hybrid")
         self.assertEqual(profile.router_review, "ambiguous")
@@ -195,6 +197,32 @@ class ModeGatingTests(unittest.TestCase):
         self.assertTrue(options.needs_access_accounts)
         self.assertTrue(options.needs_path_account)
         self.assertTrue(options.needs_browser)
+
+    def test_juice_shop_auto_is_answer_blind_and_needs_no_target_setup(self) -> None:
+        supervisor = RunSupervisor(
+            allowed_hosts=frozenset({"127.0.0.1"}), defaults=_defaults()
+        )
+        targeted = RunOptions(
+            target="http://127.0.0.1:3000/",
+            mode=MODE_JUICE_SHOP,
+            vuln="auto",
+        )
+        self.assertIn(
+            "base-url", supervisor.validate(targeted, RunSecrets()) or ""
+        )
+
+        options = RunOptions(
+            target="http://127.0.0.1:3000/",
+            mode=MODE_JUICE_SHOP,
+            vuln="auto",
+            recon_entry="base-url",
+        )
+        self.assertIsNone(supervisor.validate(options, RunSecrets()))
+        self.assertTrue(options.broad_scan)
+        self.assertTrue(options.needs_browser)
+        self.assertFalse(options.needs_access_accounts)
+        self.assertFalse(options.needs_path_account)
+        self.assertFalse(options.needs_ssti_token)
 
     def test_validation_review_needs_the_llm_profile(self) -> None:
         supervisor = RunSupervisor(

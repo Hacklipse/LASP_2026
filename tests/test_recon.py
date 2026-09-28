@@ -545,6 +545,39 @@ class ReconCrawlTests(unittest.TestCase):
             ],
         )
 
+    def test_answer_blind_recon_does_not_inject_unobserved_layout_parameter(self) -> None:
+        agent, collector, surfaces = _crawling_agent(
+            {
+                "http://localhost/": _SPA_HTML,
+                "http://localhost/main.js": _DOCUMENT_NAVIGATION_BUNDLE,
+                "http://localhost/account/export": _SERVER_RENDERED_FORM,
+            },
+            max_pages=4,
+            infer_unlinked_render_parameters=False,
+        )
+
+        agent.handle(
+            replace(
+                _task("run-answer-blind", "http://localhost/"),
+                request_budget=10,
+            )
+        )
+
+        form = next(
+            surface
+            for surface in surfaces.list_by_run("run-answer-blind")
+            if surface.url == "http://localhost/account/export"
+            and surface.method == "POST"
+        )
+        inferred = [
+            item
+            for item in collector._evidence.list_by_run("run-answer-blind")
+            if item.surface_id == form.surface_id
+            and item.observation.get("type")
+            == "unlinked_render_parameter_candidate"
+        ]
+        self.assertEqual(inferred, [])
+
     def test_leaves_request_budget_for_later_phases(self) -> None:
         chain = {
             f"http://localhost/p{index}.php": f'<html><a href="/p{index + 1}.php">n</a></html>'

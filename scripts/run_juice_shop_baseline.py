@@ -160,6 +160,7 @@ def _print_execution_preview(
     """실행 직전 설정과 통합 검사의 안전 조치를 읽기 쉽게 표시한다."""
 
     run_all = args.vuln == "all"
+    auto_scan = args.vuln == "auto"
     analysis = args.profile
     if args.profile == "llm":
         analysis = f"llm · {args.llm_provider}/{selected_model}"
@@ -175,6 +176,7 @@ def _print_execution_preview(
     print(f"  검사 대상       {'통합 검사 (5종)' if run_all else target_label}")
     print(f"  Analysis        {analysis}")
     print(f"  Recon           {args.recon}")
+    print(f"  Recon 시작      {getattr(args, 'recon_entry', 'targeted')}")
     print(f"  Surface 수집    {getattr(args, 'surface_collection', 'adaptive')}")
     print(f"  Router          {args.router} · review {args.router_review}")
     print(f"  Orchestrator    {getattr(args, 'orchestrator', 'heuristic')}")
@@ -200,6 +202,10 @@ def _print_execution_preview(
         print(f"                  검증 후 username을 {SSTI_CLEANUP_VALUE!r}(으)로 복구")
         print("  Access Control  입력받은 전용 테스트 계정 두 개를 메모리에서만 사용")
         print("  종료 처리       임시 계정 데이터 삭제 및 입력 credential 폐기")
+    elif auto_scan:
+        print("\n[검사 범위]")
+        print("  포함            현재 Run에서 발견되고 정책상 실행 가능한 Analyzer 후보")
+        print("  제외            대상별 seed · 계정 준비 · 상태 변경 승인")
     print("=" * 58)
 
 
@@ -231,10 +237,10 @@ _VULN_TARGETS = {
     ),
 }
 # 브라우저를 쓰는 유형. Playwright Runtime 과 브라우저 검증을 함께 켠다.
-_BROWSER_VULNS = frozenset({"xss", "all"})
+_BROWSER_VULNS = frozenset({"xss", "auto", "all"})
 # 시작 URL 에 표면이 없고 JS 번들과 디렉터리 목록을 거쳐야 찾을 수 있는 유형.
 # 정찰 페이지 수와 예산을 전체 모드와 같게 준다.
-_BUNDLE_DISCOVERY_VULNS = frozenset({"xss", "path_traversal", "all"})
+_BUNDLE_DISCOVERY_VULNS = frozenset({"xss", "path_traversal", "auto", "all"})
 
 
 @dataclass(slots=True)
@@ -280,6 +286,26 @@ def _all_mode_recon_seeds(
             raise ValueError("Access Control Recon seed requires a numeric object ID")
         seeds.append(urljoin(base_url, f"rest/basket/{access_control_object_id}"))
     return tuple(seeds)
+
+
+def _recon_entry_points(
+    base_url: str,
+    target_url: str,
+    seed_urls: tuple[str, ...],
+    *,
+    mode: str,
+) -> tuple[str, tuple[str, ...]]:
+    """Apply the auditable Recon start policy after all credential setup.
+
+    ``base-url`` deliberately discards target-specific entry points, including ones
+    learned during account preparation. Credentials remain execution authority only.
+    """
+
+    if mode == "base-url":
+        return base_url, ()
+    if mode == "targeted":
+        return target_url, tuple(dict.fromkeys(seed_urls))
+    raise ValueError("unsupported recon entry mode")
 
 
 def _response_json(result, *, operation: str, statuses: tuple[int, ...]) -> dict:
@@ -683,10 +709,19 @@ def _provision_path_traversal_account(
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     add_routing_arguments(parser)
+    parser.add_argument(
+        "--recon-entry",
+        choices=("targeted", "base-url"),
+        default="targeted",
+        help=(
+            "targeted keeps the existing vulnerability-specific start URL/seeds; "
+            "base-url starts Recon only from the supplied base URL"
+        ),
+    )
     parser.add_argument("base_url", help="localhost/127.0.0.1 Juice Shop base URL")
     parser.add_argument(
         "--vuln",
-        choices=(*_VULN_TARGETS, "all"),
+        choices=(*_VULN_TARGETS, "auto", "all"),
         default="ssti",
         help="취약점 유형 (default: ssti)",
     )
@@ -759,6 +794,9 @@ def main(argv: list[str]) -> int:
     if args.validation_review and args.profile != "llm":
         print("거부: --validation-review는 --profile llm과 함께 사용해야 합니다.")
         return 2
+    if args.vuln == "auto" and args.recon_entry != "base-url":
+        print("거부: --vuln auto는 --recon-entry base-url과 함께 사용해야 합니다.")
+        return 2
     if args.router_advisor:
         # 팀원 PR에서 사용하던 옵션을 새 실험 축의 명칭으로 호환한다.
         args.router = "hybrid"
@@ -770,10 +808,12 @@ def main(argv: list[str]) -> int:
         print("거부: 이 실행기는 localhost/127.0.0.1의 Juice Shop만 허용합니다.")
         return 2
     run_all = args.vuln == "all"
-    vuln = None if run_all else _VULN_TARGETS[args.vuln]
+    auto_scan = args.vuln == "auto"
+    broad_scan = run_all or auto_scan
+    vuln = None if broad_scan else _VULN_TARGETS[args.vuln]
     access_control = args.vuln in {"access_control", "all"}
     needs_path_account = args.vuln in {"path_traversal", "all"}
-    target_label = "전체" if run_all else vuln.label
+    target_label = "전체" if run_all else "자동 탐색" if auto_scan else vuln.label
     cleanup_database: Path | None = None
     if needs_path_account:
         try:
@@ -781,7 +821,9 @@ def main(argv: list[str]) -> int:
         except RuntimeError as error:
             print(f"거부: {error}")
             return 2
-    if run_all:
+    if args.recon_entry == "base-url":
+        target_url = base_url
+    elif broad_scan:
         # 전체 모드는 Recon이 시작 페이지에서 Surface를 찾아 유형별로 라우팅한다.
         target_url = base_url
     elif access_control:
@@ -842,7 +884,7 @@ def main(argv: list[str]) -> int:
 
     try:
         router = build_run_router(
-            args, vulnerability_types=None if run_all else (target_label,),
+            args, vulnerability_types=None if broad_scan else (target_label,),
             llm_client=llm_client, selected_model=selected_model,
         )
     except OSError:
@@ -858,7 +900,19 @@ def main(argv: list[str]) -> int:
     agent_credentials: tuple[tuple[str, str], ...] = ()
     recon_seed_urls: tuple[str, ...] = ()
     access_accounts: tuple[_AccessAccountInput, _AccessAccountInput] | None = None
-    if run_all:
+    if auto_scan:
+        print(
+            "이 검증은 알려진 취약점 유형·endpoint·대상별 계정 준비 없이 루트 URL에서\n"
+            "지원되는 Analyzer 후보를 자동 분류합니다. 인증과 상태 변경 승인은 제공하지 않습니다."
+        )
+        confirmation = "로컬 Juice Shop 자동 탐색을 시작할까요? [y/N] "
+        credentials = {}
+        approvals = ()
+        run_credential_ref = None
+        principal_credentials = ()
+        actor_object_id = None
+        owner_object_id = None
+    elif run_all:
         credentials = {}
         approvals = (
             _PROVISION_APPROVAL_REF,
@@ -867,7 +921,11 @@ def main(argv: list[str]) -> int:
             SSTI_APPROVAL_REF,
         )
         run_credential_ref = None
-        recon_seed_urls = _all_mode_recon_seeds(base_url, include_ssti=True)
+        recon_seed_urls = (
+            ()
+            if args.recon_entry == "base-url"
+            else _all_mode_recon_seeds(base_url, include_ssti=True)
+        )
         confirmation = "위 구성으로 로컬 Juice Shop 통합 검사를 시작할까요? [y/N] "
         principal_credentials = ()
         actor_object_id = None
@@ -1035,7 +1093,10 @@ def main(argv: list[str]) -> int:
             ("actor", _ACTOR_CREDENTIAL_REF),
             ("owner", _OWNER_CREDENTIAL_REF),
         )
-        if run_all:
+        if args.recon_entry == "base-url":
+            target_url = base_url
+            run_credential_ref = _ACTOR_CREDENTIAL_REF
+        elif run_all:
             recon_seed_urls = _all_mode_recon_seeds(
                 base_url,
                 include_ssti=True,
@@ -1071,7 +1132,16 @@ def main(argv: list[str]) -> int:
             agent_credentials += (("SSTI", _TEMP_SSTI_CREDENTIAL_REF),)
         progress.log("Path Traversal용 임시 계정 생성 및 보안 답변 등록 완료")
 
-    needs_discovery = args.vuln in _BUNDLE_DISCOVERY_VULNS
+    target_url, recon_seed_urls = _recon_entry_points(
+        base_url,
+        target_url,
+        recon_seed_urls,
+        mode=args.recon_entry,
+    )
+    needs_discovery = (
+        args.recon_entry == "base-url"
+        or args.vuln in _BUNDLE_DISCOVERY_VULNS
+    )
     request_budget = args.request_budget or (
         _ALL_MODE_BUDGET if needs_discovery else _DEFAULT_BUDGET
     )
@@ -1086,6 +1156,7 @@ def main(argv: list[str]) -> int:
             recon_max_pages=_ALL_MODE_RECON_PAGES if needs_discovery else 1,
             recon_surface_collection_mode=args.surface_collection,
             recon_seed_urls=recon_seed_urls,
+            recon_infer_unlinked_render_parameters=args.recon_entry == "targeted",
             actor_object_id=actor_object_id,
             owner_object_id=owner_object_id,
             validation_review=args.validation_review,
@@ -1171,7 +1242,7 @@ def main(argv: list[str]) -> int:
     execution_signals = 0 if vuln is None else signal_counts[vuln.signal_label]
     verdict = (
         "CONFIRMED (취약점 확인)"
-        if (snapshot.finding_count if run_all else finding_counts[target_label])
+        if (snapshot.finding_count if broad_scan else finding_counts[target_label])
         else "미확정"
     )
 
@@ -1210,7 +1281,7 @@ def main(argv: list[str]) -> int:
     print()
     print("[분석 신호]")
     print(f"  Candidate       {_format_counts(candidate_counts)}")
-    if run_all:
+    if broad_scan:
         print(
             f"  Surface         {snapshot.surface_count}개 "
             f"(파라미터 {snapshot.parameter_count}종)"
@@ -1245,7 +1316,7 @@ def main(argv: list[str]) -> int:
                 "  참고: Candidate가 없으면 token이 만료됐거나 "
                 "/rest/basket/{id} 응답을 읽지 못했을 수 있습니다."
             )
-        elif run_all:
+        elif broad_scan:
             print("  참고: Candidate가 없으면 Recon이 Surface를 찾지 못했을 수 있습니다.")
         elif args.vuln == "sqli":
             print(f"  참고: Candidate가 없으면 {vuln.seed_path} 응답을 읽지 못했을 수 있습니다.")

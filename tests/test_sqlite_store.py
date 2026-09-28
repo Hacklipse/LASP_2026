@@ -246,7 +246,7 @@ class SQLiteStoreTests(unittest.TestCase):
             RunExecutionProfile(recorded=False),
         )
 
-    def test_older_execution_profile_defaults_to_adaptive_collection(self) -> None:
+    def test_older_execution_profile_defaults_new_recon_conditions(self) -> None:
         self.stores.runs.add(self._run())
         self.stores.close()
 
@@ -258,6 +258,7 @@ class SQLiteStoreTests(unittest.TestCase):
             assert row is not None
             stored = json.loads(row[0])
             stored["execution_profile"].pop("surface_collection_mode")
+            stored["execution_profile"].pop("recon_entry_mode")
             connection.execute(
                 "UPDATE runs SET data = ? WHERE run_id = ?",
                 (json.dumps(stored), "run-1"),
@@ -270,6 +271,7 @@ class SQLiteStoreTests(unittest.TestCase):
             restored.execution_profile.surface_collection_mode,
             "adaptive",
         )
+        self.assertEqual(restored.execution_profile.recon_entry_mode, "targeted")
 
     def test_finding_proof_facts_round_trip_and_legacy_json_defaults(self) -> None:
         proved = replace(

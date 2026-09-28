@@ -46,6 +46,7 @@ class RouterComparisonTests(unittest.TestCase):
         args = argparse.Namespace(
             profile="llm",
             recon="hybrid",
+            recon_entry="base-url",
             surface_collection="deterministic",
             router="hybrid",
             router_review="ambiguous",
@@ -62,6 +63,7 @@ class RouterComparisonTests(unittest.TestCase):
         )
 
         self.assertEqual(profile.analysis_profile, "llm")
+        self.assertEqual(profile.recon_entry_mode, "base-url")
         self.assertEqual(profile.surface_collection_mode, "deterministic")
         self.assertEqual(profile.router_review, "ambiguous")
         self.assertTrue(profile.compare_routers)
@@ -116,6 +118,24 @@ class RouterComparisonTests(unittest.TestCase):
                 latest_run(args.routing_log, "missing-mode")
             changed_scope = dict(hybrid, configuration=dict(hybrid["configuration"], vulnerability_types="SQLi"))
             self.assertFalse(compare_records(baseline, changed_scope)["same_vulnerability_scope"])
+            changed_entry = dict(
+                hybrid,
+                configuration=dict(hybrid["configuration"], recon_entry_mode="base-url"),
+            )
+            entry_comparison = compare_records(baseline, changed_entry)
+            self.assertFalse(entry_comparison["same_recon_entry_mode"])
+            self.assertIn("not a controlled", entry_comparison["comparison_warning"])
+            changed_collection = dict(
+                hybrid,
+                configuration=dict(
+                    hybrid["configuration"], surface_collection_mode="deterministic"
+                ),
+            )
+            self.assertFalse(
+                compare_records(baseline, changed_collection)[
+                    "same_surface_collection_mode"
+                ]
+            )
 
             raw_only = dict(hybrid, input_fingerprint="dynamic-response-body")
             raw_comparison = compare_records(baseline, raw_only)
@@ -223,6 +243,7 @@ class RouterComparisonTests(unittest.TestCase):
                 execution_profile=RunExecutionProfile(
                     analysis_profile="llm",
                     recon_mode="hybrid",
+                    recon_entry_mode="base-url",
                     surface_collection_mode="deterministic",
                     router_mode="hybrid",
                     router_review="ambiguous",
@@ -254,6 +275,7 @@ class RouterComparisonTests(unittest.TestCase):
             self.assertTrue(record["execution_profile_recorded"])
             self.assertEqual(record["analysis_profile"], "llm")
             self.assertEqual(record["recon_mode"], "hybrid")
+            self.assertEqual(record["recon_entry_mode"], "base-url")
             self.assertEqual(record["surface_collection_mode"], "deterministic")
             self.assertEqual(record["router_mode"], "hybrid")
             self.assertEqual(record["router_review"], "ambiguous")
