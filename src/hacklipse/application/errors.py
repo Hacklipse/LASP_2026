@@ -25,3 +25,7 @@ class WorkflowExecutionError(RuntimeError):
 
 class AgentContractError(RuntimeError):
     """Agent, Router, Runtime이 선언된 계약 밖의 데이터를 반환할 때 발생한다."""
+
+
+class LlmOutputContractError(AgentContractError):
+    """LLM 응답의 의미적 계약 위반. 실행 전 거부하고 결정적 Analyzer로 복구한다."""

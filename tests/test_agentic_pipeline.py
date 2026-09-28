@@ -13,9 +13,10 @@ from hacklipse.ports.llm import LlmResponse
 
 
 class _Model:
-    def __init__(self, *, explore=False) -> None:
+    def __init__(self, *, explore=False, bad_parameter=False) -> None:
         self.roles: list[str] = []
         self.explore = explore
+        self.bad_parameter = bad_parameter
 
     def complete(self, request):
         properties = request.response_schema["properties"]
@@ -37,7 +38,7 @@ class _Model:
             }]}
         elif "parameters" in properties:
             self.roles.append("analysis")
-            payload = {"parameters": ["q"], "reason": "observed input"}
+            payload = {"parameters": ["invented" if self.bad_parameter else "q"], "reason": "observed input"}
         elif "action" in properties:
             self.roles.append("probe")
             payload = {"parameter": "q", "action": "marker" if self.explore else "syntax_quote"}
@@ -129,6 +130,27 @@ class AgenticPipelineTests(unittest.TestCase):
         follow_ups = [item for item in evidence if item.observation.get("follow_up_of")]
         self.assertEqual(len(follow_ups), 1)
         self.assertEqual(follow_ups[0].observation["action"], "syntax_quote")
+        self.assertEqual(len(app.stores.findings.list_by_run(run.run_id)), 1)
+
+    def test_invented_llm_parameter_recovers_to_heuristic_analysis(self):
+        model, runtime = _Model(bad_parameter=True), _Runtime()
+        app = build_local_application(
+            {}, runtime=runtime,
+            router=standard_router(("SQLi",), mode="agentic", llm_client=model),
+        )
+        register_standard_agents(
+            app, llm_client=model, agentic_probe_enabled=True, recon_max_pages=2,
+        )
+        run = app.orchestrator.start(RunRequest(
+            target_url="http://local.test/",
+            scope=RunScope(allowed_hosts=frozenset({"local.test"})),
+            request_budget=20,
+        ))
+        self.assertIs(run.phase, RunPhase.DONE)
+        evidence = app.stores.evidence.list_by_run(run.run_id)
+        fallbacks = [item for item in evidence if item.observation.get("type") == "analysis_llm_fallback"]
+        self.assertEqual(len(fallbacks), 1)
+        self.assertEqual(fallbacks[0].observation["reason"], "LlmOutputContractError")
         self.assertEqual(len(app.stores.findings.list_by_run(run.run_id)), 1)
 
 

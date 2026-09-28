@@ -10,6 +10,7 @@ from hacklipse.adapters.analysis_llm_fallback import (
     FallbackAnalysisAgent,
 )
 from hacklipse.adapters.memory import InMemoryEvidenceStore
+from hacklipse.application.errors import AgentContractError, LlmOutputContractError
 from hacklipse.domain import AgentResult, AgentResultStatus, TaskEnvelope
 from hacklipse.ports.errors import LlmTimeout, PolicyViolation
 from hacklipse.ports.llm import LlmMessage, LlmRequest, LlmResponse
@@ -75,6 +76,27 @@ class AnalysisLlmFallbackTests(unittest.TestCase):
                 task_id="task-1", run_id="run-1", agent_type="xss_analyzer",
             ))
         self.assertEqual(fallback.calls, 0)
+
+    def test_only_llm_output_contract_errors_are_recoverable(self) -> None:
+        task = TaskEnvelope(
+            task_id="task-1", run_id="run-1", agent_type="xss_analyzer",
+            surface_id="surface-1", candidate_id="candidate-1",
+        )
+        for error, should_fallback in (
+            (LlmOutputContractError("invented parameter"), True),
+            (AgentContractError("task and surface differ"), False),
+        ):
+            with self.subTest(error=type(error).__name__):
+                primary, fallback = _Agent(error), _Agent()
+                agent = FallbackAnalysisAgent(primary, fallback, InMemoryEvidenceStore())
+                if should_fallback:
+                    result = agent.handle(task)
+                    self.assertEqual(fallback.calls, 1)
+                    self.assertEqual(len(result.new_evidence_ids), 1)
+                else:
+                    with self.assertRaises(AgentContractError):
+                        agent.handle(task)
+                    self.assertEqual(fallback.calls, 0)
 
 
 if __name__ == "__main__":

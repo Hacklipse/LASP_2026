@@ -135,6 +135,24 @@ class PayloadValidationTests(unittest.TestCase):
 class ExecutionProfileFidelityTests(unittest.TestCase):
     """화면 선택이 그대로 기록된다. 선택지만 보이고 실행은 고정값이면 안 된다."""
 
+    def test_agentic_dashboard_uses_the_cli_analysis_round_limit(self) -> None:
+        for router, expected in (("agentic", 2), ("heuristic", 1)):
+            with self.subTest(router=router):
+                options = RunOptions(
+                    target="http://127.0.0.1:3000/", router=router,
+                )
+                supervisor = RunSupervisor(
+                    allowed_hosts=frozenset({"127.0.0.1"}), defaults=options,
+                )
+                with (
+                    patch.object(supervisor, "_build_llm_client", return_value=(None, None)),
+                    patch("dashboard_core.build_run_router", return_value=object()),
+                    patch("dashboard_core.build_local_application", side_effect=RuntimeError("stop before execution")) as build,
+                    self.assertRaisesRegex(RuntimeError, "stop before execution"),
+                ):
+                    supervisor._execute_run(options, RunSecrets())
+                self.assertEqual(build.call_args.kwargs["config"].max_evidence_rounds, expected)
+
     def test_every_choice_reaches_the_recorded_profile(self) -> None:
         options = RunOptions(
             target="http://127.0.0.1:3000/",

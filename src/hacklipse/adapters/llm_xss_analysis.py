@@ -21,7 +21,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from uuid import uuid4
 
-from hacklipse.application.errors import AgentContractError
+from hacklipse.application.errors import AgentContractError, LlmOutputContractError
 from hacklipse.domain import (
     AgentResult,
     AgentResultStatus,
@@ -407,11 +407,11 @@ def _validate_classifications(
     """맥락 분류를 검증한다. 확인되지 않은 파라미터에 대한 주장은 버린다."""
 
     if not isinstance(raw, list):
-        raise AgentContractError("llm xss interpretation did not return a reflection list")
+        raise LlmOutputContractError("llm xss interpretation did not return a reflection list")
     classifications: dict[str, dict[str, object]] = {}
     for item in raw:
         if not isinstance(item, dict):
-            raise AgentContractError("llm xss interpretation returned a non-object entry")
+            raise LlmOutputContractError("llm xss interpretation returned a non-object entry")
         parameter = item.get("parameter")
         context = item.get("context")
         encoded = item.get("encoded")
@@ -419,16 +419,16 @@ def _validate_classifications(
         if parameter not in expected:
             continue
         if context not in REFLECTION_CONTEXTS:
-            raise AgentContractError(
+            raise LlmOutputContractError(
                 f"llm xss interpretation used an unknown reflection context: {context}"
             )
         if not isinstance(encoded, bool):
-            raise AgentContractError(
+            raise LlmOutputContractError(
                 "llm xss interpretation encoded field must be boolean"
             )
         note = item.get("note")
         if not isinstance(note, str):
-            raise AgentContractError("llm xss interpretation note must be a string")
+            raise LlmOutputContractError("llm xss interpretation note must be a string")
         classifications[str(parameter)] = {
             "context": str(context),
             "encoded": encoded,

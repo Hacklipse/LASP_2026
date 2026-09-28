@@ -6,7 +6,7 @@ from collections.abc import Callable, Sequence
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from hacklipse.application.errors import AgentContractError
+from hacklipse.application.errors import AgentContractError, LlmOutputContractError
 from hacklipse.domain import AgentResult, AgentResultStatus, Evidence, Surface, TaskEnvelope
 from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.ports import CandidateStore, EvidenceStore, LlmClient, SurfaceStore
@@ -172,7 +172,7 @@ class LlmSstiAnalyzer:
         )
         reason = response.payload.get("reason")
         if not isinstance(reason, str):
-            raise AgentContractError("llm SSTI plan reason must be a string")
+            raise LlmOutputContractError("llm SSTI plan reason must be a string")
         reason = safe_selection_reason(reason, task.knowledge_hints)
         plan: dict[str, object] = {
             "type": _PLAN_OBSERVATION,

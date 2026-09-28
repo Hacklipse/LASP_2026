@@ -612,6 +612,7 @@ class RunSupervisor:
             config=OrchestratorConfig(
                 browser_xss_validation=options.needs_browser,
                 budget_allocation_enabled=options.budget_allocation != "off",
+                max_evidence_rounds=2 if options.router == "agentic" else 1,
             ),
         )
         self._app = app

@@ -26,7 +26,7 @@ from collections.abc import Callable, Sequence
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from hacklipse.application.errors import AgentContractError
+from hacklipse.application.errors import AgentContractError, LlmOutputContractError
 from hacklipse.domain import (
     AgentResult,
     AgentResultStatus,
@@ -236,7 +236,7 @@ class LlmBrowserXssAnalyzer:
         )
         reason = response.payload.get("reason")
         if not isinstance(reason, str):
-            raise AgentContractError("llm browser xss plan reason must be a string")
+            raise LlmOutputContractError("llm browser xss plan reason must be a string")
         reason = safe_selection_reason(reason, task.knowledge_hints)
         evidence_id = f"evi-{self._id_factory()}"
         self._evidence.append(

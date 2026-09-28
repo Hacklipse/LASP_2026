@@ -6,7 +6,7 @@ from collections.abc import Callable, Sequence
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from hacklipse.application.errors import AgentContractError
+from hacklipse.application.errors import AgentContractError, LlmOutputContractError
 from hacklipse.domain import AgentResult, AgentResultStatus, Evidence, Surface, TaskEnvelope
 from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.ports import CandidateStore, EvidenceStore, LlmClient, SurfaceStore
@@ -212,7 +212,7 @@ class LlmPathTraversalAnalyzer:
         )
         reason = response.payload.get("reason")
         if not isinstance(reason, str):
-            raise AgentContractError("llm path traversal plan reason must be a string")
+            raise LlmOutputContractError("llm path traversal plan reason must be a string")
         llm_selected = selected
         selected = tuple(dict.fromkeys((*recon_parameters, *llm_selected)))
         if recon_parameters:

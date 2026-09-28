@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from uuid import uuid4
 
+from hacklipse.application.errors import LlmOutputContractError
 from hacklipse.domain import AgentResult, Evidence, TaskEnvelope
 from hacklipse.ports import Agent, EvidenceStore, LlmClient
 from hacklipse.ports.errors import (
@@ -16,7 +17,10 @@ from hacklipse.ports.errors import (
 from hacklipse.ports.llm import LlmRequest, LlmResponse
 
 _FALLBACK_TYPE = "analysis_llm_fallback"
-_RECOVERABLE = (LlmTimeout, LlmTransportError, LlmResponseFormatError, LlmRefused)
+_RECOVERABLE = (
+    LlmTimeout, LlmTransportError, LlmResponseFormatError, LlmRefused,
+    LlmOutputContractError,
+)
 
 
 class BoundedAnalysisLlmClient:
