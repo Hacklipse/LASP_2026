@@ -459,6 +459,8 @@ class RunSupervisor:
         if options.validation_review and options.profile != "llm":
             # CLI 와 같은 규칙이다.
             return "Validation review는 Analysis 프로필이 llm일 때만 쓸 수 있다."
+        if options.router == "agentic" and options.compare_routers:
+            return "Agentic Router는 현재 Router 쌍 비교와 함께 사용할 수 없다."
         if (
             options.is_juice_shop
             and options.vuln == "auto"

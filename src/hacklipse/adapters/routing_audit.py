@@ -106,7 +106,10 @@ class AuditedVulnerabilityRouter:
             router_advisor_status = (
                 routed.last_advisor_status if routed else "not_configured"
             )
-            advisor_failed = router_advisor_status.startswith("advisor_failed:")
+            advisor_failed = "advisor_failed:" in router_advisor_status
+            agentic_fallback = router_advisor_status.startswith(
+                "agentic_fallback:"
+            )
             baseline = routed.last_rule_decisions if routed else decisions
             original = {item.candidate.candidate_id: item for item in baseline}
             outcomes = dict(routed.last_advisor_outcomes) if routed else {}
@@ -127,6 +130,11 @@ class AuditedVulnerabilityRouter:
                             final.priority if final is not None else ADVISOR_PRIORITY
                         ),
                         "reason": _text(item.reason),
+                        "reason_code": item.reason_code,
+                        "basis_evidence_ids": list(item.basis_evidence_ids),
+                        "required_evidence_types": list(
+                            item.required_evidence_types
+                        ),
                         "outcome": outcomes.get(index, "not_merged"),
                     })
             self._audit.append({
@@ -169,14 +177,14 @@ class AuditedVulnerabilityRouter:
                 "llm": {
                     "source": (
                         "deterministic_fallback"
-                        if advisor_failed
+                        if advisor_failed or agentic_fallback
                         else advisor_trace.source
                         if advisor_trace
                         else "error" if error_type else "skipped"
                     ),
                     "status": (
                         router_advisor_status
-                        if advisor_failed
+                        if advisor_failed or agentic_fallback
                         else advisor_trace.status
                         if advisor_trace
                         else error_type or "heuristic_mode"
@@ -236,6 +244,7 @@ def _decision(
         "source": source, "reason": _text(candidate.hypothesis),
         "evidence_ids": list(candidate.evidence_ids),
         "exploration_parameters": list(candidate.exploration_parameters),
+        "required_evidence_types": list(candidate.required_evidence_types),
     }
 
 

@@ -369,10 +369,14 @@ def standard_router(
 
     if router_advisor:
         mode = "hybrid"
-    if mode not in {"heuristic", "hybrid"}:
-        raise ValueError("router mode must be heuristic or hybrid")
-    if (mode == "hybrid" or compare) and llm_client is None:
-        raise LlmCredentialsMissing("hybrid router requires an explicit LlmClient")
+    if mode not in {"heuristic", "hybrid", "agentic"}:
+        raise ValueError("router mode must be heuristic, hybrid, or agentic")
+    if mode == "agentic" and compare:
+        raise ValueError("paired router comparison does not yet support agentic mode")
+    if (mode in {"hybrid", "agentic"} or compare) and llm_client is None:
+        raise LlmCredentialsMissing(
+            f"{mode} router requires an explicit LlmClient"
+        )
     if review_policy not in {"weak", "ambiguous"}:
         raise ValueError("review policy must be weak or ambiguous")
     if compare:
@@ -409,9 +413,11 @@ def standard_router(
             rules=rules,
             surface_rules=surface_rules,
             llm_client=llm_client,
-            requested=mode == "hybrid",
+            requested=mode in {"hybrid", "agentic"},
+            hypothesis_mode=mode == "agentic",
         ),
         review_policy=review_policy,
+        advisor_mode="primary" if mode == "agentic" else "supplemental",
     )
     if audit_log is not None:
         router = AuditedVulnerabilityRouter(
@@ -473,6 +479,7 @@ def _build_router_advisor(
     surface_rules: Sequence[SurfaceRoutingRule],
     llm_client: LlmClient | None,
     requested: bool,
+    hypothesis_mode: bool = False,
 ) -> LlmRouterAdvisor | None:
     """Advisor를 요청받았을 때만 만들고, 만들 수 없으면 조용히 넘어가지 않는다.
 
@@ -508,7 +515,11 @@ def _build_router_advisor(
         # --vuln 필터가 모든 규칙을 걷어낸 경우다. 제안할 유형이 없으므로 Advisor를
         # 만들지 않는다. 이것은 구성 오류가 아니라 선택의 결과다.
         return None
-    return LlmRouterAdvisor(llm_client=llm_client, analyzers=analyzers)
+    return LlmRouterAdvisor(
+        llm_client=llm_client,
+        analyzers=analyzers,
+        hypothesis_mode=hypothesis_mode,
+    )
 
 
 def register_standard_agents(

@@ -414,7 +414,7 @@ def _print_summary(
     print("[실행 정보]")
     print(f"  상태            완료 ({phase})")
     print(f"  분석 대상       {target_label}")
-    print(f"  Agent 구성      {profile}")
+    print(f"  Analysis 구성   {profile}")
     print(f"  감사된 실행     {audited_execution_count}회")
     print()
     print("[분석 신호]")
@@ -490,6 +490,9 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv[1:])
     if args.validation_review and args.profile != "llm":
         print("거부: --validation-review는 --profile llm과 함께 사용해야 합니다.")
+        return 2
+    if args.router == "agentic" and args.compare_routers:
+        print("거부: --router agentic은 현재 --compare-routers와 함께 사용할 수 없습니다.")
         return 2
     debug_enabled = args.debug or args.debug_llm_content
     progress = _DebugProgress(debug_enabled)

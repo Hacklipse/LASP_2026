@@ -57,8 +57,13 @@ def add_routing_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--router", choices=("heuristic", "hybrid"), default="heuristic",
-        help="routing mode, independent of --profile (default: heuristic)",
+        "--router",
+        choices=("heuristic", "hybrid", "agentic"),
+        default="heuristic",
+        help=(
+            "heuristic rules, hybrid rule-preserving LLM advice, or agentic "
+            "observation-grounded LLM hypotheses with deterministic fallback"
+        ),
     )
     parser.add_argument(
         "--report", choices=("heuristic", "llm"), default="heuristic",
@@ -100,7 +105,7 @@ def _positive_int(value: str) -> int:
 
 def needs_llm(args: argparse.Namespace) -> bool:
     return (
-        args.profile == "llm" or args.router == "hybrid"
+        args.profile == "llm" or args.router in {"hybrid", "agentic"}
         or args.recon in {"hybrid", "agentic"} or args.compare_routers
         or getattr(args, "orchestrator", "heuristic") == "hybrid"
         or getattr(args, "budget_allocation", "off") == "hybrid"
@@ -208,6 +213,7 @@ def append_run_result(args, app, run) -> None:
             "vulnerability_type": c.vulnerability_type, "agent_type": c.assigned_agent,
             "status": c.status.value, "evidence_count": len(c.evidence_ids),
             "exploration_parameters": list(c.exploration_parameters),
+            "required_evidence_types": list(c.required_evidence_types),
         } for c in candidates],
     })
 

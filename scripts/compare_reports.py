@@ -371,7 +371,8 @@ def _check_execution_conditions(off, on):
     # 다른 축에서도 LLM을 썼다면 두 Run의 모델과 rate limit까지 같아야 한다.
     other_llm = (
         off["analysis_profile"] == "llm" or off["recon_mode"] in {"hybrid", "agentic"}
-        or off["router_mode"] == "hybrid" or off["compare_routers"]
+        or off["router_mode"] in {"hybrid", "agentic"}
+        or off["compare_routers"]
         or off["orchestrator_mode"] == "hybrid"
         or off["budget_allocation_mode"] == "hybrid"
         or off["validation_mode"] == "llm"

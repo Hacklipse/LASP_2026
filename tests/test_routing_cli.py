@@ -186,7 +186,9 @@ class RoutingCliTests(unittest.TestCase):
     def test_all_profile_router_combinations_keep_analysis_selection_independent(self):
         for runner in (dvwa, juice):
             for profile in ("heuristic", "llm"):
-                for mode, recon, compare in product(("heuristic", "hybrid"), ("heuristic", "hybrid", "agentic"), (False, True)):
+                for mode, recon, compare in product(("heuristic", "hybrid", "agentic"), ("heuristic", "hybrid", "agentic"), (False, True)):
+                    if mode == "agentic" and compare:
+                        continue
                     with self.subTest(runner=runner.__name__, profile=profile, router=mode, recon=recon, compare=compare), tempfile.TemporaryDirectory() as directory:
                         with (
                             patch.object(runner, "build_gemini_llm_client_from_env", return_value=_NoCallsLlm()) as builder,
@@ -206,7 +208,7 @@ class RoutingCliTests(unittest.TestCase):
                                     "--routing-log", str(path), "--llm-model", "fixture-model",
                                     *(["--compare-routers"] if compare else []),
                                 ])
-                            self.assertEqual(builder.call_count, int(profile == "llm" or mode == "hybrid" or recon in {"hybrid", "agentic"} or compare))
+                            self.assertEqual(builder.call_count, int(profile == "llm" or mode in {"hybrid", "agentic"} or recon in {"hybrid", "agentic"} or compare))
                             router = assemble.call_args.kwargs["router"]
                             if compare:
                                 self.assertIsInstance(router, PairedVulnerabilityRouter)
@@ -214,7 +216,11 @@ class RoutingCliTests(unittest.TestCase):
                                 router = router.hybrid if mode == "hybrid" else router.heuristic
                             self.assertIsInstance(router, AuditedVulnerabilityRouter)
                             self.assertIsInstance(router.router, RuleBasedVulnerabilityRouter)
-                            self.assertEqual(router.router._advisor is not None, mode == "hybrid")
+                            self.assertEqual(router.router._advisor is not None, mode in {"hybrid", "agentic"})
+                            self.assertEqual(
+                                router.router._advisor_mode,
+                                "primary" if mode == "agentic" else "supplemental",
+                            )
                             self.assertEqual(register.call_args.kwargs["llm_client"] is not None, profile == "llm")
                             app = register.call_args.args[0]
                             if recon == "hybrid":
@@ -243,7 +249,7 @@ class RoutingCliTests(unittest.TestCase):
                             self.assertEqual(path.read_text(), "")
 
     def test_missing_router_llm_credentials_stop_before_auth_or_log_creation(self):
-        for runner, flags in product((dvwa, juice), (["--router", "hybrid"], ["--recon", "hybrid"], ["--compare-routers"])):
+        for runner, flags in product((dvwa, juice), (["--router", "hybrid"], ["--router", "agentic"], ["--recon", "hybrid"], ["--compare-routers"])):
             with self.subTest(runner=runner.__name__, flags=flags), tempfile.TemporaryDirectory() as directory:
                 with (
                     patch.object(runner, "build_gemini_llm_client_from_env", side_effect=LlmCredentialsMissing("missing")),
@@ -274,7 +280,7 @@ class RoutingCliTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as result:
                     runner.main(["runner", "--help"])
                 self.assertEqual(result.exception.code, 0)
-                self.assertIn("--router {heuristic,hybrid}", output.getvalue())
+                self.assertIn("--router {heuristic,hybrid,agentic}", output.getvalue())
                 self.assertIn("--llm-rpm-limit", output.getvalue())
                 self.assertIn("--routing-log", output.getvalue())
                 self.assertIn(

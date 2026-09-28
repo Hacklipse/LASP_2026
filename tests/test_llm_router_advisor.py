@@ -160,6 +160,110 @@ class ValidSuggestionTests(unittest.TestCase):
         self.assertEqual(_advise(llm, surfaces=(post,)), ())
         self.assertEqual(llm.requests, [])
 
+
+class AgenticHypothesisTests(unittest.TestCase):
+    def test_returns_observation_grounded_hypothesis_contract(self) -> None:
+        llm = _FakeLlmClient(
+            {
+                "suggestions": [
+                    {
+                        "surface_id": "surface-import",
+                        "vulnerability_type": "SQLi",
+                        "basis_observation_ids": ["evi-response"],
+                        "reason_code": "query_interpreter_risk",
+                        "required_evidence_types": [
+                            "control_response",
+                            "server_error_delta",
+                        ],
+                    }
+                ]
+            }
+        )
+        evidence = Evidence(
+            evidence_id="evi-response",
+            run_id="run-1",
+            surface_id="surface-import",
+            created_by="fixture",
+            evidence_type="http_response",
+            observation={
+                "type": "http_response",
+                "status": 500,
+                "content_type": "application/json; charset=utf-8",
+                "body": "SECRET_RESPONSE_MUST_NOT_REACH_LLM",
+            },
+        )
+        advisor = LlmRouterAdvisor(
+            llm_client=llm,
+            analyzers=ANALYZERS,
+            hypothesis_mode=True,
+        )
+
+        suggestions = advisor.advise(
+            _run(), (_surface(),), (evidence,), frozenset()
+        )
+
+        self.assertEqual(len(suggestions), 1)
+        self.assertEqual(suggestions[0].basis_evidence_ids, ("evi-response",))
+        self.assertEqual(suggestions[0].reason_code, "query_interpreter_risk")
+        self.assertEqual(
+            suggestions[0].required_evidence_types,
+            ("control_response", "server_error_delta"),
+        )
+        request = llm.requests[0]
+        prompt = request.messages[0].content
+        self.assertIn(
+            "evi-response:http_response_500_application_json",
+            prompt,
+        )
+        self.assertNotIn("SECRET_RESPONSE_MUST_NOT_REACH_LLM", prompt)
+        self.assertNotIn("status=500", prompt)
+
+    def test_rejects_observation_id_from_outside_the_offered_surface(self) -> None:
+        llm = _FakeLlmClient(
+            {
+                "suggestions": [
+                    {
+                        "surface_id": "surface-import",
+                        "vulnerability_type": "SQLi",
+                        "basis_observation_ids": ["evi-foreign"],
+                        "reason_code": "query_interpreter_risk",
+                        "required_evidence_types": ["server_error_delta"],
+                    }
+                ]
+            }
+        )
+        advisor = LlmRouterAdvisor(
+            llm_client=llm,
+            analyzers=ANALYZERS,
+            hypothesis_mode=True,
+        )
+
+        suggestions = advisor.advise(
+            _run(), (_surface(),), (), frozenset()
+        )
+
+        self.assertEqual(suggestions, ())
+        self.assertEqual(advisor.last_trace.status, "all_rejected")
+        self.assertEqual(
+            advisor.last_trace.rejected_items,
+            ((0, "unknown_observation"),),
+        )
+
+    def test_valid_empty_hypothesis_list_is_not_a_fallback(self) -> None:
+        llm = _FakeLlmClient({"suggestions": []})
+        advisor = LlmRouterAdvisor(
+            llm_client=llm,
+            analyzers=ANALYZERS,
+            hypothesis_mode=True,
+        )
+
+        self.assertEqual(
+            advisor.advise(_run(), (_surface(),), (), frozenset()),
+            (),
+        )
+        self.assertEqual(advisor.last_trace.source, "llm")
+        self.assertEqual(advisor.last_trace.status, "ok")
+
     def test_bounded_recon_post_coordinate_can_be_offered(self) -> None:
         llm = _FakeLlmClient(
             {"suggestions": [{

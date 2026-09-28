@@ -44,7 +44,12 @@ from hacklipse.ports.llm import LlmClient, LlmMessage, LlmRequest, LlmUsage
 
 from .request_safety import has_state_changing_parameters
 from .llm_parameter_names import alias_parameter_names
-from .routing import RouteSuggestion, _supports_suggestion
+from .routing import (
+    CANDIDATE_EVIDENCE_TYPES,
+    CANDIDATE_REASON_CODES,
+    RouteSuggestion,
+    _supports_suggestion,
+)
 
 # Evidence.created_by에 쓸 고정 식별자. selection_source(llm/rule)와 별개로 "이 판단을
 # 만든 컴포넌트가 무엇인가"는 항상 이 값으로 고정한다.
@@ -79,6 +84,47 @@ _SUGGESTION_SCHEMA = {
     "additionalProperties": False,
 }
 
+_AGENTIC_HYPOTHESIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "suggestions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "surface_id": {"type": "string"},
+                    "vulnerability_type": {"type": "string"},
+                    "basis_observation_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "reason_code": {
+                        "type": "string",
+                        "enum": sorted(CANDIDATE_REASON_CODES),
+                    },
+                    "required_evidence_types": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": sorted(CANDIDATE_EVIDENCE_TYPES),
+                        },
+                    },
+                },
+                "required": [
+                    "surface_id",
+                    "vulnerability_type",
+                    "basis_observation_ids",
+                    "reason_code",
+                    "required_evidence_types",
+                ],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["suggestions"],
+    "additionalProperties": False,
+}
+
 _SYSTEM = (
     "You review endpoints of a single authorized security assessment that the "
     "deterministic rules could not classify, and say which vulnerability type is worth "
@@ -90,6 +136,18 @@ _SYSTEM = (
     "suggestion; a plain navigation link is not. Return an empty list when none of the "
     "offered surfaces are worth spending analysis budget on. Do not repeat a pairing that "
     "is already listed as covered."
+)
+
+_AGENTIC_SYSTEM = (
+    "You form candidate hypotheses for one authorized security assessment from only "
+    "the structured surfaces and observations offered to you. Do not assume a known "
+    "vulnerable endpoint, target-specific payload, expected finding, or ground truth. "
+    "For each hypothesis, copy one offered surface_id, one allowed vulnerability type, "
+    "zero or more observation IDs belonging to that surface, one offered reason code, "
+    "and the generic evidence types needed to test the hypothesis. Select only hypotheses "
+    "worth spending analysis budget on. Never invent an endpoint, parameter, observation "
+    "ID, vulnerability type, reason code, evidence type, payload, or credential. Return "
+    "an empty list when the observations do not justify a hypothesis."
 )
 
 
@@ -117,6 +175,7 @@ class _OfferedSurface:
     client_route: bool
     parameter_names: tuple[str, ...]
     observation_types: tuple[str, ...]
+    observations: tuple[tuple[str, str], ...]
     covered_types: tuple[str, ...]
     allowed_types: tuple[str, ...]
 
@@ -150,11 +209,13 @@ class LlmRouterAdvisor:
         analyzers: Sequence[AnalyzerChoice],
         max_surfaces: int = DEFAULT_MAX_SURFACES,
         timeout_seconds: float = 60.0,
+        hypothesis_mode: bool = False,
     ) -> None:
         self._llm = llm_client
         self._analyzers = tuple(analyzers)
         self._max_surfaces = max_surfaces
         self._timeout_seconds = timeout_seconds
+        self._hypothesis_mode = hypothesis_mode
         self.last_trace = RouterAdvisorTrace()
 
     def advise(
@@ -181,8 +242,12 @@ class LlmRouterAdvisor:
                     messages=(
                         LlmMessage(role="user", content=self._prompt(offered)),
                     ),
-                    system=_SYSTEM,
-                    response_schema=_SUGGESTION_SCHEMA,
+                    system=_AGENTIC_SYSTEM if self._hypothesis_mode else _SYSTEM,
+                    response_schema=(
+                        _AGENTIC_HYPOTHESIS_SCHEMA
+                        if self._hypothesis_mode
+                        else _SUGGESTION_SCHEMA
+                    ),
                     timeout_seconds=self._timeout_seconds,
                 )
             )
@@ -242,6 +307,7 @@ class LlmRouterAdvisor:
         """규칙이 다 채우지 못한 Surface만 골라 안전한 메타데이터로 바꾼다."""
 
         observations = self._observations_by_surface(run, evidence)
+        observation_records = self._observation_records_by_surface(run, evidence)
         offered: list[_OfferedSurface] = []
         for surface in surfaces:
             if surface.run_id != run.run_id:
@@ -285,6 +351,7 @@ class LlmRouterAdvisor:
                     client_route=client_route,
                     parameter_names=parameter_names,
                     observation_types=observations.get(surface.surface_id, ()),
+                    observations=observation_records.get(surface.surface_id, ()),
                     covered_types=tuple(sorted(covered)),
                     allowed_types=allowed_types,
                 )
@@ -328,6 +395,54 @@ class LlmRouterAdvisor:
                 seen.append(observation_type)
         return {key: tuple(value) for key, value in collected.items()}
 
+    @staticmethod
+    def _observation_records_by_surface(
+        run: Run, evidence: Sequence[Evidence]
+    ) -> dict[str, tuple[tuple[str, str], ...]]:
+        """LLM이 선택할 수 있는 현재 Surface 소속 Evidence ID와 안전한 유형.
+
+        HTTP 본문·헤더·관측값은 전달하지 않는다. 응답은 status와 content-type만
+        정규화한 label로 바꿔 API/HTML/인증 경계 정도만 판단할 수 있게 한다.
+        """
+
+        collected: dict[str, list[tuple[str, str]]] = {}
+        for item in evidence:
+            if (
+                item.run_id != run.run_id
+                or item.surface_id is None
+            ):
+                continue
+            if item.evidence_type == "http_response":
+                status = item.observation.get("status")
+                status_label = (
+                    str(status)
+                    if type(status) is int and 100 <= status <= 599
+                    else "unknown"
+                )
+                content_type = item.observation.get("content_type")
+                media_type = (
+                    content_type.split(";", 1)[0].strip().casefold()
+                    if isinstance(content_type, str)
+                    else "unknown"
+                )
+                media_label = re.sub(r"[^a-z0-9]+", "_", media_type).strip("_")
+                observation_type = (
+                    f"http_response_{status_label}_{media_label or 'unknown'}"
+                )
+            elif item.evidence_type == "observation":
+                observation_type = item.observation.get("type")
+                if (
+                    not isinstance(observation_type, str)
+                    or _NAME.fullmatch(observation_type) is None
+                ):
+                    continue
+            else:
+                continue
+            collected.setdefault(item.surface_id, []).append(
+                (item.evidence_id, observation_type)
+            )
+        return {key: tuple(value) for key, value in collected.items()}
+
     # ------------------------------------------------------------------
     # 프롬프트
     # ------------------------------------------------------------------
@@ -345,17 +460,38 @@ class LlmRouterAdvisor:
             covered = ", ".join(item.covered_types) or "(none)"
             allowed = ", ".join(item.allowed_types)
             location = "client_route" if item.client_route else "server_route"
+            observation_records = ", ".join(
+                f"{evidence_id}:{kind}"
+                for evidence_id, kind in item.observations
+            ) or "(none)"
             lines.append(
                 f"- surface_id={item.surface_id} method={item.method} "
                 f"path={item.path} kind={location} parameters=[{parameters}] "
-                f"observations=[{observations}] already_covered=[{covered}] "
+                f"observations=[{observations}] "
+                + (
+                    f"observation_ids=[{observation_records}] "
+                    if self._hypothesis_mode
+                    else ""
+                )
+                + f"already_covered=[{covered}] "
                 f"allowed_types=[{allowed}]"
             )
         lines.append("")
-        lines.append(
-            "Pair each surface_id worth investigating with one vulnerability type "
-            "from the list above."
-        )
+        if self._hypothesis_mode:
+            lines.extend(
+                [
+                    "Reason codes: " + ", ".join(sorted(CANDIDATE_REASON_CODES)),
+                    "Evidence types: "
+                    + ", ".join(sorted(CANDIDATE_EVIDENCE_TYPES)),
+                    "Form only hypotheses justified by these observations and identify "
+                    "the generic evidence needed to test each one.",
+                ]
+            )
+        else:
+            lines.append(
+                "Pair each surface_id worth investigating with one vulnerability type "
+                "from the list above."
+            )
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -411,12 +547,51 @@ class LlmRouterAdvisor:
                 rejected.append((index, "unsupported_route"))
                 continue
             reason = entry.get("reason")
+            basis_evidence_ids: tuple[str, ...] = ()
+            reason_code = ""
+            required_evidence_types: tuple[str, ...] = ()
+            if self._hypothesis_mode:
+                raw_basis = entry.get("basis_observation_ids")
+                raw_reason_code = entry.get("reason_code")
+                raw_required = entry.get("required_evidence_types")
+                if (
+                    not isinstance(raw_basis, list)
+                    or any(not isinstance(item, str) for item in raw_basis)
+                    or len(set(raw_basis)) != len(raw_basis)
+                    or not isinstance(raw_reason_code, str)
+                    or raw_reason_code not in CANDIDATE_REASON_CODES
+                    or not isinstance(raw_required, list)
+                    or any(not isinstance(item, str) for item in raw_required)
+                    or len(set(raw_required)) != len(raw_required)
+                    or any(
+                        item not in CANDIDATE_EVIDENCE_TYPES
+                        for item in raw_required
+                    )
+                ):
+                    rejected.append((index, "invalid_hypothesis_contract"))
+                    continue
+                allowed_observations = {
+                    evidence_id for evidence_id, _ in surface.observations
+                }
+                if any(item not in allowed_observations for item in raw_basis):
+                    rejected.append((index, "unknown_observation"))
+                    continue
+                basis_evidence_ids = tuple(raw_basis)
+                reason_code = raw_reason_code
+                required_evidence_types = tuple(raw_required)
             accepted.append(
                 RouteSuggestion(
                     surface_id=surface_id,
                     vulnerability_type=vulnerability_type,
                     agent_type=agent_type,
-                    reason=reason if isinstance(reason, str) else "",
+                    reason=(
+                        reason_code
+                        if self._hypothesis_mode
+                        else reason if isinstance(reason, str) else ""
+                    ),
+                    basis_evidence_ids=basis_evidence_ids,
+                    reason_code=reason_code,
+                    required_evidence_types=required_evidence_types,
                 )
             )
             taken.add(key)

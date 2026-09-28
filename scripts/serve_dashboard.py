@@ -106,7 +106,7 @@ ADVANCED_CHOICES = (
     {"field": "recon", "label": "Recon", "choices": ("heuristic", "hybrid", "agentic"), "llm": ("hybrid", "agentic")},
     {"field": "recon_entry", "label": "Recon 시작", "choices": ("targeted", "base-url"), "llm": ()},
     {"field": "surface_collection", "label": "Surface 수집", "choices": ("adaptive", "deterministic"), "llm": ()},
-    {"field": "router", "label": "Router", "choices": ("heuristic", "hybrid"), "llm": ("hybrid",)},
+    {"field": "router", "label": "Router", "choices": ("heuristic", "hybrid", "agentic"), "llm": ("hybrid", "agentic")},
     {"field": "router_review", "label": "Router review", "choices": ("weak", "ambiguous"), "llm": ()},
     {"field": "orchestrator", "label": "Orchestrator", "choices": ("heuristic", "hybrid"), "llm": ("hybrid",)},
     {"field": "budget_allocation", "label": "예산 배분", "choices": ("off", "heuristic", "hybrid"), "llm": ("hybrid",)},

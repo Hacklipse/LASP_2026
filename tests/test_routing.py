@@ -21,6 +21,7 @@ from hacklipse.bootstrap import (
     standard_router,
 )
 from hacklipse.ports.errors import LlmCredentialsMissing
+from hacklipse.ports.llm import LlmResponse
 from hacklipse.domain import (
     AgentResult,
     AgentResultStatus,
@@ -224,6 +225,102 @@ class AdvisorRoutingTests(unittest.TestCase):
         ).route(_run(), surfaces, ())
 
         self.assertEqual(baseline, with_default)
+
+    def test_primary_advisor_selects_the_candidate_set_instead_of_adding_to_rules(
+        self,
+    ) -> None:
+        evidence = Evidence(
+            evidence_id="evi-http",
+            run_id="run-1",
+            surface_id="surface-search",
+            created_by="fixture",
+            evidence_type="observation",
+            observation={"type": "http_response"},
+        )
+        advisor = _StubAdvisor(
+            RouteSuggestion(
+                surface_id="surface-search",
+                vulnerability_type="SQLi",
+                agent_type="sqli_analyzer",
+                basis_evidence_ids=("evi-http",),
+                reason_code="query_interpreter_risk",
+                required_evidence_types=(
+                    "control_response",
+                    "server_error_delta",
+                ),
+            )
+        )
+        router = RuleBasedVulnerabilityRouter(
+            id_factory=iter(("1", "2", "3", "4")).__next__,
+            advisor=advisor,
+            advisor_mode="primary",
+        )
+
+        decisions = router.route(_run(), (_surface(),), (evidence,))
+
+        self.assertEqual(
+            [item.candidate.vulnerability_type for item in decisions],
+            ["SQLi"],
+        )
+        candidate = decisions[0].candidate
+        self.assertEqual(candidate.evidence_ids, ("evi-http",))
+        self.assertEqual(
+            candidate.required_evidence_types,
+            ("control_response", "server_error_delta"),
+        )
+        self.assertEqual(advisor.calls, [frozenset()])
+        self.assertTrue(router.last_advisor_status.startswith("agentic_primary:"))
+
+    def test_primary_advisor_valid_empty_result_keeps_no_rule_candidates(self) -> None:
+        router = RuleBasedVulnerabilityRouter(
+            advisor=_StubAdvisor(),
+            advisor_mode="primary",
+        )
+
+        self.assertEqual(router.route(_run(), (_surface(),), ()), ())
+
+    def test_primary_advisor_failure_restores_deterministic_rule_candidates(self) -> None:
+        router = RuleBasedVulnerabilityRouter(
+            id_factory=iter(("1", "2", "3")).__next__,
+            advisor=_RaisingAdvisor(),
+            advisor_mode="primary",
+        )
+
+        decisions = router.route(_run(), (_surface(),), ())
+
+        self.assertEqual(
+            [item.candidate.vulnerability_type for item in decisions],
+            ["XSS", "SQLi"],
+        )
+        self.assertTrue(router.last_advisor_status.startswith("agentic_fallback:"))
+
+    def test_primary_advisor_cannot_reference_a_foreign_observation(self) -> None:
+        advisor = _StubAdvisor(
+            RouteSuggestion(
+                surface_id="surface-search",
+                vulnerability_type="SQLi",
+                agent_type="sqli_analyzer",
+                basis_evidence_ids=("evi-foreign",),
+                reason_code="query_interpreter_risk",
+                required_evidence_types=("server_error_delta",),
+            )
+        )
+        router = RuleBasedVulnerabilityRouter(
+            id_factory=iter(("1", "2", "3")).__next__,
+            advisor=advisor,
+            advisor_mode="primary",
+        )
+
+        decisions = router.route(_run(), (_surface(),), ())
+
+        self.assertEqual(
+            [item.candidate.vulnerability_type for item in decisions],
+            ["XSS", "SQLi"],
+        )
+        self.assertIn(
+            (0, "invalid_basis_observation"),
+            router.last_advisor_outcomes,
+        )
 
     def test_advisor_fills_only_the_type_rules_left_empty(self) -> None:
         # 규칙은 이 Surface를 XSS와 SQLi로만 보낸다. Path Traversal 자리는 비어 있다.
@@ -516,6 +613,14 @@ class _StubLlmClient:
         raise AssertionError("bootstrap wiring test must not call the llm")
 
 
+class _PayloadLlmClient:
+    def __init__(self, payload) -> None:
+        self.payload = payload
+
+    def complete(self, request):
+        return LlmResponse(payload=self.payload)
+
+
 class StandardRouterWiringTests(unittest.TestCase):
     """bootstrap이 Advisor를 규칙과 같은 필터 아래에서 배선하는지 검증한다."""
 
@@ -533,6 +638,59 @@ class StandardRouterWiringTests(unittest.TestCase):
         router = standard_router(llm_client=_StubLlmClient(), router_advisor=True)
 
         self.assertIsInstance(router._advisor, LlmRouterAdvisor)
+
+    def test_agentic_router_uses_primary_hypothesis_mode(self) -> None:
+        router = standard_router(
+            mode="agentic",
+            llm_client=_StubLlmClient(),
+        )
+
+        self.assertIsInstance(router._advisor, LlmRouterAdvisor)
+        self.assertEqual(router._advisor_mode, "primary")
+        self.assertTrue(router._advisor._hypothesis_mode)
+
+    def test_agentic_router_turns_only_selected_hypotheses_into_candidates(self) -> None:
+        router = standard_router(
+            ("XSS", "SQLi"),
+            mode="agentic",
+            llm_client=_PayloadLlmClient(
+                {
+                    "suggestions": [
+                        {
+                            "surface_id": "surface-search",
+                            "vulnerability_type": "SQLi",
+                            "basis_observation_ids": [],
+                            "reason_code": "query_interpreter_risk",
+                            "required_evidence_types": [
+                                "control_response",
+                                "server_error_delta",
+                            ],
+                        }
+                    ]
+                }
+            ),
+        )
+
+        decisions = router.route(_run(), (_surface(),), ())
+
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].candidate.vulnerability_type, "SQLi")
+        self.assertEqual(
+            decisions[0].candidate.required_evidence_types,
+            ("control_response", "server_error_delta"),
+        )
+
+    def test_agentic_router_requires_an_llm_client(self) -> None:
+        with self.assertRaises(LlmCredentialsMissing):
+            standard_router(mode="agentic")
+
+    def test_agentic_router_rejects_legacy_paired_comparison(self) -> None:
+        with self.assertRaises(ValueError):
+            standard_router(
+                mode="agentic",
+                compare=True,
+                llm_client=_StubLlmClient(),
+            )
 
     def test_advisor_inherits_the_vulnerability_type_filter(self) -> None:
         """--vuln xss로 만든 Router의 Advisor는 SQLi를 제안할 수 없어야 한다."""

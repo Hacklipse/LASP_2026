@@ -178,7 +178,12 @@ def _print_execution_preview(
     print(f"  Recon           {args.recon}")
     print(f"  Recon 시작      {getattr(args, 'recon_entry', 'targeted')}")
     print(f"  Surface 수집    {getattr(args, 'surface_collection', 'adaptive')}")
-    print(f"  Router          {args.router} · review {args.router_review}")
+    router_detail = (
+        "primary hypotheses"
+        if args.router == "agentic"
+        else f"review {args.router_review}"
+    )
+    print(f"  Router          {args.router} · {router_detail}")
     print(f"  Orchestrator    {getattr(args, 'orchestrator', 'heuristic')}")
     print(f"  Report          {getattr(args, 'report', 'heuristic')}")
     print(f"  예산 배분       {getattr(args, 'budget_allocation', 'off')}")
@@ -794,6 +799,9 @@ def main(argv: list[str]) -> int:
     if args.validation_review and args.profile != "llm":
         print("거부: --validation-review는 --profile llm과 함께 사용해야 합니다.")
         return 2
+    if args.router == "agentic" and args.compare_routers:
+        print("거부: --router agentic은 현재 --compare-routers와 함께 사용할 수 없습니다.")
+        return 2
     if args.vuln == "auto" and args.recon_entry != "base-url":
         print("거부: --vuln auto는 --recon-entry base-url과 함께 사용해야 합니다.")
         return 2
@@ -1254,7 +1262,7 @@ def main(argv: list[str]) -> int:
     print("[실행 정보]")
     print(f"  상태            완료 ({run.phase.value})")
     print(f"  분석 대상       {target_label}")
-    print(f"  Agent 구성      {profile}")
+    print(f"  Analysis 구성   {profile}")
     print(f"  추가 Recon      {run.extra_recon_rounds}회")
     if run.budget_candidate_order:
         print(

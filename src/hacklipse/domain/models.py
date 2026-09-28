@@ -236,7 +236,10 @@ class RunExecutionProfile:
                 self.surface_collection_mode,
                 {"adaptive", "deterministic"},
             ),
-            "router mode": (self.router_mode, {"heuristic", "hybrid"}),
+            "router mode": (
+                self.router_mode,
+                {"heuristic", "hybrid", "agentic"},
+            ),
             "router review": (self.router_review, {"weak", "ambiguous"}),
             "orchestrator mode": (self.orchestrator_mode, {"heuristic", "hybrid"}),
             "budget allocation mode": (
@@ -271,7 +274,7 @@ class RunExecutionProfile:
         uses_llm = (
             self.analysis_profile == "llm"
             or self.recon_mode in {"hybrid", "agentic"}
-            or self.router_mode == "hybrid"
+            or self.router_mode in {"hybrid", "agentic"}
             or self.compare_routers
             or self.orchestrator_mode == "hybrid"
             or self.budget_allocation_mode == "hybrid"
@@ -796,6 +799,10 @@ class Candidate:
     # Router가 관측된 Surface에서 고른 탐색 입력 이름. 관측/성공 Evidence가 아니다.
     # Analyzer는 사용 전에 실제 Surface 소속과 실행 정책을 다시 검증해야 한다.
     exploration_parameters: tuple[str, ...] = ()
+    # Agentic Router가 이 가설을 검증하려면 필요하다고 제안한 Evidence 종류다.
+    # 실행 요청이나 proof가 아니라 감사 가능한 계획 메타데이터이며, 실제 Analyzer와
+    # Validation은 기존 정책·proof 계약을 독립적으로 적용한다.
+    required_evidence_types: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.exploration_parameters, tuple) or any(
@@ -805,6 +812,18 @@ class Candidate:
             raise DomainInvariantError("candidate exploration parameters must be names")
         if len(set(self.exploration_parameters)) != len(self.exploration_parameters):
             raise DomainInvariantError("candidate exploration parameters must be unique")
+        if not isinstance(self.required_evidence_types, tuple) or any(
+            not isinstance(name, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", name) is None
+            for name in self.required_evidence_types
+        ):
+            raise DomainInvariantError("candidate required evidence types must be names")
+        if len(set(self.required_evidence_types)) != len(
+            self.required_evidence_types
+        ):
+            raise DomainInvariantError(
+                "candidate required evidence types must be unique"
+            )
         # 저장소에서 문자열로 복원한 값도 같은 검사를 통과시킨다. 알 수 없는 상태는
         # 조용히 통과시키지 않고 여기서 막는다.
         for field_name in ("status", "resume_status"):
