@@ -220,6 +220,8 @@ class AgenticHypothesisTests(unittest.TestCase):
         self.assertNotIn("SECRET_RESPONSE_MUST_NOT_REACH_LLM", prompt)
         self.assertNotIn("status=500", prompt)
         self.assertIn("use basis_observation_ids=[]", request.system)
+        self.assertIn("parameterized server-side route can justify", request.system)
+        self.assertIn("review server and client routes independently", request.system)
 
     def test_observation_refs_are_local_to_each_surface_and_run(self) -> None:
         llm = _FakeLlmClient({"suggestions": [

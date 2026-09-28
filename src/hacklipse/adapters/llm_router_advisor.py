@@ -147,11 +147,15 @@ _AGENTIC_SYSTEM = (
     "belonging to that surface in basis_observation_ids, "
     "one offered reason code, "
     "and the generic evidence types needed to test the hypothesis. Select only hypotheses "
-    "worth spending analysis budget on. If a surface has observation_refs=[(none)], "
+    "worth spending analysis budget on. A parameterized server-side route can justify a "
+    "testable, low-confidence hypothesis from its path and input names even before an HTTP "
+    "response has been observed; review server and client routes independently rather than "
+    "stopping after one plausible hypothesis. If a surface has observation_refs=[(none)], "
     "use basis_observation_ids=[]; never borrow a ref from another surface. "
     "Never invent an endpoint, parameter, observation "
     "ref, vulnerability type, reason code, evidence type, payload, or credential. Return "
-    "an empty list when the observations do not justify a hypothesis."
+    "an empty list only when neither the surface structure nor observations justify a "
+    "bounded probe."
 )
 
 
