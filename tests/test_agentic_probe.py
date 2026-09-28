@@ -98,7 +98,7 @@ def _fixture(*, path="/search", budget=10, required=("server_error_delta",), par
         surface_store=app.stores.surfaces, evidence_store=app.stores.evidence,
         llm_client=llm,
         id_factory=(
-            iter(("plan", "summary", "interpretation")).__next__
+            iter(("plan", "summary", "interpretation", "follow-up", "summary-2", "interpretation-2")).__next__
             if llm else lambda: "summary"
         ),
     )
@@ -212,6 +212,8 @@ class AgenticProbeTests(unittest.TestCase):
         summary, interpretation = app.stores.evidence.get_many(task.run_id, second.new_evidence_ids)
         self.assertEqual(summary.observation["plan_evidence_id"], "evi-plan")
         self.assertEqual(interpretation.observation["assessment"], "contradicts")
+        self.assertEqual(interpretation.observation["hypothesis_decision"], "reject")
+        self.assertEqual(interpretation.observation["decision_scope"], "probe_evidence_only")
         self.assertEqual(interpretation.observation["probe_result_evidence_id"], summary.evidence_id)
         third = agent.handle(replace(
             task,
@@ -220,6 +222,90 @@ class AgenticProbeTests(unittest.TestCase):
         ))
         self.assertEqual(third.new_evidence_ids, ())
         self.assertEqual(len(llm.requests), 2)
+
+    def test_inconclusive_probe_gets_one_bounded_alternative_before_validation(self):
+        llm = _Llm([
+            {"parameter": "q", "action": "marker"},
+            {"assessment": "inconclusive", "reason_code": "insufficient_evidence"},
+            {"assessment": "supports", "reason_code": "server_error_delta"},
+        ])
+        agent, app, runtime, task = _fixture(
+            llm=llm, required=("mutated_input_response",),
+        )
+        first = agent.handle(task)
+        collected = tuple(
+            app.collector.collect(task.run_id, task.target_url, request, task_id=task.task_id)
+            for request in first.evidence_requests
+        )
+        second = agent.handle(replace(
+            task, evidence_ids=first.new_evidence_ids + collected, request_budget=7,
+        ))
+        self.assertIs(second.status, AgentResultStatus.NEEDS_EVIDENCE)
+        self.assertEqual(len(second.evidence_requests), 2)
+        self.assertEqual(second.new_evidence_ids, (
+            "evi-summary", "evi-interpretation", "evi-follow-up",
+        ))
+        follow_up = app.stores.evidence.get_many(task.run_id, ("evi-follow-up",))[0]
+        self.assertEqual(follow_up.observation["action"], "syntax_quote")
+        self.assertEqual(follow_up.observation["follow_up_of"], "evi-interpretation")
+        self.assertIsNone(second.validation)
+
+        more = tuple(
+            app.collector.collect(task.run_id, task.target_url, request, task_id=task.task_id)
+            for request in second.evidence_requests
+        )
+        third = agent.handle(replace(
+            task,
+            evidence_ids=first.new_evidence_ids + collected + second.new_evidence_ids + more,
+            request_budget=5,
+        ))
+        self.assertIs(third.status, AgentResultStatus.COMPLETED)
+        self.assertEqual(len(llm.requests), 3)
+        self.assertEqual(len(runtime.requests), 5)
+        self.assertEqual(third.new_evidence_ids, ("evi-summary-2", "evi-interpretation-2"))
+        interpretations = app.stores.evidence.get_many(
+            task.run_id, ("evi-interpretation", "evi-interpretation-2")
+        )
+        self.assertEqual(
+            [item.observation["hypothesis_decision"] for item in interpretations],
+            ["explore", "keep"],
+        )
+        self.assertTrue(all(not item.observation["authoritative"] for item in interpretations))
+        self.assertIsNone(third.validation)
+        resumed = agent.handle(replace(
+            task,
+            evidence_ids=(
+                first.new_evidence_ids + collected + second.new_evidence_ids
+                + more + third.new_evidence_ids
+            ),
+            request_budget=5,
+        ))
+        self.assertEqual(resumed.new_evidence_ids, ())
+        self.assertEqual(resumed.evidence_requests, ())
+        self.assertEqual(len(llm.requests), 3)
+
+    def test_inconclusive_probe_does_not_spend_validation_reserve(self):
+        llm = _Llm([
+            {"parameter": "q", "action": "marker"},
+            {"assessment": "inconclusive", "reason_code": "insufficient_evidence"},
+        ])
+        agent, app, _, task = _fixture(
+            llm=llm, required=("mutated_input_response",),
+        )
+        first = agent.handle(task)
+        collected = tuple(
+            app.collector.collect(task.run_id, task.target_url, request, task_id=task.task_id)
+            for request in first.evidence_requests
+        )
+        second = agent.handle(replace(
+            task, evidence_ids=first.new_evidence_ids + collected, request_budget=2,
+        ))
+        self.assertIs(second.status, AgentResultStatus.COMPLETED)
+        self.assertEqual(second.evidence_requests, ())
+        self.assertFalse(any(
+            item.observation.get("follow_up_of")
+            for item in app.stores.evidence.list_by_run(task.run_id)
+        ))
 
     def test_llm_cannot_turn_interpretation_into_verdict_or_invent_a_signal(self):
         for reply in (

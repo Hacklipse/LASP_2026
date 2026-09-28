@@ -225,7 +225,56 @@ class AgenticHttpProbeAgent:
             )
         if self._llm is None or probe is None or result.status is not AgentResultStatus.COMPLETED:
             return result
-        return self._interpret(task, candidate, summary, evidence, result)
+        result, interpretation = self._interpret(task, candidate, summary, evidence, result)
+        if (
+            interpretation.observation.get("hypothesis_decision") != "explore"
+            or interpretation.observation.get("selection_source") != "llm"
+            or any(
+                item.created_by == _CREATED_BY
+                and item.observation.get("type") == _PLAN_TYPE
+                and item.observation.get("candidate_id") == candidate.candidate_id
+                and item.observation.get("follow_up_of") is not None
+                for item in evidence
+            )
+        ):
+            return result
+        alternatives = tuple(
+            item for item in _allowed_actions(needed)
+            if item != action and _ACTION_COST[item] + 1 <= task.request_budget
+        )
+        if not alternatives:
+            return result
+        follow_up_action = alternatives[0]
+        follow_up = Evidence(
+            evidence_id=f"evi-{self._id_factory()}",
+            run_id=task.run_id,
+            surface_id=surface.surface_id,
+            created_by=_CREATED_BY,
+            evidence_type="observation",
+            observation={
+                "type": _PLAN_TYPE,
+                "candidate_id": candidate.candidate_id,
+                "requested_evidence_types": sorted(needed),
+                "parameter": parameter,
+                "action": follow_up_action,
+                "selection_source": "bounded_follow_up",
+                "status": "inconclusive_first_probe",
+                "follow_up_of": interpretation.evidence_id,
+            },
+        )
+        self._evidence.append(follow_up)
+        follow_up_requests = build_probe_requests(
+            surface, (parameter,),
+            control_value=marker if follow_up_action == "syntax_quote" else CONTROL_VALUE,
+            probe_value=marker + ("'" if follow_up_action == "syntax_quote" else ""),
+            purpose=f"agentic generic candidate {candidate.candidate_id}",
+        )
+        return replace(
+            result,
+            status=AgentResultStatus.NEEDS_EVIDENCE,
+            new_evidence_ids=result.new_evidence_ids + (follow_up.evidence_id,),
+            evidence_requests=follow_up_requests,
+        )
 
     def _interpret(
         self,
@@ -234,15 +283,16 @@ class AgenticHttpProbeAgent:
         summary: Evidence,
         evidence: tuple[Evidence, ...],
         result: AgentResult,
-    ) -> AgentResult:
-        if any(
-            item.created_by == _CREATED_BY
+    ) -> tuple[AgentResult, Evidence]:
+        previous = next((
+            item for item in evidence
+            if item.created_by == _CREATED_BY
             and item.observation.get("type") == _INTERPRETATION_TYPE
             and item.observation.get("candidate_id") == candidate.candidate_id
             and item.observation.get("probe_result_evidence_id") == summary.evidence_id
-            for item in evidence
-        ):
-            return result
+        ), None)
+        if previous is not None:
+            return result, previous
 
         facts = {
             name: summary.observation[name]
@@ -287,6 +337,10 @@ class AgenticHttpProbeAgent:
                 "control_evidence_id": summary.observation["control_evidence_id"],
                 "probe_evidence_id": summary.observation["probe_evidence_id"],
                 "assessment": assessment,
+                "hypothesis_decision": {
+                    "supports": "keep", "contradicts": "reject", "inconclusive": "explore",
+                }[assessment],
+                "decision_scope": "probe_evidence_only",
                 "reason_code": reason,
                 "selection_source": source,
                 "status": status,
@@ -297,7 +351,7 @@ class AgenticHttpProbeAgent:
         return replace(
             result,
             new_evidence_ids=result.new_evidence_ids + (interpretation.evidence_id,),
-        )
+        ), interpretation
 
     def _stored_plan(
         self,
@@ -316,7 +370,9 @@ class AgenticHttpProbeAgent:
                 and value.get("requested_evidence_types") == sorted(needed)
                 and value.get("parameter") in parameters
                 and value.get("action") in _allowed_actions(needed)
-                and value.get("selection_source") in ("llm", "deterministic_fallback")
+                and value.get("selection_source") in (
+                    "llm", "deterministic_fallback", "bounded_follow_up"
+                )
             ):
                 return str(value["parameter"]), str(value["action"]), item.evidence_id
         return None

@@ -1071,6 +1071,7 @@ def main(argv: list[str]) -> int:
         config=OrchestratorConfig(
             browser_xss_validation=needs_browser,
             budget_allocation_enabled=args.budget_allocation != "off",
+            max_evidence_rounds=2 if args.router == "agentic" else 1,
         ),
     )
     base_path = parsed.path if parsed.path.endswith("/") else f"{parsed.path}/"

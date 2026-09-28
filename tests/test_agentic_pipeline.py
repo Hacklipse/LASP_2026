@@ -6,14 +6,16 @@ import re
 import unittest
 from urllib.parse import urlsplit
 
+from hacklipse.application.orchestrator import OrchestratorConfig
 from hacklipse.bootstrap import build_local_application, register_standard_agents, standard_router
 from hacklipse.domain import ExecutionResult, RunExecutionProfile, RunPhase, RunRequest, RunScope
 from hacklipse.ports.llm import LlmResponse
 
 
 class _Model:
-    def __init__(self) -> None:
+    def __init__(self, *, explore=False) -> None:
         self.roles: list[str] = []
+        self.explore = explore
 
     def complete(self, request):
         properties = request.response_schema["properties"]
@@ -28,17 +30,24 @@ class _Model:
                 "vulnerability_type": "SQLi",
                 "basis_observation_ids": [],
                 "reason_code": "query_interpreter_risk",
-                "required_evidence_types": ["control_response", "server_error_delta"],
+                "required_evidence_types": [
+                    "control_response",
+                    "mutated_input_response" if self.explore else "server_error_delta",
+                ],
             }]}
         elif "parameters" in properties:
             self.roles.append("analysis")
             payload = {"parameters": ["q"], "reason": "observed input"}
         elif "action" in properties:
             self.roles.append("probe")
-            payload = {"parameter": "q", "action": "syntax_quote"}
+            payload = {"parameter": "q", "action": "marker" if self.explore else "syntax_quote"}
         else:
             self.roles.append("interpretation")
-            payload = {"assessment": "supports", "reason_code": "server_error_delta"}
+            payload = (
+                {"assessment": "inconclusive", "reason_code": "insufficient_evidence"}
+                if self.explore and self.roles.count("interpretation") == 1
+                else {"assessment": "supports", "reason_code": "server_error_delta"}
+            )
         return LlmResponse(payload=payload, model="fixture")
 
 
@@ -96,6 +105,31 @@ class AgenticPipelineTests(unittest.TestCase):
         self.assertIn("agentic_evidence_interpretation", kinds)
         self.assertTrue(any(item.validation_id for item in evidence))
         self.assertTrue(all(request.method == "GET" for request in runtime.requests))
+
+    def test_inconclusive_evidence_triggers_one_extra_round_then_validation(self):
+        model, runtime = _Model(explore=True), _Runtime()
+        app = build_local_application(
+            {}, runtime=runtime,
+            router=standard_router(("SQLi",), mode="agentic", llm_client=model),
+            config=OrchestratorConfig(max_evidence_rounds=2),
+        )
+        register_standard_agents(
+            app, llm_client=model, agentic_probe_enabled=True, recon_max_pages=2,
+        )
+        run = app.orchestrator.start(RunRequest(
+            target_url="http://local.test/",
+            scope=RunScope(allowed_hosts=frozenset({"local.test"})),
+            request_budget=20,
+        ))
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(model.roles, [
+            "router", "analysis", "probe", "interpretation", "interpretation",
+        ])
+        evidence = app.stores.evidence.list_by_run(run.run_id)
+        follow_ups = [item for item in evidence if item.observation.get("follow_up_of")]
+        self.assertEqual(len(follow_ups), 1)
+        self.assertEqual(follow_ups[0].observation["action"], "syntax_quote")
+        self.assertEqual(len(app.stores.findings.list_by_run(run.run_id)), 1)
 
 
 if __name__ == "__main__":
