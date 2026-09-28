@@ -39,7 +39,7 @@ _STORED_STATUSES = {
     "fallback:invalid_response",
     "fallback:deterministic_collection",
 }
-_MAX_LLM_CALL_SECONDS = 30.0
+_MAX_LLM_CALL_SECONDS = 60.0
 
 _ACTION_SCHEMA = {
     "type": "object",

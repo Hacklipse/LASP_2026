@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import replace
 
 from hacklipse.adapters.llm_iterative_recon import LlmIterativeReconPlanner
 from hacklipse.adapters.memory import InMemoryEvidenceStore, InMemorySurfaceStore
@@ -74,7 +75,7 @@ class AgenticPlannerContractTests(unittest.TestCase):
         planner = LlmIterativeReconPlanner(llm_client=llm)
 
         action = planner.decide(
-            task=_TASK,
+            task=replace(_TASK, timeout_seconds=120),
             observations=_OBSERVATIONS,
             selectable_surface_ids=("surface-a",),
             remaining_budget=3,
@@ -82,6 +83,7 @@ class AgenticPlannerContractTests(unittest.TestCase):
         )
 
         self.assertEqual(action.surface_id, "surface-a")
+        self.assertEqual(llm.requests[0].timeout_seconds, 60)
         prompt = json.loads(llm.requests[0].messages[0].content)
         self.assertEqual(prompt["selectable_surface_ids"], ["surface-a"])
         self.assertEqual(prompt["observations"][0]["parameter_names"], ["parameter_1"])

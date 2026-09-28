@@ -380,6 +380,7 @@ class BudgetAllocationTests(unittest.TestCase):
 
         self.assertEqual(decision.candidate_ids, ("candidate-b", "candidate-a"))
         self.assertEqual(decision.candidate_weights, (2, 1))
+        self.assertEqual(model.requests[0].timeout_seconds, 60)
         prompt = json.loads(model.requests[0].messages[0].content)
         self.assertEqual(len(prompt["candidates"]), 2)
         self.assertNotIn("untrusted hypothesis text", model.requests[0].messages[0].content)

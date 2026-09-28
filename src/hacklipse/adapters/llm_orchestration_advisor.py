@@ -46,7 +46,7 @@ _SCHEMA = {
 class LlmOrchestrationAdvisor:
     """Return a validated suggestion; malformed or failed calls mean continue."""
 
-    def __init__(self, *, llm_client: LlmClient, timeout_seconds: float = 20.0) -> None:
+    def __init__(self, *, llm_client: LlmClient, timeout_seconds: float = 60.0) -> None:
         if timeout_seconds <= 0:
             raise ValueError("advisor timeout must be positive")
         self._llm = llm_client

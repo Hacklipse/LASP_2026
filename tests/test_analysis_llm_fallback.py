@@ -44,7 +44,7 @@ class AnalysisLlmFallbackTests(unittest.TestCase):
         request = LlmRequest(messages=(LlmMessage(role="user", content="test"),))
         client.complete(replace(request, timeout_seconds=120))
         client.complete(replace(request, timeout_seconds=20))
-        self.assertEqual(delegate.timeouts, [30.0, 10.0])
+        self.assertEqual(delegate.timeouts, [60.0, 10.0])
 
     def test_timeout_falls_back_once_and_resume_keeps_fallback(self) -> None:
         evidence = InMemoryEvidenceStore()

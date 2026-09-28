@@ -31,7 +31,7 @@ class BoundedAnalysisLlmClient:
 
     def complete(self, request: LlmRequest) -> LlmResponse:
         return self._delegate.complete(
-            replace(request, timeout_seconds=min(request.timeout_seconds / 2, 30.0))
+            replace(request, timeout_seconds=min(request.timeout_seconds / 2, 60.0))
         )
 
 

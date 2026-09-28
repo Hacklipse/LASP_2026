@@ -61,7 +61,7 @@ class ReviewingValidationAgent:
         evidence_store: EvidenceStore,
         surface_store: SurfaceStore,
         reviewer_config_version: str = "llm-validation-review-v1",
-        timeout_seconds: float = 15.0,
+        timeout_seconds: float = 60.0,
         id_factory: Callable[[], str] | None = None,
     ) -> None:
         if timeout_seconds <= 0 or not reviewer_config_version:
@@ -242,7 +242,7 @@ class ReviewingValidationAgent:
 def build_llm_reviewing_validation_agent(
     *, llm_client: LlmClient, candidate_store: CandidateStore,
     evidence_store: EvidenceStore, surface_store: SurfaceStore,
-    timeout_seconds: float = 15.0,
+    timeout_seconds: float = 60.0,
 ) -> ReviewingValidationAgent:
     """Opt-in assembly point; common bootstrap can register this Agent unchanged."""
 

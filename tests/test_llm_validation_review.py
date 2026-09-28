@@ -14,6 +14,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
@@ -448,10 +449,11 @@ class DecoratorTests(unittest.TestCase):
             llm_client=llm, candidate_store=self.candidates,
             evidence_store=self.evidence, surface_store=self.surfaces,
         )
-        result = agent.handle(self.task)
+        result = agent.handle(replace(self.task, timeout_seconds=120))
         self.assertEqual(result.validation.verdict, ValidationVerdict.REJECTED)
         self.assertEqual(result.validation.reason_code, ValidationReasonCode.ANALYSIS_SIGNAL_MISSING)
         self.assertEqual(len(llm.requests), 1)
+        self.assertEqual(llm.requests[0].timeout_seconds, 60)
         self.assertEqual(len(result.new_evidence_ids), 1)
 
     def test_requested_review_without_client_fails_before_run(self):

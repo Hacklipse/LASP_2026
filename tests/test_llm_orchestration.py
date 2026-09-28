@@ -170,6 +170,7 @@ class LlmOrchestrationTests(unittest.TestCase):
         self.assertEqual(run.extra_recon_rounds, 1)
         self.assertIsNone(run.recon_target_surface_id)
         self.assertEqual(len(model.requests), 1)
+        self.assertEqual(model.requests[0].timeout_seconds, 60)
         self.assertEqual(len(run.candidate_ids), 2)
         self.assertEqual(len(app.stores.candidates.list_by_run(run.run_id)), 2)
         self.assertEqual(len(app.stores.reports.list_by_run(run.run_id)), 1)
