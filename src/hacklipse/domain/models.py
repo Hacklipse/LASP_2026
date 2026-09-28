@@ -226,7 +226,7 @@ class RunExecutionProfile:
     def __post_init__(self) -> None:
         modes = {
             "analysis profile": (self.analysis_profile, {"heuristic", "llm"}),
-            "recon mode": (self.recon_mode, {"heuristic", "hybrid"}),
+            "recon mode": (self.recon_mode, {"heuristic", "hybrid", "agentic"}),
             "surface collection mode": (
                 self.surface_collection_mode,
                 {"adaptive", "deterministic"},
@@ -265,7 +265,7 @@ class RunExecutionProfile:
             raise DomainInvariantError("LLM provider and model must be stored together")
         uses_llm = (
             self.analysis_profile == "llm"
-            or self.recon_mode == "hybrid"
+            or self.recon_mode in {"hybrid", "agentic"}
             or self.router_mode == "hybrid"
             or self.compare_routers
             or self.orchestrator_mode == "hybrid"

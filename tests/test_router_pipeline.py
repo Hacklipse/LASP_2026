@@ -224,7 +224,11 @@ class RouterPipelineTests(unittest.TestCase):
         self.assertFalse(any(r.method == "POST" for r in runtime.requests))
 
     def test_bootstrap_requires_explicit_clients_and_valid_modes(self):
-        for call in (lambda: standard_router(compare=True), lambda: standard_recon_planner(mode="hybrid")):
+        for call in (
+            lambda: standard_router(compare=True),
+            lambda: standard_recon_planner(mode="hybrid"),
+            lambda: standard_recon_planner(mode="agentic"),
+        ):
             with self.assertRaises(LlmCredentialsMissing):
                 call()
         with self.assertRaises(ValueError):

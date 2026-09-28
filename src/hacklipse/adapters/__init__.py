@@ -42,6 +42,7 @@ from .routing import (
     SurfaceRoutingRule,
 )
 from .llm_recon_planner import LlmReconPlanner
+from .llm_iterative_recon import LlmIterativeReconPlanner
 from .paired_routing import PairedVulnerabilityRouter
 from .runtime import DisabledExecutionRuntime
 from .security import (
@@ -102,6 +103,7 @@ __all__ = [
     "RoutingRule",
     "RuleBasedVulnerabilityRouter",
     "LlmReconPlanner",
+    "LlmIterativeReconPlanner",
     "PairedVulnerabilityRouter",
     "SensitiveDataSanitizer",
     "SurfaceRoutingRule",

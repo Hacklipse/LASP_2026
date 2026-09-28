@@ -103,7 +103,7 @@ ENGINE_BY_ID = {engine["id"]: engine for engine in ENGINES}
 
 # 고급 실행 조건. 화면·검증·기본값이 모두 이 표 하나에서 나온다.
 ADVANCED_CHOICES = (
-    {"field": "recon", "label": "Recon", "choices": ("heuristic", "hybrid"), "llm": ("hybrid",)},
+    {"field": "recon", "label": "Recon", "choices": ("heuristic", "hybrid", "agentic"), "llm": ("hybrid", "agentic")},
     {"field": "surface_collection", "label": "Surface 수집", "choices": ("adaptive", "deterministic"), "llm": ()},
     {"field": "router", "label": "Router", "choices": ("heuristic", "hybrid"), "llm": ("hybrid",)},
     {"field": "router_review", "label": "Router review", "choices": ("weak", "ambiguous"), "llm": ()},

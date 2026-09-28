@@ -360,7 +360,7 @@ def _check_execution_conditions(off, on):
     # Report가 유일한 LLM 축이면 off Run에는 provider/model이 없는 것이 정상이다.
     # 다른 축에서도 LLM을 썼다면 두 Run의 모델과 rate limit까지 같아야 한다.
     other_llm = (
-        off["analysis_profile"] == "llm" or off["recon_mode"] == "hybrid"
+        off["analysis_profile"] == "llm" or off["recon_mode"] in {"hybrid", "agentic"}
         or off["router_mode"] == "hybrid" or off["compare_routers"]
         or off["orchestrator_mode"] == "hybrid"
         or off["budget_allocation_mode"] == "hybrid"

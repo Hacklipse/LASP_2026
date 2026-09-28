@@ -51,6 +51,7 @@ from hacklipse.adapters.routing import (
 )
 from hacklipse.adapters.routing_audit import AuditedVulnerabilityRouter, RoutingAuditSink
 from hacklipse.adapters.paired_routing import PairedVulnerabilityRouter
+from hacklipse.adapters.llm_iterative_recon import LlmIterativeReconPlanner
 from hacklipse.adapters.llm_recon_planner import LlmReconPlanner, ReconPlanner
 from hacklipse.adapters.recon import DEFAULT_MAX_PAGES
 from hacklipse.application import (
@@ -79,6 +80,7 @@ from hacklipse.ports import (
     RunStore,
     SurfaceStore,
     LlmClient,
+    IterativeReconPlanner,
     CredentialResolver,
     TaskStore,
     KnowledgeBase,
@@ -513,7 +515,7 @@ def register_standard_agents(
     app: LocalApplication,
     *,
     llm_client: LlmClient | None = None,
-    recon_planner: ReconPlanner | None = None,
+    recon_planner: ReconPlanner | IterativeReconPlanner | None = None,
     recon_max_pages: int = DEFAULT_MAX_PAGES,
     recon_surface_collection_mode: str = "adaptive",
     recon_seed_urls: tuple[str, ...] = (),
@@ -542,7 +544,16 @@ def register_standard_agents(
             max_pages=recon_max_pages,
             surface_collection_mode=recon_surface_collection_mode,
             seed_urls=recon_seed_urls,
-            planner=recon_planner,
+            planner=(
+                None
+                if callable(getattr(recon_planner, "decide", None))
+                else recon_planner
+            ),
+            iterative_planner=(
+                recon_planner
+                if callable(getattr(recon_planner, "decide", None))
+                else None
+            ),
         ),
         allowed_tools=("http_get",),
     )
@@ -681,12 +692,14 @@ def register_standard_agents(
 
 def standard_recon_planner(
     *, mode: str = "heuristic", llm_client: LlmClient | None = None,
-) -> ReconPlanner | None:
+) -> ReconPlanner | IterativeReconPlanner | None:
     """Analysis/Router 프로필과 독립적으로 Recon 판단 모듈을 선택한다."""
     if mode == "heuristic":
         return None
-    if mode != "hybrid":
-        raise ValueError("recon mode must be heuristic or hybrid")
+    if mode not in {"hybrid", "agentic"}:
+        raise ValueError("recon mode must be heuristic, hybrid, or agentic")
     if llm_client is None:
-        raise LlmCredentialsMissing("hybrid recon requires an explicit LlmClient")
+        raise LlmCredentialsMissing(f"{mode} recon requires an explicit LlmClient")
+    if mode == "agentic":
+        return LlmIterativeReconPlanner(llm_client=llm_client)
     return LlmReconPlanner(llm_client=llm_client)

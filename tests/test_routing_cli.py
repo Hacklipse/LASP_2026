@@ -22,6 +22,7 @@ from hacklipse.adapters import (
 from hacklipse.adapters.routing_audit import AuditedVulnerabilityRouter
 from hacklipse.adapters.paired_routing import PairedVulnerabilityRouter
 from hacklipse.adapters.llm_recon_planner import LlmReconPlanner
+from hacklipse.adapters.llm_iterative_recon import LlmIterativeReconPlanner
 from hacklipse.adapters.reviewing_validation import ReviewingValidationAgent
 from hacklipse.application import Orchestrator
 from hacklipse.bootstrap import build_local_application, register_standard_agents
@@ -113,7 +114,7 @@ class RoutingCliTests(unittest.TestCase):
     def test_all_profile_router_combinations_keep_analysis_selection_independent(self):
         for runner in (dvwa, juice):
             for profile in ("heuristic", "llm"):
-                for mode, recon, compare in product(("heuristic", "hybrid"), ("heuristic", "hybrid"), (False, True)):
+                for mode, recon, compare in product(("heuristic", "hybrid"), ("heuristic", "hybrid", "agentic"), (False, True)):
                     with self.subTest(runner=runner.__name__, profile=profile, router=mode, recon=recon, compare=compare), tempfile.TemporaryDirectory() as directory:
                         with (
                             patch.object(runner, "build_gemini_llm_client_from_env", return_value=_NoCallsLlm()) as builder,
@@ -133,7 +134,7 @@ class RoutingCliTests(unittest.TestCase):
                                     "--routing-log", str(path), "--llm-model", "fixture-model",
                                     *(["--compare-routers"] if compare else []),
                                 ])
-                            self.assertEqual(builder.call_count, int(profile == "llm" or mode == "hybrid" or recon == "hybrid" or compare))
+                            self.assertEqual(builder.call_count, int(profile == "llm" or mode == "hybrid" or recon in {"hybrid", "agentic"} or compare))
                             router = assemble.call_args.kwargs["router"]
                             if compare:
                                 self.assertIsInstance(router, PairedVulnerabilityRouter)
@@ -146,8 +147,16 @@ class RoutingCliTests(unittest.TestCase):
                             app = register.call_args.args[0]
                             if recon == "hybrid":
                                 self.assertIsInstance(app.dispatcher._agents["recon"]._planner, LlmReconPlanner)
+                                self.assertIsNone(app.dispatcher._agents["recon"]._iterative_planner)
+                            elif recon == "agentic":
+                                self.assertIsNone(app.dispatcher._agents["recon"]._planner)
+                                self.assertIsInstance(
+                                    app.dispatcher._agents["recon"]._iterative_planner,
+                                    LlmIterativeReconPlanner,
+                                )
                             else:
                                 self.assertIsNone(app.dispatcher._agents["recon"]._planner)
+                                self.assertIsNone(app.dispatcher._agents["recon"]._iterative_planner)
                             self.assertEqual(
                                 app.dispatcher._agents["recon"]._surface_collection_mode,
                                 "deterministic",
@@ -196,7 +205,9 @@ class RoutingCliTests(unittest.TestCase):
                 self.assertIn("--router {heuristic,hybrid}", output.getvalue())
                 self.assertIn("--llm-rpm-limit", output.getvalue())
                 self.assertIn("--routing-log", output.getvalue())
-                self.assertIn("--recon {heuristic,hybrid}", output.getvalue())
+                self.assertIn(
+                    "--recon {heuristic,hybrid,agentic}", output.getvalue()
+                )
                 self.assertIn(
                     "--surface-collection {adaptive,deterministic}",
                     output.getvalue(),

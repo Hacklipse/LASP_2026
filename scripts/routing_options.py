@@ -41,8 +41,11 @@ class NoLlmUsage:
 
 def add_routing_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--recon", choices=("heuristic", "hybrid"), default="heuristic",
-        help="Recon planner mode, independent of --profile and --router",
+        "--recon", choices=("heuristic", "hybrid", "agentic"), default="heuristic",
+        help=(
+            "Recon mode: heuristic crawl, hybrid one-shot ranking, or agentic "
+            "answer-blind iterative actions"
+        ),
     )
     parser.add_argument(
         "--surface-collection",
@@ -98,7 +101,7 @@ def _positive_int(value: str) -> int:
 def needs_llm(args: argparse.Namespace) -> bool:
     return (
         args.profile == "llm" or args.router == "hybrid"
-        or args.recon == "hybrid" or args.compare_routers
+        or args.recon in {"hybrid", "agentic"} or args.compare_routers
         or getattr(args, "orchestrator", "heuristic") == "hybrid"
         or getattr(args, "budget_allocation", "off") == "hybrid"
         or getattr(args, "validation_review", False)

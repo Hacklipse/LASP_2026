@@ -12,6 +12,7 @@ from .control import (
 from .knowledge import KnowledgeBase
 from .llm import LlmClient, LlmMessage, LlmRequest, LlmResponse, LlmUsage
 from .orchestration import OrchestrationAdvisor, OrchestrationDecision
+from .recon import IterativeReconPlanner, ReconAction, ReconObservation
 from .repositories import (
     CandidateStore,
     EvidenceStore,
@@ -53,11 +54,14 @@ __all__ = [
     "LlmRequest",
     "LlmResponse",
     "LlmUsage",
+    "IterativeReconPlanner",
     "OrchestrationAdvisor",
     "OrchestrationDecision",
     "PolicyGate",
     "ProgressLog",
     "ProgressSink",
+    "ReconAction",
+    "ReconObservation",
     "ReportStore",
     "RetryPolicy",
     "ResolvedHttpCredential",
