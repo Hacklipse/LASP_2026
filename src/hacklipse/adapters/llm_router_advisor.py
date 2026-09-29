@@ -63,6 +63,7 @@ ROUTER_ADVISOR = "llm_router_advisor"
 # 한 호출에서 LLM에게 보여 줄 Surface 상한. Hybrid에서는 전체 비용 상한이고,
 # Agentic exhaustive에서는 모든 호환 Surface를 보되 이 크기로 나누는 batch 상한이다.
 DEFAULT_MAX_SURFACES = 40
+_AGENTIC_CACHE_LIMIT = 32
 
 _NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,63}$")
 _PATH_SEGMENT = re.compile(r"^[A-Za-z][A-Za-z_-]{0,63}(?:\.[A-Za-z]{1,10})?$")
@@ -314,7 +315,7 @@ class RouterAdvisorTrace:
     offered_surface_ids: tuple[str, ...] = ()
     offered_pair_count: int = 0
     excluded_surfaces: tuple[tuple[str, str], ...] = ()
-    source: Literal["llm", "deterministic_fallback", "skipped"] = "skipped"
+    source: Literal["llm", "cache", "deterministic_fallback", "skipped"] = "skipped"
     status: str = "not_called"
     llm_calls: int = 0
     usage: LlmUsage = field(default_factory=LlmUsage)
@@ -347,6 +348,11 @@ class LlmRouterAdvisor:
         self._max_surfaces = max_surfaces
         self._timeout_seconds = timeout_seconds
         self._hypothesis_mode = hypothesis_mode
+        # 같은 Run의 추가 Recon이 비실행 Surface만 관찰했다면 실행 가능한 조합의
+        # LLM 입력은 그대로다. Run별 마지막 성공 결과 하나만 보관해 중복 호출을 막는다.
+        self._agentic_cache: dict[
+            str, tuple[tuple[_OfferedSurface, ...], RouterAdvisorTrace]
+        ] = {}
         self.last_trace = RouterAdvisorTrace()
 
     def advise(
@@ -373,8 +379,30 @@ class LlmRouterAdvisor:
             return ()
 
         if self._hypothesis_mode:
+            cached = self._agentic_cache.get(run.run_id)
+            if cached is not None and cached[0] == offered:
+                started = time.monotonic()
+                previous = cached[1]
+                self.last_trace = RouterAdvisorTrace(
+                    suggestions=previous.suggestions,
+                    dispositions=previous.dispositions,
+                    surface_dispositions=previous.surface_dispositions,
+                    rejected_items=previous.rejected_items,
+                    offered_surface_ids=tuple(
+                        item.surface_id for item in offered
+                    ),
+                    offered_pair_count=offered_pair_count,
+                    excluded_surfaces=excluded_surfaces,
+                    capabilities=capabilities,
+                    source="cache",
+                    status="cache_hit",
+                    llm_calls=0,
+                    model=previous.model,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                )
+                return self.last_trace.suggestions
             return self._advise_exhaustive(
-                offered, routed, excluded_surfaces, capabilities
+                run.run_id, offered, routed, excluded_surfaces, capabilities
             )
 
         started = time.monotonic()
@@ -443,6 +471,7 @@ class LlmRouterAdvisor:
 
     def _advise_exhaustive(
         self,
+        run_id: str,
         offered: tuple[_OfferedSurface, ...],
         routed: frozenset[tuple[str, str]],
         excluded_surfaces: tuple[tuple[str, str], ...],
@@ -596,6 +625,13 @@ class LlmRouterAdvisor:
             model=model,
             elapsed_ms=(time.monotonic() - started) * 1000,
         )
+        if overall_status == "ok":
+            if (
+                run_id not in self._agentic_cache
+                and len(self._agentic_cache) >= _AGENTIC_CACHE_LIMIT
+            ):
+                self._agentic_cache.pop(next(iter(self._agentic_cache)))
+            self._agentic_cache[run_id] = (offered, self.last_trace)
         return final_suggestions
 
     def _capability_suggestions(

@@ -509,6 +509,73 @@ class AgenticHypothesisTests(unittest.TestCase):
         )
         self.assertEqual(advisor.last_trace.status, "no_candidates")
 
+    def test_agentic_cache_reuses_review_when_only_blocked_surface_changes(self) -> None:
+        llm = _ExhaustiveLlmClient()
+        executable = _surface("surface-search")
+        blocked = _surface(
+            "surface-dataerasure",
+            url="http://localhost/dataerasure",
+            parameters=(),
+        )
+        advisor = LlmRouterAdvisor(
+            llm_client=llm, analyzers=ANALYZERS, hypothesis_mode=True
+        )
+
+        first = advisor.advise(
+            _run(), (executable, blocked), (), frozenset()
+        )
+        self.assertEqual(len(llm.requests), 1)
+        self.assertEqual(
+            {item.surface_id: item.status for item in advisor.last_trace.capabilities},
+            {"surface-search": "routable", "surface-dataerasure": "blocked"},
+        )
+        observed_blocked = Evidence(
+            evidence_id="evi-dataerasure",
+            run_id="run-1",
+            surface_id="surface-dataerasure",
+            created_by="execution_runtime:http_get",
+            evidence_type="http_response",
+            observation={"status": 500, "content_type": "text/html"},
+        )
+
+        second = advisor.advise(
+            _run(), (executable, blocked), (observed_blocked,), frozenset()
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(llm.requests), 1)
+        self.assertEqual(advisor.last_trace.source, "cache")
+        self.assertEqual(advisor.last_trace.status, "cache_hit")
+        self.assertEqual(advisor.last_trace.llm_calls, 0)
+        self.assertEqual(
+            {item.surface_id: item.status for item in advisor.last_trace.capabilities},
+            {"surface-search": "routable", "surface-dataerasure": "unsupported"},
+        )
+
+    def test_agentic_cache_is_invalidated_when_routable_observation_changes(self) -> None:
+        llm = _ExhaustiveLlmClient()
+        executable = _surface("surface-search")
+        advisor = LlmRouterAdvisor(
+            llm_client=llm, analyzers=ANALYZERS, hypothesis_mode=True
+        )
+        advisor.advise(_run(), (executable,), (), frozenset())
+        observation = Evidence(
+            evidence_id="evi-search",
+            run_id="run-1",
+            surface_id="surface-search",
+            created_by="execution_runtime:http_get",
+            evidence_type="http_response",
+            observation={"status": 200, "content_type": "application/json"},
+        )
+
+        advisor.advise(
+            _run(), (executable,), (observation,), frozenset()
+        )
+
+        self.assertEqual(len(llm.requests), 2)
+        self.assertEqual(advisor.last_trace.source, "llm")
+        self.assertEqual(advisor.last_trace.llm_calls, 1)
+
     def test_non_executable_surface_is_classified_without_llm(self) -> None:
         navigation = _surface(
             "surface-navigation", url="http://localhost/about", parameters=()

@@ -276,6 +276,43 @@ class RoutingAuditTests(unittest.TestCase):
             ],
         )
 
+    def test_agentic_audit_distinguishes_cache_hit_from_llm_call(self):
+        log = _Log()
+        llm = _Llm(
+            {
+                "surface_id": "search", "vulnerability_type": "SQLi",
+                "decision": "route", "basis_observation_ids": [],
+                "reason_code": "query_interpreter_risk",
+                "required_evidence_types": ["server_error_delta"],
+            },
+            {
+                "surface_id": "search", "vulnerability_type": "XSS",
+                "decision": "defer", "basis_observation_ids": [],
+                "reason_code": "insufficient_observation",
+                "required_evidence_types": ["mutated_input_response"],
+            },
+            {
+                "surface_id": "search", "vulnerability_type": "Path Traversal",
+                "decision": "reject", "basis_observation_ids": [],
+                "reason_code": "surface_semantics_not_indicative",
+                "required_evidence_types": [],
+            },
+        )
+        router = standard_router(
+            mode="agentic", llm_client=llm, audit_log=log
+        )
+
+        router.route(_RUN, (_SURFACE,), ())
+        router.route(_RUN, (_SURFACE,), ())
+
+        self.assertEqual(llm.calls, 1)
+        self.assertEqual(log.records[0]["llm"]["source"], "llm")
+        self.assertEqual(log.records[0]["llm"]["calls"], 1)
+        self.assertEqual(log.records[1]["llm"]["source"], "cache")
+        self.assertEqual(log.records[1]["llm"]["status"], "cache_hit")
+        self.assertEqual(log.records[1]["llm"]["calls"], 0)
+        self.assertIsNone(log.records[1]["llm"]["usage"])
+
     def test_agentic_audit_records_non_executable_surface_capability(self):
         log = _Log()
         navigation = replace(
