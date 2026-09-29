@@ -45,8 +45,13 @@ class _Llm:
         self.calls += 1
         if self.error:
             raise self.error
+        key = (
+            "dispositions"
+            if "dispositions" in request.response_schema["properties"]
+            else "suggestions"
+        )
         return LlmResponse(
-            payload={"suggestions": self.items}, model="fixture-model",
+            payload={key: self.items}, model="fixture-model",
             usage=LlmUsage(input_tokens=100, output_tokens=50, cache_read_input_tokens=10),
         )
 
@@ -196,6 +201,7 @@ class RoutingAuditTests(unittest.TestCase):
         log = _Log()
         llm = _Llm({
             "surface_id": "search", "vulnerability_type": "SQLi",
+            "decision": "route",
             "basis_observation_ids": ["not-offered"],
             "reason_code": "query_interpreter_risk",
             "required_evidence_types": ["server_error_delta"],
@@ -216,6 +222,49 @@ class RoutingAuditTests(unittest.TestCase):
         self.assertEqual(record["llm"]["rejected_items"], [
             {"index": 0, "index_scope": "raw_items", "reason": "unknown_observation"}
         ])
+
+    def test_agentic_audit_records_exhaustive_dispositions_and_reject_reason(self):
+        log = _Log()
+        llm = _Llm(
+            {
+                "surface_id": "search", "vulnerability_type": "SQLi",
+                "decision": "route", "basis_observation_ids": [],
+                "reason_code": "query_interpreter_risk",
+                "required_evidence_types": ["server_error_delta"],
+            },
+            {
+                "surface_id": "search", "vulnerability_type": "XSS",
+                "decision": "defer", "basis_observation_ids": [],
+                "reason_code": "insufficient_observation",
+                "required_evidence_types": ["mutated_input_response"],
+            },
+            {
+                "surface_id": "search", "vulnerability_type": "Path Traversal",
+                "decision": "reject", "basis_observation_ids": [],
+                "reason_code": "surface_semantics_not_indicative",
+                "required_evidence_types": [],
+            },
+        )
+
+        result = standard_router(
+            mode="agentic", llm_client=llm, audit_log=log
+        ).route(_RUN, (_SURFACE,), ())
+
+        record = log.records[0]
+        self.assertEqual([item.candidate.vulnerability_type for item in result], ["SQLi"])
+        self.assertEqual(record["llm"]["offered_pair_count"], 3)
+        self.assertEqual(record["llm"]["disposition_counts"], {
+            "route": 1, "defer": 1, "reject": 1, "unanswered": 0,
+        })
+        self.assertEqual(
+            [(item["vulnerability_type"], item["decision"], item["reason_code"])
+             for item in record["llm"]["dispositions"]],
+            [
+                ("Path Traversal", "reject", "surface_semantics_not_indicative"),
+                ("SQLi", "route", "query_interpreter_risk"),
+                ("XSS", "defer", "insufficient_observation"),
+            ],
+        )
 
     def test_unexpected_exception_preserves_rules_and_is_logged(self):
         log = _Log()

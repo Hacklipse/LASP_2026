@@ -1,9 +1,10 @@
-"""규칙이 분류하지 못한 Surface만 LLM으로 해석해 라우팅 제안을 만드는 Advisor.
+"""Surface를 LLM으로 해석해 라우팅 제안과 전수 판정 trace를 만드는 Advisor.
 
 역할은 구조적으로 분리한다.
 
     Rule    설명 가능한 Observation·Surface 규칙으로 Candidate를 만든다 (routing.py, 결정적)
-    LLM     그 규칙이 비워 둔 자리에 한해 "이 표면은 어떤 유형으로 볼 만한가"만 제안 (이 파일)
+    Hybrid  규칙이 비워 둔 자리에 한해 조사할 유형을 제안
+    Agentic 호환 가능한 모든 Surface/유형 조합을 route/defer/reject로 판정
 
 LLM은 Candidate를 만들지 않고, 담당 Agent도 고르지 않는다. 고르는 것은 이미 존재하는
 ``surface_id``와 취약점 유형 두 가지뿐이며, ``agent_type`` 해석은 표면 모양(fragment 여부)을
@@ -47,6 +48,8 @@ from .llm_parameter_names import alias_parameter_names
 from .routing import (
     CANDIDATE_EVIDENCE_TYPES,
     CANDIDATE_REASON_CODES,
+    ROUTER_DEFER_REASON_CODES,
+    ROUTER_REJECT_REASON_CODES,
     RouteSuggestion,
     _supports_suggestion,
 )
@@ -55,9 +58,8 @@ from .routing import (
 # 만든 컴포넌트가 무엇인가"는 항상 이 값으로 고정한다.
 ROUTER_ADVISOR = "llm_router_advisor"
 
-# 한 Run에서 LLM에게 보여 줄 Surface 상한. Juice Shop 실측 Surface가 140개라 전부 실으면
-# 프롬프트가 비대해지고 비용이 표면 수에 비례해 늘어난다. Router는 Run당 한 번만 부르므로
-# 이 상한이 곧 이 기능의 비용 상한이다.
+# 한 호출에서 LLM에게 보여 줄 Surface 상한. Hybrid에서는 전체 비용 상한이고,
+# Agentic exhaustive에서는 모든 호환 Surface를 보되 이 크기로 나누는 batch 상한이다.
 DEFAULT_MAX_SURFACES = 40
 
 _NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,63}$")
@@ -87,20 +89,28 @@ _SUGGESTION_SCHEMA = {
 _AGENTIC_HYPOTHESIS_SCHEMA = {
     "type": "object",
     "properties": {
-        "suggestions": {
+        "dispositions": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
                     "surface_id": {"type": "string"},
                     "vulnerability_type": {"type": "string"},
+                    "decision": {
+                        "type": "string",
+                        "enum": ["route", "defer", "reject"],
+                    },
                     "basis_observation_ids": {
                         "type": "array",
                         "items": {"type": "string"},
                     },
                     "reason_code": {
                         "type": "string",
-                        "enum": sorted(CANDIDATE_REASON_CODES),
+                        "enum": sorted(
+                            CANDIDATE_REASON_CODES
+                            | ROUTER_DEFER_REASON_CODES
+                            | ROUTER_REJECT_REASON_CODES
+                        ),
                     },
                     "required_evidence_types": {
                         "type": "array",
@@ -113,6 +123,7 @@ _AGENTIC_HYPOTHESIS_SCHEMA = {
                 "required": [
                     "surface_id",
                     "vulnerability_type",
+                    "decision",
                     "basis_observation_ids",
                     "reason_code",
                     "required_evidence_types",
@@ -121,7 +132,7 @@ _AGENTIC_HYPOTHESIS_SCHEMA = {
             },
         }
     },
-    "required": ["suggestions"],
+    "required": ["dispositions"],
     "additionalProperties": False,
 }
 
@@ -139,23 +150,26 @@ _SYSTEM = (
 )
 
 _AGENTIC_SYSTEM = (
-    "You form candidate hypotheses for one authorized security assessment from only "
-    "the structured surfaces and observations offered to you. Do not assume a known "
+    "You exhaustively review candidate hypotheses for one authorized security assessment "
+    "from only the structured surfaces and observations offered to you. Do not assume a known "
     "vulnerable endpoint, target-specific payload, expected finding, or ground truth. "
-    "For each hypothesis, copy one offered surface_id, one allowed vulnerability type, "
+    "Return exactly one disposition for every surface_id and allowed vulnerability type "
+    "pair offered to you; never omit a pair. For each disposition, copy one offered "
+    "surface_id, one allowed vulnerability type, choose decision=route, defer, or reject, "
     "zero or more short observation ref values (e.g. o1), not their kind labels, "
     "belonging to that surface in basis_observation_ids, "
-    "one offered reason code, "
-    "and the generic evidence types needed to test the hypothesis. Select only hypotheses "
-    "worth spending analysis budget on. A parameterized server-side route can justify a "
+    "one reason code valid for that decision, and the generic evidence types needed to "
+    "test route or defer. Use an empty required_evidence_types list for reject. "
+    "Use route for hypotheses worth immediate analysis, defer when more observation is "
+    "needed, and reject when the supplied structure or observations do not support the "
+    "hypothesis. A parameterized server-side route can justify a "
     "testable, low-confidence hypothesis from its path and input names even before an HTTP "
     "response has been observed; review server and client routes independently rather than "
     "stopping after one plausible hypothesis. If a surface has observation_refs=[(none)], "
     "use basis_observation_ids=[]; never borrow a ref from another surface. "
-    "Never invent an endpoint, parameter, observation "
+    "Never invent or omit an endpoint, parameter, observation "
     "ref, vulnerability type, reason code, evidence type, payload, or credential. Return "
-    "an empty list only when neither the surface structure nor observations justify a "
-    "bounded probe."
+    "an empty dispositions list only when no surface/type pair was offered."
 )
 
 
@@ -190,12 +204,33 @@ class _OfferedSurface:
 
 
 @dataclass(frozen=True, slots=True)
+class RouterDisposition:
+    """Agentic Router가 호환 가능한 Surface/유형 조합 하나에 내린 판단.
+
+    route만 ``RouteSuggestion``으로 변환된다. 나머지는 Analysis 입력이 아니라 감사와
+    후속 오판 분석을 위한 Control Plane 기록이다. 모델이 항목을 누락하거나 계약을
+    위반하면 코드가 ``unanswered``를 합성해 조용한 탈락을 막는다.
+    """
+
+    surface_id: str
+    vulnerability_type: str
+    agent_type: str
+    decision: Literal["route", "defer", "reject", "unanswered"]
+    reason_code: str
+    basis_evidence_ids: tuple[str, ...] = ()
+    required_evidence_types: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class RouterAdvisorTrace:
     """감사 로그가 원문 prompt/응답 없이 읽는 마지막 호출의 계측 결과."""
 
     suggestions: tuple[RouteSuggestion, ...] = ()
+    dispositions: tuple[RouterDisposition, ...] = ()
     rejected_items: tuple[tuple[int, str], ...] = ()
     offered_surface_ids: tuple[str, ...] = ()
+    offered_pair_count: int = 0
+    excluded_surfaces: tuple[tuple[str, str], ...] = ()
     source: Literal["llm", "deterministic_fallback", "skipped"] = "skipped"
     status: str = "not_called"
     llm_calls: int = 0
@@ -206,9 +241,10 @@ class RouterAdvisorTrace:
 
 
 class LlmRouterAdvisor:
-    """LLM 제안을 검증해 ``RouteSuggestion``으로만 돌려주는 ``RouterAdvisor`` 구현.
+    """LLM 판단을 검증해 route만 ``RouteSuggestion``으로 돌려주는 구현.
 
-    Store에 쓰지 않고, Candidate를 만들지 않으며, 외부 요청도 하지 않는다.
+    defer/reject/unanswered는 trace에만 남는다. Store에 쓰거나 Candidate를 만들지 않고,
+    Router 단계에서 대상 HTTP 요청이나 Analysis Agent도 호출하지 않는다.
     """
 
     def __init__(
@@ -220,6 +256,8 @@ class LlmRouterAdvisor:
         timeout_seconds: float = 60.0,
         hypothesis_mode: bool = False,
     ) -> None:
+        if max_surfaces <= 0:
+            raise ValueError("router advisor batch size must be positive")
         self._llm = llm_client
         self._analyzers = tuple(analyzers)
         self._max_surfaces = max_surfaces
@@ -234,15 +272,21 @@ class LlmRouterAdvisor:
         evidence: Sequence[Evidence],
         routed: frozenset[tuple[str, str]],
     ) -> Sequence[RouteSuggestion]:
-        offered = self._offer(run, surfaces, evidence, routed)
+        offered, excluded_surfaces = self._offer(run, surfaces, evidence, routed)
+        offered_pair_count = sum(len(item.allowed_types) for item in offered)
         if not offered or not self._analyzers:
             # 보여 줄 표면이 없거나 제안 가능한 유형이 없다는 사실은 결정적이다.
             # LLM을 부를 이유가 없다.
             self.last_trace = RouterAdvisorTrace(
                 offered_surface_ids=tuple(item.surface_id for item in offered),
+                offered_pair_count=offered_pair_count,
+                excluded_surfaces=excluded_surfaces,
                 status="no_candidates" if not offered else "no_routes",
             )
             return ()
+
+        if self._hypothesis_mode:
+            return self._advise_exhaustive(offered, routed, excluded_surfaces)
 
         started = time.monotonic()
         try:
@@ -276,6 +320,8 @@ class LlmRouterAdvisor:
             }.get(type(error), "llm_error")
             self.last_trace = RouterAdvisorTrace(
                 offered_surface_ids=tuple(item.surface_id for item in offered),
+                offered_pair_count=offered_pair_count,
+                excluded_surfaces=excluded_surfaces,
                 source="deterministic_fallback",
                 status=status,
                 llm_calls=1,
@@ -288,6 +334,8 @@ class LlmRouterAdvisor:
             suggestions=suggestions,
             rejected_items=rejected,
             offered_surface_ids=tuple(item.surface_id for item in offered),
+            offered_pair_count=offered_pair_count,
+            excluded_surfaces=excluded_surfaces,
             source=(
                 "deterministic_fallback"
                 if status in {"invalid_response", "all_rejected"}
@@ -302,6 +350,122 @@ class LlmRouterAdvisor:
         )
         return suggestions
 
+    def _advise_exhaustive(
+        self,
+        offered: tuple[_OfferedSurface, ...],
+        routed: frozenset[tuple[str, str]],
+        excluded_surfaces: tuple[tuple[str, str], ...],
+    ) -> tuple[RouteSuggestion, ...]:
+        """Agentic mode에서 모든 호환 조합을 batch별로 빠짐없이 판정한다."""
+
+        started = time.monotonic()
+        batches = tuple(
+            offered[index : index + self._max_surfaces]
+            for index in range(0, len(offered), self._max_surfaces)
+        )
+        suggestions: list[RouteSuggestion] = []
+        dispositions: list[RouterDisposition] = []
+        rejected_items: list[tuple[int, str]] = []
+        statuses: list[str] = []
+        usage = LlmUsage()
+        model = ""
+        calls = 0
+        raw_index_offset = 0
+
+        for batch_index, batch in enumerate(batches):
+            calls += 1
+            try:
+                response = self._llm.complete(
+                    LlmRequest(
+                        messages=(LlmMessage(role="user", content=self._prompt(batch)),),
+                        system=_AGENTIC_SYSTEM,
+                        response_schema=_AGENTIC_HYPOTHESIS_SCHEMA,
+                        max_output_tokens=8192,
+                        timeout_seconds=self._timeout_seconds,
+                    )
+                )
+            except (LlmTimeout, LlmTransportError, LlmResponseFormatError, LlmRefused) as error:
+                status = {
+                    LlmTimeout: "timeout",
+                    LlmResponseFormatError: "invalid_response",
+                    LlmRefused: "refused",
+                    LlmTransportError: "transport_error",
+                }.get(type(error), "llm_error")
+                for remaining in batches[batch_index:]:
+                    dispositions.extend(
+                        self._unanswered_dispositions(remaining, status)
+                    )
+                self.last_trace = RouterAdvisorTrace(
+                    suggestions=tuple(suggestions),
+                    dispositions=tuple(dispositions),
+                    rejected_items=tuple(rejected_items),
+                    offered_surface_ids=tuple(item.surface_id for item in offered),
+                    offered_pair_count=sum(len(item.allowed_types) for item in offered),
+                    excluded_surfaces=excluded_surfaces,
+                    source="deterministic_fallback",
+                    status=status,
+                    llm_calls=calls,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                )
+                return ()
+
+            batch_dispositions, batch_suggestions, rejected, status = (
+                self._parse_dispositions(response.payload, batch, routed)
+            )
+            dispositions.extend(batch_dispositions)
+            suggestions.extend(batch_suggestions)
+            rejected_items.extend(
+                (raw_index_offset + index, reason) for index, reason in rejected
+            )
+            raw = response.payload.get("dispositions")
+            raw_index_offset += max(
+                len(raw) if isinstance(raw, list) else 0,
+                sum(len(item.allowed_types) for item in batch),
+            )
+            statuses.append(status)
+            usage = _add_usage(usage, response.usage)
+            model = model or response.model
+
+            if status in {"invalid_response", "all_rejected"}:
+                for remaining in batches[batch_index + 1 :]:
+                    dispositions.extend(
+                        self._unanswered_dispositions(remaining, status)
+                    )
+                self.last_trace = RouterAdvisorTrace(
+                    suggestions=tuple(suggestions),
+                    dispositions=tuple(dispositions),
+                    rejected_items=tuple(rejected_items),
+                    offered_surface_ids=tuple(item.surface_id for item in offered),
+                    offered_pair_count=sum(len(item.allowed_types) for item in offered),
+                    excluded_surfaces=excluded_surfaces,
+                    source="deterministic_fallback",
+                    status=status,
+                    llm_calls=calls,
+                    usage=usage,
+                    usage_available=True,
+                    model=model,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                )
+                return ()
+
+        overall_status = "partial" if "partial" in statuses else "ok"
+        self.last_trace = RouterAdvisorTrace(
+            suggestions=tuple(suggestions),
+            dispositions=tuple(dispositions),
+            rejected_items=tuple(rejected_items),
+            offered_surface_ids=tuple(item.surface_id for item in offered),
+            offered_pair_count=sum(len(item.allowed_types) for item in offered),
+            excluded_surfaces=excluded_surfaces,
+            source="llm",
+            status=overall_status,
+            llm_calls=calls,
+            usage=usage,
+            usage_available=True,
+            model=model,
+            elapsed_ms=(time.monotonic() - started) * 1000,
+        )
+        return tuple(suggestions)
+
     # ------------------------------------------------------------------
     # 제안 대상 선정
     # ------------------------------------------------------------------
@@ -312,24 +476,27 @@ class LlmRouterAdvisor:
         surfaces: Sequence[Surface],
         evidence: Sequence[Evidence],
         routed: frozenset[tuple[str, str]],
-    ) -> tuple[_OfferedSurface, ...]:
-        """규칙이 다 채우지 못한 Surface만 골라 안전한 메타데이터로 바꾼다."""
+    ) -> tuple[tuple[_OfferedSurface, ...], tuple[tuple[str, str], ...]]:
+        """실행 호환 Surface를 고르고 제외된 모든 Surface에도 이유를 부여한다."""
 
         observations = self._observations_by_surface(run, evidence)
         observation_records = self._observation_records_by_surface(run, evidence)
         offered: list[_OfferedSurface] = []
+        excluded: list[tuple[str, str]] = []
         for surface in surfaces:
             if surface.run_id != run.run_id:
+                excluded.append((surface.surface_id, "foreign_run"))
                 continue
             # 상태를 바꾸는 폼은 규칙이 후보로 만들지 않는다. LLM에게 물어볼 대상도 아니다.
             if has_state_changing_parameters(surface.parameters):
+                excluded.append((surface.surface_id, "state_changing_surface"))
                 continue
             parameter_names = alias_parameter_names(surface.parameters).prompt_names
             parsed = urlsplit(surface.url)
             client_route = bool(parsed.fragment)
             # 후속 Analyzer의 메서드·파라미터·POST 안전 계약을 실제로 통과할 수 있는
-            # 유형만 LLM에 제시한다. 응답을 받은 뒤 버릴 항목이 40개 상한을 차지하면
-            # 실행 가능한 Surface가 입력에서 밀려날 수 있다.
+            # 유형만 LLM에 제시한다. 구조적으로 실행 불가능한 조합은 LLM 판단 대상이
+            # 아니라 코드가 설명 가능한 제외 사유를 남기는 대상이다.
             assignable = {
                 choice.vulnerability_type
                 for choice in self._analyzers
@@ -352,6 +519,10 @@ class LlmRouterAdvisor:
             allowed_types = tuple(sorted(assignable - covered))
             if not allowed_types:
                 # 배정 가능한 유형을 규칙이 이미 전부 채웠다. 물어볼 것이 없다.
+                excluded.append((
+                    surface.surface_id,
+                    "already_covered" if assignable else "no_compatible_route",
+                ))
                 continue
             offered.append(
                 _OfferedSurface(
@@ -384,7 +555,14 @@ class LlmRouterAdvisor:
                 item.allowed_types,
             )
         )
-        return tuple(offered[: self._max_surfaces])
+        # Hybrid에서는 기존 비용 상한을 유지한다. Agentic exhaustive에서는 같은 값을
+        # 탈락 상한이 아니라 batch 크기로 사용하므로 모든 호환 Surface를 반환한다.
+        selected = offered if self._hypothesis_mode else offered[: self._max_surfaces]
+        excluded.extend(
+            (item.surface_id, "prompt_limit")
+            for item in offered[len(selected) :]
+        )
+        return tuple(selected), tuple(excluded)
 
     @staticmethod
     def _observations_by_surface(
@@ -497,11 +675,16 @@ class LlmRouterAdvisor:
         if self._hypothesis_mode:
             lines.extend(
                 [
-                    "Reason codes: " + ", ".join(sorted(CANDIDATE_REASON_CODES)),
+                    "Route reason codes: "
+                    + ", ".join(sorted(CANDIDATE_REASON_CODES)),
+                    "Defer reason codes: "
+                    + ", ".join(sorted(ROUTER_DEFER_REASON_CODES)),
+                    "Reject reason codes: "
+                    + ", ".join(sorted(ROUTER_REJECT_REASON_CODES)),
                     "Evidence types: "
                     + ", ".join(sorted(CANDIDATE_EVIDENCE_TYPES)),
-                    "Form only hypotheses justified by these observations and identify "
-                    "the generic evidence needed to test each one.",
+                    "Return one disposition for every allowed_types entry on every "
+                    "surface. Do not treat an omitted item as rejection.",
                 ]
             )
         else:
@@ -615,6 +798,190 @@ class LlmRouterAdvisor:
         status = "all_rejected" if raw and not accepted else "partial" if rejected else "ok"
         return tuple(accepted), tuple(rejected), status
 
+    def _parse_dispositions(
+        self,
+        payload: object,
+        offered: tuple[_OfferedSurface, ...],
+        routed: frozenset[tuple[str, str]],
+    ) -> tuple[
+        tuple[RouterDisposition, ...],
+        tuple[RouteSuggestion, ...],
+        tuple[tuple[int, str], ...],
+        str,
+    ]:
+        """모든 호환 조합을 판정하고 빠진 조합은 ``unanswered``로 합성한다."""
+
+        expected: list[tuple[str, str]] = []
+        expected_items: dict[tuple[str, str], tuple[_OfferedSurface, str]] = {}
+        for surface in offered:
+            for vulnerability_type in surface.allowed_types:
+                agent_type = self._resolve_agent(
+                    vulnerability_type, surface.client_route
+                )
+                if agent_type is None:
+                    continue
+                key = (surface.surface_id, vulnerability_type)
+                expected.append(key)
+                expected_items[key] = (surface, agent_type)
+
+        if not isinstance(payload, dict):
+            return (
+                self._unanswered_dispositions(offered, "invalid_response"),
+                (),
+                (),
+                "invalid_response",
+            )
+        raw = payload.get("dispositions")
+        if not isinstance(raw, list):
+            return (
+                self._unanswered_dispositions(offered, "invalid_response"),
+                (),
+                (),
+                "invalid_response",
+            )
+
+        valid: dict[tuple[str, str], RouterDisposition] = {}
+        invalid_expected: set[tuple[str, str]] = set()
+        rejected: list[tuple[int, str]] = []
+        for index, entry in enumerate(raw):
+            if not isinstance(entry, dict):
+                rejected.append((index, "invalid_item"))
+                continue
+            surface_id = entry.get("surface_id")
+            vulnerability_type = entry.get("vulnerability_type")
+            if not isinstance(surface_id, str) or not isinstance(
+                vulnerability_type, str
+            ):
+                rejected.append((index, "invalid_item"))
+                continue
+            key = (surface_id, vulnerability_type)
+            item = expected_items.get(key)
+            if item is None:
+                rejected.append(
+                    (index, "duplicate_or_covered" if key in routed else "unsupported_route")
+                )
+                continue
+            if key in valid:
+                rejected.append((index, "duplicate_or_covered"))
+                continue
+
+            surface, agent_type = item
+            decision = entry.get("decision")
+            raw_basis = entry.get("basis_observation_ids")
+            reason_code = entry.get("reason_code")
+            raw_required = entry.get("required_evidence_types")
+            valid_reason = (
+                decision == "route" and reason_code in CANDIDATE_REASON_CODES
+                or decision == "defer" and reason_code in ROUTER_DEFER_REASON_CODES
+                or decision == "reject" and reason_code in ROUTER_REJECT_REASON_CODES
+            )
+            if (
+                decision not in {"route", "defer", "reject"}
+                or not isinstance(raw_basis, list)
+                or any(not isinstance(value, str) for value in raw_basis)
+                or len(set(raw_basis)) != len(raw_basis)
+                or not isinstance(reason_code, str)
+                or not valid_reason
+                or not isinstance(raw_required, list)
+                or any(not isinstance(value, str) for value in raw_required)
+                or len(set(raw_required)) != len(raw_required)
+                or any(
+                    value not in CANDIDATE_EVIDENCE_TYPES
+                    for value in raw_required
+                )
+                or (decision == "reject" and raw_required)
+            ):
+                rejected.append((index, "invalid_disposition_contract"))
+                invalid_expected.add(key)
+                continue
+
+            allowed_observations = {
+                ref: evidence_id for ref, evidence_id, _ in surface.observations
+            }
+            if any(value not in allowed_observations for value in raw_basis):
+                rejected.append((index, "unknown_observation"))
+                invalid_expected.add(key)
+                continue
+            valid[key] = RouterDisposition(
+                surface_id=surface_id,
+                vulnerability_type=vulnerability_type,
+                agent_type=agent_type,
+                decision=decision,
+                reason_code=reason_code,
+                basis_evidence_ids=tuple(
+                    allowed_observations[value] for value in raw_basis
+                ),
+                required_evidence_types=tuple(raw_required),
+            )
+
+        dispositions: list[RouterDisposition] = []
+        suggestions: list[RouteSuggestion] = []
+        for key in expected:
+            disposition = valid.get(key)
+            if disposition is None:
+                surface, agent_type = expected_items[key]
+                disposition = RouterDisposition(
+                    surface_id=surface.surface_id,
+                    vulnerability_type=key[1],
+                    agent_type=agent_type,
+                    decision="unanswered",
+                    reason_code=(
+                        "invalid_disposition"
+                        if key in invalid_expected
+                        else "missing_disposition"
+                    ),
+                )
+            dispositions.append(disposition)
+            if disposition.decision == "route":
+                suggestions.append(
+                    RouteSuggestion(
+                        surface_id=disposition.surface_id,
+                        vulnerability_type=disposition.vulnerability_type,
+                        agent_type=disposition.agent_type,
+                        reason=disposition.reason_code,
+                        basis_evidence_ids=disposition.basis_evidence_ids,
+                        reason_code=disposition.reason_code,
+                        required_evidence_types=(
+                            disposition.required_evidence_types
+                        ),
+                    )
+                )
+
+        if expected and not valid:
+            status = "all_rejected"
+        elif rejected or len(valid) != len(expected):
+            status = "partial"
+        else:
+            status = "ok"
+        return (
+            tuple(dispositions),
+            tuple(suggestions),
+            tuple(rejected),
+            status,
+        )
+
+    def _unanswered_dispositions(
+        self, offered: tuple[_OfferedSurface, ...], reason_code: str
+    ) -> tuple[RouterDisposition, ...]:
+        values: list[RouterDisposition] = []
+        for surface in offered:
+            for vulnerability_type in surface.allowed_types:
+                agent_type = self._resolve_agent(
+                    vulnerability_type, surface.client_route
+                )
+                if agent_type is None:
+                    continue
+                values.append(
+                    RouterDisposition(
+                        surface_id=surface.surface_id,
+                        vulnerability_type=vulnerability_type,
+                        agent_type=agent_type,
+                        decision="unanswered",
+                        reason_code=reason_code,
+                    )
+                )
+        return tuple(values)
+
     def _resolve_agent(self, vulnerability_type: str, client_route: bool) -> str | None:
         """유형과 표면 모양으로 담당 Agent를 결정한다. LLM은 이 선택에 관여하지 않는다.
 
@@ -666,4 +1033,19 @@ def _path_hint(path: str) -> str:
     return "/".join(
         segment if not segment or _PATH_SEGMENT.fullmatch(segment) else "{value}"
         for segment in path.split("/")
+    )
+
+
+def _add_usage(left: LlmUsage, right: LlmUsage) -> LlmUsage:
+    """여러 exhaustive batch의 공급자 사용량을 한 trace로 합친다."""
+
+    return LlmUsage(
+        input_tokens=left.input_tokens + right.input_tokens,
+        output_tokens=left.output_tokens + right.output_tokens,
+        cache_read_input_tokens=(
+            left.cache_read_input_tokens + right.cache_read_input_tokens
+        ),
+        cache_creation_input_tokens=(
+            left.cache_creation_input_tokens + right.cache_creation_input_tokens
+        ),
     )

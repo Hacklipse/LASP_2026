@@ -103,6 +103,9 @@ class AuditedVulnerabilityRouter:
             )
             advisor = getattr(routed, "_advisor", None) if routed else None
             advisor_trace = getattr(advisor, "last_trace", None)
+            excluded_surfaces = dict(
+                advisor_trace.excluded_surfaces if advisor_trace else ()
+            )
             router_advisor_status = (
                 routed.last_advisor_status if routed else "not_configured"
             )
@@ -161,7 +164,11 @@ class AuditedVulnerabilityRouter:
                             "advisor_review"
                             if advisor_trace
                             and surface.surface_id in advisor_trace.offered_surface_ids
-                            else "heuristic_mode" if advisor is None else "not_offered"
+                            else "heuristic_mode"
+                            if advisor is None
+                            else excluded_surfaces.get(
+                                surface.surface_id, "not_offered"
+                            )
                         ),
                         "selected": bool(
                             advisor_trace
@@ -202,6 +209,34 @@ class AuditedVulnerabilityRouter:
                     ),
                     "model": _text(advisor_trace.model) if advisor_trace else "",
                     "elapsed_ms": advisor_trace.elapsed_ms if advisor_trace else None,
+                    "offered_pair_count": (
+                        advisor_trace.offered_pair_count if advisor_trace else 0
+                    ),
+                    "disposition_counts": {
+                        decision: sum(
+                            item.decision == decision
+                            for item in (
+                                advisor_trace.dispositions if advisor_trace else ()
+                            )
+                        )
+                        for decision in ("route", "defer", "reject", "unanswered")
+                    },
+                    "dispositions": [
+                        {
+                            "surface_id": item.surface_id,
+                            "vulnerability_type": item.vulnerability_type,
+                            "agent_type": item.agent_type,
+                            "decision": item.decision,
+                            "reason_code": item.reason_code,
+                            "basis_evidence_ids": list(item.basis_evidence_ids),
+                            "required_evidence_types": list(
+                                item.required_evidence_types
+                            ),
+                        }
+                        for item in (
+                            advisor_trace.dispositions if advisor_trace else ()
+                        )
+                    ],
                     "rejected_items": [
                         {"index": index, "index_scope": "raw_items", "reason": reason}
                         for index, reason in (

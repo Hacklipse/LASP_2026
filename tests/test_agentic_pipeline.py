@@ -20,15 +20,16 @@ class _Model:
 
     def complete(self, request):
         properties = request.response_schema["properties"]
-        if "suggestions" in properties:
+        if "dispositions" in properties:
             self.roles.append("router")
             surface_id = re.search(
                 r"surface_id=(\S+) method=GET path=/search ",
                 request.messages[0].content,
             ).group(1)
-            payload = {"suggestions": [{
+            payload = {"dispositions": [{
                 "surface_id": surface_id,
                 "vulnerability_type": "SQLi",
+                "decision": "route",
                 "basis_observation_ids": [],
                 "reason_code": "query_interpreter_risk",
                 "required_evidence_types": [

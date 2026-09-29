@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import unittest
 from dataclasses import replace
 
@@ -48,6 +49,32 @@ class _RaisingLlmClient:
     def complete(self, request):
         self.requests.append(request)
         raise self._error
+
+
+class _ExhaustiveLlmClient:
+    """각 batch에 실제로 제시된 모든 조합을 명시적으로 reject한다."""
+
+    def __init__(self) -> None:
+        self.requests: list = []
+
+    def complete(self, request):
+        self.requests.append(request)
+        dispositions = []
+        for line in request.messages[0].content.splitlines():
+            if not line.startswith("- surface_id="):
+                continue
+            surface_id = re.search(r"surface_id=(\S+)", line).group(1)
+            allowed = re.search(r"allowed_types=\[([^]]+)\]", line).group(1)
+            for vulnerability_type in allowed.split(", "):
+                dispositions.append({
+                    "surface_id": surface_id,
+                    "vulnerability_type": vulnerability_type,
+                    "decision": "reject",
+                    "basis_observation_ids": [],
+                    "reason_code": "surface_semantics_not_indicative",
+                    "required_evidence_types": [],
+                })
+        return LlmResponse(payload={"dispositions": dispositions}, model="fixture")
 
 
 def _run() -> Run:
@@ -166,10 +193,11 @@ class AgenticHypothesisTests(unittest.TestCase):
     def test_returns_observation_grounded_hypothesis_contract(self) -> None:
         llm = _FakeLlmClient(
             {
-                "suggestions": [
+                "dispositions": [
                     {
                         "surface_id": "surface-import",
                         "vulnerability_type": "SQLi",
+                        "decision": "route",
                         "basis_observation_ids": ["o1"],
                         "reason_code": "query_interpreter_risk",
                         "required_evidence_types": [
@@ -224,10 +252,11 @@ class AgenticHypothesisTests(unittest.TestCase):
         self.assertIn("review server and client routes independently", request.system)
 
     def test_observation_refs_are_local_to_each_surface_and_run(self) -> None:
-        llm = _FakeLlmClient({"suggestions": [
+        llm = _FakeLlmClient({"dispositions": [
             {
                 "surface_id": surface_id,
                 "vulnerability_type": "SQLi",
+                "decision": "route",
                 "basis_observation_ids": ["o1"],
                 "reason_code": "query_interpreter_risk",
                 "required_evidence_types": ["server_error_delta"],
@@ -261,10 +290,11 @@ class AgenticHypothesisTests(unittest.TestCase):
     def test_rejects_observation_id_from_outside_the_offered_surface(self) -> None:
         llm = _FakeLlmClient(
             {
-                "suggestions": [
+                "dispositions": [
                     {
                         "surface_id": "surface-import",
                         "vulnerability_type": "SQLi",
+                        "decision": "route",
                         "basis_observation_ids": ["evi-foreign"],
                         "reason_code": "query_interpreter_risk",
                         "required_evidence_types": ["server_error_delta"],
@@ -289,8 +319,8 @@ class AgenticHypothesisTests(unittest.TestCase):
             ((0, "unknown_observation"),),
         )
 
-    def test_valid_empty_hypothesis_list_is_not_a_fallback(self) -> None:
-        llm = _FakeLlmClient({"suggestions": []})
+    def test_empty_dispositions_are_visible_as_unanswered_and_fallback(self) -> None:
+        llm = _FakeLlmClient({"dispositions": []})
         advisor = LlmRouterAdvisor(
             llm_client=llm,
             analyzers=ANALYZERS,
@@ -301,7 +331,118 @@ class AgenticHypothesisTests(unittest.TestCase):
             advisor.advise(_run(), (_surface(),), (), frozenset()),
             (),
         )
-        self.assertEqual(advisor.last_trace.source, "llm")
+        self.assertEqual(advisor.last_trace.source, "deterministic_fallback")
+        self.assertEqual(advisor.last_trace.status, "all_rejected")
+        self.assertTrue(advisor.last_trace.dispositions)
+        self.assertEqual(
+            {item.decision for item in advisor.last_trace.dispositions},
+            {"unanswered"},
+        )
+        self.assertEqual(
+            {item.reason_code for item in advisor.last_trace.dispositions},
+            {"missing_disposition"},
+        )
+
+    def test_route_defer_and_reject_are_recorded_but_only_route_is_returned(self) -> None:
+        llm = _FakeLlmClient({"dispositions": [
+            {
+                "surface_id": "surface-import",
+                "vulnerability_type": "SQLi",
+                "decision": "route",
+                "basis_observation_ids": [],
+                "reason_code": "query_interpreter_risk",
+                "required_evidence_types": ["server_error_delta"],
+            },
+            {
+                "surface_id": "surface-import",
+                "vulnerability_type": "XSS",
+                "decision": "defer",
+                "basis_observation_ids": [],
+                "reason_code": "insufficient_observation",
+                "required_evidence_types": ["mutated_input_response"],
+            },
+            {
+                "surface_id": "surface-import",
+                "vulnerability_type": "Path Traversal",
+                "decision": "reject",
+                "basis_observation_ids": [],
+                "reason_code": "surface_semantics_not_indicative",
+                "required_evidence_types": [],
+            },
+        ]})
+        advisor = LlmRouterAdvisor(
+            llm_client=llm, analyzers=ANALYZERS, hypothesis_mode=True
+        )
+
+        suggestions = advisor.advise(_run(), (_surface(),), (), frozenset())
+
+        self.assertEqual(
+            [(item.vulnerability_type, item.reason_code) for item in suggestions],
+            [("SQLi", "query_interpreter_risk")],
+        )
+        self.assertEqual(
+            [(item.vulnerability_type, item.decision, item.reason_code)
+             for item in advisor.last_trace.dispositions],
+            [
+                ("Path Traversal", "reject", "surface_semantics_not_indicative"),
+                ("SQLi", "route", "query_interpreter_risk"),
+                ("XSS", "defer", "insufficient_observation"),
+            ],
+        )
+        self.assertEqual(advisor.last_trace.offered_pair_count, 3)
+
+    def test_missing_pair_is_unanswered_instead_of_silent_rejection(self) -> None:
+        llm = _FakeLlmClient({"dispositions": [{
+            "surface_id": "surface-import",
+            "vulnerability_type": "SQLi",
+            "decision": "route",
+            "basis_observation_ids": [],
+            "reason_code": "query_interpreter_risk",
+            "required_evidence_types": ["server_error_delta"],
+        }]})
+        advisor = LlmRouterAdvisor(
+            llm_client=llm, analyzers=ANALYZERS, hypothesis_mode=True
+        )
+
+        suggestions = advisor.advise(_run(), (_surface(),), (), frozenset())
+
+        self.assertEqual(len(suggestions), 1)
+        unanswered = [
+            item for item in advisor.last_trace.dispositions
+            if item.decision == "unanswered"
+        ]
+        self.assertEqual(
+            {item.vulnerability_type for item in unanswered},
+            {"Path Traversal", "XSS"},
+        )
+        self.assertEqual(
+            {item.reason_code for item in unanswered}, {"missing_disposition"}
+        )
+        self.assertEqual(advisor.last_trace.status, "partial")
+
+    def test_agentic_batches_cover_every_compatible_surface_without_cap_loss(self) -> None:
+        llm = _ExhaustiveLlmClient()
+        surfaces = tuple(_surface(f"surface-{index}") for index in range(5))
+        advisor = LlmRouterAdvisor(
+            llm_client=llm,
+            analyzers=ANALYZERS,
+            hypothesis_mode=True,
+            max_surfaces=2,
+        )
+
+        suggestions = advisor.advise(_run(), surfaces, (), frozenset())
+
+        self.assertEqual(suggestions, ())
+        self.assertEqual(len(llm.requests), 3)
+        self.assertEqual(advisor.last_trace.offered_pair_count, 15)
+        self.assertEqual(len(advisor.last_trace.dispositions), 15)
+        self.assertEqual(
+            {item.surface_id for item in advisor.last_trace.dispositions},
+            {f"surface-{index}" for index in range(5)},
+        )
+        self.assertEqual(
+            {item.decision for item in advisor.last_trace.dispositions}, {"reject"}
+        )
         self.assertEqual(advisor.last_trace.status, "ok")
 
     def test_bounded_recon_post_coordinate_can_be_offered(self) -> None:
@@ -508,6 +649,30 @@ class OfferSelectionTests(unittest.TestCase):
 
         self.assertEqual(llm.requests, [])
 
+    def test_every_unoffered_surface_has_an_explicit_exclusion_reason(self) -> None:
+        llm = _ExhaustiveLlmClient()
+        safe = _surface("surface-safe")
+        navigation = _surface(
+            "surface-navigation", url="http://localhost/about", parameters=()
+        )
+        changing = _surface(
+            "surface-changing", parameters=("password_new",)
+        )
+        advisor = LlmRouterAdvisor(
+            llm_client=llm, analyzers=ANALYZERS, hypothesis_mode=True
+        )
+
+        advisor.advise(_run(), (safe, navigation, changing), (), frozenset())
+
+        self.assertEqual(
+            dict(advisor.last_trace.excluded_surfaces),
+            {
+                "surface-navigation": "no_compatible_route",
+                "surface-changing": "state_changing_surface",
+            },
+        )
+        self.assertEqual(advisor.last_trace.offered_surface_ids, ("surface-safe",))
+
     def test_uncovered_surfaces_are_offered_before_partially_covered_ones(self) -> None:
         llm = _FakeLlmClient({"suggestions": []})
         surfaces = (
@@ -572,7 +737,7 @@ class OfferSelectionTests(unittest.TestCase):
 
 class PromptHygieneTests(unittest.TestCase):
     def test_client_route_path_is_visible_without_fragment_query_values(self) -> None:
-        llm = _FakeLlmClient({"suggestions": []})
+        llm = _FakeLlmClient({"dispositions": []})
         surfaces = (
             _surface(
                 "surface-login", url="http://localhost/#/login?redirectUrl=hidden",

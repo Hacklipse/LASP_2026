@@ -174,6 +174,21 @@ CANDIDATE_REASON_CODES = frozenset(
         "observed_behavior_anomaly",
     }
 )
+# Agentic Router의 비선택 판단도 자유 서술이 아니라 닫힌 reason code로 남긴다.
+# 이번 단계에서는 오판 정책을 바꾸지 않고, 왜 route하지 않았는지를 관측 가능하게만
+# 만든다. reject/defer의 의미 조정은 후속 Router 품질 작업에서 별도로 다룬다.
+ROUTER_DEFER_REASON_CODES = frozenset(
+    {
+        "insufficient_observation",
+        "ambiguous_surface_semantics",
+    }
+)
+ROUTER_REJECT_REASON_CODES = frozenset(
+    {
+        "surface_semantics_not_indicative",
+        "observations_not_supportive",
+    }
+)
 CANDIDATE_EVIDENCE_TYPES = frozenset(
     {
         "control_response",
