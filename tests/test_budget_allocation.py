@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -87,15 +86,14 @@ class _Agent:
         )
 
 
-def _app(*, stores=None, budget=None, advisor=None, analysis=None, validation=None,
-         budget_allocation_enabled=True):
+def _app(*, stores=None, budget=None, advisor=None, analysis=None, validation=None):
     runtime = _Runtime()
     app = build_local_application(
         {},
         stores=stores,
         budget_manager=budget,
         runtime=runtime,
-        config=OrchestratorConfig(budget_allocation_enabled=budget_allocation_enabled),
+        config=OrchestratorConfig(budget_allocation_enabled=True),
         budget_allocation_advisor=advisor,
     )
     calls: list[tuple[str, str]] = []
@@ -180,28 +178,6 @@ class _Llm:
 
 
 class BudgetAllocationTests(unittest.TestCase):
-    def test_coverage_automatically_reserves_validation_when_allocation_is_off(self):
-        app, _, _ = _app(
-            budget_allocation_enabled=False,
-            analysis={"candidate-a": 2, "candidate-b": 1},
-            validation={"candidate-a": 1, "candidate-b": 1},
-        )
-        run = _seed(app, budget=8)
-        candidate = app.stores.candidates.get(run.run_id, "candidate-b")
-        app.stores.candidates.save(replace(candidate, selection_source="coverage"))
-
-        completed = app.orchestrator.resume(run.run_id)
-
-        self.assertIs(completed.phase, RunPhase.DONE)
-        self.assertEqual(completed.budget_candidate_order, run.candidate_ids)
-        self.assertEqual(completed.budget_allocation_source, "coverage")
-        self.assertEqual(completed.budget_validation_reserve, 2)
-        self.assertEqual(
-            [app.stores.candidates.get(run.run_id, candidate_id).status
-             for candidate_id in run.candidate_ids],
-            [CandidateStatus.REJECTED, CandidateStatus.REJECTED],
-        )
-
     def test_hybrid_allocation_loads_llm_independently_of_other_modes(self):
         from scripts.routing_options import needs_llm
 

@@ -261,11 +261,9 @@ class Orchestrator:
                             run = self._plan_budget(run)
                     run = self._state.transition(run, next_phase)
                 elif run.phase is RunPhase.ANALYZE:
-                    if not run.budget_candidate_order:
-                        planned = self._plan_budget(run)
-                        if planned is not run:
-                            run = planned
-                            self._runs.save(run)
+                    if self._config.budget_allocation_enabled and not run.budget_candidate_order:
+                        run = self._plan_budget(run)
+                        self._runs.save(run)
                     run = self._analyze(run)
                     run = self._state.transition(run, RunPhase.VALIDATE)
                 elif run.phase is RunPhase.VALIDATE:
@@ -529,28 +527,16 @@ class Orchestrator:
         return raw(run_id)
 
     def _plan_budget(self, run: Run) -> Run:
-        if not run.candidate_ids:
+        if not self._config.budget_allocation_enabled or not run.candidate_ids:
             return run
         candidates = tuple(
             self._candidates.get(run.run_id, candidate_id)
             for candidate_id in run.candidate_ids
         )
-        coverage = any(item.selection_source == "coverage" for item in candidates)
-        if not self._config.budget_allocation_enabled and not coverage:
-            return run
         remaining = self._global_remaining(run.run_id)
-        source = "coverage" if coverage and not self._config.budget_allocation_enabled else "heuristic"
-        decision = BudgetAllocationDecision(
-            run.candidate_ids,
-            min(2, self._config.max_validation_reserve_per_candidate) if source == "coverage" else 1,
-            source=source,
-        )
-        if (
-            self._config.budget_allocation_enabled
-            and self._budget_allocation_advisor is not None
-            and remaining >= 2
-            and len(candidates) <= 30
-        ):
+        decision = BudgetAllocationDecision(run.candidate_ids, source="heuristic")
+        source = "heuristic"
+        if self._budget_allocation_advisor is not None and remaining >= 2 and len(candidates) <= 30:
             try:
                 suggested = self._budget_allocation_advisor.decide(
                     run, candidates, remaining
