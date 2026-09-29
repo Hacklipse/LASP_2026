@@ -113,6 +113,7 @@ _FILE_OR_URL_PARAM_HINTS = (
 _JS_DIRECTORY = re.compile(
     r"""["'`](?:\$\{[^}]{0,60}\})?(/[A-Za-z0-9][A-Za-z0-9._~/-]{0,100}/)[A-Za-z0-9._~-]{0,40}\$\{"""
 )
+_JS_BARE_NUMERIC_PATH = re.compile(r"/\d+")
 # SPA 클라이언트 라우트와 그 query 파라미터. 라우트 이동과 파라미터 선언이 서로
 # 앞뒤 어느 쪽에도 올 수 있어 좁은 창 안에서 함께 나타나는 짝만 취한다.
 # 따옴표 종류는 큰따옴표로 고정하지 않는다 — Angular 컴파일러 버전에 따라 배열 리터럴을
@@ -368,6 +369,7 @@ class ReconAgent:
                 names,
                 observed=observed,
                 path_identifier=path_identifier,
+                discovery_types=tuple(dict.fromkeys(discovery_types)),
             )
             evidence_ids.extend(
                 self._flag_suspect_parameters(task.run_id, surface_id, names)
@@ -606,7 +608,7 @@ class ReconAgent:
 
     def _discover_from_script(
         self, task: TaskEnvelope, source: str, origin
-    ) -> list[tuple[str, tuple[str, ...], bool]]:
+    ) -> list[tuple[str, tuple[str, ...], bool, bool]]:
         """JS 번들을 받아 경로 리터럴에서 Surface 후보를 만든다."""
 
         _, evidence = self._fetch(task, source, None)
@@ -623,6 +625,19 @@ class ReconAgent:
         paths = {match.group(1) for match in _JS_PATH.finditer(body)}
         paths.update(parameters)
         paths.update(match.group(1) for match in _JS_DIRECTORY.finditer(body))
+        # Angular 템플릿의 글자 수 표시는 ``value.length/10``을 렌더링하면서
+        # ``/10`` 같은 문자열 리터럴을 만든다. 명시적 query 좌표나 실제 navigation이
+        # 아닌 단일 숫자 루트 경로만 제거한다. ``/users/10``과
+        # ``location.assign('/10')``은 각각 정상 REST/탐색 좌표이므로 보존한다.
+        paths = {
+            path
+            for path in paths
+            if not (
+                _JS_BARE_NUMERIC_PATH.fullmatch(path)
+                and path not in parameters
+                and path not in document_paths
+            )
+        }
 
         base = f"{origin.scheme}://{origin.netloc}"
         # 실제 문서 이동을 먼저 방문한다. 일반 경로 수십 개를 정렬한 뒤 예산이
@@ -653,6 +668,7 @@ class ReconAgent:
         *,
         observed: tuple[tuple[str, str], ...] = (),
         path_identifier: tuple[str, int, str] | None = None,
+        discovery_types: tuple[str, ...] = (),
     ) -> None:
         path_name, path_index, path_value = path_identifier or (None, None, None)
         self._surfaces.add(
@@ -666,6 +682,7 @@ class ReconAgent:
                 path_identifier=path_name,
                 path_identifier_index=path_index,
                 observed_path_identifier=path_value,
+                discovery_types=discovery_types,
             )
         )
 

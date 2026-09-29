@@ -514,6 +514,36 @@ class ReconCrawlTests(unittest.TestCase):
         # 외부 URL의 경로 조각이 표면으로 새어 들어오면 안 된다.
         self.assertTrue(all("twitter.com" not in url for url in found))
 
+    def test_ignores_numeric_character_counters_but_keeps_real_numeric_routes(self) -> None:
+        bundle = (
+            "render(`${value.length || 0}/160`);"
+            "const objectRoute = '/users/10';"
+            "const numericQueryEndpoint = '/10?q=';"
+            "location.assign('/20');"
+        )
+        agent, _, surfaces = _crawling_agent(
+            {"http://localhost/": _SPA_HTML, "http://localhost/main.js": bundle}
+        )
+
+        agent.handle(_task("run-numeric-js", "http://localhost/"))
+
+        found = {
+            surface.url: surface
+            for surface in surfaces.list_by_run("run-numeric-js")
+        }
+        self.assertNotIn("http://localhost/160", found)
+        self.assertIn("http://localhost/users/10", found)
+        self.assertEqual(found["http://localhost/10"].parameters, ("q",))
+        self.assertIn("http://localhost/20", found)
+        self.assertEqual(
+            found["http://localhost/users/10"].discovery_types,
+            ("script_literal",),
+        )
+        self.assertEqual(
+            found["http://localhost/20"].discovery_types,
+            ("browser_navigation",),
+        )
+
     def test_discovers_a_spa_route_navigated_with_backtick_quotes(self) -> None:
         """실제 Juice Shop 빌드는 navigate 배열 리터럴을 백틱으로 내보낸다.
 

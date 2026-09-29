@@ -281,6 +281,7 @@ def _decode_surface(data: str) -> Surface:
         tuple(item) for item in value.get("observed_query", ())
     )
     value["parameters"] = tuple(value["parameters"])
+    value["discovery_types"] = tuple(value.get("discovery_types", ()))
     return Surface(**value)
 
 

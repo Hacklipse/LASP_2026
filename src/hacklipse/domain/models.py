@@ -732,8 +732,22 @@ class Surface:
     path_identifier: str | None = None
     path_identifier_index: int | None = None
     observed_path_identifier: str | None = None
+    # Recon이 이 좌표를 처음 발견한 구조적 출처. 추가 Recon 우선순위에만 사용하며
+    # 취약점 여부나 Analyzer 판정 근거로 취급하지 않는다.
+    discovery_types: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if (
+            not isinstance(self.discovery_types, tuple)
+            or len(set(self.discovery_types)) != len(self.discovery_types)
+            or any(
+                not isinstance(value, str) or not value
+                for value in self.discovery_types
+            )
+        ):
+            raise DomainInvariantError(
+                "surface discovery types must be unique non-empty strings"
+            )
         values = (
             self.path_identifier,
             self.path_identifier_index,

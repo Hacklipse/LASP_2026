@@ -47,6 +47,23 @@ class _Runtime:
         )
 
 
+class _PriorityRuntime(_Runtime):
+    def execute(self, request):
+        path = urlsplit(request.resolved_url).path
+        self.paths.append(path)
+        body = (
+            '<a href="/10">counter-like</a>'
+            '<a href="/api/catalog">catalog</a>'
+            if path == "/"
+            else "<html>observed</html>"
+        )
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            evidence_type="http_response",
+            observation={"type": "http_response", "status": 200, "body": body},
+        )
+
+
 class _Router:
     def route(self, run, surfaces, evidence):
         visited = {
@@ -304,6 +321,21 @@ class LlmOrchestrationTests(unittest.TestCase):
             if event.kind is ProgressEventKind.ORCHESTRATION_DECIDED
         ]
         self.assertEqual([item.detail for item in decisions], ["capability:recon"])
+
+    def test_capability_recon_prefers_semantic_path_over_bare_numeric_path(self):
+        runtime = _PriorityRuntime()
+        app, _ = _application(runtime=runtime, router=_CapabilityRouter())
+
+        run = app.orchestrator.start(
+            RunRequest(
+                target_url="http://localhost/",
+                scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+                request_budget=10,
+            )
+        )
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(runtime.paths, ["/", "/api/catalog"])
 
     def test_sqlite_resume_uses_saved_target_without_asking_again(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -498,7 +498,7 @@ class Orchestrator:
             self._emit_orchestration_decision(run, "skipped", "no_options")
             return None
         # Bounded input also bounds prompt size and makes offered-set checks cheap.
-        options.sort(key=lambda item: (urlsplit(item.url).path, item.surface_id))
+        options.sort(key=_extra_recon_priority)
         options = options[:20]
         if self._orchestration_advisor is None:
             selected = options[0]
@@ -1217,6 +1217,59 @@ def _path_only(url: str | None) -> str | None:
 _UNSAFE_RECON_PATH_PARTS = frozenset(
     {"create", "delete", "disable", "enable", "erase", "logout", "purchase", "remove", "reset", "transfer", "update", "upload"}
 )
+
+_RECON_DISCOVERY_PRIORITY = {
+    "browser_navigation": 0,
+    "html_form": 1,
+    "html_link": 2,
+    "script_literal": 3,
+    "seed": 4,
+    "discovered": 5,
+}
+_RECON_SEMANTIC_PATH_TOKENS = frozenset(
+    {
+        "account", "admin", "auth", "basket", "cart", "document", "download",
+        "file", "item", "order", "product", "profile", "report", "search",
+        "security", "session", "template", "user",
+    }
+)
+
+
+def _extra_recon_priority(surface: Surface) -> tuple[object, ...]:
+    """신뢰할 수 있는 발견 출처와 의미 있는 서버 경로를 먼저 관찰한다."""
+
+    path = urlsplit(surface.url).path or "/"
+    segments = tuple(part for part in path.split("/") if part)
+    discovery_rank = min(
+        (
+            _RECON_DISCOVERY_PRIORITY.get(value, 6)
+            for value in surface.discovery_types
+        ),
+        default=6,
+    )
+    tokens = {
+        token
+        for segment in segments
+        for token in re.split(
+            r"[^a-z0-9]+",
+            re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", segment).casefold(),
+        )
+        if token
+    }
+    return (
+        bool(re.fullmatch(r"/\d+", path)),
+        discovery_rank,
+        (
+            0
+            if segments
+            and segments[0].casefold() in {"api", "rest", "graphql"}
+            else 1
+        ),
+        0 if tokens & _RECON_SEMANTIC_PATH_TOKENS else 1,
+        -len(segments),
+        path,
+        surface.surface_id,
+    )
 
 
 def _unsafe_recon_path(path: str) -> bool:
