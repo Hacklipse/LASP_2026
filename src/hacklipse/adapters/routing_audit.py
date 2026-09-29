@@ -80,6 +80,12 @@ class AuditedVulnerabilityRouter:
             }
         }
 
+    @property
+    def last_capability_assessments(self) -> tuple[object, ...]:
+        """Orchestrator가 감사 wrapper 너머의 coverage gap을 읽게 한다."""
+
+        return tuple(getattr(self.router, "last_capability_assessments", ()))
+
     def route(
         self, run: Run, surfaces: Sequence[Surface], evidence: Sequence[Evidence],
     ) -> tuple[RouteDecision, ...]:
@@ -103,6 +109,10 @@ class AuditedVulnerabilityRouter:
             )
             advisor = getattr(routed, "_advisor", None) if routed else None
             advisor_trace = getattr(advisor, "last_trace", None)
+            capabilities = tuple(
+                getattr(advisor_trace, "capabilities", ())
+                if advisor_trace else ()
+            )
             excluded_surfaces = dict(
                 advisor_trace.excluded_surfaces if advisor_trace else ()
             )
@@ -182,6 +192,11 @@ class AuditedVulnerabilityRouter:
                     for item in baseline
                 ],
                 "llm": {
+                    "selection_policy": (
+                        "analyzer_capability"
+                        if self._mode == "agentic" else "advisor_suggestion"
+                    ),
+                    "dispositions_advisory_only": self._mode == "agentic",
                     "source": (
                         "deterministic_fallback"
                         if advisor_failed or agentic_fallback
@@ -215,6 +230,27 @@ class AuditedVulnerabilityRouter:
                     "offered_surface_count": (
                         len(advisor_trace.offered_surface_ids) if advisor_trace else 0
                     ),
+                    "coverage_surface_count": len(capabilities),
+                    "capability_counts": {
+                        status: sum(
+                            item.status == status for item in capabilities
+                        )
+                        for status in (
+                            "routable", "blocked", "unsupported", "excluded"
+                        )
+                    },
+                    "capabilities": [
+                        {
+                            "surface_id": item.surface_id,
+                            "status": item.status,
+                            "reason_code": item.reason_code,
+                            "routable_types": list(item.routable_types),
+                            "missing_requirements": list(
+                                item.missing_requirements
+                            ),
+                        }
+                        for item in capabilities
+                    ],
                     "disposition_counts": {
                         decision: sum(
                             item.decision == decision

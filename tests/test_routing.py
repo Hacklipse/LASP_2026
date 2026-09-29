@@ -649,7 +649,7 @@ class StandardRouterWiringTests(unittest.TestCase):
         self.assertEqual(router._advisor_mode, "primary")
         self.assertTrue(router._advisor._hypothesis_mode)
 
-    def test_agentic_router_turns_only_selected_hypotheses_into_candidates(self) -> None:
+    def test_agentic_router_routes_all_analyzer_capabilities(self) -> None:
         router = standard_router(
             ("XSS", "SQLi"),
             mode="agentic",
@@ -682,10 +682,17 @@ class StandardRouterWiringTests(unittest.TestCase):
 
         decisions = router.route(_run(), (_surface(),), ())
 
-        self.assertEqual(len(decisions), 1)
-        self.assertEqual(decisions[0].candidate.vulnerability_type, "SQLi")
+        self.assertEqual(len(decisions), 2)
         self.assertEqual(
-            decisions[0].candidate.required_evidence_types,
+            {item.candidate.vulnerability_type for item in decisions},
+            {"SQLi", "XSS"},
+        )
+        selected = next(
+            item for item in decisions
+            if item.candidate.vulnerability_type == "SQLi"
+        )
+        self.assertEqual(
+            selected.candidate.required_evidence_types,
             ("control_response", "server_error_delta"),
         )
 

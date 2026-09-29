@@ -216,8 +216,9 @@ class RoutingAuditTests(unittest.TestCase):
         ).route(_RUN, (_SURFACE,), ())
 
         record = log.records[0]
-        self.assertEqual(record["rule_decisions"], record["final_decisions"])
-        self.assertEqual(len(result), 2)
+        self.assertEqual(len(record["rule_decisions"]), 2)
+        self.assertEqual(len(record["final_decisions"]), 3)
+        self.assertEqual(len(result), 3)
         self.assertEqual(record["llm"]["source"], "deterministic_fallback")
         self.assertEqual(
             record["llm"]["status"],
@@ -255,8 +256,13 @@ class RoutingAuditTests(unittest.TestCase):
         ).route(_RUN, (_SURFACE,), ())
 
         record = log.records[0]
-        self.assertEqual([item.candidate.vulnerability_type for item in result], ["SQLi"])
+        self.assertEqual(
+            {item.candidate.vulnerability_type for item in result},
+            {"Path Traversal", "SQLi", "XSS"},
+        )
         self.assertEqual(record["llm"]["offered_pair_count"], 3)
+        self.assertEqual(record["llm"]["selection_policy"], "analyzer_capability")
+        self.assertIs(record["llm"]["dispositions_advisory_only"], True)
         self.assertEqual(record["llm"]["disposition_counts"], {
             "route": 1, "defer": 1, "reject": 1, "unanswered": 0,
         })
@@ -270,7 +276,7 @@ class RoutingAuditTests(unittest.TestCase):
             ],
         )
 
-    def test_agentic_audit_records_non_executable_surface_disposition(self):
+    def test_agentic_audit_records_non_executable_surface_capability(self):
         log = _Log()
         navigation = replace(
             _SURFACE,
@@ -293,18 +299,25 @@ class RoutingAuditTests(unittest.TestCase):
 
         record = log.records[0]
         self.assertEqual(result, ())
-        self.assertEqual(record["llm"]["offered_surface_count"], 1)
+        self.assertEqual(llm.calls, 0)
+        self.assertEqual(record["llm"]["offered_surface_count"], 0)
         self.assertEqual(record["llm"]["offered_pair_count"], 0)
         self.assertEqual(record["llm"]["surface_disposition_counts"], {
-            "defer": 1, "reject": 0, "unanswered": 0,
+            "defer": 0, "reject": 0, "unanswered": 0,
         })
-        self.assertEqual(record["llm"]["surface_dispositions"], [{
+        self.assertEqual(record["llm"]["surface_dispositions"], [])
+        self.assertEqual(record["llm"]["coverage_surface_count"], 1)
+        self.assertEqual(record["llm"]["capability_counts"], {
+            "routable": 0, "blocked": 1, "unsupported": 0, "excluded": 0,
+        })
+        self.assertEqual(record["llm"]["capabilities"], [{
             "surface_id": "users",
-            "decision": "defer",
-            "reason_code": "unsupported_execution_coordinate",
-            "suspected_vulnerability_types": ["Access Control"],
-            "basis_evidence_ids": [],
-            "required_evidence_types": ["cross_principal_response"],
+            "status": "blocked",
+            "reason_code": "missing_http_observation",
+            "routable_types": [],
+            "missing_requirements": [
+                "http_observation", "supported_input_coordinate"
+            ],
         }])
 
     def test_unexpected_exception_preserves_rules_and_is_logged(self):

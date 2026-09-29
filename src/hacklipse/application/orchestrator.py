@@ -438,9 +438,23 @@ class Orchestrator:
         return run.with_updates(candidate_ids=tuple(dict.fromkeys(candidate_ids)))
 
     def _select_extra_recon(self, run: Run) -> Surface | None:
-        """Accept only a known, unread GET surface; advice never authorizes execution."""
+        """Capability gap 중 안전한 미관측 GET만 한 번 Recon으로 되돌린다.
 
-        if self._orchestration_advisor is None:
+        Router는 요청을 실행하지 않는다. 이 메서드가 기존 Scope·Policy·예산 검사를
+        모두 통과한 Surface만 Recon 대상으로 정해 역할 경계를 유지한다.
+        """
+
+        capabilities = tuple(
+            getattr(self._router, "last_capability_assessments", ())
+        )
+        blocked_surface_ids = {
+            item.surface_id
+            for item in capabilities
+            if getattr(item, "status", None) == "blocked"
+            and "http_observation"
+            in getattr(item, "missing_requirements", ())
+        }
+        if self._orchestration_advisor is None and not blocked_surface_ids:
             return None
         if run.extra_recon_rounds >= self._config.max_extra_recon_rounds:
             return None
@@ -463,6 +477,8 @@ class Orchestrator:
         for surface in self._surfaces.list_by_run(run.run_id):
             if surface.surface_id not in run.surface_ids or surface.surface_id in visited:
                 continue
+            if blocked_surface_ids and surface.surface_id not in blocked_surface_ids:
+                continue
             parsed = urlsplit(surface.url)
             if (
                 surface.run_id != run.run_id
@@ -484,6 +500,12 @@ class Orchestrator:
         # Bounded input also bounds prompt size and makes offered-set checks cheap.
         options.sort(key=lambda item: (urlsplit(item.url).path, item.surface_id))
         options = options[:20]
+        if self._orchestration_advisor is None:
+            selected = options[0]
+            self._emit_orchestration_decision(
+                run, "capability", "recon", selected
+            )
+            return selected
         try:
             decision = self._orchestration_advisor.decide(run, tuple(options), remaining)
         except Exception:

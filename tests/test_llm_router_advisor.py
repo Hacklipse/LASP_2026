@@ -248,11 +248,14 @@ class AgenticHypothesisTests(unittest.TestCase):
             _run(), (_surface(),), (evidence,), frozenset()
         )
 
-        self.assertEqual(len(suggestions), 1)
-        self.assertEqual(suggestions[0].basis_evidence_ids, ("evi-response",))
-        self.assertEqual(suggestions[0].reason_code, "query_interpreter_risk")
+        self.assertEqual(len(suggestions), 3)
+        selected = next(
+            item for item in suggestions if item.vulnerability_type == "SQLi"
+        )
+        self.assertEqual(selected.basis_evidence_ids, ("evi-response",))
+        self.assertEqual(selected.reason_code, "query_interpreter_risk")
         self.assertEqual(
-            suggestions[0].required_evidence_types,
+            selected.required_evidence_types,
             ("control_response", "server_error_delta"),
         )
         request = llm.requests[0]
@@ -297,7 +300,11 @@ class AgenticHypothesisTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            {item.surface_id: item.basis_evidence_ids for item in suggestions},
+            {
+                item.surface_id: item.basis_evidence_ids
+                for item in suggestions
+                if item.vulnerability_type == "SQLi"
+            },
             {"surface-import": ("evi-first",), "surface-other": ("evi-second",)},
         )
         prompt = llm.requests[0].messages[0].content
@@ -329,7 +336,11 @@ class AgenticHypothesisTests(unittest.TestCase):
             _run(), (_surface(),), (), frozenset()
         )
 
-        self.assertEqual(suggestions, ())
+        self.assertEqual(len(suggestions), 3)
+        self.assertEqual(
+            {item.reason_code for item in suggestions},
+            {"analyzer_contract_satisfied"},
+        )
         self.assertEqual(advisor.last_trace.status, "all_rejected")
         self.assertEqual(
             advisor.last_trace.rejected_items,
@@ -345,8 +356,8 @@ class AgenticHypothesisTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            advisor.advise(_run(), (_surface(),), (), frozenset()),
-            (),
+            len(advisor.advise(_run(), (_surface(),), (), frozenset())),
+            3,
         )
         self.assertEqual(advisor.last_trace.source, "deterministic_fallback")
         self.assertEqual(advisor.last_trace.status, "all_rejected")
@@ -360,7 +371,7 @@ class AgenticHypothesisTests(unittest.TestCase):
             {"missing_disposition"},
         )
 
-    def test_route_defer_and_reject_are_recorded_but_only_route_is_returned(self) -> None:
+    def test_route_defer_and_reject_are_advisory_and_all_capabilities_returned(self) -> None:
         llm = _FakeLlmClient({"dispositions": [
             {
                 "surface_id": "surface-import",
@@ -394,9 +405,13 @@ class AgenticHypothesisTests(unittest.TestCase):
         suggestions = advisor.advise(_run(), (_surface(),), (), frozenset())
 
         self.assertEqual(
-            [(item.vulnerability_type, item.reason_code) for item in suggestions],
-            [("SQLi", "query_interpreter_risk")],
+            {item.vulnerability_type for item in suggestions},
+            {"Path Traversal", "SQLi", "XSS"},
         )
+        selected = next(
+            item for item in suggestions if item.vulnerability_type == "SQLi"
+        )
+        self.assertEqual(selected.reason_code, "query_interpreter_risk")
         self.assertEqual(
             [(item.vulnerability_type, item.decision, item.reason_code)
              for item in advisor.last_trace.dispositions],
@@ -423,7 +438,7 @@ class AgenticHypothesisTests(unittest.TestCase):
 
         suggestions = advisor.advise(_run(), (_surface(),), (), frozenset())
 
-        self.assertEqual(len(suggestions), 1)
+        self.assertEqual(len(suggestions), 3)
         unanswered = [
             item for item in advisor.last_trace.dispositions
             if item.decision == "unanswered"
@@ -449,7 +464,7 @@ class AgenticHypothesisTests(unittest.TestCase):
 
         suggestions = advisor.advise(_run(), surfaces, (), frozenset())
 
-        self.assertEqual(suggestions, ())
+        self.assertEqual(len(suggestions), 15)
         self.assertEqual(len(llm.requests), 3)
         self.assertEqual(advisor.last_trace.offered_pair_count, 15)
         self.assertEqual(len(advisor.last_trace.dispositions), 15)
@@ -481,16 +496,20 @@ class AgenticHypothesisTests(unittest.TestCase):
         suggestions = advisor.advise(_run(), surfaces, (), frozenset())
 
         self.assertEqual(suggestions, ())
-        self.assertEqual(len(llm.requests), 3)
+        self.assertEqual(len(llm.requests), 0)
         self.assertEqual(advisor.last_trace.offered_pair_count, 0)
-        self.assertEqual(len(advisor.last_trace.surface_dispositions), 81)
+        self.assertEqual(len(advisor.last_trace.surface_dispositions), 0)
+        self.assertEqual(len(advisor.last_trace.capabilities), 81)
         self.assertEqual(
-            {item.surface_id for item in advisor.last_trace.surface_dispositions},
+            {item.surface_id for item in advisor.last_trace.capabilities},
             {f"surface-navigation-{index}" for index in range(81)},
         )
-        self.assertEqual(advisor.last_trace.status, "ok")
+        self.assertEqual(
+            {item.status for item in advisor.last_trace.capabilities}, {"blocked"}
+        )
+        self.assertEqual(advisor.last_trace.status, "no_candidates")
 
-    def test_missing_surface_disposition_is_unanswered(self) -> None:
+    def test_non_executable_surface_is_classified_without_llm(self) -> None:
         navigation = _surface(
             "surface-navigation", url="http://localhost/about", parameters=()
         )
@@ -507,14 +526,17 @@ class AgenticHypothesisTests(unittest.TestCase):
         )
 
         self.assertEqual(suggestions, ())
-        self.assertEqual(advisor.last_trace.source, "deterministic_fallback")
-        self.assertEqual(advisor.last_trace.status, "all_rejected")
+        self.assertEqual(llm.requests, [])
+        self.assertEqual(advisor.last_trace.source, "skipped")
+        self.assertEqual(advisor.last_trace.status, "no_candidates")
         self.assertEqual(
             [
-                (item.decision, item.reason_code)
-                for item in advisor.last_trace.surface_dispositions
+                (item.status, item.reason_code, item.missing_requirements)
+                for item in advisor.last_trace.capabilities
             ],
-            [("unanswered", "missing_surface_disposition")],
+            [("blocked", "missing_http_observation", (
+                "http_observation", "supported_input_coordinate"
+            ))],
         )
 
     def test_bounded_recon_post_coordinate_can_be_offered(self) -> None:
@@ -721,7 +743,7 @@ class OfferSelectionTests(unittest.TestCase):
 
         self.assertEqual(llm.requests, [])
 
-    def test_agentic_reviews_every_current_run_surface_including_non_executable(self) -> None:
+    def test_agentic_capability_ledger_covers_non_executable_surfaces(self) -> None:
         llm = _ExhaustiveLlmClient()
         safe = _surface("surface-safe")
         navigation = _surface(
@@ -736,21 +758,27 @@ class OfferSelectionTests(unittest.TestCase):
 
         advisor.advise(_run(), (safe, navigation, changing), (), frozenset())
 
-        self.assertEqual(advisor.last_trace.excluded_surfaces, ())
+        self.assertEqual(
+            dict(advisor.last_trace.excluded_surfaces),
+            {
+                "surface-navigation": "no_compatible_route",
+                "surface-changing": "state_changing_surface",
+            },
+        )
         self.assertEqual(
             set(advisor.last_trace.offered_surface_ids),
-            {"surface-safe", "surface-navigation", "surface-changing"},
+            {"surface-safe"},
         )
         self.assertEqual(
-            {item.surface_id for item in advisor.last_trace.surface_dispositions},
-            {"surface-navigation", "surface-changing"},
-        )
-        self.assertEqual(
-            {item.decision for item in advisor.last_trace.surface_dispositions},
-            {"reject"},
+            {item.surface_id: item.status for item in advisor.last_trace.capabilities},
+            {
+                "surface-safe": "routable",
+                "surface-navigation": "blocked",
+                "surface-changing": "unsupported",
+            },
         )
 
-    def test_non_executable_surface_can_be_deferred_with_suspected_type(self) -> None:
+    def test_non_executable_surface_becomes_deterministic_recon_gap(self) -> None:
         navigation = _surface(
             "surface-users", url="http://localhost/api/Users", parameters=()
         )
@@ -778,13 +806,45 @@ class OfferSelectionTests(unittest.TestCase):
         )
 
         self.assertEqual(suggestions, ())
-        self.assertEqual(advisor.last_trace.offered_surface_ids, ("surface-users",))
+        self.assertEqual(llm.requests, [])
+        self.assertEqual(advisor.last_trace.offered_surface_ids, ())
         self.assertEqual(
-            advisor.last_trace.surface_dispositions[0].decision, "defer"
+            advisor.last_trace.capabilities[0].status, "blocked"
         )
         self.assertEqual(
-            advisor.last_trace.surface_dispositions[0].suspected_vulnerability_types,
-            ("Access Control",),
+            advisor.last_trace.capabilities[0].missing_requirements,
+            ("http_observation", "supported_input_coordinate"),
+        )
+
+    def test_observed_surface_without_supported_coordinate_is_unsupported(self) -> None:
+        navigation = _surface(
+            "surface-users", url="http://localhost/api/Users", parameters=()
+        )
+        response = Evidence(
+            evidence_id="evi-users",
+            run_id="run-1",
+            surface_id="surface-users",
+            created_by="execution_runtime:http_get",
+            evidence_type="http_response",
+            observation={"status": 401, "content_type": "application/json"},
+        )
+        llm = _FakeLlmClient({"dispositions": [], "surface_dispositions": []})
+        advisor = LlmRouterAdvisor(
+            llm_client=llm, analyzers=ANALYZERS, hypothesis_mode=True
+        )
+
+        suggestions = advisor.advise(
+            _run(), (navigation,), (response,), frozenset()
+        )
+
+        self.assertEqual(suggestions, ())
+        self.assertEqual(llm.requests, [])
+        self.assertEqual(
+            (
+                advisor.last_trace.capabilities[0].status,
+                advisor.last_trace.capabilities[0].reason_code,
+            ),
+            ("unsupported", "no_supported_input_coordinate"),
         )
 
     def test_uncovered_surfaces_are_offered_before_partially_covered_ones(self) -> None:

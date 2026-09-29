@@ -72,6 +72,32 @@ class _Router:
         )
 
 
+class _CapabilityRouter(_Router):
+    """미관측 Surface를 capability gap으로 노출하는 Router 대역."""
+
+    def __init__(self) -> None:
+        self.last_capability_assessments = ()
+
+    def route(self, run, surfaces, evidence):
+        visited = {
+            item.surface_id
+            for item in evidence
+            if item.created_by == "execution_runtime:http_get"
+        }
+        self.last_capability_assessments = tuple(
+            SimpleNamespace(
+                surface_id=surface.surface_id,
+                status="blocked",
+                missing_requirements=(
+                    "http_observation", "supported_input_coordinate"
+                ),
+            )
+            for surface in surfaces
+            if surface.surface_id not in visited and not surface.parameters
+        )
+        return super().route(run, surfaces, evidence)
+
+
 class _Analyzer:
     def handle(self, task):
         return AgentResult(
@@ -117,11 +143,11 @@ class _Model:
         )
 
 
-def _application(*, advisor=None, runtime=None, stores=None, budget=None):
+def _application(*, advisor=None, runtime=None, stores=None, budget=None, router=None):
     runtime = runtime or _Runtime()
     app = build_local_application(
         {"xss_analyzer": _Analyzer(), "validation": _Validator()},
-        router=_Router(),
+        router=router or _Router(),
         runtime=runtime,
         stores=stores,
         budget_manager=budget,
@@ -259,6 +285,25 @@ class LlmOrchestrationTests(unittest.TestCase):
         )
         self.assertIs(run.phase, RunPhase.DONE)
         self.assertEqual(runtime.paths, ["/"])
+
+    def test_capability_gap_triggers_bounded_recon_without_llm_advisor(self):
+        app, runtime = _application(router=_CapabilityRouter())
+        run = app.orchestrator.start(
+            RunRequest(
+                target_url="http://localhost/",
+                scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+                request_budget=10,
+            )
+        )
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(runtime.paths, ["/", "/deep"])
+        self.assertEqual(run.extra_recon_rounds, 1)
+        decisions = [
+            event for event in app.progress_log.list_by_run(run.run_id)
+            if event.kind is ProgressEventKind.ORCHESTRATION_DECIDED
+        ]
+        self.assertEqual([item.detail for item in decisions], ["capability:recon"])
 
     def test_sqlite_resume_uses_saved_target_without_asking_again(self):
         with tempfile.TemporaryDirectory() as directory:

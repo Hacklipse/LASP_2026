@@ -4,8 +4,9 @@
 
     Rule    설명 가능한 Observation·Surface 규칙으로 Candidate를 만든다 (routing.py, 결정적)
     Hybrid  규칙이 비워 둔 자리에 한해 조사할 유형을 제안
-    Agentic 현재 Run의 모든 Surface를 검토하고, 실행 가능한 Surface/유형 조합을
-            route/defer/reject로 판정
+    Agentic 현재 Run의 모든 Surface를 Analyzer 실행 계약으로 분류하고, 실행 가능한
+            Surface/유형 조합은 빠짐없이 Analysis로 전달한다. LLM 판단은 감사용 진단
+            신호일 뿐 Candidate를 제거하지 않는다.
 
 LLM은 Candidate를 만들지 않고, 담당 Agent도 고르지 않는다. 고르는 것은 이미 존재하는
 ``surface_id``와 취약점 유형 두 가지뿐이며, ``agent_type`` 해석은 표면 모양(fragment 여부)을
@@ -194,7 +195,7 @@ _SYSTEM = (
 )
 
 _AGENTIC_SYSTEM = (
-    "You exhaustively review candidate hypotheses for one authorized security assessment "
+    "You review executable analyzer assignments for one authorized security assessment "
     "from only the structured surfaces and observations offered to you. Do not assume a known "
     "vulnerable endpoint, target-specific payload, expected finding, or ground truth. "
     "Return exactly one disposition for every surface_id and allowed vulnerability type "
@@ -206,9 +207,10 @@ _AGENTIC_SYSTEM = (
     "belonging to that surface in basis_observation_ids, "
     "one reason code valid for that decision, and the generic evidence types needed to "
     "test route or defer. Use an empty required_evidence_types list for reject. "
-    "Use route for hypotheses worth immediate analysis, defer when more observation is "
-    "needed, and reject when the supplied structure or observations do not support the "
-    "hypothesis. A parameterized server-side route can justify a "
+    "Your route, defer, and reject values are advisory diagnostic labels and never suppress "
+    "an executable assignment; Analysis performs the actual security test. Use route when "
+    "the supplied metadata supports the hypothesis, defer when context is insufficient, "
+    "and reject when it does not. A parameterized server-side route can justify a "
     "testable, low-confidence hypothesis from its path and input names even before an HTTP "
     "response has been observed; review server and client routes independently rather than "
     "stopping after one plausible hypothesis. If a surface has observation_refs=[(none)], "
@@ -258,11 +260,10 @@ class _OfferedSurface:
 
 @dataclass(frozen=True, slots=True)
 class RouterDisposition:
-    """Agentic Router가 호환 가능한 Surface/유형 조합 하나에 내린 판단.
+    """Agentic LLM이 호환 가능한 Surface/유형 조합 하나에 남긴 진단 신호.
 
-    route만 ``RouteSuggestion``으로 변환된다. 나머지는 Analysis 입력이 아니라 감사와
-    후속 오판 분석을 위한 Control Plane 기록이다. 모델이 항목을 누락하거나 계약을
-    위반하면 코드가 ``unanswered``를 합성해 조용한 탈락을 막는다.
+    실제 Analysis 전달 여부는 이 값이 아니라 Analyzer capability가 정한다. 모델이 항목을
+    누락하거나 계약을 위반하면 코드가 ``unanswered``를 합성해 감사 가능성을 유지한다.
     """
 
     surface_id: str
@@ -291,12 +292,24 @@ class SurfaceDisposition:
 
 
 @dataclass(frozen=True, slots=True)
+class SurfaceCapability:
+    """Surface가 현재 Analyzer 계약으로 실행 가능한지 나타내는 coverage 항목."""
+
+    surface_id: str
+    status: Literal["routable", "blocked", "unsupported", "excluded"]
+    reason_code: str
+    routable_types: tuple[str, ...] = ()
+    missing_requirements: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class RouterAdvisorTrace:
     """감사 로그가 원문 prompt/응답 없이 읽는 마지막 호출의 계측 결과."""
 
     suggestions: tuple[RouteSuggestion, ...] = ()
     dispositions: tuple[RouterDisposition, ...] = ()
     surface_dispositions: tuple[SurfaceDisposition, ...] = ()
+    capabilities: tuple[SurfaceCapability, ...] = ()
     rejected_items: tuple[tuple[int, str], ...] = ()
     offered_surface_ids: tuple[str, ...] = ()
     offered_pair_count: int = 0
@@ -311,10 +324,11 @@ class RouterAdvisorTrace:
 
 
 class LlmRouterAdvisor:
-    """LLM 판단을 검증해 route만 ``RouteSuggestion``으로 돌려주는 구현.
+    """LLM 판단을 검증하고 Analyzer capability를 라우팅 결과로 돌려주는 구현.
 
-    defer/reject/unanswered는 trace에만 남는다. Store에 쓰거나 Candidate를 만들지 않고,
-    Router 단계에서 대상 HTTP 요청이나 Analysis Agent도 호출하지 않는다.
+    Agentic 모드의 defer/reject/unanswered는 trace에만 남고 실행 가능한 모든 조합은
+    ``RouteSuggestion``이 된다. Router 단계에서 대상 HTTP 요청이나 Analysis Agent는
+    호출하지 않는다.
     """
 
     def __init__(
@@ -342,7 +356,9 @@ class LlmRouterAdvisor:
         evidence: Sequence[Evidence],
         routed: frozenset[tuple[str, str]],
     ) -> Sequence[RouteSuggestion]:
-        offered, excluded_surfaces = self._offer(run, surfaces, evidence, routed)
+        offered, excluded_surfaces, capabilities = self._offer(
+            run, surfaces, evidence, routed
+        )
         offered_pair_count = sum(len(item.allowed_types) for item in offered)
         if not offered or not self._analyzers:
             # 보여 줄 표면이 없거나 제안 가능한 유형이 없다는 사실은 결정적이다.
@@ -351,12 +367,15 @@ class LlmRouterAdvisor:
                 offered_surface_ids=tuple(item.surface_id for item in offered),
                 offered_pair_count=offered_pair_count,
                 excluded_surfaces=excluded_surfaces,
+                capabilities=capabilities,
                 status="no_candidates" if not offered else "no_routes",
             )
             return ()
 
         if self._hypothesis_mode:
-            return self._advise_exhaustive(offered, routed, excluded_surfaces)
+            return self._advise_exhaustive(
+                offered, routed, excluded_surfaces, capabilities
+            )
 
         started = time.monotonic()
         try:
@@ -392,6 +411,7 @@ class LlmRouterAdvisor:
                 offered_surface_ids=tuple(item.surface_id for item in offered),
                 offered_pair_count=offered_pair_count,
                 excluded_surfaces=excluded_surfaces,
+                capabilities=capabilities,
                 source="deterministic_fallback",
                 status=status,
                 llm_calls=1,
@@ -406,6 +426,7 @@ class LlmRouterAdvisor:
             offered_surface_ids=tuple(item.surface_id for item in offered),
             offered_pair_count=offered_pair_count,
             excluded_surfaces=excluded_surfaces,
+            capabilities=capabilities,
             source=(
                 "deterministic_fallback"
                 if status in {"invalid_response", "all_rejected"}
@@ -425,15 +446,17 @@ class LlmRouterAdvisor:
         offered: tuple[_OfferedSurface, ...],
         routed: frozenset[tuple[str, str]],
         excluded_surfaces: tuple[tuple[str, str], ...],
+        capabilities: tuple[SurfaceCapability, ...],
     ) -> tuple[RouteSuggestion, ...]:
-        """Agentic mode에서 모든 Surface와 실행 가능한 조합을 batch별로 판정한다."""
+        """실행 가능한 모든 조합을 보존하고 LLM 판단은 감사 근거로만 쓴다."""
 
         started = time.monotonic()
+        capability_suggestions = self._capability_suggestions(offered)
+        suggestion_overrides: dict[tuple[str, str], RouteSuggestion] = {}
         batches = tuple(
             offered[index : index + self._max_surfaces]
             for index in range(0, len(offered), self._max_surfaces)
         )
-        suggestions: list[RouteSuggestion] = []
         dispositions: list[RouterDisposition] = []
         surface_dispositions: list[SurfaceDisposition] = []
         rejected_items: list[tuple[int, str]] = []
@@ -469,25 +492,29 @@ class LlmRouterAdvisor:
                     surface_dispositions.extend(
                         self._unanswered_surface_dispositions(remaining, status)
                     )
+                final_suggestions = self._merge_capability_suggestions(
+                    capability_suggestions, suggestion_overrides
+                )
                 self.last_trace = RouterAdvisorTrace(
-                    suggestions=tuple(suggestions),
+                    suggestions=final_suggestions,
                     dispositions=tuple(dispositions),
                     surface_dispositions=tuple(surface_dispositions),
                     rejected_items=tuple(rejected_items),
                     offered_surface_ids=tuple(item.surface_id for item in offered),
                     offered_pair_count=sum(len(item.allowed_types) for item in offered),
                     excluded_surfaces=excluded_surfaces,
+                    capabilities=capabilities,
                     source="deterministic_fallback",
                     status=status,
                     llm_calls=calls,
                     elapsed_ms=(time.monotonic() - started) * 1000,
                 )
-                return ()
+                return final_suggestions
 
             (
                 batch_dispositions,
                 batch_surface_dispositions,
-                batch_suggestions,
+                _batch_suggestions,
                 rejected,
                 status,
             ) = (
@@ -495,7 +522,14 @@ class LlmRouterAdvisor:
             )
             dispositions.extend(batch_dispositions)
             surface_dispositions.extend(batch_surface_dispositions)
-            suggestions.extend(batch_suggestions)
+            # LLM의 route/defer/reject는 취약점 진위 판정이 아니다. 실행 가능한 조합은
+            # 하나도 자르지 않고 Analysis가 자체 control/probe로 판정하게 한다.
+            suggestion_overrides.update(
+                {
+                    (item.surface_id, item.vulnerability_type): item
+                    for item in _batch_suggestions
+                }
+            )
             rejected_items.extend(
                 (raw_index_offset + index, reason) for index, reason in rejected
             )
@@ -519,14 +553,18 @@ class LlmRouterAdvisor:
                     surface_dispositions.extend(
                         self._unanswered_surface_dispositions(remaining, status)
                     )
+                final_suggestions = self._merge_capability_suggestions(
+                    capability_suggestions, suggestion_overrides
+                )
                 self.last_trace = RouterAdvisorTrace(
-                    suggestions=tuple(suggestions),
+                    suggestions=final_suggestions,
                     dispositions=tuple(dispositions),
                     surface_dispositions=tuple(surface_dispositions),
                     rejected_items=tuple(rejected_items),
                     offered_surface_ids=tuple(item.surface_id for item in offered),
                     offered_pair_count=sum(len(item.allowed_types) for item in offered),
                     excluded_surfaces=excluded_surfaces,
+                    capabilities=capabilities,
                     source="deterministic_fallback",
                     status=status,
                     llm_calls=calls,
@@ -535,17 +573,21 @@ class LlmRouterAdvisor:
                     model=model,
                     elapsed_ms=(time.monotonic() - started) * 1000,
                 )
-                return ()
+                return final_suggestions
 
         overall_status = "partial" if "partial" in statuses else "ok"
+        final_suggestions = self._merge_capability_suggestions(
+            capability_suggestions, suggestion_overrides
+        )
         self.last_trace = RouterAdvisorTrace(
-            suggestions=tuple(suggestions),
+            suggestions=final_suggestions,
             dispositions=tuple(dispositions),
             surface_dispositions=tuple(surface_dispositions),
             rejected_items=tuple(rejected_items),
             offered_surface_ids=tuple(item.surface_id for item in offered),
             offered_pair_count=sum(len(item.allowed_types) for item in offered),
             excluded_surfaces=excluded_surfaces,
+            capabilities=capabilities,
             source="llm",
             status=overall_status,
             llm_calls=calls,
@@ -554,7 +596,43 @@ class LlmRouterAdvisor:
             model=model,
             elapsed_ms=(time.monotonic() - started) * 1000,
         )
-        return tuple(suggestions)
+        return final_suggestions
+
+    def _capability_suggestions(
+        self, offered: tuple[_OfferedSurface, ...]
+    ) -> tuple[RouteSuggestion, ...]:
+        """Analyzer 실행 계약을 만족한 모든 조합을 Analysis 후보로 만든다."""
+
+        values: list[RouteSuggestion] = []
+        for surface in offered:
+            for vulnerability_type in surface.allowed_types:
+                agent_type = self._resolve_agent(
+                    vulnerability_type, surface.client_route
+                )
+                if agent_type is None:
+                    continue
+                values.append(RouteSuggestion(
+                    surface_id=surface.surface_id,
+                    vulnerability_type=vulnerability_type,
+                    agent_type=agent_type,
+                    reason="analyzer_contract_satisfied",
+                    reason_code="analyzer_contract_satisfied",
+                ))
+        return tuple(values)
+
+    @staticmethod
+    def _merge_capability_suggestions(
+        capability_suggestions: tuple[RouteSuggestion, ...],
+        overrides: dict[tuple[str, str], RouteSuggestion],
+    ) -> tuple[RouteSuggestion, ...]:
+        """LLM route 근거는 보존하되 defer/reject가 capability를 제거하지 못하게 한다."""
+
+        return tuple(
+            overrides.get(
+                (item.surface_id, item.vulnerability_type), item
+            )
+            for item in capability_suggestions
+        )
 
     # ------------------------------------------------------------------
     # 제안 대상 선정
@@ -566,16 +644,27 @@ class LlmRouterAdvisor:
         surfaces: Sequence[Surface],
         evidence: Sequence[Evidence],
         routed: frozenset[tuple[str, str]],
-    ) -> tuple[tuple[_OfferedSurface, ...], tuple[tuple[str, str], ...]]:
-        """Agentic에는 현재 Run의 모든 Surface를, Hybrid에는 실행 호환 표면만 싣는다."""
+    ) -> tuple[
+        tuple[_OfferedSurface, ...],
+        tuple[tuple[str, str], ...],
+        tuple[SurfaceCapability, ...],
+    ]:
+        """실행 가능한 조합만 LLM에 싣고 Agentic coverage는 모든 Surface에 남긴다."""
 
         observations = self._observations_by_surface(run, evidence)
         observation_records = self._observation_records_by_surface(run, evidence)
         offered: list[_OfferedSurface] = []
         excluded: list[tuple[str, str]] = []
+        capabilities: list[SurfaceCapability] = []
         for surface in surfaces:
             if surface.run_id != run.run_id:
                 excluded.append((surface.surface_id, "foreign_run"))
+                if self._hypothesis_mode:
+                    capabilities.append(SurfaceCapability(
+                        surface_id=surface.surface_id,
+                        status="excluded",
+                        reason_code="foreign_run",
+                    ))
                 continue
             parameter_names = alias_parameter_names(surface.parameters).prompt_names
             parsed = urlsplit(surface.url)
@@ -588,8 +677,7 @@ class LlmRouterAdvisor:
             }))
             # 후속 Analyzer의 메서드·파라미터·POST 안전 계약을 실제로 통과할 수 있는
             # 유형만 LLM에 제시한다. 구조적으로 실행 불가능한 조합은 LLM 판단 대상이
-            # 아니다. 다만 Agentic에서는 그 Surface 자체를 숨기지 않고 별도 disposition으로
-            # defer/reject하게 한다. state-changing 표면도 읽기 전용 검토만 허용한다.
+            # 아니며 capability ledger에 blocked/unsupported 사유로 남긴다.
             assignable = set() if state_changing else {
                     choice.vulnerability_type
                     for choice in self._analyzers
@@ -619,10 +707,58 @@ class LlmRouterAdvisor:
                     if assignable
                     else "no_compatible_route"
                 )
-                if not self._hypothesis_mode:
-                    # Hybrid는 기존 호출량과 동작을 유지한다.
-                    excluded.append((surface.surface_id, execution_blocker))
+                excluded.append((surface.surface_id, execution_blocker))
+                if self._hypothesis_mode:
+                    has_http_observation = any(
+                        kind.startswith("http_response_")
+                        for _, _, kind in observation_records.get(
+                            surface.surface_id, ()
+                        )
+                    )
+                    if state_changing:
+                        capabilities.append(SurfaceCapability(
+                            surface_id=surface.surface_id,
+                            status="unsupported",
+                            reason_code="approval_required",
+                            missing_requirements=("state_change_approval",),
+                        ))
+                    elif assignable:
+                        capabilities.append(SurfaceCapability(
+                            surface_id=surface.surface_id,
+                            status="routable",
+                            reason_code="already_covered",
+                            routable_types=tuple(sorted(assignable)),
+                        ))
+                    elif (
+                        surface.method.upper() == "GET"
+                        and not client_route
+                        and not has_http_observation
+                    ):
+                        capabilities.append(SurfaceCapability(
+                            surface_id=surface.surface_id,
+                            status="blocked",
+                            reason_code="missing_http_observation",
+                            missing_requirements=(
+                                "http_observation",
+                                "supported_input_coordinate",
+                            ),
+                        ))
+                    else:
+                        capabilities.append(SurfaceCapability(
+                            surface_id=surface.surface_id,
+                            status="unsupported",
+                            reason_code="no_supported_input_coordinate",
+                        ))
                     continue
+                # Hybrid는 기존 호출량과 동작을 유지한다.
+                continue
+            if self._hypothesis_mode:
+                capabilities.append(SurfaceCapability(
+                    surface_id=surface.surface_id,
+                    status="routable",
+                    reason_code="analyzer_contract_satisfied",
+                    routable_types=allowed_types,
+                ))
             offered.append(
                 _OfferedSurface(
                     surface_id=surface.surface_id,
@@ -663,7 +799,7 @@ class LlmRouterAdvisor:
             (item.surface_id, "prompt_limit")
             for item in offered[len(selected) :]
         )
-        return tuple(selected), tuple(excluded)
+        return tuple(selected), tuple(excluded), tuple(capabilities)
 
     @staticmethod
     def _observations_by_surface(
@@ -915,7 +1051,7 @@ class LlmRouterAdvisor:
         tuple[tuple[int, str], ...],
         str,
     ]:
-        """모든 Surface를 판정하고 빠진 조합·표면은 ``unanswered``로 합성한다."""
+        """제시된 실행 가능 조합을 검토하고 누락은 ``unanswered``로 합성한다."""
 
         expected: list[tuple[str, str]] = []
         expected_items: dict[tuple[str, str], tuple[_OfferedSurface, str]] = {}

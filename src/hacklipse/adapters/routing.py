@@ -172,6 +172,7 @@ CANDIDATE_REASON_CODES = frozenset(
         "template_rendering_risk",
         "object_authorization_risk",
         "observed_behavior_anomaly",
+        "analyzer_contract_satisfied",
     }
 )
 # Agentic Router의 비선택 판단도 자유 서술이 아니라 닫힌 reason code로 남긴다.
@@ -347,6 +348,7 @@ class RuleBasedVulnerabilityRouter:
         self.last_rule_decisions: tuple[RouteDecision, ...] = ()
         self.last_advisor_suggestions: tuple[RouteSuggestion, ...] = ()
         self.last_advisor_outcomes: tuple[tuple[int, str], ...] = ()
+        self.last_capability_assessments: tuple[object, ...] = ()
         self.last_advisor_status = "not_configured" if advisor is None else "not_called"
 
     def route(
@@ -360,6 +362,7 @@ class RuleBasedVulnerabilityRouter:
         self.last_rule_decisions = ()
         self.last_advisor_suggestions = ()
         self.last_advisor_outcomes = ()
+        self.last_capability_assessments = ()
         self.last_advisor_status = (
             "not_configured" if self._advisor is None else "not_called"
         )
@@ -424,18 +427,21 @@ class RuleBasedVulnerabilityRouter:
             sorted(decisions.values(), key=lambda item: item.priority, reverse=True)
         )
 
-        # 3단계. 규칙이 비워 둔 자리만 Advisor 제안으로 채운다. 이미 들어 있는 키는
-        # 건드리지 않으므로 "LLM이 Rule을 덮어쓰지 않는다"가 검사 한 줄이 아니라 병합
-        # 순서 자체로 보장된다.
+        # 3단계. Hybrid는 규칙이 비워 둔 자리만 Advisor 제안으로 채운다. Agentic은
+        # 규칙 결과를 정답 힌트로 주지 않고 Analyzer capability로 실행 가능한 조합을
+        # 다시 구성한다.
         if self._advisor is not None:
             if self._advisor_mode == "primary":
                 # Agentic mode는 규칙 Candidate를 정답처럼 LLM에 먼저 주지 않는다.
-                # 모든 호환 가능한 유형 중 관찰로 지지되는 가설만 고르게 하고, 호출·응답
-                # 실패일 때만 위에서 만든 결정적 규칙 결과를 복구한다.
+                # LLM의 disposition은 감사용 진단 신호이고, 실제 전달 대상은
+                # Analyzer 실행 계약을 만족한 모든 조합이다.
                 suggested, status = self._advisor_decisions(
                     run, surfaces, evidence, {}
                 )
                 trace = getattr(self._advisor, "last_trace", None)
+                self.last_capability_assessments = tuple(
+                    getattr(trace, "capabilities", ())
+                )
                 adapter_fallback = (
                     getattr(trace, "source", None) == "deterministic_fallback"
                 )
@@ -449,6 +455,11 @@ class RuleBasedVulnerabilityRouter:
                         f"agentic_fallback:{trace.status}"
                         + (f":{reasons}" if reasons else "")
                     )
+                    # Agentic LLM 장애나 형식 위반은 실행 가능한 Analyzer 조합을
+                    # 제거할 근거가 아니다. Advisor가 capability로 복구한 후보는 그대로
+                    # Analysis에 넘기고, 상태만 fallback으로 감사한다.
+                    if suggested:
+                        decisions = suggested
                 elif advisor_failed or router_rejected_all:
                     self.last_advisor_status = f"agentic_fallback:{status}"
                 else:
@@ -459,6 +470,10 @@ class RuleBasedVulnerabilityRouter:
                     run, surfaces, evidence, decisions
                 )
                 self.last_advisor_status = status
+                trace = getattr(self._advisor, "last_trace", None)
+                self.last_capability_assessments = tuple(
+                    getattr(trace, "capabilities", ())
+                )
                 decisions.update(suggested)
 
         # 우선순위가 높은 분석 대상을 먼저 처리하도록 정렬한다.
