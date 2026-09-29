@@ -212,6 +212,9 @@ class AuditedVulnerabilityRouter:
                     "offered_pair_count": (
                         advisor_trace.offered_pair_count if advisor_trace else 0
                     ),
+                    "offered_surface_count": (
+                        len(advisor_trace.offered_surface_ids) if advisor_trace else 0
+                    ),
                     "disposition_counts": {
                         decision: sum(
                             item.decision == decision
@@ -235,6 +238,34 @@ class AuditedVulnerabilityRouter:
                         }
                         for item in (
                             advisor_trace.dispositions if advisor_trace else ()
+                        )
+                    ],
+                    "surface_disposition_counts": {
+                        decision: sum(
+                            item.decision == decision
+                            for item in (
+                                advisor_trace.surface_dispositions
+                                if advisor_trace else ()
+                            )
+                        )
+                        for decision in ("defer", "reject", "unanswered")
+                    },
+                    "surface_dispositions": [
+                        {
+                            "surface_id": item.surface_id,
+                            "decision": item.decision,
+                            "reason_code": item.reason_code,
+                            "suspected_vulnerability_types": list(
+                                item.suspected_vulnerability_types
+                            ),
+                            "basis_evidence_ids": list(item.basis_evidence_ids),
+                            "required_evidence_types": list(
+                                item.required_evidence_types
+                            ),
+                        }
+                        for item in (
+                            advisor_trace.surface_dispositions
+                            if advisor_trace else ()
                         )
                     ],
                     "rejected_items": [

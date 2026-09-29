@@ -36,8 +36,9 @@ def _item(**changes):
 
 
 class _Llm:
-    def __init__(self, *items, error=None):
+    def __init__(self, *items, error=None, surface_items=()):
         self.items = list(items)
+        self.surface_items = list(surface_items)
         self.error = error
         self.calls = 0
 
@@ -50,8 +51,11 @@ class _Llm:
             if "dispositions" in request.response_schema["properties"]
             else "suggestions"
         )
+        payload = {key: self.items}
+        if key == "dispositions":
+            payload["surface_dispositions"] = self.surface_items
         return LlmResponse(
-            payload={key: self.items}, model="fixture-model",
+            payload=payload, model="fixture-model",
             usage=LlmUsage(input_tokens=100, output_tokens=50, cache_read_input_tokens=10),
         )
 
@@ -265,6 +269,43 @@ class RoutingAuditTests(unittest.TestCase):
                 ("XSS", "defer", "insufficient_observation"),
             ],
         )
+
+    def test_agentic_audit_records_non_executable_surface_disposition(self):
+        log = _Log()
+        navigation = replace(
+            _SURFACE,
+            surface_id="users",
+            url="http://localhost/api/Users",
+            parameters=(),
+        )
+        llm = _Llm(surface_items=({
+            "surface_id": "users",
+            "decision": "defer",
+            "suspected_vulnerability_types": ["Access Control"],
+            "basis_observation_ids": [],
+            "reason_code": "unsupported_execution_coordinate",
+            "required_evidence_types": ["cross_principal_response"],
+        },))
+
+        result = standard_router(
+            mode="agentic", llm_client=llm, audit_log=log
+        ).route(_RUN, (navigation,), ())
+
+        record = log.records[0]
+        self.assertEqual(result, ())
+        self.assertEqual(record["llm"]["offered_surface_count"], 1)
+        self.assertEqual(record["llm"]["offered_pair_count"], 0)
+        self.assertEqual(record["llm"]["surface_disposition_counts"], {
+            "defer": 1, "reject": 0, "unanswered": 0,
+        })
+        self.assertEqual(record["llm"]["surface_dispositions"], [{
+            "surface_id": "users",
+            "decision": "defer",
+            "reason_code": "unsupported_execution_coordinate",
+            "suspected_vulnerability_types": ["Access Control"],
+            "basis_evidence_ids": [],
+            "required_evidence_types": ["cross_principal_response"],
+        }])
 
     def test_unexpected_exception_preserves_rules_and_is_logged(self):
         log = _Log()

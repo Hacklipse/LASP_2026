@@ -181,6 +181,7 @@ ROUTER_DEFER_REASON_CODES = frozenset(
     {
         "insufficient_observation",
         "ambiguous_surface_semantics",
+        "unsupported_execution_coordinate",
     }
 )
 ROUTER_REJECT_REASON_CODES = frozenset(

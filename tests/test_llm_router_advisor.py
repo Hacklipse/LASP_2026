@@ -60,11 +60,22 @@ class _ExhaustiveLlmClient:
     def complete(self, request):
         self.requests.append(request)
         dispositions = []
+        surface_dispositions = []
         for line in request.messages[0].content.splitlines():
             if not line.startswith("- surface_id="):
                 continue
             surface_id = re.search(r"surface_id=(\S+)", line).group(1)
             allowed = re.search(r"allowed_types=\[([^]]+)\]", line).group(1)
+            if allowed == "(none)":
+                surface_dispositions.append({
+                    "surface_id": surface_id,
+                    "decision": "reject",
+                    "suspected_vulnerability_types": [],
+                    "basis_observation_ids": [],
+                    "reason_code": "surface_semantics_not_indicative",
+                    "required_evidence_types": [],
+                })
+                continue
             for vulnerability_type in allowed.split(", "):
                 dispositions.append({
                     "surface_id": surface_id,
@@ -74,7 +85,13 @@ class _ExhaustiveLlmClient:
                     "reason_code": "surface_semantics_not_indicative",
                     "required_evidence_types": [],
                 })
-        return LlmResponse(payload={"dispositions": dispositions}, model="fixture")
+        return LlmResponse(
+            payload={
+                "dispositions": dispositions,
+                "surface_dispositions": surface_dispositions,
+            },
+            model="fixture",
+        )
 
 
 def _run() -> Run:
@@ -445,6 +462,61 @@ class AgenticHypothesisTests(unittest.TestCase):
         )
         self.assertEqual(advisor.last_trace.status, "ok")
 
+    def test_agentic_batches_cover_every_non_executable_surface(self) -> None:
+        llm = _ExhaustiveLlmClient()
+        surfaces = tuple(
+            _surface(
+                f"surface-navigation-{index}",
+                url=f"http://localhost/page-{index}",
+                parameters=(),
+            )
+            for index in range(81)
+        )
+        advisor = LlmRouterAdvisor(
+            llm_client=llm,
+            analyzers=ANALYZERS,
+            hypothesis_mode=True,
+        )
+
+        suggestions = advisor.advise(_run(), surfaces, (), frozenset())
+
+        self.assertEqual(suggestions, ())
+        self.assertEqual(len(llm.requests), 3)
+        self.assertEqual(advisor.last_trace.offered_pair_count, 0)
+        self.assertEqual(len(advisor.last_trace.surface_dispositions), 81)
+        self.assertEqual(
+            {item.surface_id for item in advisor.last_trace.surface_dispositions},
+            {f"surface-navigation-{index}" for index in range(81)},
+        )
+        self.assertEqual(advisor.last_trace.status, "ok")
+
+    def test_missing_surface_disposition_is_unanswered(self) -> None:
+        navigation = _surface(
+            "surface-navigation", url="http://localhost/about", parameters=()
+        )
+        llm = _FakeLlmClient({
+            "dispositions": [],
+            "surface_dispositions": [],
+        })
+        advisor = LlmRouterAdvisor(
+            llm_client=llm, analyzers=ANALYZERS, hypothesis_mode=True
+        )
+
+        suggestions = advisor.advise(
+            _run(), (navigation,), (), frozenset()
+        )
+
+        self.assertEqual(suggestions, ())
+        self.assertEqual(advisor.last_trace.source, "deterministic_fallback")
+        self.assertEqual(advisor.last_trace.status, "all_rejected")
+        self.assertEqual(
+            [
+                (item.decision, item.reason_code)
+                for item in advisor.last_trace.surface_dispositions
+            ],
+            [("unanswered", "missing_surface_disposition")],
+        )
+
     def test_bounded_recon_post_coordinate_can_be_offered(self) -> None:
         llm = _FakeLlmClient(
             {"suggestions": [{
@@ -649,7 +721,7 @@ class OfferSelectionTests(unittest.TestCase):
 
         self.assertEqual(llm.requests, [])
 
-    def test_every_unoffered_surface_has_an_explicit_exclusion_reason(self) -> None:
+    def test_agentic_reviews_every_current_run_surface_including_non_executable(self) -> None:
         llm = _ExhaustiveLlmClient()
         safe = _surface("surface-safe")
         navigation = _surface(
@@ -664,14 +736,56 @@ class OfferSelectionTests(unittest.TestCase):
 
         advisor.advise(_run(), (safe, navigation, changing), (), frozenset())
 
+        self.assertEqual(advisor.last_trace.excluded_surfaces, ())
         self.assertEqual(
-            dict(advisor.last_trace.excluded_surfaces),
-            {
-                "surface-navigation": "no_compatible_route",
-                "surface-changing": "state_changing_surface",
-            },
+            set(advisor.last_trace.offered_surface_ids),
+            {"surface-safe", "surface-navigation", "surface-changing"},
         )
-        self.assertEqual(advisor.last_trace.offered_surface_ids, ("surface-safe",))
+        self.assertEqual(
+            {item.surface_id for item in advisor.last_trace.surface_dispositions},
+            {"surface-navigation", "surface-changing"},
+        )
+        self.assertEqual(
+            {item.decision for item in advisor.last_trace.surface_dispositions},
+            {"reject"},
+        )
+
+    def test_non_executable_surface_can_be_deferred_with_suspected_type(self) -> None:
+        navigation = _surface(
+            "surface-users", url="http://localhost/api/Users", parameters=()
+        )
+        llm = _FakeLlmClient({
+            "dispositions": [],
+            "surface_dispositions": [{
+                "surface_id": "surface-users",
+                "decision": "defer",
+                "suspected_vulnerability_types": ["Access Control"],
+                "basis_observation_ids": [],
+                "reason_code": "unsupported_execution_coordinate",
+                "required_evidence_types": ["cross_principal_response"],
+            }],
+        })
+        advisor = LlmRouterAdvisor(
+            llm_client=llm,
+            analyzers=ANALYZERS + (
+                AnalyzerChoice("Access Control", "access_control_analyzer"),
+            ),
+            hypothesis_mode=True,
+        )
+
+        suggestions = advisor.advise(
+            _run(), (navigation,), (), frozenset()
+        )
+
+        self.assertEqual(suggestions, ())
+        self.assertEqual(advisor.last_trace.offered_surface_ids, ("surface-users",))
+        self.assertEqual(
+            advisor.last_trace.surface_dispositions[0].decision, "defer"
+        )
+        self.assertEqual(
+            advisor.last_trace.surface_dispositions[0].suspected_vulnerability_types,
+            ("Access Control",),
+        )
 
     def test_uncovered_surfaces_are_offered_before_partially_covered_ones(self) -> None:
         llm = _FakeLlmClient({"suggestions": []})

@@ -26,17 +26,33 @@ class _Model:
                 r"surface_id=(\S+) method=GET path=/search ",
                 request.messages[0].content,
             ).group(1)
-            payload = {"dispositions": [{
-                "surface_id": surface_id,
-                "vulnerability_type": "SQLi",
-                "decision": "route",
-                "basis_observation_ids": [],
-                "reason_code": "query_interpreter_risk",
-                "required_evidence_types": [
-                    "control_response",
-                    "mutated_input_response" if self.explore else "server_error_delta",
-                ],
-            }]}
+            surface_dispositions = []
+            for line in request.messages[0].content.splitlines():
+                if not line.startswith("- surface_id=") or "allowed_types=[(none)]" not in line:
+                    continue
+                review_surface_id = re.search(r"surface_id=(\S+)", line).group(1)
+                surface_dispositions.append({
+                    "surface_id": review_surface_id,
+                    "decision": "reject",
+                    "suspected_vulnerability_types": [],
+                    "basis_observation_ids": [],
+                    "reason_code": "surface_semantics_not_indicative",
+                    "required_evidence_types": [],
+                })
+            payload = {
+                "dispositions": [{
+                    "surface_id": surface_id,
+                    "vulnerability_type": "SQLi",
+                    "decision": "route",
+                    "basis_observation_ids": [],
+                    "reason_code": "query_interpreter_risk",
+                    "required_evidence_types": [
+                        "control_response",
+                        "mutated_input_response" if self.explore else "server_error_delta",
+                    ],
+                }],
+                "surface_dispositions": surface_dispositions,
+            }
         elif "parameters" in properties:
             self.roles.append("analysis")
             payload = {"parameters": ["invented" if self.bad_parameter else "q"], "reason": "observed input"}
