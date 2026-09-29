@@ -212,7 +212,10 @@ class AuditedVulnerabilityRouter:
                 },
                 "final_decisions": [
                     _decision(
-                        item, _source(item, original), surface_keys, routing_identities
+                        item,
+                        _source(item, original),
+                        surface_keys,
+                        routing_identities,
                     )
                     for item in decisions
                 ],
@@ -220,6 +223,8 @@ class AuditedVulnerabilityRouter:
 
 
 def _source(item: RouteDecision, original: Mapping[str, RouteDecision]) -> str:
+    if item.candidate.selection_source == "coverage":
+        return "coverage"
     baseline = original.get(item.candidate.candidate_id)
     if baseline is None:
         return "llm"

@@ -211,6 +211,7 @@ def append_run_result(args, app, run) -> None:
         "candidates": [{
             "candidate_id": c.candidate_id, "surface_key": keys.get(c.surface_id),
             "vulnerability_type": c.vulnerability_type, "agent_type": c.assigned_agent,
+            "selection_source": c.selection_source,
             "status": c.status.value, "evidence_count": len(c.evidence_ids),
             "exploration_parameters": list(c.exploration_parameters),
             "required_evidence_types": list(c.required_evidence_types),

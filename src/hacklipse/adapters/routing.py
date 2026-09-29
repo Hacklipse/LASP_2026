@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -12,6 +12,7 @@ from hacklipse.domain import Candidate, Evidence, RouteDecision, Run, Surface
 
 from .request_safety import (
     has_state_changing_parameters,
+    has_state_changing_get,
     object_identifier_parameters,
 )
 
@@ -156,6 +157,12 @@ DEFAULT_SURFACE_RULES = (
 # 판정이 LLM 제안 때문에 잘리는 일이 없어야 한다.
 ADVISOR_PRIORITY = 0.15
 
+# Agentic LLM이 놓친 안전한 GET 후보만 작은 요청 몫으로 보완한다. 실제 요청 상한은
+# 중앙 BudgetManager가 강제하며, 각 후보의 독립 Validation에도 여유를 남긴다.
+COVERAGE_PRIORITY = 0.10
+MAX_COVERAGE_CANDIDATES = 8
+REQUESTS_PER_CANDIDATE = 10
+
 _PATH_TRAVERSAL_POST_OBSERVATION = "unlinked_render_parameter_candidate"
 _PATH_TRAVERSAL_POST_SOURCE = "bounded_unlinked_render_parameter"
 _ROUTER_REVIEW_POLICIES = frozenset({"weak", "ambiguous"})
@@ -287,10 +294,11 @@ def _supports_suggestion(
 
 
 class RuleBasedVulnerabilityRouter:
-    """Surface 탐색 규칙과 강한 Observation 규칙을 함께 사용하는 결정적 Router.
+    """Surface 탐색 규칙과 강한 Observation 규칙을 함께 사용하는 Router.
 
     ``advisor``를 주면 규칙이 비워 둔 자리에 한해 제안을 받아 Candidate를 더 만든다.
-    주지 않으면 규칙만 사용하며 결과는 결정적이다.
+    Agentic primary에서는 LLM 선택을 우선하고 미선택 안전 GET 후보를 제한적으로 보완한다.
+    Advisor가 없으면 규칙만 사용하며 결과는 결정적이다.
     """
 
     def __init__(
@@ -414,8 +422,9 @@ class RuleBasedVulnerabilityRouter:
         if self._advisor is not None:
             if self._advisor_mode == "primary":
                 # Agentic mode는 규칙 Candidate를 정답처럼 LLM에 먼저 주지 않는다.
-                # 모든 호환 가능한 유형 중 관찰로 지지되는 가설만 고르게 하고, 호출·응답
-                # 실패일 때만 위에서 만든 결정적 규칙 결과를 복구한다.
+                # 모든 호환 가능한 유형 중 관찰로 지지되는 가설만 고르게 한다.
+                # 호출·응답 실패 때는 규칙 전체를 복구하고, 유효한 응답이 일부를
+                # 빠뜨린 때만 안전한 GET 규칙 후보를 작은 예산 몫으로 보완한다.
                 suggested, status = self._advisor_decisions(
                     run, surfaces, evidence, {}
                 )
@@ -438,6 +447,44 @@ class RuleBasedVulnerabilityRouter:
                 else:
                     self.last_advisor_status = f"agentic_primary:{status}"
                     decisions = suggested
+                    surfaces_by_id = {
+                        surface.surface_id: surface
+                        for surface in surfaces if surface.run_id == run.run_id
+                    }
+                    coverage_limit = min(
+                        MAX_COVERAGE_CANDIDATES,
+                        max(0, run.request_budget // REQUESTS_PER_CANDIDATE - len(suggested)),
+                    )
+                    for rule_decision in self.last_rule_decisions:
+                        if coverage_limit == 0:
+                            break
+                        candidate = rule_decision.candidate
+                        key = (candidate.surface_id, candidate.vulnerability_type)
+                        surface = surfaces_by_id.get(candidate.surface_id)
+                        if (
+                            key in decisions
+                            or surface is None
+                            or surface.method.upper() != "GET"
+                            or has_state_changing_get(surface.url, surface.parameters)
+                            or has_state_changing_parameters(
+                                (urlsplit(surface.url).fragment.split("?", 1)[0],)
+                            )
+                            or not _supports_suggestion(
+                                surface,
+                                RouteSuggestion(
+                                    surface_id=candidate.surface_id,
+                                    vulnerability_type=candidate.vulnerability_type,
+                                    agent_type=candidate.assigned_agent,
+                                ),
+                                evidence,
+                            )
+                        ):
+                            continue
+                        decisions[key] = RouteDecision(
+                            replace(candidate, selection_source="coverage"),
+                            COVERAGE_PRIORITY,
+                        )
+                        coverage_limit -= 1
             else:
                 suggested, status = self._advisor_decisions(
                     run, surfaces, evidence, decisions
@@ -590,6 +637,7 @@ class RuleBasedVulnerabilityRouter:
                     else ()
                 ),
                 required_evidence_types=suggestion.required_evidence_types,
+                selection_source="llm",
             )
             accepted[key] = RouteDecision(
                 candidate=candidate, priority=self._advisor_priority

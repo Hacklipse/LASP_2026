@@ -571,6 +571,29 @@ class OfferSelectionTests(unittest.TestCase):
 
 
 class PromptHygieneTests(unittest.TestCase):
+    def test_client_route_path_is_visible_without_fragment_query_values(self) -> None:
+        llm = _FakeLlmClient({"suggestions": []})
+        surfaces = (
+            _surface(
+                "surface-login", url="http://localhost/#/login?redirectUrl=hidden",
+                parameters=("redirectUrl",),
+            ),
+            _surface(
+                "surface-search", url="http://localhost/#/search?q=private",
+                parameters=("q",),
+            ),
+        )
+
+        _advise(llm, surfaces=surfaces, hypothesis_mode=True)
+
+        prompt = llm.requests[0].messages[0].content
+        self.assertIn(
+            "kind=client_route client_route_path=/login parameters=[redirectUrl]", prompt
+        )
+        self.assertIn("kind=client_route client_route_path=/search parameters=[q]", prompt)
+        self.assertNotIn("hidden", prompt)
+        self.assertNotIn("private", prompt)
+
     def test_prompt_carries_only_sanitized_surface_metadata(self) -> None:
         llm = _FakeLlmClient({"suggestions": []})
         evidence = Evidence(

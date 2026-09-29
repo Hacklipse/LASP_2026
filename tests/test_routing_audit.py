@@ -217,6 +217,27 @@ class RoutingAuditTests(unittest.TestCase):
             {"index": 0, "index_scope": "raw_items", "reason": "unknown_observation"}
         ])
 
+    def test_agentic_audit_separates_llm_choice_from_coverage(self):
+        log = _Log()
+        llm = _Llm({
+            "surface_id": "search", "vulnerability_type": "SQLi",
+            "basis_observation_ids": [],
+            "reason_code": "query_interpreter_risk",
+            "required_evidence_types": ["control_response", "server_error_delta"],
+        })
+
+        standard_router(mode="agentic", llm_client=llm, audit_log=log).route(
+            replace(_RUN, request_budget=80), (_SURFACE,), ()
+        )
+
+        record = log.records[0]
+        self.assertEqual(record["llm"]["source"], "llm")
+        self.assertEqual(
+            [(item["vulnerability_type"], item["source"])
+             for item in record["final_decisions"]],
+            [("SQLi", "llm"), ("XSS", "coverage")],
+        )
+
     def test_unexpected_exception_preserves_rules_and_is_logged(self):
         log = _Log()
         router = standard_router(mode="hybrid", llm_client=_Llm(error=RuntimeError("private-error")), audit_log=log)

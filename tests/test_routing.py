@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 from hacklipse.adapters import RuleBasedVulnerabilityRouter
 from hacklipse.adapters.routing import (
     ADVISOR_PRIORITY,
+    COVERAGE_PRIORITY,
     DEFAULT_RULES,
     OPTIONAL_RESTRICTED_FILE_BYPASS_RULES,
     RouteSuggestion,
@@ -271,13 +273,81 @@ class AdvisorRoutingTests(unittest.TestCase):
         self.assertEqual(advisor.calls, [frozenset()])
         self.assertTrue(router.last_advisor_status.startswith("agentic_primary:"))
 
-    def test_primary_advisor_valid_empty_result_keeps_no_rule_candidates(self) -> None:
+    def test_primary_advisor_valid_empty_result_uses_bounded_coverage(self) -> None:
         router = RuleBasedVulnerabilityRouter(
             advisor=_StubAdvisor(),
             advisor_mode="primary",
         )
 
-        self.assertEqual(router.route(_run(), (_surface(),), ()), ())
+        decisions = router.route(_run(), (_surface(),), ())
+
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].candidate.vulnerability_type, "XSS")
+        self.assertEqual(decisions[0].priority, COVERAGE_PRIORITY)
+
+    def test_primary_advisor_keeps_unselected_safe_surface_after_llm_choice(self) -> None:
+        login = Surface(
+            surface_id="login", run_id="run-1",
+            url="http://localhost/#/login?redirectUrl=", method="GET",
+            parameters=("redirectUrl",),
+        )
+        search = replace(
+            login, surface_id="search", url="http://localhost/#/search?q=",
+            parameters=("q",),
+        )
+        unsafe = replace(
+            login, surface_id="change", url="http://localhost/#/change?password_new=",
+            parameters=("password_new",),
+        )
+        unsafe_path = replace(
+            login, surface_id="delete", url="http://localhost/#/delete?q=",
+            parameters=("q",),
+        )
+        router = RuleBasedVulnerabilityRouter(
+            surface_rules=(SurfaceRoutingRule(
+                "XSS", "browser_xss_analyzer", client_route=True, priority=0.4,
+            ),),
+            advisor=_StubAdvisor(RouteSuggestion(
+                surface_id="login", vulnerability_type="XSS",
+                agent_type="browser_xss_analyzer",
+            )),
+            advisor_mode="primary",
+        )
+
+        decisions = router.route(
+            replace(_run(), request_budget=80),
+            (login, search, unsafe, unsafe_path),
+            (),
+        )
+
+        self.assertEqual(
+            [(item.candidate.surface_id, item.priority) for item in decisions],
+            [("login", ADVISOR_PRIORITY), ("search", COVERAGE_PRIORITY)],
+        )
+        self.assertEqual(
+            [item.candidate.selection_source for item in decisions],
+            ["llm", "coverage"],
+        )
+
+    def test_primary_coverage_stays_within_candidate_budget_share(self) -> None:
+        surfaces = tuple(
+            replace(_surface(), surface_id=f"surface-{index}") for index in range(12)
+        )
+        router = RuleBasedVulnerabilityRouter(
+            surface_rules=(SurfaceRoutingRule("XSS", "xss_analyzer"),),
+            advisor=_StubAdvisor(), advisor_mode="primary",
+        )
+
+        decisions = router.route(replace(_run(), request_budget=80), surfaces, ())
+
+        self.assertEqual(len(decisions), 8)
+        self.assertEqual(
+            [item.candidate.surface_id for item in decisions],
+            [f"surface-{index}" for index in range(8)],
+        )
+        self.assertEqual(
+            router.route(replace(_run(), request_budget=5), surfaces, ()), ()
+        )
 
     def test_primary_advisor_failure_restores_deterministic_rule_candidates(self) -> None:
         router = RuleBasedVulnerabilityRouter(

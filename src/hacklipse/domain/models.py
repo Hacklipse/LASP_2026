@@ -374,7 +374,7 @@ class Run:
             if self.budget_validation_reserve < 1:
                 raise DomainInvariantError("budget order requires a validation reserve")
             if self.budget_allocation_source not in {
-                "heuristic", "llm", "advisor", "deterministic_fallback"
+                "heuristic", "llm", "advisor", "deterministic_fallback", "coverage"
             }:
                 raise DomainInvariantError("budget order requires a known source")
             if (
@@ -803,8 +803,12 @@ class Candidate:
     # 실행 요청이나 proof가 아니라 감사 가능한 계획 메타데이터이며, 실제 Analyzer와
     # Validation은 기존 정책·proof 계약을 독립적으로 적용한다.
     required_evidence_types: tuple[str, ...] = ()
+    # 실행·재개와 감사 로그에서 LLM 선택과 안전한 추가 탐색을 구분한다.
+    selection_source: str = "rule"
 
     def __post_init__(self) -> None:
+        if self.selection_source not in {"rule", "llm", "coverage"}:
+            raise DomainInvariantError("unknown candidate selection source")
         if not isinstance(self.exploration_parameters, tuple) or any(
             not isinstance(name, str) or not name or not name.isprintable()
             for name in self.exploration_parameters

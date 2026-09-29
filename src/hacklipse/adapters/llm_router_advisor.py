@@ -181,6 +181,7 @@ class _OfferedSurface:
     method: str
     path: str
     client_route: bool
+    client_route_path: str | None
     parameter_names: tuple[str, ...]
     observation_types: tuple[str, ...]
     observations: tuple[tuple[str, str, str], ...]
@@ -324,7 +325,8 @@ class LlmRouterAdvisor:
             if has_state_changing_parameters(surface.parameters):
                 continue
             parameter_names = alias_parameter_names(surface.parameters).prompt_names
-            client_route = bool(urlsplit(surface.url).fragment)
+            parsed = urlsplit(surface.url)
+            client_route = bool(parsed.fragment)
             # 후속 Analyzer의 메서드·파라미터·POST 안전 계약을 실제로 통과할 수 있는
             # 유형만 LLM에 제시한다. 응답을 받은 뒤 버릴 항목이 40개 상한을 차지하면
             # 실행 가능한 Surface가 입력에서 밀려날 수 있다.
@@ -355,8 +357,12 @@ class LlmRouterAdvisor:
                 _OfferedSurface(
                     surface_id=surface.surface_id,
                     method=surface.method.upper(),
-                    path=_path_hint(urlsplit(surface.url).path or "/"),
+                    path=_path_hint(parsed.path or "/"),
                     client_route=client_route,
+                    client_route_path=(
+                        _path_hint(parsed.fragment.split("?", 1)[0])
+                        if client_route else None
+                    ),
                     parameter_names=parameter_names,
                     observation_types=observations.get(surface.surface_id, ()),
                     observations=observation_records.get(surface.surface_id, ()),
@@ -467,13 +473,17 @@ class LlmRouterAdvisor:
             covered = ", ".join(item.covered_types) or "(none)"
             allowed = ", ".join(item.allowed_types)
             location = "client_route" if item.client_route else "server_route"
+            route = (
+                f" client_route_path={item.client_route_path}"
+                if item.client_route_path else ""
+            )
             observation_records = ", ".join(
                 f'{{"ref":"{ref}","kind":"{kind}"}}'
                 for ref, _, kind in item.observations
             ) or "(none)"
             lines.append(
                 f"- surface_id={item.surface_id} method={item.method} "
-                f"path={item.path} kind={location} parameters=[{parameters}] "
+                f"path={item.path} kind={location}{route} parameters=[{parameters}] "
                 f"observations=[{observations}] "
                 + (
                     f"observation_refs=[{observation_records}] "

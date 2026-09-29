@@ -179,7 +179,7 @@ def _print_execution_preview(
     print(f"  Recon 시작      {getattr(args, 'recon_entry', 'targeted')}")
     print(f"  Surface 수집    {getattr(args, 'surface_collection', 'adaptive')}")
     router_detail = (
-        "primary hypotheses"
+        "primary hypotheses + bounded safe coverage"
         if args.router == "agentic"
         else f"review {args.router_review}"
     )
