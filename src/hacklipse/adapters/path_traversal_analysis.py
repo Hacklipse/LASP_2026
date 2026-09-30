@@ -40,6 +40,7 @@ from .probing import (
     response_body,
 )
 from .request_safety import has_state_changing_parameters
+from .hidden_parameter_planner import HiddenParameterPlanner, safe_hidden_name
 
 PATH_TRAVERSAL_TOOL = "path_traversal_probe"
 HEURISTIC_PATH_TRAVERSAL_ANALYZER = "heuristic_path_traversal_analyzer"
@@ -57,6 +58,9 @@ RESTRICTED_FILE_OBSERVATION = "restricted_file_path"
 UNLINKED_RENDER_PARAMETER_OBSERVATION = "unlinked_render_parameter_candidate"
 PATH_TRAVERSAL_POST_APPROVAL_REF = "approved-path-traversal-form-probe"
 _INFERRED_PARAMETER_SOURCE = "bounded_unlinked_render_parameter"
+HIDDEN_BODY_CAPABILITY = "path_traversal.hidden_body_parameter"
+HIDDEN_PLAN_OBSERVATION = "hidden_body_parameter_plan"
+_HIDDEN_BENIGN_PATH = "package.json"
 
 
 def validate_path_traversal_request(request: ExecutionRequest) -> None:
@@ -66,17 +70,27 @@ def validate_path_traversal_request(request: ExecutionRequest) -> None:
         raise ValueError("path traversal request must use its dedicated tool")
     method = request.method.upper()
     if method == "POST":
+        if request.approval_ref != PATH_TRAVERSAL_POST_APPROVAL_REF:
+            raise ValueError("path traversal POST requires its dedicated approval")
         if request.path_suffix is not None or request.query_parameters:
             raise ValueError("path traversal form probe cannot alter the URL")
-        if request.request_kind is not HttpRequestKind.PATH_TRAVERSAL_PROBE:
-            raise ValueError("path traversal POST must be a safe-file probe")
+        if request.request_kind not in {
+            HttpRequestKind.CONTROL, HttpRequestKind.PATH_TRAVERSAL_PROBE
+        }:
+            raise ValueError("path traversal POST must be a control or safe-file probe")
         if request.headers != (("Content-Type", "application/x-www-form-urlencoded"),):
             raise ValueError("path traversal POST must use form-urlencoded content")
         fields = parse_qsl(request.body or "", keep_blank_values=True)
-        if len(fields) != 1 or not fields[0][0]:
-            raise ValueError("path traversal POST must change exactly one form field")
-        if not is_path_traversal_safe_form_probe_value(fields[0][1]):
-            raise ValueError("path traversal POST may only use the fixed safe path")
+        if not fields or any(not name for name, _ in fields):
+            raise ValueError("path traversal POST requires named form fields")
+        changed = [value for _, value in fields if value]
+        if request.request_kind is HttpRequestKind.CONTROL:
+            if changed:
+                raise ValueError("path traversal POST control must have blank field values")
+        elif len(changed) != 1 or changed[0] not in {
+            _HIDDEN_BENIGN_PATH, PATH_TRAVERSAL_FORM_PROBE_PATH
+        }:
+            raise ValueError("path traversal POST may change one fixed safe-file value")
         return
     if method != "GET" or request.body is not None or request.headers:
         raise ValueError("path traversal safe-file probe supports GET or approved POST")
@@ -142,6 +156,17 @@ class HeuristicPathTraversalAnalyzer:
             allowed_methods=("GET", "POST"),
         )
         evidence = tuple(self._evidence.get_many(task.run_id, task.evidence_ids))
+        if candidate.routing_capability_id == HIDDEN_BODY_CAPABILITY:
+            return handle_hidden_body_parameter(
+                task=task,
+                candidate=candidate,
+                surface=surface,
+                evidence=evidence,
+                evidence_store=self._evidence,
+                planner=HiddenParameterPlanner(None),
+                created_by=HEURISTIC_PATH_TRAVERSAL_ANALYZER,
+                id_factory=self._id_factory,
+            )
         if is_restricted_file_surface(evidence, surface):
             return handle_path_traversal_bypass(
                 task=task,
@@ -558,6 +583,208 @@ def _build_path_traversal_form_requests(
             )
         )
     return tuple(requests)
+
+
+def build_hidden_body_requests(
+    surface: Surface,
+    parameters: Sequence[str],
+    *,
+    purpose: str,
+) -> tuple[EvidenceRequest, ...]:
+    """Keep the observed form field names and add only one hypothesis per POST."""
+
+    if surface.method.upper() != "POST" or not surface.parameters:
+        raise AgentContractError("hidden body search requires a POST form surface")
+    base = tuple((name, "") for name in surface.parameters)
+
+    def request(fields: tuple[tuple[str, str], ...], kind: HttpRequestKind, reason: str) -> EvidenceRequest:
+        return EvidenceRequest(
+            evidence_type="http_response",
+            surface_id=surface.surface_id,
+            reason=f"{reason} for {purpose}",
+            suggested_tool=PATH_TRAVERSAL_TOOL,
+            http_request=HttpRequestSpec(
+                method="POST",
+                headers=(("Content-Type", "application/x-www-form-urlencoded"),),
+                body=urlencode(fields),
+                request_kind=kind,
+            ),
+            approval_ref=PATH_TRAVERSAL_POST_APPROVAL_REF,
+        )
+
+    requests = [request(base, HttpRequestKind.CONTROL, "form-body control")]
+    for parameter in dict.fromkeys(parameters):
+        if not safe_hidden_name(parameter, surface.parameters):
+            raise AgentContractError("hidden parameter name is unsafe or already observed")
+        requests.append(request(
+            (*base, (parameter, _HIDDEN_BENIGN_PATH)),
+            HttpRequestKind.PATH_TRAVERSAL_PROBE,
+            f"benign hidden-body check for {parameter}",
+        ))
+        requests.append(request(
+            (*base, (parameter, PATH_TRAVERSAL_FORM_PROBE_PATH)),
+            HttpRequestKind.PATH_TRAVERSAL_PROBE,
+            f"safe traversal hidden-body check for {parameter}",
+        ))
+    return tuple(requests)
+
+
+def hidden_body_signal(control: Evidence, benign: Evidence, traversal: Evidence) -> bool:
+    """A 2xx marker in traversal only is required; error pages never confirm."""
+
+    control_body = response_body(control) or ""
+    benign_body = response_body(benign) or ""
+    traversal_body = response_body(traversal) or ""
+    status = traversal.observation.get("status")
+    return bool(
+        isinstance(status, int)
+        and 200 <= status < 300
+        and all(marker in traversal_body for marker in PATH_TRAVERSAL_FORM_PROOF_MARKERS)
+        and all(marker not in control_body for marker in PATH_TRAVERSAL_FORM_PROOF_MARKERS)
+        and all(marker not in benign_body for marker in PATH_TRAVERSAL_FORM_PROOF_MARKERS)
+        and benign_body != traversal_body
+    )
+
+
+def handle_hidden_body_parameter(
+    *,
+    task: TaskEnvelope,
+    candidate: Candidate,
+    surface: Surface,
+    evidence: Sequence[Evidence],
+    evidence_store: EvidenceStore,
+    planner: HiddenParameterPlanner,
+    created_by: str,
+    id_factory: Callable[[], str],
+) -> AgentResult:
+    """Plan names once, then use only centrally approved/budgeted evidence requests."""
+
+    stored = next((
+        item for item in reversed(evidence)
+        if item.surface_id == surface.surface_id
+        and item.created_by == created_by
+        and item.observation.get("type") == HIDDEN_PLAN_OBSERVATION
+        and item.observation.get("candidate_id") == candidate.candidate_id
+    ), None)
+    new_ids: list[str] = []
+    if stored is None:
+        # One control and two POSTs per name; leave three requests for Validation.
+        capacity = min(12, max(0, (task.request_budget - 4) // 2))
+        if capacity == 0:
+            raise BudgetExceeded("hidden-body analysis needs control, probe and validation reserve")
+        hypotheses = planner.plan(surface, timeout_seconds=task.timeout_seconds)[:capacity]
+        if not hypotheses:
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.COMPLETED,
+                candidate_ids=(candidate.candidate_id,),
+            )
+        plan_id = f"evi-{id_factory()}"
+        evidence_store.append(Evidence(
+            evidence_id=plan_id,
+            run_id=task.run_id,
+            surface_id=surface.surface_id,
+            created_by=created_by,
+            evidence_type="observation",
+            observation={
+                "type": HIDDEN_PLAN_OBSERVATION,
+                "candidate_id": candidate.candidate_id,
+                "strategy": "hidden_parameter_differential_probe",
+                "hypotheses": [item.observation() for item in hypotheses],
+            },
+        ))
+        new_ids.append(plan_id)
+    else:
+        plan_id = stored.evidence_id
+        hypotheses = tuple(
+            item for item in stored.observation.get("hypotheses", ())
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        )
+        if len(hypotheses) > 12 or any(
+            not safe_hidden_name(item["name"], surface.parameters)
+            for item in hypotheses
+        ):
+            raise AgentContractError("stored hidden-body plan contains unsafe names")
+    names = tuple(
+        item.name if hasattr(item, "name") else item["name"]
+        for item in hypotheses
+    )
+    # The second wave is considered only after the first six names have produced
+    # no signal. One-per-request avoids parameter interference and keeps the plan
+    # stable across resume; the same blank form control is shared by both waves.
+    for start in range(0, len(names), 6):
+        wave = names[start : start + 6]
+        requests = build_hidden_body_requests(
+            surface, wave, purpose=f"Path Traversal candidate {candidate.candidate_id}"
+        )
+        collected = tuple(
+            matching_evidence(evidence, surface.url, request) for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "hidden-body analysis lacks budget for its evidence requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+                new_evidence_ids=tuple(new_ids),
+                candidate_ids=(candidate.candidate_id,),
+            )
+
+        control = collected[0]
+        assert control is not None
+        found = False
+        for index, parameter in enumerate(wave):
+            benign = collected[1 + 2 * index]
+            traversal = collected[2 + 2 * index]
+            assert benign is not None and traversal is not None
+            if not hidden_body_signal(control, benign, traversal):
+                continue
+            found = True
+            if has_observation_record(
+                evidence, created_by, PATH_TRAVERSAL_OBSERVATION,
+                parameter, control.evidence_id, traversal.evidence_id,
+            ):
+                continue
+            observation_id = f"evi-{id_factory()}"
+            hypothesis = hypotheses[start + index]
+            source = (
+                hypothesis.source if hasattr(hypothesis, "source")
+                else hypothesis.get("source")
+            )
+            evidence_store.append(Evidence(
+                evidence_id=observation_id,
+                run_id=task.run_id,
+                surface_id=surface.surface_id,
+                created_by=created_by,
+                evidence_type="observation",
+                observation={
+                    "type": PATH_TRAVERSAL_OBSERVATION,
+                    "parameter": parameter,
+                    "source": "active_differential_probe",
+                    "observed": True,
+                    "hypothesis_source": source,
+                    "plan_evidence_id": plan_id,
+                    "proof_file": PATH_TRAVERSAL_FORM_PROOF_FILE,
+                    "control_evidence_id": control.evidence_id,
+                    "benign_evidence_id": benign.evidence_id,
+                    "probe_evidence_id": traversal.evidence_id,
+                },
+            ))
+            new_ids.append(observation_id)
+        if found:
+            break
+    return AgentResult(
+        task_id=task.task_id,
+        status=AgentResultStatus.COMPLETED,
+        new_evidence_ids=tuple(new_ids),
+        candidate_ids=(candidate.candidate_id,),
+    )
 
 
 def path_traversal_signal(control: Evidence, probe: Evidence) -> bool:

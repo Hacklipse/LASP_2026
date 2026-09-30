@@ -13,16 +13,19 @@ from hacklipse.ports import CandidateStore, EvidenceStore, LlmClient, SurfaceSto
 from hacklipse.ports.llm import LlmMessage, LlmRequest
 
 from .path_traversal_analysis import (
+    HIDDEN_BODY_CAPABILITY,
     PATH_TRAVERSAL_FORM_PROBE_PATH,
     PATH_TRAVERSAL_PROBE_PATH,
     PATH_TRAVERSAL_TOOL,
     bounded_render_parameters_from_evidence,
     build_path_traversal_requests,
     handle_path_traversal_bypass,
+    handle_hidden_body_parameter,
     is_restricted_file_surface,
     path_parameter_candidates,
     record_path_traversal_observations,
 )
+from .hidden_parameter_planner import HiddenParameterPlanner
 from .knowledge_prompt import (
     knowledge_system_prompt,
     render_knowledge_hints,
@@ -85,6 +88,17 @@ class LlmPathTraversalAnalyzer:
             allowed_methods=("GET", "POST"),
         )
         evidence = tuple(self._evidence.get_many(task.run_id, task.evidence_ids))
+        if candidate.routing_capability_id == HIDDEN_BODY_CAPABILITY:
+            return handle_hidden_body_parameter(
+                task=task,
+                candidate=candidate,
+                surface=surface,
+                evidence=evidence,
+                evidence_store=self._evidence,
+                planner=HiddenParameterPlanner(self._llm),
+                created_by=LLM_PATH_TRAVERSAL_ANALYZER,
+                id_factory=self._id_factory,
+            )
         if is_restricted_file_surface(evidence, surface):
             # 선택할 파라미터가 없는 결정적 검증이므로 LLM 호출 없이 고정 접미사만 쓴다.
             return handle_path_traversal_bypass(

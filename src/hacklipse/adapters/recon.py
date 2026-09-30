@@ -419,10 +419,20 @@ class ReconAgent:
                     continue
 
                 links, forms, sources = _parse_page(body, url)
-                for form_url, method, names in forms:
+                for form_url, method, names, content_type in forms:
                     form_surface_id = remember(
                         form_url, method, names, discovery_types=("html_form",)
                     )
+                    if (
+                        method == "POST"
+                        and names
+                        and content_type == "application/x-www-form-urlencoded"
+                    ):
+                        evidence_ids.append(
+                            self._flag_post_form_structure(
+                                task.run_id, form_surface_id, names
+                            )
+                        )
                     if (
                         self._infer_unlinked_render_parameters
                         and method == "POST"
@@ -727,6 +737,30 @@ class ReconAgent:
             )
             evidence_ids.append(evidence_id)
         return evidence_ids
+
+    def _flag_post_form_structure(
+        self, run_id: str, surface_id: str, names: tuple[str, ...]
+    ) -> str:
+        """Record a form-declared POST shape, not a submitted request or hidden field."""
+
+        evidence_id = f"evi-{self._id_factory()}"
+        self._evidence.append(
+            Evidence(
+                evidence_id=evidence_id,
+                run_id=run_id,
+                surface_id=surface_id,
+                created_by="recon",
+                evidence_type="observation",
+                observation={
+                    "type": "post_form_body_structure",
+                    "source": "html_form",
+                    "content_type": "application/x-www-form-urlencoded",
+                    "field_names": list(names),
+                    "observed_request": False,
+                },
+            )
+        )
+        return evidence_id
 
     def _flag_unlinked_render_parameters(
         self, run_id: str, surface_id: str
@@ -1050,7 +1084,7 @@ def _is_html_response(evidence: Evidence) -> bool:
 
 def _parse_page(
     body: str, base_url: str
-) -> tuple[list[str], list[tuple[str, str, tuple[str, ...]]], list[str]]:
+) -> tuple[list[str], list[tuple[str, str, tuple[str, ...], str]], list[str]]:
     """HTML에서 링크·폼·스크립트 출처를 뽑는다.
 
     lxml 파서는 닫는 태그가 없는 폼처럼 깨진 HTML도 복구한다 — 취약한 대상일수록
@@ -1082,6 +1116,8 @@ def _parse_page(
                 urljoin(base_url, action).split("?", 1)[0],
                 (form.get("method") or "GET").upper(),
                 names,
+                (form.get("enctype") or "application/x-www-form-urlencoded")
+                .split(";", 1)[0].strip().casefold(),
             )
         )
 

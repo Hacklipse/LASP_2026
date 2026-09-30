@@ -25,6 +25,7 @@ from hacklipse.adapters.path_traversal_analysis import (
 )
 from hacklipse.adapters.routing_audit import JsonlRoutingAuditLog
 from hacklipse.adapters.sqlite_store import _decode_candidate
+from hacklipse.application.orchestrator import OrchestratorConfig
 from hacklipse.bootstrap import build_local_application, register_standard_agents, standard_recon_planner, standard_router
 from hacklipse.domain import (
     Candidate,
@@ -102,6 +103,7 @@ def _execute(*, mode="hybrid", recon="hybrid", compare=True, log=None, method="G
                              compare=compare, audit_log=log,
                              audit_metadata={"analysis_profile": "heuristic", "recon_mode": recon})
     app = build_local_application({}, runtime=runtime, router=router,
+                                  config=OrchestratorConfig(max_evidence_rounds=2),
                                   approval_gate=StaticApprovalGate((PATH_TRAVERSAL_POST_APPROVAL_REF,) if approved else ()))
     register_standard_agents(app, recon_max_pages=6,
                              recon_planner=standard_recon_planner(mode=recon, llm_client=model))
@@ -181,13 +183,29 @@ class RouterPipelineTests(unittest.TestCase):
             self.assertFalse(comparison["analysis_comparison_available"])
             self.assertIn("Only the selected", comparison["comparison_warning"])
 
-    def test_generic_post_surface_is_not_sent_to_router_or_probed(self):
+    def test_post_form_is_routed_to_bounded_hidden_body_analysis(self):
         app, run, runtime, model = _execute(method="POST")
 
         self.assertIs(run.phase, RunPhase.DONE)
-        self.assertEqual(model.roles, ["recon"])
-        self.assertEqual(app.stores.candidates.list_by_run(run.run_id), ())
-        self.assertFalse(any(r.tool == PATH_TRAVERSAL_TOOL for r in runtime.requests))
+        self.assertEqual(model.roles, ["recon", "router"])
+        candidates = app.stores.candidates.list_by_run(run.run_id)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].routing_capability_id,
+                         "path_traversal.hidden_body_parameter")
+        self.assertIs(candidates[0].status, CandidateStatus.CONFIRMED)
+        self.assertTrue(any(r.tool == PATH_TRAVERSAL_TOOL for r in runtime.requests))
+
+    def test_hidden_body_search_neither_confirms_without_marker_nor_runs_without_approval(self):
+        app, run, runtime, _ = _execute(method="POST", vulnerable=False)
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(app.stores.findings.list_by_run(run.run_id), ())
+        self.assertIs(app.stores.candidates.list_by_run(run.run_id)[0].status,
+                      CandidateStatus.REJECTED)
+
+        app, run, runtime, _ = _execute(method="POST", approved=False)
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(app.stores.findings.list_by_run(run.run_id), ())
+        self.assertFalse(any(r.method.upper() == "POST" for r in runtime.requests))
 
     def test_shadow_hybrid_does_not_store_or_execute_candidates(self):
         app, run, runtime, model = _execute(mode="heuristic")

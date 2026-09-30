@@ -78,6 +78,20 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         default_priority=0.25,
     ),
     AnalyzerCapability(
+        capability_id="path_traversal.hidden_body_parameter",
+        agent_type="path_traversal_analyzer",
+        vulnerability_type="Path Traversal",
+        methods=("POST",),
+        surface_kind="server",
+        observation_requirements=(
+            ObservationRequirement("post_form_body_structure", "html_form"),
+        ),
+        exploration_parameter_source="none",
+        supported_evidence_types=("control_response", "file_read_marker"),
+        strategy_ids=("hidden_parameter_differential_probe",),
+        default_priority=0.20,
+    ),
+    AnalyzerCapability(
         capability_id="ssti.form.username",
         agent_type="ssti_analyzer",
         vulnerability_type="SSTI",
