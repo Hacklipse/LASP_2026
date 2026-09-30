@@ -336,6 +336,15 @@ def _format_counts(counts: Counter[str]) -> str:
     return ", ".join(f"{name} {count}개" for name, count in counts.items())
 
 
+def _blocked_analyzer_gaps(router) -> tuple[object, ...]:
+    # Candidate totals are vulnerability-wide, but a gap belongs to one capability.
+    return tuple(
+        item
+        for item in getattr(router, "last_analyzer_coverage", ())
+        if getattr(item, "status", None) == "blocked"
+    )
+
+
 def _all_mode_recon_seeds(
     base_url: str,
     *,
@@ -1430,12 +1439,7 @@ def main(argv: list[str]) -> int:
         for item in snapshot.unchecked:
             mark = marks.get(item.status, item.status)
             print(f"  {mark:<8} {item.vulnerability_type:<14} {item.reason}")
-    analyzer_gaps = tuple(
-        item
-        for item in getattr(router, "last_analyzer_coverage", ())
-        if getattr(item, "status", None) == "blocked"
-        and not candidate_counts[getattr(item, "vulnerability_type", "")]
-    )
+    analyzer_gaps = _blocked_analyzer_gaps(router)
     if broad_scan and analyzer_gaps:
         requirement_labels = {
             "method": "HTTP 메서드",

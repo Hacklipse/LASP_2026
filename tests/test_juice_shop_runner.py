@@ -23,6 +23,7 @@ from run_juice_shop_baseline import (  # noqa: E402
     _ProvisionedAccount,
     _all_mode_recon_seeds,
     _authenticate_access_control_accounts,
+    _blocked_analyzer_gaps,
     _cleanup_provisioned_accounts,
     _knowledge_database_path,
     _print_execution_preview,
@@ -43,6 +44,21 @@ from hacklipse.ports.errors import CredentialNotFound  # noqa: E402
 
 
 class JuiceShopAllModeTests(unittest.TestCase):
+    def test_blocked_capability_is_shown_even_with_other_routable_capability(self) -> None:
+        query = SimpleNamespace(
+            capability_id="path_traversal.http.query",
+            vulnerability_type="Path Traversal",
+            status="routable",
+        )
+        form = SimpleNamespace(
+            capability_id="path_traversal.bounded_render_form",
+            vulnerability_type="Path Traversal",
+            status="blocked",
+        )
+        router = SimpleNamespace(last_analyzer_coverage=(query, form))
+
+        self.assertEqual(_blocked_analyzer_gaps(router), (form,))
+
     def test_base_url_entry_discards_target_specific_start_urls_and_seeds(self) -> None:
         target, seeds = _recon_entry_points(
             "http://127.0.0.1:3000/",
