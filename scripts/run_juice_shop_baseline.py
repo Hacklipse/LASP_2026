@@ -116,10 +116,10 @@ _PROVISION_SESSION_REF = "temporary-local-juice-shop-provisioning-session"
 _PROVISION_APPROVAL_REF = "interactive-local-juice-shop-account-provisioning"
 _ACCESS_LOGIN_APPROVAL_REF = "interactive-local-juice-shop-access-login"
 _STATE_CHANGING_APPROVAL_REF = "interactive-local-juice-shop-state-changing"
-_DEFAULT_BUDGET = 20
+_DEFAULT_BUDGET = 500
 # 전체 모드는 Recon 크롤링과 여러 Candidate 분석을 한 Run에서 감당해야 한다. 정확한
 # 배분은 Task 3(Budget·스케줄링)에서 다루고, 여기서는 우선 상한만 넉넉히 잡는다.
-_ALL_MODE_BUDGET = 80
+_ALL_MODE_BUDGET = 500
 _ALL_MODE_RECON_PAGES = 12
 # 공급자 상한 15 RPM을 꽉 채우지 않고 한 슬롯을 남긴다. 이 프로세스 밖에서 발생한
 # 호출이나 공급자 집계 경계의 오차 때문에 15번째가 429가 되는 일을 줄인다.
