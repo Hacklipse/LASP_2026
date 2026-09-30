@@ -94,6 +94,8 @@ def _execution_lines(execution: RunExecutionProfile | None) -> list[str]:
         f"- Orchestrator: {_code(execution.orchestrator_mode)} · 예산 배분 {_code(execution.budget_allocation_mode)}",
         f"- Validation: {_code(execution.validation_mode)}",
         f"- Report: {_code(execution.report_mode)}",
+        "- 상태 변경 가능 요청: "
+        + ("명시적으로 승인" if execution.state_changing_approved else "차단"),
         f"- LLM: {model}",
     ])
     if execution.llm_rpm_limit is not None:

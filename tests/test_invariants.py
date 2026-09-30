@@ -45,6 +45,7 @@ class ArchitectureInvariantTests(unittest.TestCase):
             {"recon_entry_mode": "known-answer"},
             {"compare_routers": 1},
             {"llm_rpm_limit": 0},
+            {"state_changing_approved": "yes"},
             {"analysis_profile": "llm"},
             {"llm_provider": "gemini"},
             {"llm_provider": "gemini", "llm_model": "unused-model"},

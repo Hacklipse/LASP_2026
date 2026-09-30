@@ -223,6 +223,9 @@ class RunExecutionProfile:
     llm_provider: str = ""
     llm_model: str = ""
     llm_rpm_limit: int | None = None
+    # 안전 프로필은 유지하되, 사용자가 이 Run에서 상태 변경 가능 요청을 명시적으로
+    # 승인했는지 기록한다. 승인 참조 문자열 자체는 실행 구성에 저장하지 않는다.
+    state_changing_approved: bool = False
 
     def __post_init__(self) -> None:
         modes = {
@@ -256,6 +259,10 @@ class RunExecutionProfile:
             raise DomainInvariantError("recorded execution profile flag must be boolean")
         if type(self.compare_routers) is not bool:
             raise DomainInvariantError("compare routers flag must be boolean")
+        if type(self.state_changing_approved) is not bool:
+            raise DomainInvariantError(
+                "state-changing approval flag must be boolean"
+            )
         if (
             self.llm_rpm_limit is not None
             and (type(self.llm_rpm_limit) is not int or self.llm_rpm_limit <= 0)
@@ -817,6 +824,12 @@ class Candidate:
     # 실행 요청이나 proof가 아니라 감사 가능한 계획 메타데이터이며, 실제 Analyzer와
     # Validation은 기존 정책·proof 계약을 독립적으로 적용한다.
     required_evidence_types: tuple[str, ...] = ()
+    # Router LLM의 판단을 실행 결과와 분리해 보존하는 계획 메타데이터다. 실제 probe와
+    # 최종 판정 권한은 Analysis/Validation 계약에 그대로 남는다.
+    routing_capability_id: str = ""
+    routing_confidence: str = ""
+    routing_priority: str = ""
+    analysis_strategy_id: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.exploration_parameters, tuple) or any(
@@ -838,6 +851,14 @@ class Candidate:
             raise DomainInvariantError(
                 "candidate required evidence types must be unique"
             )
+        if self.routing_confidence not in {"", "low", "medium", "high"}:
+            raise DomainInvariantError("candidate routing confidence is invalid")
+        if self.routing_priority not in {"", "low", "normal", "high"}:
+            raise DomainInvariantError("candidate routing priority is invalid")
+        for field_name in ("routing_capability_id", "analysis_strategy_id"):
+            value = getattr(self, field_name)
+            if value and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}", value) is None:
+                raise DomainInvariantError(f"candidate {field_name} is invalid")
         # 저장소에서 문자열로 복원한 값도 같은 검사를 통과시킨다. 알 수 없는 상태는
         # 조용히 통과시키지 않고 여기서 막는다.
         for field_name in ("status", "resume_status"):

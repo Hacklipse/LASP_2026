@@ -47,6 +47,7 @@ from hacklipse.ports import (
 )
 from hacklipse.ports.errors import (
     AgentUnavailable,
+    ApprovalRequired,
     BudgetExceeded,
     DuplicateRecord,
     RecordNotFound,
@@ -1012,6 +1013,24 @@ class Orchestrator:
 
         if isinstance(error, _CANDIDATE_FATAL_ERRORS):
             raise error
+        if isinstance(error, ApprovalRequired):
+            # 사용자가 실행 권한을 주지 않아 멈춘 것은 Agent/대상 실패가 아니다.
+            # 취약하지 않다는 판정도 아니므로 BLOCKED로 명확히 분리한다.
+            candidate = self._candidates.get(run.run_id, candidate_id)
+            self._candidates.save(
+                candidate.set_status(
+                    CandidateStatus.BLOCKED,
+                    reason="state-changing request approval required",
+                )
+            )
+            self._emit(
+                run,
+                ProgressEventKind.CANDIDATE_FAILED,
+                agent_type=candidate.assigned_agent,
+                candidate=candidate,
+                detail="ApprovalRequired",
+            )
+            return run
         if isinstance(error, BudgetExceeded):
             # 예산 부족은 대상의 문제도 Agent의 결함도 아니다. 실행하지 못한 것이다.
             return self._skip_candidate_for_budget(

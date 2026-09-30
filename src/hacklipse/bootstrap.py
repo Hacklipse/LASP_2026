@@ -39,7 +39,8 @@ from hacklipse.adapters import (
     SensitiveDataSanitizer,
     ValidationAgent,
 )
-from hacklipse.adapters.llm_router_advisor import AnalyzerChoice, LlmRouterAdvisor
+from hacklipse.adapters.llm_router_advisor import LlmRouterAdvisor
+from hacklipse.adapters.analyzer_capabilities import DEFAULT_ANALYZER_CAPABILITIES
 from hacklipse.adapters.agentic_probe import AgenticHttpProbeAgent
 from hacklipse.adapters.analysis_llm_fallback import (
     BoundedAnalysisLlmClient,
@@ -72,6 +73,8 @@ from hacklipse.domain import TaskEnvelope
 from hacklipse.ports import (
     ProgressSink,
     Agent,
+    AnalyzerCapability,
+    AnalyzerCapabilityRegistry,
     BudgetManager,
     ApprovalGate,
     CandidateStore,
@@ -181,6 +184,7 @@ def build_local_application(
     evidence_sanitizer: EvidenceSanitizer | None = None,
     audit_log: ExecutionAuditLog | None = None,
     approval_gate: ApprovalGate | None = None,
+    default_approval_ref: str | None = None,
     agent_allowed_tools: Mapping[str, tuple[str, ...]] | None = None,
     task_progress_callback: Callable[[str, TaskEnvelope, int, float], None]
     | None = None,
@@ -222,6 +226,7 @@ def build_local_application(
         runtime=selected_runtime,
         evidence_sanitizer=selected_sanitizer,
         audit_log=selected_audit,
+        default_approval_ref=default_approval_ref,
     )
 
     for agent_type, agent in agents.items():
@@ -355,6 +360,9 @@ IMPLEMENTED_ANALYZERS = (
 def standard_router(
     vulnerability_types: Collection[str] | None = None,
     *,
+    analyzer_capabilities: Sequence[AnalyzerCapability]
+    | AnalyzerCapabilityRegistry
+    | None = None,
     mode: str = "heuristic",
     llm_client: LlmClient | None = None,
     audit_log: RoutingAuditSink | None = None,
@@ -388,11 +396,13 @@ def standard_router(
         return PairedVulnerabilityRouter(
             primary=mode,
             heuristic=standard_router(
-                vulnerability_types, mode="heuristic", audit_log=audit_log,
+                vulnerability_types, analyzer_capabilities=analyzer_capabilities,
+                mode="heuristic", audit_log=audit_log,
                 audit_metadata=audit_metadata, review_policy=review_policy,
             ),
             hybrid=standard_router(
-                vulnerability_types, mode="hybrid", llm_client=llm_client,
+                vulnerability_types, analyzer_capabilities=analyzer_capabilities,
+                mode="hybrid", llm_client=llm_client,
                 audit_log=audit_log, audit_metadata=audit_metadata, review_policy=review_policy,
             ),
         )
@@ -411,12 +421,29 @@ def standard_router(
         if rule.agent_type in IMPLEMENTED_ANALYZERS
         and (selected_types is None or rule.vulnerability_type in selected_types)
     )
+    registered_capabilities = (
+        analyzer_capabilities.snapshot()
+        if isinstance(analyzer_capabilities, AnalyzerCapabilityRegistry)
+        else tuple(analyzer_capabilities)
+        if analyzer_capabilities is not None
+        else DEFAULT_ANALYZER_CAPABILITIES
+    )
+    capabilities = tuple(
+        capability
+        for capability in registered_capabilities
+        if (
+            selected_types is None
+            or capability.vulnerability_type in selected_types
+        )
+    )
     router: VulnerabilityRouter = RuleBasedVulnerabilityRouter(
         rules=rules,
         surface_rules=surface_rules,
+        capabilities=capabilities,
         advisor=_build_router_advisor(
             rules=rules,
             surface_rules=surface_rules,
+            capabilities=capabilities,
             llm_client=llm_client,
             requested=mode in {"hybrid", "agentic"},
             hypothesis_mode=mode == "agentic",
@@ -482,6 +509,7 @@ def _build_router_advisor(
     *,
     rules: Sequence[RoutingRule],
     surface_rules: Sequence[SurfaceRoutingRule],
+    capabilities: Sequence[AnalyzerCapability],
     llm_client: LlmClient | None,
     requested: bool,
     hypothesis_mode: bool = False,
@@ -503,26 +531,13 @@ def _build_router_advisor(
             "router advisor was requested without an LlmClient; "
             "pass one or drop the router advisor option"
         )
-    # 제안 가능 범위를 이미 필터링된 규칙에서 그대로 도출한다. 별도 목록을 두면
-    # --vuln 필터와 IMPLEMENTED_ANALYZERS 필터를 두 번 관리하게 되고, 어긋나는 순간
-    # Dispatcher가 AgentUnavailable로 Run을 죽인다.
-    analyzers = tuple(
-        dict.fromkeys(
-            AnalyzerChoice(
-                vulnerability_type=rule.vulnerability_type,
-                agent_type=rule.agent_type,
-                client_route=getattr(rule, "client_route", False),
-            )
-            for rule in (*rules, *surface_rules)
-        )
-    )
-    if not analyzers:
+    if not capabilities:
         # --vuln 필터가 모든 규칙을 걷어낸 경우다. 제안할 유형이 없으므로 Advisor를
         # 만들지 않는다. 이것은 구성 오류가 아니라 선택의 결과다.
         return None
     return LlmRouterAdvisor(
         llm_client=llm_client,
-        analyzers=analyzers,
+        capabilities=capabilities,
         hypothesis_mode=hypothesis_mode,
     )
 

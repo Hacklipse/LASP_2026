@@ -157,6 +157,7 @@ class ReportingTests(unittest.TestCase):
             "- Router: `hybrid` · review `ambiguous`",
             "- Orchestrator: `hybrid` · 예산 배분 `heuristic`",
             "- Validation: `llm`", "- Report: `llm`",
+            "- 상태 변경 가능 요청: 차단",
             "- LLM: `gemini` / `gemini-3.5-flash-lite`",
             "- LLM 분당 호출 제한: 14",
         ):

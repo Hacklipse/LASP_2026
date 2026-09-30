@@ -46,6 +46,7 @@ class RuntimeEvidenceCollector:
         evidence_sanitizer: EvidenceSanitizer | None = None,
         audit_log: ExecutionAuditLog | None = None,
         id_factory: Callable[[], str] | None = None,
+        default_approval_ref: str | None = None,
     ) -> None:
         self._runs = run_store
         self._evidence = evidence_store
@@ -55,6 +56,7 @@ class RuntimeEvidenceCollector:
         self._sanitizer = evidence_sanitizer
         self._audit = audit_log
         self._id_factory = id_factory or (lambda: str(uuid4()))
+        self._default_approval_ref = default_approval_ref
 
     def collect(
         self,
@@ -121,7 +123,14 @@ class RuntimeEvidenceCollector:
             validation_id=validation_id,
             timeout_seconds=min(timeout_seconds, run.timeout_seconds),
             credential_ref=_credential_for(run, spec.principal_role, credential_ref),
-            approval_ref=approval_ref,
+            # 개별 Agent가 더 좁은 승인 참조를 지정했다면 그것을 우선한다. CLI에서
+            # 사용자가 Run 전체의 상태 변경 가능 요청을 명시적으로 승인한 경우에만
+            # 기본 참조를 보충하며, 실제 허용 여부는 중앙 ApprovalGate가 재검증한다.
+            approval_ref=(
+                approval_ref
+                if approval_ref is not None
+                else self._default_approval_ref
+            ),
             scope=run.scope,
         )
         # 실제 호출 직전에 Scope와 예산을 검사해 우회 실행을 막는다.

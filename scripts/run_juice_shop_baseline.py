@@ -114,6 +114,7 @@ _TEMP_SSTI_CREDENTIAL_REF = "temporary-local-juice-shop-ssti"
 _PROVISION_SESSION_REF = "temporary-local-juice-shop-provisioning-session"
 _PROVISION_APPROVAL_REF = "interactive-local-juice-shop-account-provisioning"
 _ACCESS_LOGIN_APPROVAL_REF = "interactive-local-juice-shop-access-login"
+_STATE_CHANGING_APPROVAL_REF = "interactive-local-juice-shop-state-changing"
 _DEFAULT_BUDGET = 20
 # 전체 모드는 Recon 크롤링과 여러 Candidate 분석을 한 Run에서 감당해야 한다. 정확한
 # 배분은 Task 3(Budget·스케줄링)에서 다루고, 여기서는 우선 상한만 넉넉히 잡는다.
@@ -188,6 +189,10 @@ def _print_execution_preview(
     print(f"  Report          {getattr(args, 'report', 'heuristic')}")
     print(f"  예산 배분       {getattr(args, 'budget_allocation', 'off')}")
     print(f"  Router 비교     {'켬' if args.compare_routers else '끔'}")
+    print(
+        "  상태 변경 승인  "
+        f"{'허용 (명시적 옵션)' if getattr(args, 'approve_state_changing', False) else '차단'}"
+    )
     if needs_llm(args):
         limit = f"{rpm_limit}회 / rolling 60초" if rpm_limit is not None else "없음"
         print(f"  LLM 호출 제한   {limit}")
@@ -210,7 +215,10 @@ def _print_execution_preview(
     elif auto_scan:
         print("\n[검사 범위]")
         print("  포함            현재 Run에서 발견되고 정책상 실행 가능한 Analyzer 후보")
-        print("  제외            대상별 seed · 계정 준비 · 상태 변경 승인")
+        excluded = "대상별 seed · 계정 준비"
+        if not getattr(args, "approve_state_changing", False):
+            excluded += " · 상태 변경 승인"
+        print(f"  제외            {excluded}")
     print("=" * 58)
 
 
@@ -785,6 +793,14 @@ def main(argv: list[str]) -> int:
         % (_DEFAULT_BUDGET, _ALL_MODE_BUDGET),
     )
     parser.add_argument(
+        "--approve-state-changing",
+        action="store_true",
+        help=(
+            "현재 로컬 Run에서 상태 변경 가능성이 있는 요청을 명시적으로 승인한다. "
+            "호스트·경로·도구·요청 예산 제한은 그대로 적용된다"
+        ),
+    )
+    parser.add_argument(
         "--validation-review",
         action="store_true",
         help="비확정 Validation 결과에 LLM 분류 Claim을 남긴다(--profile llm 전용, 판정 불변)",
@@ -909,10 +925,17 @@ def main(argv: list[str]) -> int:
     recon_seed_urls: tuple[str, ...] = ()
     access_accounts: tuple[_AccessAccountInput, _AccessAccountInput] | None = None
     if auto_scan:
-        print(
-            "이 검증은 알려진 취약점 유형·endpoint·대상별 계정 준비 없이 루트 URL에서\n"
-            "지원되는 Analyzer 후보를 자동 분류합니다. 인증과 상태 변경 승인은 제공하지 않습니다."
-        )
+        if args.approve_state_changing:
+            print(
+                "이 검증은 알려진 취약점 유형·endpoint·대상별 계정 준비 없이 루트 URL에서\n"
+                "지원되는 Analyzer 후보를 자동 분류합니다. 상태 변경 가능 요청을 명시적으로\n"
+                "승인했으므로 대상 데이터나 세션이 변경될 수 있습니다."
+            )
+        else:
+            print(
+                "이 검증은 알려진 취약점 유형·endpoint·대상별 계정 준비 없이 루트 URL에서\n"
+                "지원되는 Analyzer 후보를 자동 분류합니다. 인증과 상태 변경 승인은 제공하지 않습니다."
+            )
         confirmation = "로컬 Juice Shop 자동 탐색을 시작할까요? [y/N] "
         credentials = {}
         approvals = ()
@@ -1008,6 +1031,10 @@ def main(argv: list[str]) -> int:
         actor_object_id = None
         owner_object_id = None
         approvals = (SSTI_APPROVAL_REF,)
+    if args.approve_state_changing:
+        approvals = tuple(
+            dict.fromkeys((*approvals, _STATE_CHANGING_APPROVAL_REF))
+        )
     if input(confirmation).strip().casefold() != "y":
         print("취소했습니다.")
         return 2
@@ -1063,6 +1090,11 @@ def main(argv: list[str]) -> int:
         router=router,
         credential_resolver=resolver,
         approval_gate=StaticApprovalGate(approvals),
+        default_approval_ref=(
+            _STATE_CHANGING_APPROVAL_REF
+            if args.approve_state_changing
+            else None
+        ),
         audit_log=audit,
         task_progress_callback=progress.task_event if debug_enabled else None,
         # 진행 화면과 상세 로그 중 하나만 붙인다. 상세 로그가 중간에 끼면 화면을
@@ -1309,6 +1341,7 @@ def main(argv: list[str]) -> int:
         # 검사했는데 없었다 / 검사하다 실패했다 / 시작조차 못 했다를 구분해서 보여준다.
         marks = {
             CandidateStatus.FAILED.value: "실패",
+            CandidateStatus.BLOCKED.value: "승인필요",
             CandidateStatus.SKIPPED_BUDGET.value: "예산부족",
         }
         for item in snapshot.unchecked:

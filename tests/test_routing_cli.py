@@ -87,6 +87,47 @@ class RoutingCliTests(unittest.TestCase):
         provision.assert_not_called()
         secret_prompt.assert_not_called()
 
+    def test_juice_shop_state_change_approval_is_explicitly_wired_and_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(
+                    juice,
+                    "build_local_application",
+                    wraps=build_local_application,
+                ) as assemble,
+                patch.object(
+                    Orchestrator,
+                    "start",
+                    side_effect=_StopBeforeExecution,
+                ) as start,
+                patch("builtins.input", return_value="y"),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                with self.assertRaises(_StopBeforeExecution):
+                    juice.main([
+                        "runner",
+                        "http://localhost:3000/",
+                        "--vuln",
+                        "auto",
+                        "--recon-entry",
+                        "base-url",
+                        "--approve-state-changing",
+                        "--routing-log",
+                        str(Path(directory) / "routing.jsonl"),
+                    ])
+
+        self.assertEqual(
+            assemble.call_args.kwargs["default_approval_ref"],
+            juice._STATE_CHANGING_APPROVAL_REF,
+        )
+        self.assertIn(
+            juice._STATE_CHANGING_APPROVAL_REF,
+            assemble.call_args.kwargs["approval_gate"]._approved,
+        )
+        request = start.call_args.args[0]
+        self.assertTrue(request.execution_profile.state_changing_approved)
+        self.assertIn("대상 데이터나 세션이 변경될 수 있습니다", output.getvalue())
+
     def test_juice_shop_base_url_entry_discards_type_specific_target_and_seeds(self):
         with tempfile.TemporaryDirectory() as directory:
             with (

@@ -76,7 +76,7 @@ class AuditedVulnerabilityRouter:
             if key in {
                 "analysis_profile", "llm_provider", "llm_model", "vulnerability_types",
                 "recon_mode", "recon_entry_mode", "surface_collection_mode",
-                "router_review",
+                "router_review", "state_changing_approved",
             }
         }
 
@@ -196,7 +196,7 @@ class AuditedVulnerabilityRouter:
                         "analyzer_capability"
                         if self._mode == "agentic" else "advisor_suggestion"
                     ),
-                    "dispositions_advisory_only": self._mode == "agentic",
+                    "hypotheses_advisory_only": self._mode == "agentic",
                     "source": (
                         "deterministic_fallback"
                         if advisor_failed or agentic_fallback
@@ -251,57 +251,33 @@ class AuditedVulnerabilityRouter:
                         }
                         for item in capabilities
                     ],
-                    "disposition_counts": {
-                        decision: sum(
-                            item.decision == decision
+                    "hypothesis_counts": {
+                        status: sum(
+                            item.status == status
                             for item in (
-                                advisor_trace.dispositions if advisor_trace else ()
+                                advisor_trace.hypotheses if advisor_trace else ()
                             )
                         )
-                        for decision in ("route", "defer", "reject", "unanswered")
+                        for status in ("planned", "unanswered")
                     },
-                    "dispositions": [
+                    "hypotheses": [
                         {
                             "surface_id": item.surface_id,
+                            "capability_id": item.capability_id,
                             "vulnerability_type": item.vulnerability_type,
                             "agent_type": item.agent_type,
-                            "decision": item.decision,
+                            "status": item.status,
+                            "confidence": item.confidence,
+                            "priority": item.priority,
                             "reason_code": item.reason_code,
+                            "analysis_strategy_id": item.analysis_strategy_id,
                             "basis_evidence_ids": list(item.basis_evidence_ids),
                             "required_evidence_types": list(
                                 item.required_evidence_types
                             ),
                         }
                         for item in (
-                            advisor_trace.dispositions if advisor_trace else ()
-                        )
-                    ],
-                    "surface_disposition_counts": {
-                        decision: sum(
-                            item.decision == decision
-                            for item in (
-                                advisor_trace.surface_dispositions
-                                if advisor_trace else ()
-                            )
-                        )
-                        for decision in ("defer", "reject", "unanswered")
-                    },
-                    "surface_dispositions": [
-                        {
-                            "surface_id": item.surface_id,
-                            "decision": item.decision,
-                            "reason_code": item.reason_code,
-                            "suspected_vulnerability_types": list(
-                                item.suspected_vulnerability_types
-                            ),
-                            "basis_evidence_ids": list(item.basis_evidence_ids),
-                            "required_evidence_types": list(
-                                item.required_evidence_types
-                            ),
-                        }
-                        for item in (
-                            advisor_trace.surface_dispositions
-                            if advisor_trace else ()
+                            advisor_trace.hypotheses if advisor_trace else ()
                         )
                     ],
                     "rejected_items": [

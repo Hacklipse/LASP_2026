@@ -47,17 +47,46 @@ class _Llm:
         if self.error:
             raise self.error
         key = (
-            "dispositions"
-            if "dispositions" in request.response_schema["properties"]
+            "hypotheses"
+            if "hypotheses" in request.response_schema["properties"]
             else "suggestions"
         )
-        payload = {key: self.items}
-        if key == "dispositions":
-            payload["surface_dispositions"] = self.surface_items
+        payload = {
+            key: (
+                [_as_hypothesis(item) for item in self.items]
+                if key == "hypotheses"
+                else self.items
+            )
+        }
         return LlmResponse(
             payload=payload, model="fixture-model",
             usage=LlmUsage(input_tokens=100, output_tokens=50, cache_read_input_tokens=10),
         )
+
+
+def _as_hypothesis(item):
+    vulnerability_type = item["vulnerability_type"]
+    capability_id, strategy_id, reason_code = {
+        "XSS": ("xss.http.query", "reflect_each_parameter", "input_reflection_risk"),
+        "SQLi": ("sqli.http.query", "compare_query_mutations", "query_interpreter_risk"),
+        "Path Traversal": (
+            "path_traversal.http.query",
+            "probe_file_parameter",
+            "file_path_resolution_risk",
+        ),
+    }[vulnerability_type]
+    return {
+        "surface_id": item["surface_id"],
+        "capability_id": capability_id,
+        "confidence": {
+            "route": "high", "defer": "medium", "reject": "low"
+        }.get(item.get("decision"), "low"),
+        "priority": "normal",
+        "basis_observation_ids": item.get("basis_observation_ids", []),
+        "reason_code": reason_code,
+        "required_evidence_types": item.get("required_evidence_types", []),
+        "analysis_strategy_id": strategy_id,
+    }
 
 
 class _Log:
@@ -228,7 +257,7 @@ class RoutingAuditTests(unittest.TestCase):
             {"index": 0, "index_scope": "raw_items", "reason": "unknown_observation"}
         ])
 
-    def test_agentic_audit_records_exhaustive_dispositions_and_reject_reason(self):
+    def test_agentic_audit_records_exhaustive_hypotheses(self):
         log = _Log()
         llm = _Llm(
             {
@@ -262,17 +291,19 @@ class RoutingAuditTests(unittest.TestCase):
         )
         self.assertEqual(record["llm"]["offered_pair_count"], 3)
         self.assertEqual(record["llm"]["selection_policy"], "analyzer_capability")
-        self.assertIs(record["llm"]["dispositions_advisory_only"], True)
-        self.assertEqual(record["llm"]["disposition_counts"], {
-            "route": 1, "defer": 1, "reject": 1, "unanswered": 0,
+        self.assertIs(record["llm"]["hypotheses_advisory_only"], True)
+        self.assertEqual(record["llm"]["hypothesis_counts"], {
+            "planned": 3, "unanswered": 0,
         })
         self.assertEqual(
-            [(item["vulnerability_type"], item["decision"], item["reason_code"])
-             for item in record["llm"]["dispositions"]],
+            sorted(
+                (item["vulnerability_type"], item["status"], item["confidence"])
+                for item in record["llm"]["hypotheses"]
+            ),
             [
-                ("Path Traversal", "reject", "surface_semantics_not_indicative"),
-                ("SQLi", "route", "query_interpreter_risk"),
-                ("XSS", "defer", "insufficient_observation"),
+                ("Path Traversal", "planned", "low"),
+                ("SQLi", "planned", "high"),
+                ("XSS", "planned", "medium"),
             ],
         )
 
@@ -339,10 +370,6 @@ class RoutingAuditTests(unittest.TestCase):
         self.assertEqual(llm.calls, 0)
         self.assertEqual(record["llm"]["offered_surface_count"], 0)
         self.assertEqual(record["llm"]["offered_pair_count"], 0)
-        self.assertEqual(record["llm"]["surface_disposition_counts"], {
-            "defer": 0, "reject": 0, "unanswered": 0,
-        })
-        self.assertEqual(record["llm"]["surface_dispositions"], [])
         self.assertEqual(record["llm"]["coverage_surface_count"], 1)
         self.assertEqual(record["llm"]["capability_counts"], {
             "routable": 0, "blocked": 1, "unsupported": 0, "excluded": 0,

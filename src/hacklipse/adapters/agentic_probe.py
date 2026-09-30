@@ -392,6 +392,8 @@ class AgenticHttpProbeAgent:
         aliases = alias_parameter_names(parameters)
         context = {
             "candidate_type": candidate.vulnerability_type,
+            "capability_id": candidate.routing_capability_id,
+            "analysis_strategy_id": candidate.analysis_strategy_id,
             "method": surface.method.upper(),
             "path": _path_hint(urlsplit(surface.url).path or "/"),
             "parameters": list(aliases.prompt_names),

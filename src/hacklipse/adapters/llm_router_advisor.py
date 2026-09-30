@@ -37,6 +37,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from hacklipse.domain import Evidence, Run, Surface
+from hacklipse.ports import AnalyzerCapability
 from hacklipse.ports.errors import (
     LlmRefused,
     LlmResponseFormatError,
@@ -47,13 +48,14 @@ from hacklipse.ports.llm import LlmClient, LlmMessage, LlmRequest, LlmUsage
 
 from .request_safety import has_state_changing_parameters
 from .llm_parameter_names import alias_parameter_names
+from .analyzer_capabilities import (
+    DEFAULT_ANALYZER_CAPABILITIES,
+    capability_matches,
+)
 from .routing import (
     CANDIDATE_EVIDENCE_TYPES,
     CANDIDATE_REASON_CODES,
-    ROUTER_DEFER_REASON_CODES,
-    ROUTER_REJECT_REASON_CODES,
     RouteSuggestion,
-    _supports_suggestion,
 )
 
 # Evidence.created_by에 쓸 고정 식별자. selection_source(llm/rule)와 별개로 "이 판단을
@@ -92,16 +94,18 @@ _SUGGESTION_SCHEMA = {
 _AGENTIC_HYPOTHESIS_SCHEMA = {
     "type": "object",
     "properties": {
-        "dispositions": {
+        "hypotheses": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
                     "surface_id": {"type": "string"},
-                    "vulnerability_type": {"type": "string"},
-                    "decision": {
-                        "type": "string",
-                        "enum": ["route", "defer", "reject"],
+                    "capability_id": {"type": "string"},
+                    "confidence": {
+                        "type": "string", "enum": ["low", "medium", "high"]
+                    },
+                    "priority": {
+                        "type": "string", "enum": ["low", "normal", "high"]
                     },
                     "basis_observation_ids": {
                         "type": "array",
@@ -109,11 +113,7 @@ _AGENTIC_HYPOTHESIS_SCHEMA = {
                     },
                     "reason_code": {
                         "type": "string",
-                        "enum": sorted(
-                            CANDIDATE_REASON_CODES
-                            | ROUTER_DEFER_REASON_CODES
-                            | ROUTER_REJECT_REASON_CODES
-                        ),
+                        "enum": sorted(CANDIDATE_REASON_CODES),
                     },
                     "required_evidence_types": {
                         "type": "array",
@@ -122,63 +122,23 @@ _AGENTIC_HYPOTHESIS_SCHEMA = {
                             "enum": sorted(CANDIDATE_EVIDENCE_TYPES),
                         },
                     },
+                    "analysis_strategy_id": {"type": "string"},
                 },
                 "required": [
                     "surface_id",
-                    "vulnerability_type",
-                    "decision",
+                    "capability_id",
+                    "confidence",
+                    "priority",
                     "basis_observation_ids",
                     "reason_code",
                     "required_evidence_types",
-                ],
-                "additionalProperties": False,
-            },
-        },
-        "surface_dispositions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "surface_id": {"type": "string"},
-                    "decision": {
-                        "type": "string",
-                        "enum": ["defer", "reject"],
-                    },
-                    "suspected_vulnerability_types": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "basis_observation_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "reason_code": {
-                        "type": "string",
-                        "enum": sorted(
-                            ROUTER_DEFER_REASON_CODES | ROUTER_REJECT_REASON_CODES
-                        ),
-                    },
-                    "required_evidence_types": {
-                        "type": "array",
-                        "items": {
-                            "type": "string",
-                            "enum": sorted(CANDIDATE_EVIDENCE_TYPES),
-                        },
-                    },
-                },
-                "required": [
-                    "surface_id",
-                    "decision",
-                    "suspected_vulnerability_types",
-                    "basis_observation_ids",
-                    "reason_code",
-                    "required_evidence_types",
+                    "analysis_strategy_id",
                 ],
                 "additionalProperties": False,
             },
         },
     },
-    "required": ["dispositions", "surface_dispositions"],
+    "required": ["hypotheses"],
     "additionalProperties": False,
 }
 
@@ -196,34 +156,25 @@ _SYSTEM = (
 )
 
 _AGENTIC_SYSTEM = (
-    "You review executable analyzer assignments for one authorized security assessment "
+    "You rank executable analyzer hypotheses for one authorized security assessment "
     "from only the structured surfaces and observations offered to you. Do not assume a known "
     "vulnerable endpoint, target-specific payload, expected finding, or ground truth. "
-    "Return exactly one disposition for every surface_id and allowed vulnerability type "
-    "pair offered to you; never omit a pair. Also return exactly one surface_disposition "
-    "for every surface whose allowed_types is empty; never return a surface_disposition "
-    "for a surface with a non-empty allowed_types list. For each disposition, copy one offered "
-    "surface_id, one allowed vulnerability type, choose decision=route, defer, or reject, "
+    "Return exactly one hypothesis for every offered surface_id and capability_id pair; "
+    "never omit a pair. For each hypothesis, copy the offered identifiers and choose "
+    "confidence and execution priority, "
     "zero or more short observation ref values (e.g. o1), not their kind labels, "
     "belonging to that surface in basis_observation_ids, "
-    "one reason code valid for that decision, and the generic evidence types needed to "
-    "test route or defer. Use an empty required_evidence_types list for reject. "
-    "Your route, defer, and reject values are advisory diagnostic labels and never suppress "
-    "an executable assignment; Analysis performs the actual security test. Use route when "
-    "the supplied metadata supports the hypothesis, defer when context is insufficient, "
-    "and reject when it does not. A parameterized server-side route can justify a "
+    "one hypothesis reason code, generic evidence types needed for Analysis, and one "
+    "analysis_strategy_id offered by that capability. Your confidence and priority rank "
+    "work but never suppress an executable assignment; Analysis performs the security test. "
+    "A parameterized server-side route can justify a "
     "testable, low-confidence hypothesis from its path and input names even before an HTTP "
     "response has been observed; review server and client routes independently rather than "
     "stopping after one plausible hypothesis. If a surface has observation_refs=[(none)], "
     "use basis_observation_ids=[]; never borrow a ref from another surface. "
-    "A surface_disposition must be defer or reject because no Analyzer can safely execute "
-    "on that surface yet. For defer, choose one or more types from that surface's "
-    "reviewable_types and generic evidence types that would establish an executable "
-    "coordinate. For reject, use empty suspected_vulnerability_types and "
-    "required_evidence_types. Never invent or omit an endpoint, parameter, observation "
-    "ref, vulnerability type, reason code, evidence type, payload, or credential. Return "
-    "an empty dispositions list only when no surface/type pair was offered, and an empty "
-    "surface_dispositions list only when every offered surface has allowed types."
+    "Never invent or omit an endpoint, capability, parameter, observation ref, reason code, "
+    "evidence type, strategy, payload, or credential. Return an empty hypotheses list only "
+    "when no surface/capability pair was offered."
 )
 
 
@@ -255,13 +206,14 @@ class _OfferedSurface:
     observations: tuple[tuple[str, str, str], ...]
     covered_types: tuple[str, ...]
     allowed_types: tuple[str, ...]
+    allowed_capability_ids: tuple[str, ...]
     reviewable_types: tuple[str, ...]
     execution_blocker: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class RouterDisposition:
-    """Agentic LLM이 호환 가능한 Surface/유형 조합 하나에 남긴 진단 신호.
+class RouterHypothesis:
+    """Agentic LLM이 실행 가능한 capability에 부여한 분석 계획.
 
     실제 Analysis 전달 여부는 이 값이 아니라 Analyzer capability가 정한다. 모델이 항목을
     누락하거나 계약을 위반하면 코드가 ``unanswered``를 합성해 감사 가능성을 유지한다.
@@ -270,26 +222,14 @@ class RouterDisposition:
     surface_id: str
     vulnerability_type: str
     agent_type: str
-    decision: Literal["route", "defer", "reject", "unanswered"]
+    status: Literal["planned", "unanswered"]
     reason_code: str
     basis_evidence_ids: tuple[str, ...] = ()
     required_evidence_types: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class SurfaceDisposition:
-    """실행 가능한 Analyzer 좌표가 없는 Surface 자체에 대한 LLM 검토 결과.
-
-    이 판단은 Candidate를 만들지 않는다. 잠재 유형을 보존하되 실행 좌표가 추가로
-    발견될 때까지 defer하거나, 현재 구조상 의미가 없으면 reject한다.
-    """
-
-    surface_id: str
-    decision: Literal["defer", "reject", "unanswered"]
-    reason_code: str
-    suspected_vulnerability_types: tuple[str, ...] = ()
-    basis_evidence_ids: tuple[str, ...] = ()
-    required_evidence_types: tuple[str, ...] = ()
+    capability_id: str = ""
+    confidence: Literal["low", "medium", "high"] = "low"
+    priority: Literal["low", "normal", "high"] = "normal"
+    analysis_strategy_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,8 +248,7 @@ class RouterAdvisorTrace:
     """감사 로그가 원문 prompt/응답 없이 읽는 마지막 호출의 계측 결과."""
 
     suggestions: tuple[RouteSuggestion, ...] = ()
-    dispositions: tuple[RouterDisposition, ...] = ()
-    surface_dispositions: tuple[SurfaceDisposition, ...] = ()
+    hypotheses: tuple[RouterHypothesis, ...] = ()
     capabilities: tuple[SurfaceCapability, ...] = ()
     rejected_items: tuple[tuple[int, str], ...] = ()
     offered_surface_ids: tuple[str, ...] = ()
@@ -327,16 +266,17 @@ class RouterAdvisorTrace:
 class LlmRouterAdvisor:
     """LLM 판단을 검증하고 Analyzer capability를 라우팅 결과로 돌려주는 구현.
 
-    Agentic 모드의 defer/reject/unanswered는 trace에만 남고 실행 가능한 모든 조합은
-    ``RouteSuggestion``이 된다. Router 단계에서 대상 HTTP 요청이나 Analysis Agent는
-    호출하지 않는다.
+    Agentic 모드의 confidence/priority는 실행 순서 메타데이터이고, 실행 가능한 모든
+    조합은 ``RouteSuggestion``이 된다. Router 단계에서는 대상 HTTP 요청이나 Analysis
+    Agent를 호출하지 않는다.
     """
 
     def __init__(
         self,
         *,
         llm_client: LlmClient,
-        analyzers: Sequence[AnalyzerChoice],
+        analyzers: Sequence[AnalyzerChoice] = (),
+        capabilities: Sequence[AnalyzerCapability] = (),
         max_surfaces: int = DEFAULT_MAX_SURFACES,
         timeout_seconds: float = 60.0,
         hypothesis_mode: bool = False,
@@ -345,6 +285,36 @@ class LlmRouterAdvisor:
             raise ValueError("router advisor batch size must be positive")
         self._llm = llm_client
         self._analyzers = tuple(analyzers)
+        if capabilities:
+            self._capabilities = tuple(capabilities)
+        else:
+            requested = {
+                (choice.vulnerability_type, choice.agent_type, choice.client_route)
+                for choice in analyzers
+            }
+            self._capabilities = tuple(
+                capability
+                for capability in DEFAULT_ANALYZER_CAPABILITIES
+                if (
+                    capability.vulnerability_type,
+                    capability.agent_type,
+                    capability.surface_kind == "client",
+                )
+                in requested
+            )
+        self._capabilities_by_id = {
+            capability.capability_id: capability
+            for capability in self._capabilities
+        }
+        if not self._analyzers:
+            self._analyzers = tuple(
+                AnalyzerChoice(
+                    capability.vulnerability_type,
+                    capability.agent_type,
+                    capability.surface_kind == "client",
+                )
+                for capability in self._capabilities
+            )
         self._max_surfaces = max_surfaces
         self._timeout_seconds = timeout_seconds
         self._hypothesis_mode = hypothesis_mode
@@ -365,8 +335,10 @@ class LlmRouterAdvisor:
         offered, excluded_surfaces, capabilities = self._offer(
             run, surfaces, evidence, routed
         )
-        offered_pair_count = sum(len(item.allowed_types) for item in offered)
-        if not offered or not self._analyzers:
+        offered_pair_count = sum(
+            len(item.allowed_capability_ids) for item in offered
+        )
+        if not offered or not self._capabilities:
             # 보여 줄 표면이 없거나 제안 가능한 유형이 없다는 사실은 결정적이다.
             # LLM을 부를 이유가 없다.
             self.last_trace = RouterAdvisorTrace(
@@ -385,8 +357,7 @@ class LlmRouterAdvisor:
                 previous = cached[1]
                 self.last_trace = RouterAdvisorTrace(
                     suggestions=previous.suggestions,
-                    dispositions=previous.dispositions,
-                    surface_dispositions=previous.surface_dispositions,
+                    hypotheses=previous.hypotheses,
                     rejected_items=previous.rejected_items,
                     offered_surface_ids=tuple(
                         item.surface_id for item in offered
@@ -486,8 +457,7 @@ class LlmRouterAdvisor:
             offered[index : index + self._max_surfaces]
             for index in range(0, len(offered), self._max_surfaces)
         )
-        dispositions: list[RouterDisposition] = []
-        surface_dispositions: list[SurfaceDisposition] = []
+        hypotheses: list[RouterHypothesis] = []
         rejected_items: list[tuple[int, str]] = []
         statuses: list[str] = []
         usage = LlmUsage()
@@ -515,22 +485,20 @@ class LlmRouterAdvisor:
                     LlmTransportError: "transport_error",
                 }.get(type(error), "llm_error")
                 for remaining in batches[batch_index:]:
-                    dispositions.extend(
-                        self._unanswered_dispositions(remaining, status)
-                    )
-                    surface_dispositions.extend(
-                        self._unanswered_surface_dispositions(remaining, status)
+                    hypotheses.extend(
+                        self._unanswered_hypotheses(remaining, status)
                     )
                 final_suggestions = self._merge_capability_suggestions(
                     capability_suggestions, suggestion_overrides
                 )
                 self.last_trace = RouterAdvisorTrace(
                     suggestions=final_suggestions,
-                    dispositions=tuple(dispositions),
-                    surface_dispositions=tuple(surface_dispositions),
+                    hypotheses=tuple(hypotheses),
                     rejected_items=tuple(rejected_items),
                     offered_surface_ids=tuple(item.surface_id for item in offered),
-                    offered_pair_count=sum(len(item.allowed_types) for item in offered),
+                    offered_pair_count=sum(
+                        len(item.allowed_capability_ids) for item in offered
+                    ),
                     excluded_surfaces=excluded_surfaces,
                     capabilities=capabilities,
                     source="deterministic_fallback",
@@ -541,34 +509,30 @@ class LlmRouterAdvisor:
                 return final_suggestions
 
             (
-                batch_dispositions,
-                batch_surface_dispositions,
+                batch_hypotheses,
+                _batch_surface_assessments,
                 _batch_suggestions,
                 rejected,
                 status,
             ) = (
-                self._parse_dispositions(response.payload, batch, routed)
+                self._parse_hypotheses(response.payload, batch)
             )
-            dispositions.extend(batch_dispositions)
-            surface_dispositions.extend(batch_surface_dispositions)
-            # LLM의 route/defer/reject는 취약점 진위 판정이 아니다. 실행 가능한 조합은
+            hypotheses.extend(batch_hypotheses)
+            # LLM의 confidence/priority는 취약점 진위 판정이 아니다. 실행 가능한 조합은
             # 하나도 자르지 않고 Analysis가 자체 control/probe로 판정하게 한다.
             suggestion_overrides.update(
                 {
-                    (item.surface_id, item.vulnerability_type): item
+                    (item.surface_id, item.capability_id): item
                     for item in _batch_suggestions
                 }
             )
             rejected_items.extend(
                 (raw_index_offset + index, reason) for index, reason in rejected
             )
-            raw = response.payload.get("dispositions")
-            raw_surface = response.payload.get("surface_dispositions")
+            raw = response.payload.get("hypotheses")
             raw_index_offset += max(
-                (len(raw) if isinstance(raw, list) else 0)
-                + (len(raw_surface) if isinstance(raw_surface, list) else 0),
-                sum(len(item.allowed_types) for item in batch)
-                + sum(not item.allowed_types for item in batch),
+                len(raw) if isinstance(raw, list) else 0,
+                sum(len(item.allowed_capability_ids) for item in batch),
             )
             statuses.append(status)
             usage = _add_usage(usage, response.usage)
@@ -576,22 +540,20 @@ class LlmRouterAdvisor:
 
             if status in {"invalid_response", "all_rejected"}:
                 for remaining in batches[batch_index + 1 :]:
-                    dispositions.extend(
-                        self._unanswered_dispositions(remaining, status)
-                    )
-                    surface_dispositions.extend(
-                        self._unanswered_surface_dispositions(remaining, status)
+                    hypotheses.extend(
+                        self._unanswered_hypotheses(remaining, status)
                     )
                 final_suggestions = self._merge_capability_suggestions(
                     capability_suggestions, suggestion_overrides
                 )
                 self.last_trace = RouterAdvisorTrace(
                     suggestions=final_suggestions,
-                    dispositions=tuple(dispositions),
-                    surface_dispositions=tuple(surface_dispositions),
+                    hypotheses=tuple(hypotheses),
                     rejected_items=tuple(rejected_items),
                     offered_surface_ids=tuple(item.surface_id for item in offered),
-                    offered_pair_count=sum(len(item.allowed_types) for item in offered),
+                    offered_pair_count=sum(
+                        len(item.allowed_capability_ids) for item in offered
+                    ),
                     excluded_surfaces=excluded_surfaces,
                     capabilities=capabilities,
                     source="deterministic_fallback",
@@ -610,11 +572,12 @@ class LlmRouterAdvisor:
         )
         self.last_trace = RouterAdvisorTrace(
             suggestions=final_suggestions,
-            dispositions=tuple(dispositions),
-            surface_dispositions=tuple(surface_dispositions),
+            hypotheses=tuple(hypotheses),
             rejected_items=tuple(rejected_items),
             offered_surface_ids=tuple(item.surface_id for item in offered),
-            offered_pair_count=sum(len(item.allowed_types) for item in offered),
+            offered_pair_count=sum(
+                len(item.allowed_capability_ids) for item in offered
+            ),
             excluded_surfaces=excluded_surfaces,
             capabilities=capabilities,
             source="llm",
@@ -641,18 +604,20 @@ class LlmRouterAdvisor:
 
         values: list[RouteSuggestion] = []
         for surface in offered:
-            for vulnerability_type in surface.allowed_types:
-                agent_type = self._resolve_agent(
-                    vulnerability_type, surface.client_route
-                )
-                if agent_type is None:
+            for capability_id in surface.allowed_capability_ids:
+                capability = self._capabilities_by_id.get(capability_id)
+                if capability is None:
                     continue
                 values.append(RouteSuggestion(
                     surface_id=surface.surface_id,
-                    vulnerability_type=vulnerability_type,
-                    agent_type=agent_type,
+                    vulnerability_type=capability.vulnerability_type,
+                    agent_type=capability.agent_type,
                     reason="analyzer_contract_satisfied",
                     reason_code="analyzer_contract_satisfied",
+                    capability_id=capability.capability_id,
+                    confidence="low",
+                    priority_label="normal",
+                    analysis_strategy_id=capability.strategy_ids[0],
                 ))
         return tuple(values)
 
@@ -665,7 +630,7 @@ class LlmRouterAdvisor:
 
         return tuple(
             overrides.get(
-                (item.surface_id, item.vulnerability_type), item
+                (item.surface_id, item.capability_id), item
             )
             for item in capability_suggestions
         )
@@ -707,35 +672,35 @@ class LlmRouterAdvisor:
             client_route = bool(parsed.fragment)
             state_changing = has_state_changing_parameters(surface.parameters)
             reviewable_types = tuple(sorted({
-                choice.vulnerability_type
-                for choice in self._analyzers
-                if choice.client_route is client_route
+                capability.vulnerability_type
+                for capability in self._capabilities
+                if (capability.surface_kind == "client") is client_route
             }))
             # 후속 Analyzer의 메서드·파라미터·POST 안전 계약을 실제로 통과할 수 있는
             # 유형만 LLM에 제시한다. 구조적으로 실행 불가능한 조합은 LLM 판단 대상이
             # 아니며 capability ledger에 blocked/unsupported 사유로 남긴다.
-            assignable = set() if state_changing else {
-                    choice.vulnerability_type
-                    for choice in self._analyzers
-                    if choice.client_route is client_route
-                    and _supports_suggestion(
-                        surface,
-                        RouteSuggestion(
-                            surface_id=surface.surface_id,
-                            vulnerability_type=choice.vulnerability_type,
-                            agent_type=choice.agent_type,
-                        ),
-                        evidence,
-                    )
-                }
+            assignable_capabilities = () if state_changing else tuple(
+                capability
+                for capability in self._capabilities
+                if capability_matches(capability, surface, evidence)
+            )
+            assignable = {
+                capability.vulnerability_type
+                for capability in assignable_capabilities
+            }
             covered = {
                 vulnerability_type
                 for surface_id, vulnerability_type in routed
                 if surface_id == surface.surface_id
             }
             allowed_types = tuple(sorted(assignable - covered))
+            allowed_capability_ids = tuple(
+                capability.capability_id
+                for capability in assignable_capabilities
+                if capability.vulnerability_type not in covered
+            )
             execution_blocker = None
-            if not allowed_types:
+            if not allowed_capability_ids:
                 execution_blocker = (
                     "state_changing_surface"
                     if state_changing
@@ -810,6 +775,7 @@ class LlmRouterAdvisor:
                     observations=observation_records.get(surface.surface_id, ()),
                     covered_types=tuple(sorted(covered)),
                     allowed_types=allowed_types,
+                    allowed_capability_ids=allowed_capability_ids,
                     reviewable_types=reviewable_types,
                     execution_blocker=execution_blocker,
                 )
@@ -826,6 +792,7 @@ class LlmRouterAdvisor:
                 item.parameter_names,
                 item.observation_types,
                 item.allowed_types,
+                item.allowed_capability_ids,
             )
         )
         # Hybrid에서는 기존 비용 상한을 유지한다. Agentic exhaustive에서는 같은 값을
@@ -923,6 +890,18 @@ class LlmRouterAdvisor:
             observations = ", ".join(item.observation_types) or "(none)"
             covered = ", ".join(item.covered_types) or "(none)"
             allowed = ", ".join(item.allowed_types) or "(none)"
+            capability_plans = ", ".join(
+                (
+                    f'{{"capability_id":"{capability_id}",'
+                    f'"vulnerability_type":"{capability.vulnerability_type}",'
+                    f'"agent_type":"{capability.agent_type}",'
+                    f'"evidence_types":{list(capability.supported_evidence_types)},'
+                    f'"strategy_ids":{list(capability.strategy_ids)}}}'
+                )
+                for capability_id in item.allowed_capability_ids
+                if (capability := self._capabilities_by_id.get(capability_id))
+                is not None
+            ) or "(none)"
             reviewable = ", ".join(item.reviewable_types) or "(none)"
             blocker = item.execution_blocker or "(none)"
             location = "client_route" if item.client_route else "server_route"
@@ -945,23 +924,23 @@ class LlmRouterAdvisor:
                 )
                 + f"already_covered=[{covered}] "
                 f"allowed_types=[{allowed}] reviewable_types=[{reviewable}] "
-                f"execution_blocker={blocker}"
+                + (
+                    f"allowed_capabilities=[{capability_plans}] "
+                    if self._hypothesis_mode
+                    else ""
+                )
+                + f"execution_blocker={blocker}"
             )
         lines.append("")
         if self._hypothesis_mode:
             lines.extend(
                 [
-                    "Route reason codes: "
+                    "Hypothesis reason codes: "
                     + ", ".join(sorted(CANDIDATE_REASON_CODES)),
-                    "Defer reason codes: "
-                    + ", ".join(sorted(ROUTER_DEFER_REASON_CODES)),
-                    "Reject reason codes: "
-                    + ", ".join(sorted(ROUTER_REJECT_REASON_CODES)),
                     "Evidence types: "
                     + ", ".join(sorted(CANDIDATE_EVIDENCE_TYPES)),
-                    "Return one disposition for every allowed_types entry on every "
-                    "surface. For each surface with allowed_types=[(none)], return one "
-                    "surface_disposition instead. Do not treat an omitted item as rejection.",
+                    "Return one hypothesis for every allowed_capabilities entry. "
+                    "Confidence and priority rank Analysis work; they never remove it.",
                 ]
             )
         else:
@@ -1075,117 +1054,88 @@ class LlmRouterAdvisor:
         status = "all_rejected" if raw and not accepted else "partial" if rejected else "ok"
         return tuple(accepted), tuple(rejected), status
 
-    def _parse_dispositions(
+    def _parse_hypotheses(
         self,
         payload: object,
         offered: tuple[_OfferedSurface, ...],
-        routed: frozenset[tuple[str, str]],
     ) -> tuple[
-        tuple[RouterDisposition, ...],
-        tuple[SurfaceDisposition, ...],
+        tuple[RouterHypothesis, ...],
+        tuple[object, ...],
         tuple[RouteSuggestion, ...],
         tuple[tuple[int, str], ...],
         str,
     ]:
-        """제시된 실행 가능 조합을 검토하고 누락은 ``unanswered``로 합성한다."""
+        """Capability별 우선순위 계획을 검증한다. 실행 가능 조합은 절대 제거하지 않는다."""
 
-        expected: list[tuple[str, str]] = []
-        expected_items: dict[tuple[str, str], tuple[_OfferedSurface, str]] = {}
+        expected: dict[tuple[str, str], tuple[_OfferedSurface, AnalyzerCapability]] = {}
         for surface in offered:
-            for vulnerability_type in surface.allowed_types:
-                agent_type = self._resolve_agent(
-                    vulnerability_type, surface.client_route
-                )
-                if agent_type is None:
-                    continue
-                key = (surface.surface_id, vulnerability_type)
-                expected.append(key)
-                expected_items[key] = (surface, agent_type)
-        expected_surfaces = {
-            surface.surface_id: surface
-            for surface in offered
-            if not surface.allowed_types
-        }
+            for capability_id in surface.allowed_capability_ids:
+                capability = self._capabilities_by_id.get(capability_id)
+                if capability is not None:
+                    expected[(surface.surface_id, capability_id)] = (
+                        surface,
+                        capability,
+                    )
 
-        if not isinstance(payload, dict):
-            return (
-                self._unanswered_dispositions(offered, "invalid_response"),
-                self._unanswered_surface_dispositions(offered, "invalid_response"),
-                (),
-                (),
-                "invalid_response",
-            )
-        raw = payload.get("dispositions", [])
-        raw_surfaces = payload.get("surface_dispositions", [])
-        if (
-            not isinstance(raw, list)
-            or not isinstance(raw_surfaces, list)
-            or (expected and "dispositions" not in payload)
-            or (expected_surfaces and "surface_dispositions" not in payload)
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("hypotheses"), list
         ):
             return (
-                self._unanswered_dispositions(offered, "invalid_response"),
-                self._unanswered_surface_dispositions(offered, "invalid_response"),
+                self._unanswered_hypotheses(offered, "invalid_response"),
+                (),
                 (),
                 (),
                 "invalid_response",
             )
 
-        valid: dict[tuple[str, str], RouterDisposition] = {}
-        invalid_expected: set[tuple[str, str]] = set()
+        raw = payload["hypotheses"]
+        valid: dict[tuple[str, str], RouterHypothesis] = {}
+        suggestions: dict[tuple[str, str], RouteSuggestion] = {}
         rejected: list[tuple[int, str]] = []
+        invalid_expected: set[tuple[str, str]] = set()
         for index, entry in enumerate(raw):
             if not isinstance(entry, dict):
                 rejected.append((index, "invalid_item"))
                 continue
             surface_id = entry.get("surface_id")
-            vulnerability_type = entry.get("vulnerability_type")
-            if not isinstance(surface_id, str) or not isinstance(
-                vulnerability_type, str
-            ):
+            capability_id = entry.get("capability_id")
+            if not isinstance(surface_id, str) or not isinstance(capability_id, str):
                 rejected.append((index, "invalid_item"))
                 continue
-            key = (surface_id, vulnerability_type)
-            item = expected_items.get(key)
-            if item is None:
-                rejected.append(
-                    (index, "duplicate_or_covered" if key in routed else "unsupported_route")
-                )
+            key = (surface_id, capability_id)
+            expected_item = expected.get(key)
+            if expected_item is None:
+                rejected.append((index, "unsupported_capability"))
                 continue
             if key in valid:
-                rejected.append((index, "duplicate_or_covered"))
+                rejected.append((index, "duplicate_capability"))
                 continue
-
-            surface, agent_type = item
-            decision = entry.get("decision")
-            raw_basis = entry.get("basis_observation_ids")
+            surface, capability = expected_item
+            confidence = entry.get("confidence")
+            priority = entry.get("priority")
             reason_code = entry.get("reason_code")
+            raw_basis = entry.get("basis_observation_ids")
             raw_required = entry.get("required_evidence_types")
-            valid_reason = (
-                decision == "route" and reason_code in CANDIDATE_REASON_CODES
-                or decision == "defer" and reason_code in ROUTER_DEFER_REASON_CODES
-                or decision == "reject" and reason_code in ROUTER_REJECT_REASON_CODES
-            )
+            strategy_id = entry.get("analysis_strategy_id")
             if (
-                decision not in {"route", "defer", "reject"}
+                confidence not in {"low", "medium", "high"}
+                or priority not in {"low", "normal", "high"}
+                or reason_code not in CANDIDATE_REASON_CODES
                 or not isinstance(raw_basis, list)
                 or any(not isinstance(value, str) for value in raw_basis)
                 or len(set(raw_basis)) != len(raw_basis)
-                or not isinstance(reason_code, str)
-                or not valid_reason
                 or not isinstance(raw_required, list)
                 or any(not isinstance(value, str) for value in raw_required)
                 or len(set(raw_required)) != len(raw_required)
                 or any(
-                    value not in CANDIDATE_EVIDENCE_TYPES
+                    value not in capability.supported_evidence_types
                     for value in raw_required
                 )
-                or (decision == "reject" and raw_required)
+                or strategy_id not in capability.strategy_ids
             ):
-                rejected.append((index, "invalid_disposition_contract"))
+                rejected.append((index, "invalid_hypothesis_contract"))
                 invalid_expected.add(key)
                 continue
-
             allowed_observations = {
                 ref: evidence_id for ref, evidence_id, _ in surface.observations
             }
@@ -1193,190 +1143,95 @@ class LlmRouterAdvisor:
                 rejected.append((index, "unknown_observation"))
                 invalid_expected.add(key)
                 continue
-            valid[key] = RouterDisposition(
+            evidence_ids = tuple(
+                allowed_observations[value] for value in raw_basis
+            )
+            assessment = RouterHypothesis(
                 surface_id=surface_id,
-                vulnerability_type=vulnerability_type,
-                agent_type=agent_type,
-                decision=decision,
+                vulnerability_type=capability.vulnerability_type,
+                agent_type=capability.agent_type,
+                status="planned",
                 reason_code=reason_code,
-                basis_evidence_ids=tuple(
-                    allowed_observations[value] for value in raw_basis
-                ),
+                basis_evidence_ids=evidence_ids,
                 required_evidence_types=tuple(raw_required),
+                capability_id=capability_id,
+                confidence=confidence,
+                priority=priority,
+                analysis_strategy_id=strategy_id,
             )
-
-        valid_surfaces: dict[str, SurfaceDisposition] = {}
-        invalid_expected_surfaces: set[str] = set()
-        surface_index_offset = len(raw)
-        for relative_index, entry in enumerate(raw_surfaces):
-            index = surface_index_offset + relative_index
-            if not isinstance(entry, dict):
-                rejected.append((index, "invalid_surface_item"))
-                continue
-            surface_id = entry.get("surface_id")
-            if not isinstance(surface_id, str):
-                rejected.append((index, "invalid_surface_item"))
-                continue
-            surface = expected_surfaces.get(surface_id)
-            if surface is None:
-                rejected.append((index, "unsupported_surface_disposition"))
-                continue
-            if surface_id in valid_surfaces:
-                rejected.append((index, "duplicate_surface_disposition"))
-                continue
-
-            decision = entry.get("decision")
-            raw_types = entry.get("suspected_vulnerability_types")
-            raw_basis = entry.get("basis_observation_ids")
-            reason_code = entry.get("reason_code")
-            raw_required = entry.get("required_evidence_types")
-            valid_reason = (
-                decision == "defer" and reason_code in ROUTER_DEFER_REASON_CODES
-                or decision == "reject" and reason_code in ROUTER_REJECT_REASON_CODES
-            )
-            if (
-                decision not in {"defer", "reject"}
-                or not isinstance(raw_types, list)
-                or any(not isinstance(value, str) for value in raw_types)
-                or len(set(raw_types)) != len(raw_types)
-                or any(value not in surface.reviewable_types for value in raw_types)
-                or (decision == "defer" and not raw_types)
-                or (decision == "reject" and raw_types)
-                or not isinstance(raw_basis, list)
-                or any(not isinstance(value, str) for value in raw_basis)
-                or len(set(raw_basis)) != len(raw_basis)
-                or not isinstance(reason_code, str)
-                or not valid_reason
-                or not isinstance(raw_required, list)
-                or any(not isinstance(value, str) for value in raw_required)
-                or len(set(raw_required)) != len(raw_required)
-                or any(
-                    value not in CANDIDATE_EVIDENCE_TYPES
-                    for value in raw_required
-                )
-                or (decision == "reject" and raw_required)
-            ):
-                rejected.append((index, "invalid_surface_disposition_contract"))
-                invalid_expected_surfaces.add(surface_id)
-                continue
-
-            allowed_observations = {
-                ref: evidence_id for ref, evidence_id, _ in surface.observations
-            }
-            if any(value not in allowed_observations for value in raw_basis):
-                rejected.append((index, "unknown_surface_observation"))
-                invalid_expected_surfaces.add(surface_id)
-                continue
-            valid_surfaces[surface_id] = SurfaceDisposition(
+            valid[key] = assessment
+            suggestions[key] = RouteSuggestion(
                 surface_id=surface_id,
-                decision=decision,
+                vulnerability_type=capability.vulnerability_type,
+                agent_type=capability.agent_type,
+                reason=reason_code,
+                basis_evidence_ids=evidence_ids,
                 reason_code=reason_code,
-                suspected_vulnerability_types=tuple(raw_types),
-                basis_evidence_ids=tuple(
-                    allowed_observations[value] for value in raw_basis
-                ),
                 required_evidence_types=tuple(raw_required),
+                capability_id=capability_id,
+                confidence=confidence,
+                priority_label=priority,
+                analysis_strategy_id=strategy_id,
             )
 
-        dispositions: list[RouterDisposition] = []
-        surface_dispositions: list[SurfaceDisposition] = []
-        suggestions: list[RouteSuggestion] = []
-        for key in expected:
-            disposition = valid.get(key)
-            if disposition is None:
-                surface, agent_type = expected_items[key]
-                disposition = RouterDisposition(
+        assessments: list[RouterHypothesis] = []
+        for key, (surface, capability) in expected.items():
+            assessment = valid.get(key)
+            if assessment is None:
+                assessment = RouterHypothesis(
                     surface_id=surface.surface_id,
-                    vulnerability_type=key[1],
-                    agent_type=agent_type,
-                    decision="unanswered",
+                    vulnerability_type=capability.vulnerability_type,
+                    agent_type=capability.agent_type,
+                    status="unanswered",
                     reason_code=(
-                        "invalid_disposition"
+                        "invalid_hypothesis"
                         if key in invalid_expected
-                        else "missing_disposition"
+                        else "missing_hypothesis"
                     ),
+                    capability_id=capability.capability_id,
+                    confidence="low",
+                    priority="normal",
+                    analysis_strategy_id=capability.strategy_ids[0],
                 )
-            dispositions.append(disposition)
-            if disposition.decision == "route":
-                suggestions.append(
-                    RouteSuggestion(
-                        surface_id=disposition.surface_id,
-                        vulnerability_type=disposition.vulnerability_type,
-                        agent_type=disposition.agent_type,
-                        reason=disposition.reason_code,
-                        basis_evidence_ids=disposition.basis_evidence_ids,
-                        reason_code=disposition.reason_code,
-                        required_evidence_types=(
-                            disposition.required_evidence_types
-                        ),
-                    )
-                )
+            assessments.append(assessment)
 
-        for surface_id in expected_surfaces:
-            disposition = valid_surfaces.get(surface_id)
-            if disposition is None:
-                disposition = SurfaceDisposition(
-                    surface_id=surface_id,
-                    decision="unanswered",
-                    reason_code=(
-                        "invalid_surface_disposition"
-                        if surface_id in invalid_expected_surfaces
-                        else "missing_surface_disposition"
-                    ),
-                )
-            surface_dispositions.append(disposition)
-
-        expected_count = len(expected) + len(expected_surfaces)
-        valid_count = len(valid) + len(valid_surfaces)
-        if expected_count and not valid_count:
+        if expected and not valid:
             status = "all_rejected"
-        elif rejected or valid_count != expected_count:
+        elif rejected or len(valid) != len(expected):
             status = "partial"
         else:
             status = "ok"
         return (
-            tuple(dispositions),
-            tuple(surface_dispositions),
-            tuple(suggestions),
+            tuple(assessments),
+            (),
+            tuple(suggestions.values()),
             tuple(rejected),
             status,
         )
 
-    def _unanswered_dispositions(
-        self, offered: tuple[_OfferedSurface, ...], reason_code: str
-    ) -> tuple[RouterDisposition, ...]:
-        values: list[RouterDisposition] = []
+    def _unanswered_hypotheses(
+        self,
+        offered: tuple[_OfferedSurface, ...],
+        reason_code: str,
+    ) -> tuple[RouterHypothesis, ...]:
+        values: list[RouterHypothesis] = []
         for surface in offered:
-            for vulnerability_type in surface.allowed_types:
-                agent_type = self._resolve_agent(
-                    vulnerability_type, surface.client_route
-                )
-                if agent_type is None:
+            for capability_id in surface.allowed_capability_ids:
+                capability = self._capabilities_by_id.get(capability_id)
+                if capability is None:
                     continue
-                values.append(
-                    RouterDisposition(
-                        surface_id=surface.surface_id,
-                        vulnerability_type=vulnerability_type,
-                        agent_type=agent_type,
-                        decision="unanswered",
-                        reason_code=reason_code,
-                    )
-                )
+                values.append(RouterHypothesis(
+                    surface_id=surface.surface_id,
+                    vulnerability_type=capability.vulnerability_type,
+                    agent_type=capability.agent_type,
+                    status="unanswered",
+                    reason_code=reason_code,
+                    capability_id=capability.capability_id,
+                    confidence="low",
+                    priority="normal",
+                    analysis_strategy_id=capability.strategy_ids[0],
+                ))
         return tuple(values)
-
-    @staticmethod
-    def _unanswered_surface_dispositions(
-        offered: tuple[_OfferedSurface, ...], reason_code: str
-    ) -> tuple[SurfaceDisposition, ...]:
-        return tuple(
-            SurfaceDisposition(
-                surface_id=surface.surface_id,
-                decision="unanswered",
-                reason_code=reason_code,
-            )
-            for surface in offered
-            if not surface.allowed_types
-        )
 
     def _resolve_agent(self, vulnerability_type: str, client_route: bool) -> str | None:
         """유형과 표면 모양으로 담당 Agent를 결정한다. LLM은 이 선택에 관여하지 않는다.

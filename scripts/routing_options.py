@@ -139,6 +139,9 @@ def execution_profile_from_args(
         llm_provider=getattr(args, "llm_provider", "") if selected_model else "",
         llm_model=selected_model,
         llm_rpm_limit=llm_rpm_limit,
+        state_changing_approved=getattr(
+            args, "approve_state_changing", False
+        ),
     )
 
 
@@ -159,6 +162,9 @@ def build_run_router(
             "surface_collection_mode": getattr(
                 args, "surface_collection", "adaptive"
             ),
+            "state_changing_approved": str(
+                getattr(args, "approve_state_changing", False)
+            ).lower(),
         },
     )
     # 계정 생성/로그인/HTTP 실행 전에 쓰기 실패를 확인한다. 기존 로그는 보존한다.
@@ -197,6 +203,7 @@ def append_run_result(args, app, run) -> None:
         "llm_provider": profile.llm_provider,
         "llm_model": profile.llm_model,
         "llm_rpm_limit": profile.llm_rpm_limit,
+        "state_changing_approved": profile.state_changing_approved,
         "budget_validation_reserve": run.budget_validation_reserve,
         "budget_allocation_source": run.budget_allocation_source,
         "budget_candidate_order": list(run.budget_candidate_order),

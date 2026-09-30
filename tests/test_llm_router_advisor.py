@@ -38,7 +38,19 @@ class _FakeLlmClient:
 
     def complete(self, request):
         self.requests.append(request)
-        return LlmResponse(payload=self._payload)
+        payload = self._payload
+        if (
+            isinstance(payload, dict)
+            and "hypotheses" in request.response_schema["properties"]
+            and "dispositions" in payload
+        ):
+            payload = {
+                "hypotheses": [
+                    _legacy_hypothesis(item)
+                    for item in payload["dispositions"]
+                ]
+            }
+        return LlmResponse(payload=payload)
 
 
 class _RaisingLlmClient:
@@ -59,39 +71,68 @@ class _ExhaustiveLlmClient:
 
     def complete(self, request):
         self.requests.append(request)
-        dispositions = []
-        surface_dispositions = []
+        hypotheses = []
         for line in request.messages[0].content.splitlines():
             if not line.startswith("- surface_id="):
                 continue
             surface_id = re.search(r"surface_id=(\S+)", line).group(1)
-            allowed = re.search(r"allowed_types=\[([^]]+)\]", line).group(1)
-            if allowed == "(none)":
-                surface_dispositions.append({
+            for capability_id, vulnerability_type, strategy_id in re.findall(
+                r'"capability_id":"([^"]+)","vulnerability_type":"([^"]+)",'
+                r'"agent_type":"[^"]+","evidence_types":\[[^]]*\],'
+                r'"strategy_ids":\[\'([^\']+)\'\]',
+                line,
+            ):
+                hypotheses.append({
                     "surface_id": surface_id,
-                    "decision": "reject",
-                    "suspected_vulnerability_types": [],
+                    "capability_id": capability_id,
+                    "confidence": "low",
+                    "priority": "normal",
                     "basis_observation_ids": [],
-                    "reason_code": "surface_semantics_not_indicative",
+                    "reason_code": _reason_code(vulnerability_type),
                     "required_evidence_types": [],
-                })
-                continue
-            for vulnerability_type in allowed.split(", "):
-                dispositions.append({
-                    "surface_id": surface_id,
-                    "vulnerability_type": vulnerability_type,
-                    "decision": "reject",
-                    "basis_observation_ids": [],
-                    "reason_code": "surface_semantics_not_indicative",
-                    "required_evidence_types": [],
+                    "analysis_strategy_id": strategy_id,
                 })
         return LlmResponse(
-            payload={
-                "dispositions": dispositions,
-                "surface_dispositions": surface_dispositions,
-            },
+            payload={"hypotheses": hypotheses},
             model="fixture",
         )
+
+
+def _reason_code(vulnerability_type: str) -> str:
+    return {
+        "XSS": "input_reflection_risk",
+        "SQLi": "query_interpreter_risk",
+        "Path Traversal": "file_path_resolution_risk",
+        "SSTI": "template_rendering_risk",
+        "Access Control": "object_authorization_risk",
+    }.get(vulnerability_type, "analyzer_contract_satisfied")
+
+
+def _legacy_hypothesis(item: dict) -> dict:
+    vulnerability_type = item["vulnerability_type"]
+    capability_id, strategy_id = {
+        "XSS": ("xss.http.query", "reflect_each_parameter"),
+        "SQLi": ("sqli.http.query", "compare_query_mutations"),
+        "Path Traversal": (
+            "path_traversal.http.query", "probe_file_parameter"
+        ),
+        "Access Control": (
+            "access_control.object_identifier", "compare_object_ownership"
+        ),
+        "SSTI": ("ssti.form.username", "compare_template_expressions"),
+    }[vulnerability_type]
+    return {
+        "surface_id": item["surface_id"],
+        "capability_id": capability_id,
+        "confidence": {
+            "route": "high", "defer": "medium", "reject": "low"
+        }.get(item.get("decision"), "low"),
+        "priority": "normal",
+        "basis_observation_ids": item.get("basis_observation_ids", []),
+        "reason_code": _reason_code(vulnerability_type),
+        "required_evidence_types": item.get("required_evidence_types", []),
+        "analysis_strategy_id": strategy_id,
+    }
 
 
 def _run() -> Run:
@@ -347,7 +388,7 @@ class AgenticHypothesisTests(unittest.TestCase):
             ((0, "unknown_observation"),),
         )
 
-    def test_empty_dispositions_are_visible_as_unanswered_and_fallback(self) -> None:
+    def test_empty_hypotheses_are_visible_as_unanswered_and_fallback(self) -> None:
         llm = _FakeLlmClient({"dispositions": []})
         advisor = LlmRouterAdvisor(
             llm_client=llm,
@@ -361,17 +402,17 @@ class AgenticHypothesisTests(unittest.TestCase):
         )
         self.assertEqual(advisor.last_trace.source, "deterministic_fallback")
         self.assertEqual(advisor.last_trace.status, "all_rejected")
-        self.assertTrue(advisor.last_trace.dispositions)
+        self.assertTrue(advisor.last_trace.hypotheses)
         self.assertEqual(
-            {item.decision for item in advisor.last_trace.dispositions},
+            {item.status for item in advisor.last_trace.hypotheses},
             {"unanswered"},
         )
         self.assertEqual(
-            {item.reason_code for item in advisor.last_trace.dispositions},
-            {"missing_disposition"},
+            {item.reason_code for item in advisor.last_trace.hypotheses},
+            {"missing_hypothesis"},
         )
 
-    def test_route_defer_and_reject_are_advisory_and_all_capabilities_returned(self) -> None:
+    def test_hypothesis_ranking_preserves_all_capabilities(self) -> None:
         llm = _FakeLlmClient({"dispositions": [
             {
                 "surface_id": "surface-import",
@@ -413,12 +454,14 @@ class AgenticHypothesisTests(unittest.TestCase):
         )
         self.assertEqual(selected.reason_code, "query_interpreter_risk")
         self.assertEqual(
-            [(item.vulnerability_type, item.decision, item.reason_code)
-             for item in advisor.last_trace.dispositions],
+            sorted(
+                (item.vulnerability_type, item.status, item.confidence)
+                for item in advisor.last_trace.hypotheses
+            ),
             [
-                ("Path Traversal", "reject", "surface_semantics_not_indicative"),
-                ("SQLi", "route", "query_interpreter_risk"),
-                ("XSS", "defer", "insufficient_observation"),
+                ("Path Traversal", "planned", "low"),
+                ("SQLi", "planned", "high"),
+                ("XSS", "planned", "medium"),
             ],
         )
         self.assertEqual(advisor.last_trace.offered_pair_count, 3)
@@ -440,15 +483,15 @@ class AgenticHypothesisTests(unittest.TestCase):
 
         self.assertEqual(len(suggestions), 3)
         unanswered = [
-            item for item in advisor.last_trace.dispositions
-            if item.decision == "unanswered"
+            item for item in advisor.last_trace.hypotheses
+            if item.status == "unanswered"
         ]
         self.assertEqual(
             {item.vulnerability_type for item in unanswered},
             {"Path Traversal", "XSS"},
         )
         self.assertEqual(
-            {item.reason_code for item in unanswered}, {"missing_disposition"}
+            {item.reason_code for item in unanswered}, {"missing_hypothesis"}
         )
         self.assertEqual(advisor.last_trace.status, "partial")
 
@@ -467,13 +510,13 @@ class AgenticHypothesisTests(unittest.TestCase):
         self.assertEqual(len(suggestions), 15)
         self.assertEqual(len(llm.requests), 3)
         self.assertEqual(advisor.last_trace.offered_pair_count, 15)
-        self.assertEqual(len(advisor.last_trace.dispositions), 15)
+        self.assertEqual(len(advisor.last_trace.hypotheses), 15)
         self.assertEqual(
-            {item.surface_id for item in advisor.last_trace.dispositions},
+            {item.surface_id for item in advisor.last_trace.hypotheses},
             {f"surface-{index}" for index in range(5)},
         )
         self.assertEqual(
-            {item.decision for item in advisor.last_trace.dispositions}, {"reject"}
+            {item.status for item in advisor.last_trace.hypotheses}, {"planned"}
         )
         self.assertEqual(advisor.last_trace.status, "ok")
 
@@ -498,7 +541,6 @@ class AgenticHypothesisTests(unittest.TestCase):
         self.assertEqual(suggestions, ())
         self.assertEqual(len(llm.requests), 0)
         self.assertEqual(advisor.last_trace.offered_pair_count, 0)
-        self.assertEqual(len(advisor.last_trace.surface_dispositions), 0)
         self.assertEqual(len(advisor.last_trace.capabilities), 81)
         self.assertEqual(
             {item.surface_id for item in advisor.last_trace.capabilities},

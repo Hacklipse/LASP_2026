@@ -44,10 +44,13 @@ _COMPARISON_FIELDS = (
     "analysis_profile", "recon_mode", "recon_entry_mode", "surface_collection_mode",
     "router_mode", "router_review", "compare_routers",
     "orchestrator_mode", "budget_allocation_mode", "validation_mode",
-    "request_budget",
+    "state_changing_approved", "request_budget",
 )
 _LLM_FIELDS = ("llm_provider", "llm_model", "llm_rpm_limit")
-_LEGACY_CONDITION_DEFAULTS = {"recon_entry_mode": "targeted"}
+_LEGACY_CONDITION_DEFAULTS = {
+    "recon_entry_mode": "targeted",
+    "state_changing_approved": False,
+}
 _FAILURES = {
     "timeout": LlmTimeout,
     "transport_error": LlmTransportError,

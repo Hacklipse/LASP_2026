@@ -655,25 +655,29 @@ class StandardRouterWiringTests(unittest.TestCase):
             mode="agentic",
             llm_client=_PayloadLlmClient(
                 {
-                    "dispositions": [
+                    "hypotheses": [
                         {
                             "surface_id": "surface-search",
-                            "vulnerability_type": "XSS",
-                            "decision": "reject",
+                            "capability_id": "xss.http.query",
+                            "confidence": "low",
+                            "priority": "normal",
                             "basis_observation_ids": [],
-                            "reason_code": "surface_semantics_not_indicative",
+                            "reason_code": "input_reflection_risk",
                             "required_evidence_types": [],
+                            "analysis_strategy_id": "reflect_each_parameter",
                         },
                         {
                             "surface_id": "surface-search",
-                            "vulnerability_type": "SQLi",
-                            "decision": "route",
+                            "capability_id": "sqli.http.query",
+                            "confidence": "high",
+                            "priority": "high",
                             "basis_observation_ids": [],
                             "reason_code": "query_interpreter_risk",
                             "required_evidence_types": [
                                 "control_response",
                                 "server_error_delta",
                             ],
+                            "analysis_strategy_id": "compare_query_mutations",
                         }
                     ]
                 }
