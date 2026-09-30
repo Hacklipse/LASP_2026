@@ -383,6 +383,19 @@ class RoutingAuditTests(unittest.TestCase):
                 "http_observation", "supported_input_coordinate"
             ],
         }])
+        access_coverage = next(
+            item
+            for item in record["llm"]["analyzer_coverage"]
+            if item["capability_id"] == "access_control.object_identifier"
+        )
+        self.assertEqual(access_coverage, {
+            "capability_id": "access_control.object_identifier",
+            "vulnerability_type": "Access Control",
+            "agent_type": "access_control_analyzer",
+            "status": "blocked",
+            "matched_surface_count": 0,
+            "missing_requirements": ["object_identifier"],
+        })
 
     def test_unexpected_exception_preserves_rules_and_is_logged(self):
         log = _Log()

@@ -86,6 +86,12 @@ class AuditedVulnerabilityRouter:
 
         return tuple(getattr(self.router, "last_capability_assessments", ()))
 
+    @property
+    def last_analyzer_coverage(self) -> tuple[object, ...]:
+        """CLI와 Orchestrator가 wrapper 너머의 Analyzer 계약 gap을 읽게 한다."""
+
+        return tuple(getattr(self.router, "last_analyzer_coverage", ()))
+
     def route(
         self, run: Run, surfaces: Sequence[Surface], evidence: Sequence[Evidence],
     ) -> tuple[RouteDecision, ...]:
@@ -111,6 +117,10 @@ class AuditedVulnerabilityRouter:
             advisor_trace = getattr(advisor, "last_trace", None)
             capabilities = tuple(
                 getattr(advisor_trace, "capabilities", ())
+                if advisor_trace else ()
+            )
+            analyzer_coverage = tuple(
+                getattr(advisor_trace, "analyzer_coverage", ())
                 if advisor_trace else ()
             )
             excluded_surfaces = dict(
@@ -250,6 +260,19 @@ class AuditedVulnerabilityRouter:
                             ),
                         }
                         for item in capabilities
+                    ],
+                    "analyzer_coverage": [
+                        {
+                            "capability_id": item.capability_id,
+                            "vulnerability_type": item.vulnerability_type,
+                            "agent_type": item.agent_type,
+                            "status": item.status,
+                            "matched_surface_count": item.matched_surface_count,
+                            "missing_requirements": list(
+                                item.missing_requirements
+                            ),
+                        }
+                        for item in analyzer_coverage
                     ],
                     "hypothesis_counts": {
                         status: sum(

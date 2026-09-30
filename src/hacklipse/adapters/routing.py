@@ -343,6 +343,7 @@ class RuleBasedVulnerabilityRouter:
         self.last_advisor_suggestions: tuple[RouteSuggestion, ...] = ()
         self.last_advisor_outcomes: tuple[tuple[int, str], ...] = ()
         self.last_capability_assessments: tuple[object, ...] = ()
+        self.last_analyzer_coverage: tuple[object, ...] = ()
         self.last_advisor_status = "not_configured" if advisor is None else "not_called"
 
     def route(
@@ -357,6 +358,7 @@ class RuleBasedVulnerabilityRouter:
         self.last_advisor_suggestions = ()
         self.last_advisor_outcomes = ()
         self.last_capability_assessments = ()
+        self.last_analyzer_coverage = ()
         self.last_advisor_status = (
             "not_configured" if self._advisor is None else "not_called"
         )
@@ -436,6 +438,9 @@ class RuleBasedVulnerabilityRouter:
                 self.last_capability_assessments = tuple(
                     getattr(trace, "capabilities", ())
                 )
+                self.last_analyzer_coverage = tuple(
+                    getattr(trace, "analyzer_coverage", ())
+                )
                 adapter_fallback = (
                     getattr(trace, "source", None) == "deterministic_fallback"
                 )
@@ -467,6 +472,9 @@ class RuleBasedVulnerabilityRouter:
                 trace = getattr(self._advisor, "last_trace", None)
                 self.last_capability_assessments = tuple(
                     getattr(trace, "capabilities", ())
+                )
+                self.last_analyzer_coverage = tuple(
+                    getattr(trace, "analyzer_coverage", ())
                 )
                 decisions.update(suggested)
 

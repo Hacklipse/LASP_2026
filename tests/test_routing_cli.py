@@ -64,7 +64,9 @@ class RoutingCliTests(unittest.TestCase):
                 patch.object(juice, "_prompt_access_control_accounts") as access_prompt,
                 patch.object(juice, "_provision_path_traversal_account") as provision,
                 patch.object(Orchestrator, "start", side_effect=_StopBeforeExecution) as start,
-                patch.object(juice.getpass, "getpass") as secret_prompt,
+                patch.object(
+                    juice.getpass, "getpass", return_value=""
+                ) as secret_prompt,
                 patch("builtins.input", return_value="y"),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
@@ -85,7 +87,7 @@ class RoutingCliTests(unittest.TestCase):
         )
         access_prompt.assert_not_called()
         provision.assert_not_called()
-        secret_prompt.assert_not_called()
+        secret_prompt.assert_called_once()
 
     def test_juice_shop_state_change_approval_is_explicitly_wired_and_recorded(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -100,6 +102,7 @@ class RoutingCliTests(unittest.TestCase):
                     "start",
                     side_effect=_StopBeforeExecution,
                 ) as start,
+                patch.object(juice.getpass, "getpass", return_value=""),
                 patch("builtins.input", return_value="y"),
                 contextlib.redirect_stdout(io.StringIO()) as output,
             ):
@@ -124,9 +127,57 @@ class RoutingCliTests(unittest.TestCase):
             juice._STATE_CHANGING_APPROVAL_REF,
             assemble.call_args.kwargs["approval_gate"]._approved,
         )
+        self.assertIn(
+            juice.SSTI_APPROVAL_REF,
+            assemble.call_args.kwargs["approval_gate"]._approved,
+        )
+        self.assertIn(
+            juice.PATH_TRAVERSAL_POST_APPROVAL_REF,
+            assemble.call_args.kwargs["approval_gate"]._approved,
+        )
         request = start.call_args.args[0]
         self.assertTrue(request.execution_profile.state_changing_approved)
         self.assertIn("대상 데이터나 세션이 변경될 수 있습니다", output.getvalue())
+
+    def test_juice_shop_auto_binds_optional_session_to_the_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(
+                    juice,
+                    "build_local_application",
+                    wraps=build_local_application,
+                ) as assemble,
+                patch.object(
+                    Orchestrator,
+                    "start",
+                    side_effect=_StopBeforeExecution,
+                ) as start,
+                patch.object(
+                    juice.getpass,
+                    "getpass",
+                    return_value="token=private-session-value; language=ko",
+                ),
+                patch("builtins.input", return_value="y"),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                with self.assertRaises(_StopBeforeExecution):
+                    juice.main([
+                        "runner",
+                        "http://localhost:3000/",
+                        "--vuln",
+                        "auto",
+                        "--recon-entry",
+                        "base-url",
+                        "--routing-log",
+                        str(Path(directory) / "routing.jsonl"),
+                    ])
+
+        request = start.call_args.args[0]
+        self.assertEqual(
+            request.credential_ref,
+            juice._AUTO_SESSION_CREDENTIAL_REF,
+        )
+        self.assertNotIn("private-session-value", output.getvalue())
 
     def test_juice_shop_base_url_entry_discards_type_specific_target_and_seeds(self):
         with tempfile.TemporaryDirectory() as directory:

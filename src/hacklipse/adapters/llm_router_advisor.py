@@ -50,6 +50,7 @@ from .request_safety import has_state_changing_parameters
 from .llm_parameter_names import alias_parameter_names
 from .analyzer_capabilities import (
     DEFAULT_ANALYZER_CAPABILITIES,
+    capability_missing_requirements,
     capability_matches,
 )
 from .routing import (
@@ -244,12 +245,25 @@ class SurfaceCapability:
 
 
 @dataclass(frozen=True, slots=True)
+class AnalyzerCapabilityCoverage:
+    """등록된 Analyzer capability 하나가 현재 Run에서 실행 가능한지 나타낸다."""
+
+    capability_id: str
+    vulnerability_type: str
+    agent_type: str
+    status: Literal["routable", "blocked"]
+    matched_surface_count: int = 0
+    missing_requirements: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class RouterAdvisorTrace:
     """감사 로그가 원문 prompt/응답 없이 읽는 마지막 호출의 계측 결과."""
 
     suggestions: tuple[RouteSuggestion, ...] = ()
     hypotheses: tuple[RouterHypothesis, ...] = ()
     capabilities: tuple[SurfaceCapability, ...] = ()
+    analyzer_coverage: tuple[AnalyzerCapabilityCoverage, ...] = ()
     rejected_items: tuple[tuple[int, str], ...] = ()
     offered_surface_ids: tuple[str, ...] = ()
     offered_pair_count: int = 0
@@ -332,7 +346,7 @@ class LlmRouterAdvisor:
         evidence: Sequence[Evidence],
         routed: frozenset[tuple[str, str]],
     ) -> Sequence[RouteSuggestion]:
-        offered, excluded_surfaces, capabilities = self._offer(
+        offered, excluded_surfaces, capabilities, analyzer_coverage = self._offer(
             run, surfaces, evidence, routed
         )
         offered_pair_count = sum(
@@ -346,6 +360,7 @@ class LlmRouterAdvisor:
                 offered_pair_count=offered_pair_count,
                 excluded_surfaces=excluded_surfaces,
                 capabilities=capabilities,
+                analyzer_coverage=analyzer_coverage,
                 status="no_candidates" if not offered else "no_routes",
             )
             return ()
@@ -365,6 +380,7 @@ class LlmRouterAdvisor:
                     offered_pair_count=offered_pair_count,
                     excluded_surfaces=excluded_surfaces,
                     capabilities=capabilities,
+                    analyzer_coverage=analyzer_coverage,
                     source="cache",
                     status="cache_hit",
                     llm_calls=0,
@@ -373,7 +389,12 @@ class LlmRouterAdvisor:
                 )
                 return self.last_trace.suggestions
             return self._advise_exhaustive(
-                run.run_id, offered, routed, excluded_surfaces, capabilities
+                run.run_id,
+                offered,
+                routed,
+                excluded_surfaces,
+                capabilities,
+                analyzer_coverage,
             )
 
         started = time.monotonic()
@@ -411,6 +432,7 @@ class LlmRouterAdvisor:
                 offered_pair_count=offered_pair_count,
                 excluded_surfaces=excluded_surfaces,
                 capabilities=capabilities,
+                analyzer_coverage=analyzer_coverage,
                 source="deterministic_fallback",
                 status=status,
                 llm_calls=1,
@@ -426,6 +448,7 @@ class LlmRouterAdvisor:
             offered_pair_count=offered_pair_count,
             excluded_surfaces=excluded_surfaces,
             capabilities=capabilities,
+            analyzer_coverage=analyzer_coverage,
             source=(
                 "deterministic_fallback"
                 if status in {"invalid_response", "all_rejected"}
@@ -447,6 +470,7 @@ class LlmRouterAdvisor:
         routed: frozenset[tuple[str, str]],
         excluded_surfaces: tuple[tuple[str, str], ...],
         capabilities: tuple[SurfaceCapability, ...],
+        analyzer_coverage: tuple[AnalyzerCapabilityCoverage, ...],
     ) -> tuple[RouteSuggestion, ...]:
         """실행 가능한 모든 조합을 보존하고 LLM 판단은 감사 근거로만 쓴다."""
 
@@ -501,6 +525,7 @@ class LlmRouterAdvisor:
                     ),
                     excluded_surfaces=excluded_surfaces,
                     capabilities=capabilities,
+                    analyzer_coverage=analyzer_coverage,
                     source="deterministic_fallback",
                     status=status,
                     llm_calls=calls,
@@ -556,6 +581,7 @@ class LlmRouterAdvisor:
                     ),
                     excluded_surfaces=excluded_surfaces,
                     capabilities=capabilities,
+                    analyzer_coverage=analyzer_coverage,
                     source="deterministic_fallback",
                     status=status,
                     llm_calls=calls,
@@ -580,6 +606,7 @@ class LlmRouterAdvisor:
             ),
             excluded_surfaces=excluded_surfaces,
             capabilities=capabilities,
+            analyzer_coverage=analyzer_coverage,
             source="llm",
             status=overall_status,
             llm_calls=calls,
@@ -649,6 +676,7 @@ class LlmRouterAdvisor:
         tuple[_OfferedSurface, ...],
         tuple[tuple[str, str], ...],
         tuple[SurfaceCapability, ...],
+        tuple[AnalyzerCapabilityCoverage, ...],
     ]:
         """실행 가능한 조합만 LLM에 싣고 Agentic coverage는 모든 Surface에 남긴다."""
 
@@ -802,7 +830,51 @@ class LlmRouterAdvisor:
             (item.surface_id, "prompt_limit")
             for item in offered[len(selected) :]
         )
-        return tuple(selected), tuple(excluded), tuple(capabilities)
+        return (
+            tuple(selected),
+            tuple(excluded),
+            tuple(capabilities),
+            self._analyzer_coverage(run, surfaces, evidence),
+        )
+
+    def _analyzer_coverage(
+        self,
+        run: Run,
+        surfaces: Sequence[Surface],
+        evidence: Sequence[Evidence],
+    ) -> tuple[AnalyzerCapabilityCoverage, ...]:
+        """Capability별 실행 가능 Surface 수와 가장 작은 계약 gap을 계산한다."""
+
+        run_surfaces = tuple(
+            surface for surface in surfaces if surface.run_id == run.run_id
+        )
+        coverage: list[AnalyzerCapabilityCoverage] = []
+        for capability in self._capabilities:
+            gaps = tuple(
+                capability_missing_requirements(capability, surface, evidence)
+                for surface in run_surfaces
+            )
+            matched = sum(not gap for gap in gaps)
+            if matched:
+                coverage.append(AnalyzerCapabilityCoverage(
+                    capability_id=capability.capability_id,
+                    vulnerability_type=capability.vulnerability_type,
+                    agent_type=capability.agent_type,
+                    status="routable",
+                    matched_surface_count=matched,
+                ))
+                continue
+            closest = min(gaps, key=lambda value: (len(value), value)) if gaps else (
+                "surface",
+            )
+            coverage.append(AnalyzerCapabilityCoverage(
+                capability_id=capability.capability_id,
+                vulnerability_type=capability.vulnerability_type,
+                agent_type=capability.agent_type,
+                status="blocked",
+                missing_requirements=closest,
+            ))
+        return tuple(coverage)
 
     @staticmethod
     def _observations_by_surface(

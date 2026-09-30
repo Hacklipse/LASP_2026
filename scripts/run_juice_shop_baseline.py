@@ -106,6 +106,7 @@ from run_dvwa_baseline import (  # noqa: E402
 
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1"})
 _CREDENTIAL_REF = "interactive-local-juice-shop"
+_AUTO_SESSION_CREDENTIAL_REF = "interactive-local-juice-shop-auto-session"
 _ACTOR_CREDENTIAL_REF = "interactive-local-juice-shop-actor"
 _OWNER_CREDENTIAL_REF = "interactive-local-juice-shop-owner"
 _RECON_CREDENTIAL_REF = "temporary-local-juice-shop-recon"
@@ -125,6 +126,59 @@ _ALL_MODE_RECON_PAGES = 12
 _DEFAULT_GEMINI_RPM_LIMIT = 14
 _OBJECT_ID = re.compile(r"^[0-9]{1,10}$")
 _KNOWLEDGE_DIRECTORY = Path("knowledge")
+_MAX_SESSION_COOKIE_LENGTH = 16_384
+_MAX_SESSION_COOKIE_COUNT = 64
+
+
+def _parse_session_cookie(value: str) -> ResolvedHttpCredential:
+    """브라우저에서 복사한 Cookie 헤더 값을 메모리 credential로 변환한다.
+
+    원문은 예외 메시지나 로그에 포함하지 않는다. ``Cookie:`` 접두사는 편의를 위해
+    허용하지만, 임의 헤더 전체가 아니라 이름/값 쌍만 받는다.
+    """
+
+    raw = value.strip()
+    if raw.casefold().startswith("cookie:"):
+        raw = raw.split(":", 1)[1].strip()
+    if not raw:
+        raise ValueError("세션 Cookie가 비어 있습니다")
+    if len(raw) > _MAX_SESSION_COOKIE_LENGTH:
+        raise ValueError("세션 Cookie가 허용 길이를 초과했습니다")
+    pairs: list[tuple[str, str]] = []
+    for part in raw.split(";"):
+        item = part.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError("세션 Cookie는 name=value 형식이어야 합니다")
+        name, cookie_value = item.split("=", 1)
+        name = name.strip()
+        cookie_value = cookie_value.strip()
+        if not name or not cookie_value:
+            raise ValueError("세션 Cookie 이름과 값은 비어 있을 수 없습니다")
+        pairs.append((name, cookie_value))
+    if not pairs:
+        raise ValueError("세션 Cookie에 name=value 항목이 없습니다")
+    if len(pairs) > _MAX_SESSION_COOKIE_COUNT:
+        raise ValueError("세션 Cookie 항목 수가 허용 범위를 초과했습니다")
+    try:
+        return ResolvedHttpCredential(cookies=tuple(pairs))
+    except ValueError as error:
+        raise ValueError("세션 Cookie 형식이 올바르지 않습니다") from error
+
+
+def _prompt_optional_session_cookie(
+    *, password_fn=None,
+) -> ResolvedHttpCredential | None:
+    """auto Run용 로그인 Cookie를 숨김 입력으로 받고, 빈 입력은 익명 실행으로 둔다."""
+
+    password_fn = getpass.getpass if password_fn is None else password_fn
+    value = password_fn(
+        "로그인 세션 Cookie (선택, name=value 형식, 익명 실행은 Enter): "
+    )
+    if not value.strip():
+        return None
+    return _parse_session_cookie(value)
 
 
 def _recon_planner_summary(evidence) -> str | None:
@@ -215,6 +269,7 @@ def _print_execution_preview(
     elif auto_scan:
         print("\n[검사 범위]")
         print("  포함            현재 Run에서 발견되고 정책상 실행 가능한 Analyzer 후보")
+        print("  로그인 세션     실행 직전 선택 입력 (메모리에서만 사용)")
         excluded = "대상별 seed · 계정 준비"
         if not getattr(args, "approve_state_changing", False):
             excluded += " · 상태 변경 승인"
@@ -1033,11 +1088,28 @@ def main(argv: list[str]) -> int:
         approvals = (SSTI_APPROVAL_REF,)
     if args.approve_state_changing:
         approvals = tuple(
-            dict.fromkeys((*approvals, _STATE_CHANGING_APPROVAL_REF))
+            dict.fromkeys((
+                *approvals,
+                _STATE_CHANGING_APPROVAL_REF,
+                SSTI_APPROVAL_REF,
+                PATH_TRAVERSAL_POST_APPROVAL_REF,
+            ))
         )
     if input(confirmation).strip().casefold() != "y":
         print("취소했습니다.")
         return 2
+    if auto_scan:
+        try:
+            session_credential = _prompt_optional_session_cookie()
+        except ValueError as error:
+            print(f"취소: {error}")
+            return 2
+        if session_credential is not None:
+            credentials[_AUTO_SESSION_CREDENTIAL_REF] = session_credential
+            run_credential_ref = _AUTO_SESSION_CREDENTIAL_REF
+            print("로그인 세션을 이 Run에 적용합니다. Cookie 원문은 저장하지 않습니다.")
+        else:
+            print("로그인 세션 없이 익명 탐색을 진행합니다.")
     if access_control:
         try:
             access_accounts = _prompt_access_control_accounts()
@@ -1046,7 +1118,13 @@ def main(argv: list[str]) -> int:
             return 2
 
     progress_view = None if debug_enabled else RunProgressView()
-    resolver = InMemoryCredentialResolver(credentials)
+    resolver = InMemoryCredentialResolver({})
+    for credential_ref, credential in credentials.items():
+        resolver.add(
+            credential_ref,
+            credential,
+            allowed_origins=(base_url,),
+        )
     http_runtime = HttpExecutionRuntime(credential_resolver=resolver)
     # SPA 의 DOM sink 는 브라우저로만 관측된다. 필요할 때만 감싸 다른 유형의
     # 실행 비용을 늘리지 않는다.
@@ -1297,6 +1375,11 @@ def main(argv: list[str]) -> int:
     print(f"  상태            완료 ({run.phase.value})")
     print(f"  분석 대상       {target_label}")
     print(f"  Analysis 구성   {profile}")
+    if auto_scan:
+        print(
+            "  로그인 세션     "
+            f"{'사용' if run.credential_ref == _AUTO_SESSION_CREDENTIAL_REF else '미사용'}"
+        )
     print(f"  추가 Recon      {run.extra_recon_rounds}회")
     if run.budget_candidate_order:
         print(
@@ -1347,6 +1430,35 @@ def main(argv: list[str]) -> int:
         for item in snapshot.unchecked:
             mark = marks.get(item.status, item.status)
             print(f"  {mark:<8} {item.vulnerability_type:<14} {item.reason}")
+    analyzer_gaps = tuple(
+        item
+        for item in getattr(router, "last_analyzer_coverage", ())
+        if getattr(item, "status", None) == "blocked"
+        and not candidate_counts[getattr(item, "vulnerability_type", "")]
+    )
+    if broad_scan and analyzer_gaps:
+        requirement_labels = {
+            "method": "HTTP 메서드",
+            "surface_kind": "Surface 종류",
+            "state_changing_input": "상태 변경 입력",
+            "input_parameter": "입력 파라미터",
+            "parameter_hint": "필수 파라미터",
+            "object_identifier": "객체 식별자",
+            "required_observation": "필수 관측",
+            "observation_parameter": "관측 기반 파라미터",
+            "surface": "Surface",
+        }
+        print()
+        print("[실행하지 못한 Analyzer 계약]")
+        for item in analyzer_gaps:
+            missing = ", ".join(
+                requirement_labels.get(value, value)
+                for value in item.missing_requirements
+            ) or "실행 가능한 Surface"
+            print(
+                f"  {item.vulnerability_type:<14} "
+                f"{item.capability_id} · 부족: {missing}"
+            )
     print()
     print("[최종 판정]")
     print(f"  결과            {verdict}")

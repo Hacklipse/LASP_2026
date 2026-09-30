@@ -27,6 +27,8 @@ from run_juice_shop_baseline import (  # noqa: E402
     _knowledge_database_path,
     _print_execution_preview,
     _prompt_access_control_accounts,
+    _prompt_optional_session_cookie,
+    _parse_session_cookie,
     _recon_entry_points,
     _recon_planner_summary,
     _resolve_juice_shop_db,
@@ -200,6 +202,31 @@ class _AccessLoginRuntime:
 
 
 class JuiceShopAccessCredentialBrokerTests(unittest.TestCase):
+    def test_optional_session_cookie_accepts_header_without_exposing_values(self) -> None:
+        credential = _parse_session_cookie(
+            "Cookie: token=private.jwt.value; language=ko"
+        )
+
+        self.assertEqual(
+            credential.cookies,
+            (("token", "private.jwt.value"), ("language", "ko")),
+        )
+        self.assertNotIn("private.jwt.value", repr(credential))
+        self.assertIsNone(
+            _prompt_optional_session_cookie(password_fn=lambda _: "")
+        )
+
+    def test_optional_session_cookie_rejects_malformed_or_duplicate_values(self) -> None:
+        for value in (
+            "token-without-equals",
+            "token=",
+            "token=one; token=two",
+            "Cookie: ",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError) as error:
+                _parse_session_cookie(value)
+            self.assertNotIn(value, str(error.exception))
+
     def test_prompt_hides_passwords_and_rejects_the_same_account(self) -> None:
         emails = iter(("actor@example.test", "owner@example.test"))
         passwords = iter(("actor-password", "owner-password"))

@@ -956,6 +956,43 @@ class OfferSelectionTests(unittest.TestCase):
             ("unsupported", "no_supported_input_coordinate"),
         )
 
+    def test_analyzer_coverage_explains_ssti_and_access_control_gaps(self) -> None:
+        profile = _surface(
+            "surface-profile", url="http://localhost/profile", parameters=()
+        )
+        basket = _surface(
+            "surface-basket", url="http://localhost/rest/basket/", parameters=()
+        )
+        advisor = LlmRouterAdvisor(
+            llm_client=_FakeLlmClient({"hypotheses": []}),
+            analyzers=ANALYZERS + (
+                AnalyzerChoice("SSTI", "ssti_analyzer"),
+                AnalyzerChoice("Access Control", "access_control_analyzer"),
+            ),
+            hypothesis_mode=True,
+        )
+
+        advisor.advise(_run(), (profile, basket), (), frozenset())
+
+        coverage = {
+            item.capability_id: item
+            for item in advisor.last_trace.analyzer_coverage
+        }
+        self.assertEqual(
+            coverage["ssti.form.username"].missing_requirements,
+            ("method", "input_parameter", "parameter_hint"),
+        )
+        self.assertEqual(
+            coverage[
+                "access_control.object_identifier"
+            ].missing_requirements,
+            ("object_identifier",),
+        )
+        self.assertEqual(
+            coverage["access_control.object_identifier"].status,
+            "blocked",
+        )
+
     def test_uncovered_surfaces_are_offered_before_partially_covered_ones(self) -> None:
         llm = _FakeLlmClient({"suggestions": []})
         surfaces = (

@@ -144,26 +144,43 @@ def capability_matches(
 ) -> bool:
     """Agent 이름과 취약점 유형을 분기하지 않는 범용 capability matcher."""
 
+    return not capability_missing_requirements(capability, surface, evidence)
+
+
+def capability_missing_requirements(
+    capability: AnalyzerCapability,
+    surface: Surface,
+    evidence: Sequence[Evidence] = (),
+) -> tuple[str, ...]:
+    """Surface가 capability를 만족하지 못한 이유를 안정된 코드로 반환한다.
+
+    Router의 실행 여부와 진단 결과가 서로 달라지지 않도록
+    :func:`capability_matches`와 같은 조건을 한 곳에서 계산한다. 반환값은 감사 로그와
+    CLI에 노출되므로 URL, 파라미터 값, 응답 본문은 포함하지 않는다.
+    """
+
+    missing: list[str] = []
+
     if surface.method.upper() not in capability.methods:
-        return False
+        missing.append("method")
     is_client = bool(urlsplit(surface.url).fragment)
     if is_client != (capability.surface_kind == "client"):
-        return False
+        missing.append("surface_kind")
     if has_state_changing_parameters(surface.parameters):
-        return False
+        missing.append("state_changing_input")
     if capability.requires_parameters and not surface.parameters:
-        return False
+        missing.append("input_parameter")
     if capability.parameter_hints:
         offered = {name.casefold() for name in surface.parameters}
         if not offered.intersection(
             hint.casefold() for hint in capability.parameter_hints
         ):
-            return False
+            missing.append("parameter_hint")
     if capability.requires_object_identifier and not (
         object_identifier_parameters(surface.parameters)
         or surface.path_identifier is not None
     ):
-        return False
+        missing.append("object_identifier")
     for requirement in capability.observation_requirements:
         if not any(
             item.run_id == surface.run_id
@@ -176,13 +193,13 @@ def capability_matches(
             )
             for item in evidence
         ):
-            return False
+            missing.append("required_observation")
     if (
         capability.exploration_parameter_source == "observation"
         and not observation_parameters(capability, surface, evidence)
     ):
-        return False
-    return True
+        missing.append("observation_parameter")
+    return tuple(dict.fromkeys(missing))
 
 
 def exploration_parameters(
@@ -195,4 +212,3 @@ def exploration_parameters(
     if capability.exploration_parameter_source == "observation":
         return observation_parameters(capability, surface, evidence)
     return ()
-
