@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import time
 import unittest
 from dataclasses import replace
 
 from hacklipse.adapters.llm_iterative_recon import LlmIterativeReconPlanner
+from hacklipse.adapters import BoundedRetryPolicy, InMemoryBudgetManager, LocalTaskDispatcher
 from hacklipse.adapters.memory import InMemoryEvidenceStore, InMemorySurfaceStore
+from hacklipse.adapters.memory import InMemoryTaskStore
 from hacklipse.adapters.recon import ReconAgent
+from hacklipse.application import TaskExecutor
 from hacklipse.domain import Evidence, TaskEnvelope
 from hacklipse.ports import ReconAction, ReconObservation
 from hacklipse.ports.errors import LlmTimeout
@@ -144,9 +148,10 @@ class AgenticPlannerContractTests(unittest.TestCase):
 
 
 class _Collector:
-    def __init__(self, evidence_store, bodies: dict[str, str]) -> None:
+    def __init__(self, evidence_store, bodies: dict[str, str], statuses=None) -> None:
         self._evidence = evidence_store
         self._bodies = bodies
+        self._statuses = statuses or {}
         self.calls: list[str] = []
         self._next_id = 0
 
@@ -173,7 +178,7 @@ class _Collector:
                 evidence_type="http_response",
                 observation={
                     "type": "http_response",
-                    "status": 200,
+                    "status": self._statuses.get(target_url, 200),
                     "content_type": "text/html; charset=utf-8",
                     "headers": (("set-cookie", "must-not-reach-the-planner"),),
                     "body": self._bodies[target_url],
@@ -280,6 +285,136 @@ class _CaptureStopPlanner:
 
 
 class AgenticReconIntegrationTests(unittest.TestCase):
+    def test_replayed_actions_do_not_consume_new_llm_call_limit(self) -> None:
+        class FirstOfferedLlm:
+            def __init__(self):
+                self.calls = 0
+
+            def complete(self, request):
+                self.calls += 1
+                offered = json.loads(request.messages[0].content)["selectable_surface_ids"]
+                return LlmResponse(payload={
+                    "action": "visit_surface", "surface_id": offered[0],
+                    "basis_observation_ids": [], "reason_code": "expand_coverage",
+                })
+
+        bodies = {"http://localhost/": "".join(
+            f'<a href="/p{i}">page</a>' for i in range(8)
+        )}
+        bodies.update({f"http://localhost/p{i}": "<p>page</p>" for i in range(8)})
+        evidence_store = InMemoryEvidenceStore()
+        surface_store = InMemorySurfaceStore()
+        collector = _Collector(evidence_store, bodies)
+        llm = FirstOfferedLlm()
+        planner = LlmIterativeReconPlanner(llm_client=llm)
+        task = replace(_TASK, request_budget=20)
+
+        ReconAgent(
+            collector=collector, evidence_store=evidence_store,
+            surface_store=surface_store, iterative_planner=planner, max_pages=4,
+        ).handle(task)
+        self.assertEqual(llm.calls, 3)
+        ReconAgent(
+            collector=collector, evidence_store=evidence_store,
+            surface_store=surface_store, iterative_planner=planner, max_pages=5,
+        ).handle(task)
+        self.assertEqual(llm.calls, 4)
+
+    def test_deterministic_collection_never_spends_llm_call_allowance(self) -> None:
+        class ForbiddenPlanner:
+            def decide(self, **kwargs):
+                raise AssertionError("deterministic collection must not call the LLM")
+
+        bodies = {"http://localhost/": "".join(
+            f'<a href="/p{i}">page</a>' for i in range(8)
+        )}
+        bodies.update({f"http://localhost/p{i}": "<p>page</p>" for i in range(8)})
+        evidence_store = InMemoryEvidenceStore()
+        agent = ReconAgent(
+            collector=_Collector(evidence_store, bodies), evidence_store=evidence_store,
+            surface_store=InMemorySurfaceStore(), iterative_planner=ForbiddenPlanner(),
+            surface_collection_mode="deterministic", max_pages=5,
+        )
+
+        agent.handle(replace(_TASK, request_budget=20))
+
+        traces = [item.observation for item in evidence_store.list_by_run(_TASK.run_id)]
+        actions = [item for item in traces if item.get("type") == "recon_action"]
+        summary = next(item for item in traces if item.get("type") == "recon_collection_summary")
+        self.assertEqual(summary["llm_call_count"], 0)
+        self.assertTrue(all(item["status"] == "fallback:deterministic_collection" for item in actions))
+
+    def test_collection_summary_distinguishes_attempt_response_and_success(self) -> None:
+        bodies = {"http://localhost/": (
+            '<a href="/a-missing">missing</a><a href="/b-bad">bad</a>'
+            '<a href="/c-good">good</a><a href="/z-later">later</a>'
+        ), "http://localhost/a-missing": "<p>missing status</p>",
+            "http://localhost/b-bad": '<a href="/error-link">not a page</a>',
+            "http://localhost/c-good": "<p>good</p>",
+            "http://localhost/z-later": "<p>later</p>"}
+        evidence_store = InMemoryEvidenceStore()
+        agent = ReconAgent(
+            collector=_Collector(evidence_store, bodies, {
+                "http://localhost/a-missing": None, "http://localhost/b-bad": 500,
+            }),
+            evidence_store=evidence_store, surface_store=InMemorySurfaceStore(),
+            iterative_planner=object(), surface_collection_mode="deterministic",
+            max_pages=4,
+        )
+
+        agent.handle(replace(_TASK, request_budget=10))
+
+        summary = next(
+            item.observation for item in evidence_store.list_by_run(_TASK.run_id)
+            if item.observation.get("type") == "recon_collection_summary"
+        )
+        self.assertEqual(summary["attempted_url_count"], 4)
+        self.assertEqual(summary["response_url_count"], 3)
+        self.assertEqual(summary["fetched_url_count"], 2)
+        self.assertEqual(summary["parsed_url_count"], 2)
+        self.assertEqual(summary["unfetched_count"], 1)
+
+    def test_slow_llm_completes_through_task_executor_deadline(self) -> None:
+        class SlowLlm:
+            def __init__(self):
+                self.calls = 0
+
+            def complete(self, request):
+                self.calls += 1
+                time.sleep(0.05)
+                offered = json.loads(request.messages[0].content)["selectable_surface_ids"]
+                return LlmResponse(payload={
+                    "action": "visit_surface", "surface_id": offered[0],
+                    "basis_observation_ids": [], "reason_code": "expand_coverage",
+                })
+
+        bodies = {"http://localhost/": "".join(
+            f'<a href="/p{i}">page</a>' for i in range(8)
+        )}
+        bodies.update({f"http://localhost/p{i}": "<p>page</p>" for i in range(8)})
+        evidence_store = InMemoryEvidenceStore()
+        llm = SlowLlm()
+        agent = ReconAgent(
+            collector=_Collector(evidence_store, bodies), evidence_store=evidence_store,
+            surface_store=InMemorySurfaceStore(),
+            iterative_planner=LlmIterativeReconPlanner(llm_client=llm), max_pages=8,
+        )
+        dispatcher = LocalTaskDispatcher()
+        dispatcher.register("recon", agent, allowed_tools=("http_get",))
+        budget = InMemoryBudgetManager()
+        budget.open_run(_TASK.run_id, 30)
+        tasks = InMemoryTaskStore()
+        executor = TaskExecutor(
+            dispatcher=dispatcher, task_store=tasks, budget_manager=budget,
+            retry_policy=BoundedRetryPolicy(),
+        )
+
+        result = executor.execute(replace(_TASK, request_budget=30, timeout_seconds=1.5))
+
+        self.assertEqual(result.status.value, "completed")
+        self.assertEqual(tasks.get(_TASK.task_id).status.value, "succeeded")
+        self.assertEqual(llm.calls, 3)
+
     def test_slow_llm_has_three_call_limit_then_collects_deterministically(self) -> None:
         now = [0.0]
 

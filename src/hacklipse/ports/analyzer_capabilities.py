@@ -77,4 +77,3 @@ class AnalyzerCapabilityRegistry:
 
     def snapshot(self) -> tuple[AnalyzerCapability, ...]:
         return tuple(self._items.values())
-

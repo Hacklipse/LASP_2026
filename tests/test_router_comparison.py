@@ -191,14 +191,21 @@ class RouterComparisonTests(unittest.TestCase):
             replay(args)
             baseline, _ = latest_run(args.routing_log, "heuristic")
             hybrid, _ = latest_run(args.routing_log, "hybrid")
+            hybrid = dict(hybrid, run_id="independent-run")
             left = {"finding_count": 0, "requests_used": 3, "request_budget": 10,
                     "state_changing_approved": False, "authenticated": False,
+                    "phase": "done", "execution_profile_recorded": True,
+                    "code_version": "test-version",
                     "candidate_status_counts": {"blocked": 1}}
             right = {"finding_count": 1, "requests_used": 5, "request_budget": 10,
                      "state_changing_approved": False, "authenticated": False,
+                     "phase": "done", "execution_profile_recorded": True,
+                     "code_version": "test-version",
                      "candidate_status_counts": {"confirmed": 1}}
             result = compare_records(baseline, hybrid, left, right)
             self.assertTrue(result["analysis_comparison_available"])
+            self.assertEqual(result["comparison_axis"], "router_mode")
+            self.assertEqual(result["analysis_unavailable_reasons"], [])
             self.assertEqual(result["analysis_delta"], {
                 "finding_count": 1, "requests_used": 2,
                 "candidate_status_counts": {"blocked": -1, "confirmed": 1},
@@ -211,6 +218,30 @@ class RouterComparisonTests(unittest.TestCase):
             changed_approval = dict(right, state_changing_approved=True)
             self.assertFalse(compare_records(
                 baseline, hybrid, left, changed_approval
+            )["analysis_comparison_available"])
+            for change, reason in (
+                ({"phase": "failed"}, "run_incomplete"),
+                ({"code_version": ""}, "code_version_missing"),
+                ({"code_version": "new-version"}, "code_version_mismatch"),
+                ({"authenticated": True}, "authentication_mismatch"),
+                ({"execution_profile_recorded": False}, "execution_profile_missing"),
+            ):
+                with self.subTest(change=change):
+                    rejected = compare_records(baseline, hybrid, left, dict(right, **change))
+                    self.assertFalse(rejected["analysis_comparison_available"])
+                    self.assertIsNone(rejected["analysis_delta"])
+                    self.assertIn(reason, rejected["analysis_unavailable_reasons"])
+            self.assertFalse(compare_records(
+                baseline, dict(hybrid, input_fingerprint="different-raw-input"), left, right,
+            )["analysis_comparison_available"])
+            changed_manifest = json.loads(json.dumps(hybrid["routing_input_manifest"]))
+            changed_manifest["surfaces"][0]["method"] = "POST"
+            changed_input = compare_records(
+                baseline, dict(hybrid, routing_input_manifest=changed_manifest), left, right,
+            )
+            self.assertIn("router_input_mismatch", changed_input["analysis_unavailable_reasons"])
+            self.assertFalse(compare_records(
+                baseline, dict(hybrid, status="failed"), left, right,
             )["analysis_comparison_available"])
 
     def test_fingerprint_ignores_generated_ids_but_detects_input_changes(self):

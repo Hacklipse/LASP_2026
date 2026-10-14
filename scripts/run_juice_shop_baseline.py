@@ -987,6 +987,8 @@ def main(argv: list[str]) -> int:
         selected_model=selected_model,
         rpm_limit=rpm_limit,
     )
+    if broad_scan:
+        print("참고: 검증된 정상 요청 템플릿이 없어 POST Path Traversal 탐침은 차단됩니다.")
 
     agent_credentials: tuple[tuple[str, str], ...] = ()
     recon_seed_urls: tuple[str, ...] = ()
@@ -1049,10 +1051,10 @@ def main(argv: list[str]) -> int:
             )
         else:
             print(
-                "이 검증은 폐기 가능한 임시 계정을 만들고 Recon이 SPA 번들에서 발견한\n"
-                "서버 렌더링 폼에 고정된 비민감 파일 경로만 전송합니다.\n"
-                "POST는 개인정보 삭제 요청 행을 만들지만 실제 계정은 삭제하지 않으며,\n"
-                "검증 종료 시 임시 계정과 연결 데이터를 직접 정리합니다."
+                "이 검증은 폐기 가능한 임시 계정으로 보호 페이지를 관측합니다.\n"
+                "정상 요청 템플릿이 검증되지 않은 POST Path Traversal 탐침은 보내지\n"
+                "않으며, 발견된 안전한 GET Surface만 검사합니다. 검증 종료 시\n"
+                "임시 계정과 연결 데이터를 직접 정리합니다."
             )
         confirmation = f"로컬 Juice Shop {vuln.label} 검증을 실행할까요? [y/N] "
         credentials = {}

@@ -495,6 +495,8 @@ class RunSupervisor:
         if self.state.running:
             raise RuntimeError("이미 실행 중인 Run이 있다.")
         self.state.begin(options, engine_label=_engine_label(options))
+        if options.vuln in {"path_traversal", "all", "auto"}:
+            self.state.note("검증된 정상 요청 템플릿이 없어 POST Path Traversal 탐침은 차단됩니다.")
         self._current_agent = None
         self._usage = None
         self._app = None

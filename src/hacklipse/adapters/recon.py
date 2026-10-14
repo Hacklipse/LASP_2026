@@ -323,6 +323,9 @@ class ReconAgent:
             url: {"seed"} for url in pending
         }
         fetched: set[str] = set()
+        responded: set[str] = set()
+        successful: set[str] = set()
+        parsed: set[str] = set()
         scripts: list[str] = []
         document_pages: set[str] = set()
         if targeted:
@@ -353,6 +356,16 @@ class ReconAgent:
         recently_fetched_surface_ids: list[str] = []
         deadline_exhausted = False
         stop_reason: str | None = None
+
+        def record_response(url: str, evidence: Evidence) -> None:
+            status = evidence.observation.get("status")
+            if (
+                evidence.evidence_type == "http_response"
+                and type(status) is int and 100 <= status <= 599
+            ):
+                responded.add(url)
+                if 200 <= status < 300:
+                    successful.add(url)
 
         def remember(
             url: str,
@@ -427,12 +440,13 @@ class ReconAgent:
                 evidence_id, evidence = self._fetch(
                     task, url, surface_id, timeout_seconds=remaining_work()
                 )
+                record_response(url, evidence)
                 evidence_ids.append(evidence_id)
                 recently_fetched_surface_ids.append(surface_id)
                 del recently_fetched_surface_ids[:-_MAX_AGENTIC_CONTEXT]
 
                 body = evidence.observation.get("body")
-                if not isinstance(body, str) or not body:
+                if url not in successful or not isinstance(body, str) or not body:
                     continue
                 if not _is_html_response(evidence):
                     # JSON/API 응답 안의 escaped HTML 조각을 실제 링크나 폼으로 오인하면
@@ -441,6 +455,7 @@ class ReconAgent:
                     continue
 
                 links, forms, sources = _parse_page(body, url)
+                parsed.add(url)
                 for form_url, method, names, content_type in forms:
                     form_surface_id = remember(
                         form_url, method, names, discovery_types=("html_form",)
@@ -503,9 +518,13 @@ class ReconAgent:
                 deadline_exhausted = True
                 break
             fetched.add(source)
-            for url, names, should_crawl, is_navigation in self._discover_from_script(
+            script_paths, script_evidence, script_parsed = self._discover_from_script(
                 task, source, origin, timeout_seconds=remaining_work()
-            ):
+            )
+            record_response(source, script_evidence)
+            if script_parsed:
+                parsed.add(source)
+            for url, names, should_crawl, is_navigation in script_paths:
                 discovery_type = (
                     "browser_navigation" if is_navigation else "script_literal"
                 )
@@ -562,9 +581,7 @@ class ReconAgent:
                     _MAX_AGENTIC_LLM_CALL_SECONDS, remaining_work() / 2
                 )
                 planner_task = replace(task, timeout_seconds=2 * llm_timeout)
-                if provider_fallback_status is None:
-                    llm_calls += 1
-                action, action_evidence_id, executed_surface_id = self._next_action(
+                action, action_evidence_id, executed_surface_id, llm_called = self._next_action(
                     planner_task,
                     observations,
                     selectable_surface_ids,
@@ -572,6 +589,7 @@ class ReconAgent:
                     round_index,
                     provider_fallback_status=provider_fallback_status,
                 )
+                llm_calls += int(llm_called)
                 if action.status in {
                     "fallback:timeout", "fallback:transport_error", "fallback:refused"
                 }:
@@ -634,9 +652,13 @@ class ReconAgent:
             if unfetched_ids or unregistered_hashes:
                 summary = {
                     "type": "recon_collection_summary",
-                    "fetched_url_count": len(fetched),
+                    "attempted_url_count": len(fetched),
+                    "response_url_count": len(responded),
+                    "fetched_url_count": len(successful),
+                    "parsed_url_count": len(parsed),
+                    "llm_call_count": llm_calls,
                     "fetched_surface_ids": sorted({
-                        pending_surface_ids[url] for url in fetched
+                        pending_surface_ids[url] for url in successful
                         if url in pending_surface_ids
                     }),
                     "unfetched_surface_ids": list(unfetched_ids),
@@ -708,13 +730,18 @@ class ReconAgent:
     def _discover_from_script(
         self, task: TaskEnvelope, source: str, origin,
         *, timeout_seconds: float | None = None,
-    ) -> list[tuple[str, tuple[str, ...], bool, bool]]:
+    ) -> tuple[list[tuple[str, tuple[str, ...], bool, bool]], Evidence, bool]:
         """JS 번들을 받아 경로 리터럴에서 Surface 후보를 만든다."""
 
         _, evidence = self._fetch(task, source, None, timeout_seconds=timeout_seconds)
+        status = evidence.observation.get("status")
         body = evidence.observation.get("body")
-        if not isinstance(body, str) or not body or len(body) > _MAX_SCRIPT_BYTES:
-            return []
+        if (
+            evidence.evidence_type != "http_response"
+            or type(status) is not int or not 200 <= status < 300
+            or not isinstance(body, str) or not body or len(body) > _MAX_SCRIPT_BYTES
+        ):
+            return [], evidence, False
 
         parameters: dict[str, set[str]] = {}
         for match in _JS_PATH_PARAM.finditer(body):
@@ -756,7 +783,7 @@ class ReconAgent:
             (f"{base}/#/{route}", names, False, False)
             for route, names in sorted(_client_routes(body).items())
         )
-        return found
+        return found, evidence, True
 
     def _store_surface(
         self,
@@ -1014,7 +1041,7 @@ class ReconAgent:
         round_index: int,
         *,
         provider_fallback_status: str | None = None,
-    ) -> tuple[ReconAction, str, str | None]:
+    ) -> tuple[ReconAction, str, str | None, bool]:
         """Restore or persist exactly one policy-checked iterative Recon action."""
 
         stored = find_stored_recon_action(
@@ -1024,7 +1051,7 @@ class ReconAgent:
             round_index=round_index,
         )
         if stored is not None:
-            return stored
+            return (*stored, False)
 
         if self._surface_collection_mode == "deterministic" or provider_fallback_status:
             selected = selectable_surface_ids[0]
@@ -1080,7 +1107,10 @@ class ReconAgent:
                 ),
             )
         )
-        return action, evidence_id, executed_surface_id
+        return action, evidence_id, executed_surface_id, (
+            self._surface_collection_mode != "deterministic"
+            and provider_fallback_status is None
+        )
 
     def _plan(
         self,

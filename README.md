@@ -28,13 +28,19 @@ runs, pass `--code-version` (or fill in **Code version** in the Dashboard).
 The run profile and JSONL result record that label, execution modes, approval
 and authentication flags, request ceiling, and requests used. Compare runs
 under the same budget and target state.
+Router analysis deltas require two completed, independent runs with matching
+Recon inputs, execution conditions, and a nonempty matching code version. A
+different Router mode is the intended comparison axis; changing code versions
+requires a separate experiment. Authentication is recorded only as a flag, so
+the operator must still verify the same principal and target state externally.
 
 Agentic Recon limits LLM decisions to three calls of at most 15 seconds each,
 using the task's remaining time for each call. It then visits remaining safe
 surfaces in deterministic order and records unvisited surface IDs and the stop
-reason. POST Path Traversal probes remain unavailable until a verified normal
-request template and safe proof target exist. Stored POST candidates are
-blocked without sending a synthesized request.
+reason. Its collection summary separates attempted URLs, HTTP responses,
+successful fetches, and parsed responses. POST Path Traversal probes remain
+unavailable until a verified normal request template and safe proof target
+exist. Stored POST candidates are blocked without sending a synthesized request.
 
 Run the local verification suite with:
 

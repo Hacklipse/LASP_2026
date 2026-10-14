@@ -363,6 +363,8 @@ def _check_execution_conditions(off, on):
         raise ValueError("unrecorded execution conditions cannot be compared")
     if off["phase"] != "done" or on["phase"] != "done":
         raise ValueError("report comparison requires completed runs")
+    if not off.get("code_version") or not on.get("code_version"):
+        raise ValueError("report comparison requires recorded code versions")
     different = [
         field
         for field in _COMPARISON_FIELDS
