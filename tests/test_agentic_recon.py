@@ -280,6 +280,100 @@ class _CaptureStopPlanner:
 
 
 class AgenticReconIntegrationTests(unittest.TestCase):
+    def test_slow_llm_has_three_call_limit_then_collects_deterministically(self) -> None:
+        now = [0.0]
+
+        class SlowLlm:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def complete(self, request):
+                self.requests.append(request)
+                now[0] += request.timeout_seconds
+                offered = json.loads(request.messages[0].content)["selectable_surface_ids"]
+                return LlmResponse(payload={
+                    "action": "visit_surface", "surface_id": offered[0],
+                    "basis_observation_ids": [],
+                    "reason_code": "expand_coverage",
+                })
+
+        bodies = {"http://localhost/": "".join(
+            f'<a href="/p{i}">page</a>' for i in range(12)
+        )}
+        bodies.update({f"http://localhost/p{i}": "<p>page</p>" for i in range(12)})
+        evidence_store = InMemoryEvidenceStore()
+        collector = _Collector(evidence_store, bodies)
+        llm = SlowLlm()
+        agent = ReconAgent(
+            collector=collector, evidence_store=evidence_store,
+            surface_store=InMemorySurfaceStore(),
+            iterative_planner=LlmIterativeReconPlanner(llm_client=llm),
+            max_pages=10, clock=lambda: now[0],
+        )
+        task = replace(_TASK, request_budget=30, timeout_seconds=120)
+
+        result = agent.handle(task)
+
+        self.assertEqual(result.status.value, "completed")
+        self.assertEqual(len(llm.requests), 3)
+        self.assertEqual(len(collector.calls), 10)
+        self.assertEqual(result.message, "agentic_recon:fallback:llm_call_limit")
+        traces = [
+            item.observation for item in evidence_store.list_by_run(task.run_id)
+            if item.observation.get("type") == "recon_action"
+        ]
+        self.assertIn("fallback:llm_call_limit", [item["status"] for item in traces])
+
+    def test_time_limit_records_unfetched_surfaces_without_failing(self) -> None:
+        now = [0.0]
+
+        class SlowLlm:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def complete(self, request):
+                self.requests.append(request)
+                now[0] += request.timeout_seconds
+                offered = json.loads(request.messages[0].content)["selectable_surface_ids"]
+                return LlmResponse(payload={
+                    "action": "visit_surface", "surface_id": offered[0],
+                    "basis_observation_ids": [],
+                    "reason_code": "expand_coverage",
+                })
+
+        class TimedCollector(_Collector):
+            def collect(self, *args, **kwargs):
+                result = super().collect(*args, **kwargs)
+                now[0] += 1.0
+                return result
+
+        bodies = {"http://localhost/": "".join(
+            f'<a href="/p{i}">page</a>' for i in range(8)
+        )}
+        bodies.update({f"http://localhost/p{i}": "<p>page</p>" for i in range(8)})
+        evidence_store = InMemoryEvidenceStore()
+        llm = SlowLlm()
+        agent = ReconAgent(
+            collector=TimedCollector(evidence_store, bodies),
+            evidence_store=evidence_store, surface_store=InMemorySurfaceStore(),
+            iterative_planner=LlmIterativeReconPlanner(llm_client=llm),
+            max_pages=9, clock=lambda: now[0],
+        )
+        task = replace(_TASK, request_budget=30, timeout_seconds=10)
+
+        result = agent.handle(task)
+
+        self.assertEqual(result.status.value, "completed")
+        self.assertLessEqual(len(llm.requests), 3)
+        self.assertEqual(result.message, "agentic_recon:fallback:time_budget")
+        summary = next(
+            item.observation for item in evidence_store.list_by_run(task.run_id)
+            if item.observation.get("type") == "recon_collection_summary"
+        )
+        self.assertEqual(summary["reason"], "time_budget")
+        self.assertTrue(summary["unfetched_surface_ids"])
+        self.assertNotIn("http://", json.dumps(summary))
+
     def test_provider_timeout_keeps_recon_running_without_repeated_llm_calls(self) -> None:
         bodies = {
             "http://localhost/": '<a href="/a">a</a><a href="/b">b</a>',

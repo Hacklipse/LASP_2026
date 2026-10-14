@@ -71,6 +71,7 @@ DEFAULT_ANALYZER_CAPABILITIES = (
                 "unlinked_render_parameter_candidate",
                 "bounded_unlinked_render_parameter",
             ),
+            ObservationRequirement("valid_post_request_template", "trusted_template_store"),
         ),
         exploration_parameter_source="observation",
         supported_evidence_types=("control_response", "file_read_marker"),
@@ -85,6 +86,10 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         surface_kind="server",
         observation_requirements=(
             ObservationRequirement("post_form_body_structure", "html_form"),
+            # A field-name-only HTML form cannot justify a POST probe. No standard
+            # adapter publishes this observation until a verified request template
+            # and session/token refresh are implemented.
+            ObservationRequirement("valid_post_request_template", "trusted_template_store"),
         ),
         exploration_parameter_source="none",
         supported_evidence_types=("control_response", "file_read_marker"),

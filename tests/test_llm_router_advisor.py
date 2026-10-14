@@ -648,7 +648,7 @@ class AgenticHypothesisTests(unittest.TestCase):
             ))],
         )
 
-    def test_bounded_recon_post_coordinate_can_be_offered(self) -> None:
+    def test_bounded_recon_post_coordinate_requires_request_template(self) -> None:
         llm = _FakeLlmClient(
             {"suggestions": [{
                 "surface_id": "surface-import",
@@ -662,12 +662,21 @@ class AgenticHypothesisTests(unittest.TestCase):
             parameters=("email", "securityAnswer", "layout"),
         )
 
-        suggestions = _advise(
-            llm, surfaces=(post,), evidence=(_bounded_post_evidence(),)
+        advisor = LlmRouterAdvisor(
+            llm_client=llm, analyzers=ANALYZERS, hypothesis_mode=True
+        )
+        suggestions = advisor.advise(
+            _run(), (post,), (_bounded_post_evidence(),), frozenset()
         )
 
-        self.assertEqual(len(suggestions), 1)
-        self.assertEqual(suggestions[0].vulnerability_type, "Path Traversal")
+        self.assertEqual(suggestions, ())
+        self.assertEqual(llm.requests, [])
+        bounded = next(
+            item for item in advisor.last_trace.analyzer_coverage
+            if item.capability_id == "path_traversal.bounded_render_form"
+        )
+        self.assertEqual(bounded.status, "blocked")
+        self.assertIn("required_observation", bounded.missing_requirements)
 
     def test_no_llm_call_when_rules_already_covered_every_type(self) -> None:
         llm = _FakeLlmClient({"suggestions": []})

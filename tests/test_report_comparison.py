@@ -306,6 +306,7 @@ class LogsTests(unittest.TestCase):
             {"budget_allocation_mode": "heuristic"},
             {"validation_mode": "llm"},
             {"request_budget": 200},
+            {"code_version": "different-version"},
         ):
             with self.subTest(changed=changed), self.assertRaises(ValueError):
                 self.logs([

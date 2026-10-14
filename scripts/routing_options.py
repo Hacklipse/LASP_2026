@@ -41,6 +41,10 @@ class NoLlmUsage:
 
 def add_routing_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
+        "--code-version", default="", type=_code_version,
+        help="version or branch label to record with benchmark runs",
+    )
+    parser.add_argument(
         "--recon", choices=("heuristic", "hybrid", "agentic"), default="heuristic",
         help=(
             "Recon mode: heuristic crawl, hybrid one-shot ranking, or agentic "
@@ -103,6 +107,12 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _code_version(value: str) -> str:
+    if value and re.fullmatch(r"[A-Za-z0-9._/-]{1,80}", value) is None:
+        raise argparse.ArgumentTypeError("code version must be a short version or branch label")
+    return value
+
+
 def needs_llm(args: argparse.Namespace) -> bool:
     return (
         args.profile == "llm" or args.router in {"hybrid", "agentic"}
@@ -139,6 +149,7 @@ def execution_profile_from_args(
         llm_provider=getattr(args, "llm_provider", "") if selected_model else "",
         llm_model=selected_model,
         llm_rpm_limit=llm_rpm_limit,
+        code_version=getattr(args, "code_version", ""),
         state_changing_approved=getattr(
             args, "approve_state_changing", False
         ),
@@ -203,7 +214,11 @@ def append_run_result(args, app, run) -> None:
         "llm_provider": profile.llm_provider,
         "llm_model": profile.llm_model,
         "llm_rpm_limit": profile.llm_rpm_limit,
+        "code_version": profile.code_version,
         "state_changing_approved": profile.state_changing_approved,
+        "authenticated": bool(
+            run.credential_ref or run.principal_credentials or run.agent_credentials
+        ),
         "budget_validation_reserve": run.budget_validation_reserve,
         "budget_allocation_source": run.budget_allocation_source,
         "budget_candidate_order": list(run.budget_candidate_order),

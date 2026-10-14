@@ -34,6 +34,7 @@ sys.path.insert(0, str(_ROOT / "src"))
 sys.path.insert(0, str(_ROOT / "scripts"))
 
 import serve_dashboard as sd  # noqa: E402
+import run_juice_shop_baseline as juice_cli  # noqa: E402
 from dashboard_core import (  # noqa: E402
     MODE_GENERIC,
     MODE_JUICE_SHOP,
@@ -48,6 +49,41 @@ from routing_options import execution_profile_from_args  # noqa: E402
 
 def _defaults() -> RunOptions:
     return RunOptions(target="http://127.0.0.1:3000/")
+
+
+class BudgetDefaultTests(unittest.TestCase):
+    def test_cli_and_dashboard_use_conservative_defaults(self) -> None:
+        self.assertEqual(juice_cli._DEFAULT_BUDGET, 20)
+        self.assertEqual(juice_cli._ALL_MODE_BUDGET, 80)
+        self.assertEqual(RunOptions(
+            target="http://127.0.0.1:3000/", mode=MODE_JUICE_SHOP,
+            vuln="ssti",
+        ).resolved_budget(), 20)
+        self.assertEqual(RunOptions(
+            target="http://127.0.0.1:3000/", mode=MODE_JUICE_SHOP,
+            vuln="xss",
+        ).resolved_budget(), 20)
+        self.assertEqual(RunOptions(
+            target="http://127.0.0.1:3000/", mode=MODE_JUICE_SHOP,
+            vuln="path_traversal",
+        ).resolved_budget(), 20)
+        self.assertEqual(RunOptions(
+            target="http://127.0.0.1:3000/", mode=MODE_JUICE_SHOP,
+            vuln="all",
+        ).resolved_budget(), 80)
+        self.assertEqual(_defaults().resolved_budget(), 80)
+
+    def test_explicit_500_remains_available_and_version_is_recorded(self) -> None:
+        options = RunOptions(
+            target="http://127.0.0.1:3000/", mode=MODE_JUICE_SHOP,
+            vuln="all", budget=500, code_version="feat/capability-driven-routing",
+        )
+        self.assertEqual(sd._require_budget({"budget": 500}), 500)
+        self.assertEqual(options.resolved_budget(), 500)
+        self.assertEqual(
+            execution_profile_from_args(options.to_namespace()).code_version,
+            "feat/capability-driven-routing",
+        )
 
 
 class DashboardMarkupTests(unittest.TestCase):

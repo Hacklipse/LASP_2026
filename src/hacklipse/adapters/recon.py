@@ -13,14 +13,17 @@ URL을 만들어야 하므로 경로가 소스에 리터럴로 박힌다. 브라
 브라우저를 띄우지 않으므로 동적으로 조립되는 URL과 코드 스플리팅된 청크는 놓친다.
 그건 헤드리스 Runtime의 몫으로 남긴다.
 
-LLM을 쓰지 않는다: 크롤링과 폼 추출은 결정적 작업이라 판단 품질이 오르지 않고, 이 버전
-자체가 이후 LLM 기반 Recon과 비교할 연구 대조군이 된다.
+크롤링과 폼 추출은 결정적이다. 선택한 모드에서만 LLM이 다음 방문 순서를 제안하며,
+실행과 시간·요청 한도는 이 Agent가 통제한다.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
+import time
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from urllib.parse import parse_qsl, urljoin, urlsplit
 from uuid import uuid4
 
@@ -65,6 +68,9 @@ RECON_TOOL = "http_get"
 
 DEFAULT_MAX_PAGES = 10
 DEFAULT_MAX_SCRIPTS = 3
+_RECON_DEADLINE_RESERVE_SECONDS = 5.0
+_MAX_AGENTIC_LLM_CALLS = 3
+_MAX_AGENTIC_LLM_CALL_SECONDS = 15.0
 
 # 남은 예산의 이 비율까지만 정찰에 쓴다. 정찰이 예산을 다 먹으면 뒤의 Analysis가
 # 아무것도 못 한다 — 찾기만 하고 확인은 못 하는 상태가 된다.
@@ -253,6 +259,7 @@ class ReconAgent:
         id_factory: Callable[[], str] | None = None,
         planner: ReconPlanner | None = None,
         iterative_planner: IterativeReconPlanner | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         if max_pages < 1:
             raise ValueError("recon must fetch at least one page")
@@ -273,6 +280,7 @@ class ReconAgent:
         # 않아 기존 결정적 동작과 한 줄도 다르지 않다.
         self._planner = planner
         self._iterative_planner = iterative_planner
+        self._clock = clock or time.monotonic
 
     def handle(self, task: TaskEnvelope) -> AgentResult:
         """예산 안에서 크롤링하며 Surface·Evidence를 채운다."""
@@ -294,6 +302,11 @@ class ReconAgent:
             ):
                 raise AgentContractError("targeted recon requires an existing simple GET surface")
         page_budget = 1 if targeted else self._page_budget(task)
+        reserve = min(_RECON_DEADLINE_RESERVE_SECONDS, task.timeout_seconds / 10)
+        work_deadline = self._clock() + task.timeout_seconds - reserve
+
+        def remaining_work() -> float:
+            return max(0.0, work_deadline - self._clock())
 
         for seed_url in self._seed_urls:
             if not _same_origin(seed_url, origin):
@@ -338,6 +351,8 @@ class ReconAgent:
         pending_surface_ids: dict[str, str] = {}
         surface_discovery_types: dict[str, set[str]] = {}
         recently_fetched_surface_ids: list[str] = []
+        deadline_exhausted = False
+        stop_reason: str | None = None
 
         def remember(
             url: str,
@@ -385,8 +400,12 @@ class ReconAgent:
             protected: Sequence[str] | set[str] = (),
             max_visits: int | None = None,
         ) -> int:
+            nonlocal deadline_exhausted
             visited = 0
             while pending and len(fetched) < page_budget:
+                if remaining_work() < 1.0:
+                    deadline_exhausted = True
+                    break
                 if max_visits is not None and visited >= max_visits:
                     break
                 if self._surface_collection_mode == "deterministic":
@@ -404,7 +423,10 @@ class ReconAgent:
                     _query_pairs(url),
                     tuple(sorted(pending_discovery_types.get(url, {"discovered"}))),
                 )
-                evidence_id, evidence = self._fetch(task, url, surface_id)
+                pending_surface_ids[url] = surface_id
+                evidence_id, evidence = self._fetch(
+                    task, url, surface_id, timeout_seconds=remaining_work()
+                )
                 evidence_ids.append(evidence_id)
                 recently_fetched_surface_ids.append(surface_id)
                 del recently_fetched_surface_ids[:-_MAX_AGENTIC_CONTEXT]
@@ -477,9 +499,12 @@ class ReconAgent:
             else scripts
         )
         for source in script_sources[:affordable]:
+            if remaining_work() < 1.0:
+                deadline_exhausted = True
+                break
             fetched.add(source)
             for url, names, should_crawl, is_navigation in self._discover_from_script(
-                task, source, origin
+                task, source, origin, timeout_seconds=remaining_work()
             ):
                 discovery_type = (
                     "browser_navigation" if is_navigation else "script_literal"
@@ -506,9 +531,15 @@ class ReconAgent:
 
         if self._iterative_planner is not None and pending and not targeted:
             round_index = 0
+            llm_calls = 0
             provider_fallback_status: str | None = None
             while pending and len(fetched) < page_budget:
-                if self._surface_collection_mode == "deterministic":
+                if remaining_work() < 1.0:
+                    deadline_exhausted = True
+                    break
+                if llm_calls >= _MAX_AGENTIC_LLM_CALLS and provider_fallback_status is None:
+                    provider_fallback_status = "fallback:llm_call_limit"
+                if self._surface_collection_mode == "deterministic" or provider_fallback_status:
                     pending[:] = _deterministic_pending(pending, navigation_pages)
                 remaining_budget = max(page_budget - len(fetched), 0)
                 candidates = self._recon_candidates(
@@ -518,6 +549,7 @@ class ReconAgent:
                     dict.fromkeys(candidate.surface_id for candidate in candidates)
                 )[:_MAX_AGENTIC_SELECTABLE]
                 if not selectable_surface_ids:
+                    stop_reason = "no_available_surface"
                     break
                 observations = self._recon_observations(
                     task.run_id,
@@ -526,8 +558,14 @@ class ReconAgent:
                     selectable_surface_ids,
                     context_surface_ids=tuple(recently_fetched_surface_ids),
                 )
+                llm_timeout = min(
+                    _MAX_AGENTIC_LLM_CALL_SECONDS, remaining_work() / 2
+                )
+                planner_task = replace(task, timeout_seconds=2 * llm_timeout)
+                if provider_fallback_status is None:
+                    llm_calls += 1
                 action, action_evidence_id, executed_surface_id = self._next_action(
-                    task,
+                    planner_task,
                     observations,
                     selectable_surface_ids,
                     remaining_budget,
@@ -541,6 +579,7 @@ class ReconAgent:
                 evidence_ids.append(action_evidence_id)
                 planner_status = recon_action_status_detail(action)
                 if action.action == "stop" or executed_surface_id is None:
+                    stop_reason = "planner_stop"
                     break
 
                 url_by_surface_id: dict[str, str] = {}
@@ -550,10 +589,12 @@ class ReconAgent:
                         url_by_surface_id.setdefault(surface_id, url)
                 selected_url = url_by_surface_id.get(executed_surface_id)
                 if selected_url is None:
+                    stop_reason = "selected_surface_missing"
                     break
                 pending.remove(selected_url)
                 pending.insert(0, selected_url)
                 if crawl(max_visits=1) != 1:
+                    stop_reason = "time_budget" if deadline_exhausted else "visit_unavailable"
                     break
                 round_index += 1
 
@@ -577,6 +618,53 @@ class ReconAgent:
         if self._iterative_planner is None:
             crawl(protected=navigation_pages)
 
+        if deadline_exhausted and self._iterative_planner is not None:
+            planner_status = "agentic_recon:fallback:time_budget"
+
+        if self._iterative_planner is not None and pending and not targeted:
+            unfetched_ids = tuple(dict.fromkeys(
+                pending_surface_ids[url] for url in pending
+                if url not in fetched and url in pending_surface_ids
+            ))
+            unregistered_hashes = tuple(dict.fromkeys(
+                hashlib.sha256(url.encode("utf-8")).hexdigest()
+                for url in pending
+                if url not in fetched and url not in pending_surface_ids
+            ))
+            if unfetched_ids or unregistered_hashes:
+                summary = {
+                    "type": "recon_collection_summary",
+                    "fetched_url_count": len(fetched),
+                    "fetched_surface_ids": sorted({
+                        pending_surface_ids[url] for url in fetched
+                        if url in pending_surface_ids
+                    }),
+                    "unfetched_surface_ids": list(unfetched_ids),
+                    "unfetched_url_hashes": list(unregistered_hashes),
+                    "unfetched_count": len(unfetched_ids) + len(unregistered_hashes),
+                    "reason": (
+                        "time_budget" if deadline_exhausted else
+                        stop_reason or
+                        ("request_budget" if len(fetched) >= page_budget else "not_selected")
+                    ),
+                    "fallback_status": provider_fallback_status,
+                }
+                existing_summary = next((
+                    item for item in self._evidence.list_by_run(task.run_id)
+                    if item.created_by == AGENTIC_RECON_PLANNER
+                    and item.observation == summary
+                ), None)
+                if existing_summary is None:
+                    summary_id = f"evi-{self._id_factory()}"
+                    self._evidence.append(Evidence(
+                        evidence_id=summary_id, run_id=task.run_id,
+                        surface_id=None, created_by=AGENTIC_RECON_PLANNER,
+                        evidence_type="observation", observation=summary,
+                    ))
+                else:
+                    summary_id = existing_summary.evidence_id
+                evidence_ids.append(summary_id)
+
         surface_ids = list(surfaces.values())
         return AgentResult(
             task_id=task.task_id,
@@ -595,7 +683,8 @@ class ReconAgent:
         return max(min(self._max_pages, share), 1)
 
     def _fetch(
-        self, task: TaskEnvelope, url: str, surface_id: str | None
+        self, task: TaskEnvelope, url: str, surface_id: str | None,
+        *, timeout_seconds: float | None = None,
     ) -> tuple[str, Evidence]:
         """중앙 수집 경계를 거쳐 한 문서를 가져온다."""
 
@@ -609,7 +698,7 @@ class ReconAgent:
                 suggested_tool=RECON_TOOL,
             ),
             task_id=task.task_id,
-            timeout_seconds=task.timeout_seconds,
+            timeout_seconds=min(task.timeout_seconds, timeout_seconds or task.timeout_seconds),
             # Recon은 특정 취약점 Agent가 아니므로 Run 기본 세션을 쓴다. TaskFactory가
             # 선택한 참조를 전달하지 않으면 다중 취약점 Run에서 무인증으로 바뀐다.
             credential_ref=task.credential_ref,
@@ -617,11 +706,12 @@ class ReconAgent:
         return evidence_id, self._evidence.get(task.run_id, evidence_id)
 
     def _discover_from_script(
-        self, task: TaskEnvelope, source: str, origin
+        self, task: TaskEnvelope, source: str, origin,
+        *, timeout_seconds: float | None = None,
     ) -> list[tuple[str, tuple[str, ...], bool, bool]]:
         """JS 번들을 받아 경로 리터럴에서 Surface 후보를 만든다."""
 
-        _, evidence = self._fetch(task, source, None)
+        _, evidence = self._fetch(task, source, None, timeout_seconds=timeout_seconds)
         body = evidence.observation.get("body")
         if not isinstance(body, str) or not body or len(body) > _MAX_SCRIPT_BYTES:
             return []

@@ -183,28 +183,24 @@ class RouterPipelineTests(unittest.TestCase):
             self.assertFalse(comparison["analysis_comparison_available"])
             self.assertIn("Only the selected", comparison["comparison_warning"])
 
-    def test_post_form_is_routed_to_bounded_hidden_body_analysis(self):
+    def test_post_form_without_request_template_is_not_routed(self):
         app, run, runtime, model = _execute(method="POST")
 
         self.assertIs(run.phase, RunPhase.DONE)
-        self.assertEqual(model.roles, ["recon", "router"])
-        candidates = app.stores.candidates.list_by_run(run.run_id)
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0].routing_capability_id,
-                         "path_traversal.hidden_body_parameter")
-        self.assertIs(candidates[0].status, CandidateStatus.CONFIRMED)
-        self.assertTrue(any(r.tool == PATH_TRAVERSAL_TOOL for r in runtime.requests))
+        self.assertEqual(model.roles, ["recon"])
+        self.assertEqual(tuple(app.stores.candidates.list_by_run(run.run_id)), ())
+        self.assertFalse(any(r.method.upper() == "POST" for r in runtime.requests))
 
-    def test_hidden_body_search_neither_confirms_without_marker_nor_runs_without_approval(self):
+    def test_hidden_body_search_stays_disabled_with_or_without_approval(self):
         app, run, runtime, _ = _execute(method="POST", vulnerable=False)
         self.assertIs(run.phase, RunPhase.DONE)
         self.assertEqual(app.stores.findings.list_by_run(run.run_id), ())
-        self.assertIs(app.stores.candidates.list_by_run(run.run_id)[0].status,
-                      CandidateStatus.REJECTED)
+        self.assertEqual(tuple(app.stores.candidates.list_by_run(run.run_id)), ())
 
         app, run, runtime, _ = _execute(method="POST", approved=False)
         self.assertIs(run.phase, RunPhase.DONE)
         self.assertEqual(app.stores.findings.list_by_run(run.run_id), ())
+        self.assertEqual(tuple(app.stores.candidates.list_by_run(run.run_id)), ())
         self.assertFalse(any(r.method.upper() == "POST" for r in runtime.requests))
 
     def test_shadow_hybrid_does_not_store_or_execute_candidates(self):

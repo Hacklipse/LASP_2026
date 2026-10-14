@@ -85,6 +85,26 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
     )
     same_review = baseline["configuration"].get("router_review") == hybrid["configuration"].get("router_review")
     paired = baseline["run_id"] == hybrid["run_id"]
+    same_budget = bool(
+        baseline_result and hybrid_result
+        and baseline_result.get("request_budget") is not None
+        and baseline_result.get("request_budget") == hybrid_result.get("request_budget")
+    )
+    same_approval = bool(
+        baseline_result and hybrid_result
+        and baseline_result.get("state_changing_approved") is not None
+        and baseline_result.get("state_changing_approved")
+        == hybrid_result.get("state_changing_approved")
+    )
+    same_authentication = bool(
+        baseline_result and hybrid_result
+        and baseline_result.get("authenticated") is not None
+        and baseline_result.get("authenticated") == hybrid_result.get("authenticated")
+    )
+    analysis_available = bool(
+        baseline_result and hybrid_result
+        and same_budget and same_approval and same_authentication
+    )
     return {
         "schema_version": 1, "event": "router_comparison",
         "baseline_run_id": baseline["run_id"], "hybrid_run_id": hybrid["run_id"],
@@ -95,6 +115,13 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
         "same_recon_entry_mode": same_recon_entry,
         "same_surface_collection_mode": same_surface_collection,
         "same_review_policy": same_review,
+        "same_request_budget": same_budget if baseline_result and hybrid_result else None,
+        "same_state_changing_approval": same_approval if baseline_result and hybrid_result else None,
+        "same_authentication": same_authentication if baseline_result and hybrid_result else None,
+        "code_versions": {
+            "heuristic": baseline_result.get("code_version") if baseline_result else None,
+            "hybrid": hybrid_result.get("code_version") if hybrid_result else None,
+        },
         "paired_run": paired,
         "routing_completed": baseline["status"] == hybrid["status"] == "completed",
         "input_manifest_delta": _manifest_delta(
@@ -120,7 +147,7 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
             "note": "Router token/time telemetry only, not total Recon/Analysis cost. Missing usage is unknown; fixture responses are not real billing.",
         },
         "analysis_results": {"heuristic": baseline_result, "hybrid": hybrid_result},
-        "analysis_comparison_available": bool(baseline_result and hybrid_result),
+        "analysis_comparison_available": analysis_available,
         "analysis_delta": {
             "finding_count": hybrid_result["finding_count"] - baseline_result["finding_count"],
             "requests_used": hybrid_result["requests_used"] - baseline_result["requests_used"],
@@ -130,8 +157,12 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
                 for status in sorted(set(baseline_result["candidate_status_counts"])
                                      | set(hybrid_result["candidate_status_counts"]))
             },
-        } if baseline_result and hybrid_result else None,
+        } if analysis_available else None,
         "comparison_warning": (
+            "Request budgets differ or were not recorded; analysis results are not a controlled comparison."
+            if baseline_result and hybrid_result and not same_budget else
+            "Approval or authentication conditions differ or were not recorded; analysis results are not a controlled comparison."
+            if baseline_result and hybrid_result and not (same_approval and same_authentication) else
             "Inputs/profiles differ; differences are not a controlled Router ablation."
             if not all((
                 same_input, same_profile, same_scope, same_recon, same_recon_entry,
@@ -140,7 +171,7 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
             "Paired Router comparison uses one Recon input. Only the selected Router's candidates execute analyzers; this is not a two-branch analysis comparison."
             if paired else
             "Normalized Router inputs match. Analyzer results came from separate target runs; inspect same_raw_recon_input before causal interpretation."
-            if baseline_result and hybrid_result else
+            if analysis_available else
             "Replay does not execute analyzers."
         ),
     }

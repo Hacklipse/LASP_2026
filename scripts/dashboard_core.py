@@ -58,6 +58,7 @@ from hacklipse.ports.errors import LlmCredentialsMissing, RecordNotFound
 # CLI 와 공유하는 실행 옵션 계약. Namespace 하나로 같은 함수를 먹인다.
 from routing_options import (
     NoLlmUsage,
+    append_run_result,
     build_run_router,
     execution_profile_from_args,
     needs_llm,
@@ -109,6 +110,7 @@ class RunOptions:
     mode: str = MODE_GENERIC
     vuln: str = "all"
     budget: int = 0  # 0 = 유형별 기본값을 쓴다
+    code_version: str = ""
     profile: str = "heuristic"
     recon: str = "heuristic"
     recon_entry: str = "targeted"
@@ -153,6 +155,7 @@ class RunOptions:
             llm_provider=self.llm_provider,
             llm_model=self.llm_model or None,
             llm_rpm_limit=self.llm_rpm_limit,
+            code_version=self.code_version,
         )
 
     @property
@@ -198,7 +201,7 @@ class RunOptions:
             return self.budget
         if not self.is_juice_shop:
             return _ALL_MODE_BUDGET
-        return _ALL_MODE_BUDGET if self.vuln in _BUNDLE_DISCOVERY_VULNS else _DEFAULT_BUDGET
+        return _ALL_MODE_BUDGET if self.broad_scan else _DEFAULT_BUDGET
 
     def resolved_model(self) -> str:
         if not needs_llm(self.to_namespace()):
@@ -553,6 +556,9 @@ class RunSupervisor:
         if options.needs_path_account:
             cleanup_database = _resolve_juice_shop_db(options.juice_shop_db or None)
 
+        plan = _preparation_plan(options, secrets)
+        namespace.approve_state_changing = bool(plan.approvals)
+
         try:
             router = build_run_router(
                 namespace,
@@ -566,7 +572,6 @@ class RunSupervisor:
             )
             return
 
-        plan = _preparation_plan(options, secrets)
         resolver = InMemoryCredentialResolver(plan.credentials)
         http_runtime = HttpExecutionRuntime(credential_resolver=resolver)
         # SPA 의 DOM sink 는 브라우저로만 관측된다. 필요할 때만 감싸 다른 유형의
@@ -758,6 +763,16 @@ class RunSupervisor:
                     cleanup_error = error
             _release(http_runtime, resolver, preparation_run_ids, run)
             self.state.note("세션 credential 메모리 참조 폐기 완료")
+
+        try:
+            completed_run = (
+                app.stores.runs.get(workflow_error.run_id)
+                if workflow_error is not None else run
+            )
+            if completed_run is not None:
+                append_run_result(namespace, app, completed_run)
+        except Exception as error:  # noqa: BLE001 - 기록 실패가 Run 결과를 뒤집지 않는다
+            self.state.note(f"실행 조건 기록 실패: {type(error).__name__}")
 
         self._refresh()
         if workflow_error is not None:

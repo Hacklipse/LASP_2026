@@ -68,6 +68,7 @@ class ValidationReasonCode(str, Enum):
 
     UNSPECIFIED = "unspecified"
     ANALYSIS_SIGNAL_MISSING = "analysis_signal_missing"
+    POST_REQUEST_TEMPLATE_MISSING = "post_request_template_missing"
     CONTROL_SIGNAL_PRESENT = "control_signal_present"
     PROBE_SIGNAL_NOT_REPRODUCED = "probe_signal_not_reproduced"
     REPRODUCTION_EXECUTION_ERROR = "reproduction_execution_error"
@@ -223,6 +224,7 @@ class RunExecutionProfile:
     llm_provider: str = ""
     llm_model: str = ""
     llm_rpm_limit: int | None = None
+    code_version: str = ""
     # 안전 프로필은 유지하되, 사용자가 이 Run에서 상태 변경 가능 요청을 명시적으로
     # 승인했는지 기록한다. 승인 참조 문자열 자체는 실행 구성에 저장하지 않는다.
     state_changing_approved: bool = False
@@ -276,6 +278,10 @@ class RunExecutionProfile:
                 value and (not value.strip() or not value.isprintable())
             ):
                 raise DomainInvariantError(f"{label} must be a short printable string")
+        if not isinstance(self.code_version, str) or (
+            self.code_version and re.fullmatch(r"[A-Za-z0-9._/-]{1,80}", self.code_version) is None
+        ):
+            raise DomainInvariantError("code version must be a short version or branch label")
         if bool(self.llm_provider) != bool(self.llm_model):
             raise DomainInvariantError("LLM provider and model must be stored together")
         uses_llm = (

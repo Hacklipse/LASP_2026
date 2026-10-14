@@ -40,6 +40,7 @@ _ACTION_STATUSES = {
     "fallback:refused",
     "fallback:invalid_response",
     "fallback:deterministic_collection",
+    "fallback:llm_call_limit",
 }
 
 

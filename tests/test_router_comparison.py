@@ -191,8 +191,12 @@ class RouterComparisonTests(unittest.TestCase):
             replay(args)
             baseline, _ = latest_run(args.routing_log, "heuristic")
             hybrid, _ = latest_run(args.routing_log, "hybrid")
-            left = {"finding_count": 0, "requests_used": 3, "candidate_status_counts": {"blocked": 1}}
-            right = {"finding_count": 1, "requests_used": 5, "candidate_status_counts": {"confirmed": 1}}
+            left = {"finding_count": 0, "requests_used": 3, "request_budget": 10,
+                    "state_changing_approved": False, "authenticated": False,
+                    "candidate_status_counts": {"blocked": 1}}
+            right = {"finding_count": 1, "requests_used": 5, "request_budget": 10,
+                     "state_changing_approved": False, "authenticated": False,
+                     "candidate_status_counts": {"confirmed": 1}}
             result = compare_records(baseline, hybrid, left, right)
             self.assertTrue(result["analysis_comparison_available"])
             self.assertEqual(result["analysis_delta"], {
@@ -200,6 +204,14 @@ class RouterComparisonTests(unittest.TestCase):
                 "candidate_status_counts": {"blocked": -1, "confirmed": 1},
             })
             self.assertIsNone(compare_records(baseline, hybrid, left, None)["analysis_delta"])
+            changed_budget = dict(right, request_budget=20)
+            mismatch = compare_records(baseline, hybrid, left, changed_budget)
+            self.assertFalse(mismatch["analysis_comparison_available"])
+            self.assertIsNone(mismatch["analysis_delta"])
+            changed_approval = dict(right, state_changing_approved=True)
+            self.assertFalse(compare_records(
+                baseline, hybrid, left, changed_approval
+            )["analysis_comparison_available"])
 
     def test_fingerprint_ignores_generated_ids_but_detects_input_changes(self):
         run = Run(run_id="first", target_url="http://localhost/", policy_profile="safe",
@@ -255,6 +267,7 @@ class RouterComparisonTests(unittest.TestCase):
                     llm_provider="fixture",
                     llm_model="fixture-model",
                     llm_rpm_limit=7,
+                    code_version="feat/test",
                 ),
             )
             # 실제 실행에서는 Orchestrator.start가 예산을 초기화한다.
@@ -287,6 +300,8 @@ class RouterComparisonTests(unittest.TestCase):
             self.assertEqual(record["llm_provider"], "fixture")
             self.assertEqual(record["llm_model"], "fixture-model")
             self.assertEqual(record["llm_rpm_limit"], 7)
+            self.assertEqual(record["code_version"], "feat/test")
+            self.assertFalse(record["authenticated"])
             self.assertNotIn("private-value", json.dumps(record))
 
     def test_comparison_cli_appends_results(self):

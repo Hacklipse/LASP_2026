@@ -24,18 +24,15 @@ from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 from .probing import build_probe_requests, matching_evidence, probe_marker
 from .path_traversal_analysis import (
     HIDDEN_BODY_CAPABILITY,
-    HIDDEN_PLAN_OBSERVATION,
     PATH_TRAVERSAL_BYPASS_OBSERVATION,
     PATH_TRAVERSAL_OBSERVATION,
     PATH_TRAVERSAL_TOOL,
     build_path_traversal_bypass_requests,
-    build_hidden_body_requests,
     build_path_traversal_requests,
     is_restricted_file_surface,
     path_parameter_candidates,
     path_traversal_bypass_signal,
     path_traversal_signal,
-    hidden_body_signal,
 )
 from .access_control_analysis import (
     ACCESS_CONTROL_TOOL,
@@ -517,6 +514,14 @@ class ValidationAgent:
             return self._validate_hidden_body_parameter(
                 task, candidate, surface, evidence, reproduction
             )
+        if surface.method.upper() == "POST":
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=(),
+                reason="valid POST request template and safe proof target are unavailable",
+                reason_code=ValidationReasonCode.POST_REQUEST_TEMPLATE_MISSING,
+            )
         if is_restricted_file_surface(evidence, surface):
             return self._validate_path_traversal_bypass(
                 task, candidate, surface, evidence, reproduction
@@ -616,88 +621,14 @@ class ValidationAgent:
         evidence: Sequence[Evidence],
         reproduction: Sequence[Evidence],
     ) -> AgentResult:
-        """Independently repeat the same three-way comparison for one proven name."""
+        """Never replay a hidden POST without a verified normal request template."""
 
-        plan_ids = {
-            item.evidence_id for item in evidence
-            if item.surface_id == surface.surface_id
-            and item.observation.get("type") == HIDDEN_PLAN_OBSERVATION
-            and item.observation.get("candidate_id") == candidate.candidate_id
-        }
-        parameters = tuple(dict.fromkeys(
-            item.observation["parameter"]
-            for item in evidence
-            if item.surface_id == surface.surface_id
-            and item.observation.get("type") == PATH_TRAVERSAL_OBSERVATION
-            and item.observation.get("source") == "active_differential_probe"
-            and item.observation.get("observed") is True
-            and item.observation.get("plan_evidence_id") in plan_ids
-            and isinstance(item.observation.get("parameter"), str)
-        ))
-        if not parameters:
-            return self._validation_result(
-                task,
-                verdict=ValidationVerdict.REJECTED,
-                evidence=(),
-                reason="analysis found no active hidden-body coordinate",
-                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
-            )
-        requests = build_hidden_body_requests(
-            surface,
-            parameters[:1],
-            purpose=f"Path Traversal validation {task.validation_id}",
-        )
-        collected = tuple(
-            matching_evidence(reproduction, surface.url, request)
-            for request in requests
-        )
-        missing = tuple(
-            request for request, item in zip(requests, collected) if item is None
-        )
-        if missing:
-            if task.request_budget < len(missing):
-                raise BudgetExceeded(
-                    "hidden-body validation needs three independent requests"
-                )
-            return AgentResult(
-                task_id=task.task_id,
-                status=AgentResultStatus.NEEDS_EVIDENCE,
-                evidence_requests=missing,
-            )
-        control, benign, traversal = collected
-        assert control is not None and benign is not None and traversal is not None
-        reproduced = (control, benign, traversal)
-        if any(item.observation.get("type") in {"http_error", "http_redirect"} for item in reproduced):
-            return self._validation_result(
-                task,
-                verdict=ValidationVerdict.BLOCKED,
-                evidence=reproduced,
-                reason="independent hidden-body responses are not comparable",
-                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
-            )
-        if hidden_body_signal(control, benign, traversal):
-            proof = ValidationProof(
-                proof_type=ValidationProofType.PATH_TRAVERSAL_FILE_READ,
-                evidence_ids=tuple(item.evidence_id for item in reproduced),
-                summary=(
-                    "independent control/benign/traversal requests reproduced a fixed "
-                    f"safe-file read for parameter {parameters[0]}"
-                ),
-            )
-            return self._validation_result(
-                task,
-                verdict=ValidationVerdict.CONFIRMED,
-                evidence=reproduced,
-                reason="independent three-way comparison reproduced the safe-file read",
-                reason_code=ValidationReasonCode.CONFIRMED_PROOF,
-                proof=proof,
-            )
         return self._validation_result(
             task,
-            verdict=ValidationVerdict.REJECTED,
-            evidence=reproduced,
-            reason="independent hidden-body probe did not reproduce the file marker",
-            reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+            verdict=ValidationVerdict.BLOCKED,
+            evidence=(),
+            reason="valid POST request template and session refresh are unavailable",
+            reason_code=ValidationReasonCode.POST_REQUEST_TEMPLATE_MISSING,
         )
 
     def _validate_path_traversal_bypass(

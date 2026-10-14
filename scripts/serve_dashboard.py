@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets as secrets_module
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -190,11 +191,16 @@ def parse_run_payload(payload, defaults: RunOptions) -> tuple[RunOptions, RunSec
             f"{engine['label']}를 쓰려면 {engine['key_env']} 환경변수가 필요하다."
         )
 
+    code_version = _require_str(payload, "code_version", max_length=80).strip()
+    if code_version and re.fullmatch(r"[A-Za-z0-9._/-]{1,80}", code_version) is None:
+        raise RequestRejected("code_version 은 짧은 버전 또는 브랜치 이름이어야 한다.")
+
     options = RunOptions(
         target=_require_str(payload, "target", default=defaults.target).strip(),
         mode=_require_choice(payload, "mode", MODES, default=MODE_GENERIC),
         vuln=_require_choice(payload, "vuln", VULN_CHOICES, default="all"),
         budget=_require_budget(payload),
+        code_version=code_version,
         profile="llm" if engine["provider"] else "heuristic",
         llm_provider=engine["provider"] or "gemini",
         llm_model=_require_str(payload, "llm_model", max_length=120).strip(),

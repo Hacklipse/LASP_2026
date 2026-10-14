@@ -45,9 +45,11 @@ _COMPARISON_FIELDS = (
     "router_mode", "router_review", "compare_routers",
     "orchestrator_mode", "budget_allocation_mode", "validation_mode",
     "state_changing_approved", "request_budget",
+    "code_version",
 )
 _LLM_FIELDS = ("llm_provider", "llm_model", "llm_rpm_limit")
 _LEGACY_CONDITION_DEFAULTS = {
+    "code_version": "",
     "recon_entry_mode": "targeted",
     "state_changing_approved": False,
 }

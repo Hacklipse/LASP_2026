@@ -116,10 +116,10 @@ _PROVISION_SESSION_REF = "temporary-local-juice-shop-provisioning-session"
 _PROVISION_APPROVAL_REF = "interactive-local-juice-shop-account-provisioning"
 _ACCESS_LOGIN_APPROVAL_REF = "interactive-local-juice-shop-access-login"
 _STATE_CHANGING_APPROVAL_REF = "interactive-local-juice-shop-state-changing"
-_DEFAULT_BUDGET = 500
+_DEFAULT_BUDGET = 20
 # 전체 모드는 Recon 크롤링과 여러 Candidate 분석을 한 Run에서 감당해야 한다. 정확한
 # 배분은 Task 3(Budget·스케줄링)에서 다루고, 여기서는 우선 상한만 넉넉히 잡는다.
-_ALL_MODE_BUDGET = 500
+_ALL_MODE_BUDGET = 80
 _ALL_MODE_RECON_PAGES = 12
 # 공급자 상한 15 RPM을 꽉 채우지 않고 한 슬롯을 남긴다. 이 프로세스 밖에서 발생한
 # 호출이나 공급자 집계 경계의 오차 때문에 15번째가 429가 되는 일을 줄인다.
@@ -876,6 +876,9 @@ def main(argv: list[str]) -> int:
         help="LLM prompt와 구조화 응답 출력",
     )
     args = parser.parse_args(argv[1:])
+    if args.request_budget is not None and args.request_budget <= 0:
+        print("거부: --request-budget는 양수여야 합니다.")
+        return 2
     if args.validation_review and args.profile != "llm":
         print("거부: --validation-review는 --profile llm과 함께 사용해야 합니다.")
         return 2
@@ -1270,8 +1273,9 @@ def main(argv: list[str]) -> int:
         args.recon_entry == "base-url"
         or args.vuln in _BUNDLE_DISCOVERY_VULNS
     )
-    request_budget = args.request_budget or (
-        _ALL_MODE_BUDGET if needs_discovery else _DEFAULT_BUDGET
+    request_budget = (
+        args.request_budget if args.request_budget is not None
+        else _ALL_MODE_BUDGET if broad_scan else _DEFAULT_BUDGET
     )
     run = None
     workflow_error: WorkflowExecutionError | None = None

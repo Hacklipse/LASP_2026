@@ -99,6 +99,13 @@ class LlmPathTraversalAnalyzer:
                 created_by=LLM_PATH_TRAVERSAL_ANALYZER,
                 id_factory=self._id_factory,
             )
+        if surface.method.upper() == "POST":
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.COMPLETED,
+                candidate_ids=(candidate.candidate_id,),
+                message="post_request_template_unavailable",
+            )
         if is_restricted_file_surface(evidence, surface):
             # 선택할 파라미터가 없는 결정적 검증이므로 LLM 호출 없이 고정 접미사만 쓴다.
             return handle_path_traversal_bypass(
