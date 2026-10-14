@@ -34,6 +34,7 @@ sys.path.insert(0, str(_ROOT / "src"))
 sys.path.insert(0, str(_ROOT / "scripts"))
 
 import serve_dashboard as sd  # noqa: E402
+import run_juice_shop_baseline as juice_cli  # noqa: E402
 from dashboard_core import (  # noqa: E402
     MODE_GENERIC,
     MODE_JUICE_SHOP,
@@ -48,6 +49,41 @@ from routing_options import execution_profile_from_args  # noqa: E402
 
 def _defaults() -> RunOptions:
     return RunOptions(target="http://127.0.0.1:3000/")
+
+
+class BudgetDefaultTests(unittest.TestCase):
+    def test_cli_and_dashboard_use_conservative_defaults(self) -> None:
+        self.assertEqual(juice_cli._DEFAULT_BUDGET, 20)
+        self.assertEqual(juice_cli._ALL_MODE_BUDGET, 80)
+        self.assertEqual(RunOptions(
+            target="http://127.0.0.1:3000/", mode=MODE_JUICE_SHOP,
+            vuln="ssti",
+        ).resolved_budget(), 20)
+        self.assertEqual(RunOptions(
+            target="http://127.0.0.1:3000/", mode=MODE_JUICE_SHOP,
+            vuln="xss",
+        ).resolved_budget(), 20)
+        self.assertEqual(RunOptions(
+            target="http://127.0.0.1:3000/", mode=MODE_JUICE_SHOP,
+            vuln="path_traversal",
+        ).resolved_budget(), 20)
+        self.assertEqual(RunOptions(
+            target="http://127.0.0.1:3000/", mode=MODE_JUICE_SHOP,
+            vuln="all",
+        ).resolved_budget(), 80)
+        self.assertEqual(_defaults().resolved_budget(), 80)
+
+    def test_explicit_500_remains_available_and_version_is_recorded(self) -> None:
+        options = RunOptions(
+            target="http://127.0.0.1:3000/", mode=MODE_JUICE_SHOP,
+            vuln="all", budget=500, code_version="feat/capability-driven-routing",
+        )
+        self.assertEqual(sd._require_budget({"budget": 500}), 500)
+        self.assertEqual(options.resolved_budget(), 500)
+        self.assertEqual(
+            execution_profile_from_args(options.to_namespace()).code_version,
+            "feat/capability-driven-routing",
+        )
 
 
 class DashboardMarkupTests(unittest.TestCase):
@@ -135,11 +171,30 @@ class PayloadValidationTests(unittest.TestCase):
 class ExecutionProfileFidelityTests(unittest.TestCase):
     """화면 선택이 그대로 기록된다. 선택지만 보이고 실행은 고정값이면 안 된다."""
 
+    def test_agentic_dashboard_uses_the_cli_analysis_round_limit(self) -> None:
+        for router, expected in (("agentic", 2), ("heuristic", 1)):
+            with self.subTest(router=router):
+                options = RunOptions(
+                    target="http://127.0.0.1:3000/", router=router,
+                )
+                supervisor = RunSupervisor(
+                    allowed_hosts=frozenset({"127.0.0.1"}), defaults=options,
+                )
+                with (
+                    patch.object(supervisor, "_build_llm_client", return_value=(None, None)),
+                    patch("dashboard_core.build_run_router", return_value=object()),
+                    patch("dashboard_core.build_local_application", side_effect=RuntimeError("stop before execution")) as build,
+                    self.assertRaisesRegex(RuntimeError, "stop before execution"),
+                ):
+                    supervisor._execute_run(options, RunSecrets())
+                self.assertEqual(build.call_args.kwargs["config"].max_evidence_rounds, expected)
+
     def test_every_choice_reaches_the_recorded_profile(self) -> None:
         options = RunOptions(
             target="http://127.0.0.1:3000/",
             profile="llm",
             recon="hybrid",
+            recon_entry="base-url",
             surface_collection="deterministic",
             router="hybrid",
             router_review="ambiguous",
@@ -157,6 +212,7 @@ class ExecutionProfileFidelityTests(unittest.TestCase):
         )
         self.assertEqual(profile.analysis_profile, "llm")
         self.assertEqual(profile.recon_mode, "hybrid")
+        self.assertEqual(profile.recon_entry_mode, "base-url")
         self.assertEqual(profile.surface_collection_mode, "deterministic")
         self.assertEqual(profile.router_mode, "hybrid")
         self.assertEqual(profile.router_review, "ambiguous")
@@ -195,6 +251,32 @@ class ModeGatingTests(unittest.TestCase):
         self.assertTrue(options.needs_access_accounts)
         self.assertTrue(options.needs_path_account)
         self.assertTrue(options.needs_browser)
+
+    def test_juice_shop_auto_is_answer_blind_and_needs_no_target_setup(self) -> None:
+        supervisor = RunSupervisor(
+            allowed_hosts=frozenset({"127.0.0.1"}), defaults=_defaults()
+        )
+        targeted = RunOptions(
+            target="http://127.0.0.1:3000/",
+            mode=MODE_JUICE_SHOP,
+            vuln="auto",
+        )
+        self.assertIn(
+            "base-url", supervisor.validate(targeted, RunSecrets()) or ""
+        )
+
+        options = RunOptions(
+            target="http://127.0.0.1:3000/",
+            mode=MODE_JUICE_SHOP,
+            vuln="auto",
+            recon_entry="base-url",
+        )
+        self.assertIsNone(supervisor.validate(options, RunSecrets()))
+        self.assertTrue(options.broad_scan)
+        self.assertTrue(options.needs_browser)
+        self.assertFalse(options.needs_access_accounts)
+        self.assertFalse(options.needs_path_account)
+        self.assertFalse(options.needs_ssti_token)
 
     def test_validation_review_needs_the_llm_profile(self) -> None:
         supervisor = RunSupervisor(

@@ -281,6 +281,7 @@ def _decode_surface(data: str) -> Surface:
         tuple(item) for item in value.get("observed_query", ())
     )
     value["parameters"] = tuple(value["parameters"])
+    value["discovery_types"] = tuple(value.get("discovery_types", ()))
     return Surface(**value)
 
 
@@ -288,6 +289,9 @@ def _decode_candidate(data: str) -> Candidate:
     value = _load(data)
     value["evidence_ids"] = tuple(value["evidence_ids"])
     value["exploration_parameters"] = tuple(value.get("exploration_parameters", ()))
+    value["required_evidence_types"] = tuple(
+        value.get("required_evidence_types", ())
+    )
     return Candidate(**value)
 
 

@@ -9,7 +9,13 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from hacklipse.domain import Candidate, Evidence, RouteDecision, Run, Surface
+from hacklipse.ports import AnalyzerCapability
 
+from .analyzer_capabilities import (
+    DEFAULT_ANALYZER_CAPABILITIES,
+    capability_matches,
+    exploration_parameters,
+)
 from .request_safety import (
     has_state_changing_parameters,
     object_identifier_parameters,
@@ -159,6 +165,33 @@ ADVISOR_PRIORITY = 0.15
 _PATH_TRAVERSAL_POST_OBSERVATION = "unlinked_render_parameter_candidate"
 _PATH_TRAVERSAL_POST_SOURCE = "bounded_unlinked_render_parameter"
 _ROUTER_REVIEW_POLICIES = frozenset({"weak", "ambiguous"})
+_ADVISOR_MODES = frozenset({"supplemental", "primary"})
+
+# Agentic hypothesis가 표현할 수 있는 근거와 후속 Evidence의 닫힌 vocabulary.
+# 자유 문자열을 실행 계획처럼 취급하지 않도록 Router와 LLM Adapter가 같은 목록을
+# 사용하고, 실제 실행·proof는 여전히 Analyzer와 Validation의 기존 계약이 결정한다.
+CANDIDATE_REASON_CODES = frozenset(
+    {
+        "input_reflection_risk",
+        "query_interpreter_risk",
+        "file_path_resolution_risk",
+        "template_rendering_risk",
+        "object_authorization_risk",
+        "observed_behavior_anomaly",
+        "analyzer_contract_satisfied",
+    }
+)
+CANDIDATE_EVIDENCE_TYPES = frozenset(
+    {
+        "control_response",
+        "mutated_input_response",
+        "browser_execution",
+        "server_error_delta",
+        "file_read_marker",
+        "template_execution_marker",
+        "cross_principal_response",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +212,17 @@ class RouteSuggestion:
     # 왜 이 제안을 했는지에 대한 Advisor의 서술. Evidence 기록용이며 TaskEnvelope로
     # 넘기지 않는다 - 다른 Agent의 장문 추론을 Task에 싣지 않는다는 계약 때문이다.
     reason: str = ""
+    # Agentic mode에서는 LLM이 프롬프트에 제공된 현재 Surface의 Observation ID만
+    # 근거로 고를 수 있다. Router가 다시 소속을 확인한 뒤 Candidate에 연결한다.
+    basis_evidence_ids: tuple[str, ...] = ()
+    reason_code: str = ""
+    required_evidence_types: tuple[str, ...] = ()
+    # Agent가 등록한 실행 계약의 안정적인 식별자. 같은 취약점 유형에 여러 Agent가
+    # 붙어도 이 ID로 서로 다른 실행 계획을 보존한다.
+    capability_id: str = ""
+    confidence: str = "low"
+    priority_label: str = "normal"
+    analysis_strategy_id: str = ""
 
 
 class RouterAdvisor(Protocol):
@@ -225,34 +269,24 @@ def _supports_suggestion(
     surface: Surface,
     suggestion: RouteSuggestion,
     evidence: Sequence[Evidence] = (),
+    capabilities: Sequence[AnalyzerCapability] = DEFAULT_ANALYZER_CAPABILITIES,
 ) -> bool:
-    """Advisor 제안이 실제 Analyzer의 현재 실행 계약에 맞는지 확인한다."""
+    """Advisor 제안을 등록된 capability와 대조한다.
 
-    method = surface.method.upper()
-    parameters = bool(surface.parameters)
-    client_route = bool(urlsplit(surface.url).fragment)
-    pair = (suggestion.vulnerability_type, suggestion.agent_type)
-    if pair == ("XSS", "browser_xss_analyzer"):
-        return method == "GET" and parameters and client_route
-    if client_route:
-        return False
-    if pair in {("XSS", "xss_analyzer"), ("SQLi", "sqli_analyzer")}:
-        return method == "GET" and parameters
-    if pair == ("Path Traversal", "path_traversal_analyzer"):
-        if method == "POST":
-            # POST 검증은 일반 폼이 아니라 Recon이 코드의 제한 목록에서 표시한 서버
-            # 렌더링 좌표만 허용한다. 사용자 승인은 이 좌표의 고정 safe-file probe에
-            # 대한 것이지 Recon이 발견한 모든 POST endpoint에 대한 포괄 승인이 아니다.
-            return bool(_path_traversal_post_parameters(surface, evidence))
-        return method == "GET" and parameters
-    if pair == ("SSTI", "ssti_analyzer"):
-        return method == "POST" and "username" in surface.parameters
-    if pair == ("Access Control", "access_control_analyzer"):
-        return method == "GET" and bool(
-            object_identifier_parameters(surface.parameters)
-            or surface.path_identifier is not None
+    이전처럼 Agent 이름별 분기를 두지 않는다. 새 Agent는 capability 등록만으로 이
+    검사를 통과할 수 있다.
+    """
+
+    return any(
+        capability.agent_type == suggestion.agent_type
+        and capability.vulnerability_type == suggestion.vulnerability_type
+        and (
+            not suggestion.capability_id
+            or capability.capability_id == suggestion.capability_id
         )
-    return False
+        and capability_matches(capability, surface, evidence)
+        for capability in capabilities
+    )
 
 
 class RuleBasedVulnerabilityRouter:
@@ -270,21 +304,33 @@ class RuleBasedVulnerabilityRouter:
         advisor: RouterAdvisor | None = None,
         advisor_priority: float = ADVISOR_PRIORITY,
         review_policy: str = "weak",
+        advisor_mode: str = "supplemental",
+        capabilities: Sequence[AnalyzerCapability] = DEFAULT_ANALYZER_CAPABILITIES,
     ) -> None:
         if review_policy not in _ROUTER_REVIEW_POLICIES:
             raise ValueError("review policy must be weak or ambiguous")
+        if advisor_mode not in _ADVISOR_MODES:
+            raise ValueError("advisor mode must be supplemental or primary")
         self._rules = {rule.observation_type: rule for rule in rules}
         self._surface_rules = tuple(surface_rules)
         self._id_factory = id_factory or (lambda: str(uuid4()))
         self._advisor = advisor
         self._advisor_priority = advisor_priority
         self._review_policy = review_policy
+        self._advisor_mode = advisor_mode
+        self._capabilities = tuple(capabilities)
+        self._capabilities_by_id = {
+            capability.capability_id: capability for capability in self._capabilities
+        }
         # 제안의 유효 범위를 규칙 목록에서 그대로 끌어온다. 별도 허용 목록을 두면
         # `standard_router()`의 `--vuln` 필터와 `IMPLEMENTED_ANALYZERS` 필터를 두 번
         # 관리하게 되고, 어긋나는 순간 Dispatcher가 AgentUnavailable로 Run을 죽인다.
         self._allowed_pairs = frozenset(
             (rule.vulnerability_type, rule.agent_type)
             for rule in (*rules, *surface_rules)
+        ) | frozenset(
+            (capability.vulnerability_type, capability.agent_type)
+            for capability in self._capabilities
         )
         # fragment 표면을 다룰 수 있는 Agent. 규칙과 같은 기준을 제안에도 적용한다.
         self._client_route_agents = frozenset(
@@ -296,6 +342,8 @@ class RuleBasedVulnerabilityRouter:
         self.last_rule_decisions: tuple[RouteDecision, ...] = ()
         self.last_advisor_suggestions: tuple[RouteSuggestion, ...] = ()
         self.last_advisor_outcomes: tuple[tuple[int, str], ...] = ()
+        self.last_capability_assessments: tuple[object, ...] = ()
+        self.last_analyzer_coverage: tuple[object, ...] = ()
         self.last_advisor_status = "not_configured" if advisor is None else "not_called"
 
     def route(
@@ -309,6 +357,8 @@ class RuleBasedVulnerabilityRouter:
         self.last_rule_decisions = ()
         self.last_advisor_suggestions = ()
         self.last_advisor_outcomes = ()
+        self.last_capability_assessments = ()
+        self.last_analyzer_coverage = ()
         self.last_advisor_status = (
             "not_configured" if self._advisor is None else "not_called"
         )
@@ -373,15 +423,60 @@ class RuleBasedVulnerabilityRouter:
             sorted(decisions.values(), key=lambda item: item.priority, reverse=True)
         )
 
-        # 3단계. 규칙이 비워 둔 자리만 Advisor 제안으로 채운다. 이미 들어 있는 키는
-        # 건드리지 않으므로 "LLM이 Rule을 덮어쓰지 않는다"가 검사 한 줄이 아니라 병합
-        # 순서 자체로 보장된다.
+        # 3단계. Hybrid는 규칙이 비워 둔 자리만 Advisor 제안으로 채운다. Agentic은
+        # 규칙 결과를 정답 힌트로 주지 않고 Analyzer capability로 실행 가능한 조합을
+        # 다시 구성한다.
         if self._advisor is not None:
-            suggested, status = self._advisor_decisions(
-                run, surfaces, evidence, decisions
-            )
-            self.last_advisor_status = status
-            decisions.update(suggested)
+            if self._advisor_mode == "primary":
+                # Agentic mode는 규칙 Candidate를 정답처럼 LLM에 먼저 주지 않는다.
+                # LLM은 실행 가능 조합의 우선순위와 분석 계획만 정한다. 실제 전달
+                # 대상은 Analyzer 실행 계약을 만족한 모든 조합이다.
+                suggested, status = self._advisor_decisions(
+                    run, surfaces, evidence, {}
+                )
+                trace = getattr(self._advisor, "last_trace", None)
+                self.last_capability_assessments = tuple(
+                    getattr(trace, "capabilities", ())
+                )
+                self.last_analyzer_coverage = tuple(
+                    getattr(trace, "analyzer_coverage", ())
+                )
+                adapter_fallback = (
+                    getattr(trace, "source", None) == "deterministic_fallback"
+                )
+                advisor_failed = status.startswith("advisor_failed:")
+                router_rejected_all = bool(self.last_advisor_suggestions) and not suggested
+                if adapter_fallback:
+                    reasons = ",".join(dict.fromkeys(
+                        reason for _, reason in trace.rejected_items
+                    ))
+                    self.last_advisor_status = (
+                        f"agentic_fallback:{trace.status}"
+                        + (f":{reasons}" if reasons else "")
+                    )
+                    # Agentic LLM 장애나 형식 위반은 실행 가능한 Analyzer 조합을
+                    # 제거할 근거가 아니다. Advisor가 capability로 복구한 후보는 그대로
+                    # Analysis에 넘기고, 상태만 fallback으로 감사한다.
+                    if suggested:
+                        decisions = suggested
+                elif advisor_failed or router_rejected_all:
+                    self.last_advisor_status = f"agentic_fallback:{status}"
+                else:
+                    self.last_advisor_status = f"agentic_primary:{status}"
+                    decisions = suggested
+            else:
+                suggested, status = self._advisor_decisions(
+                    run, surfaces, evidence, decisions
+                )
+                self.last_advisor_status = status
+                trace = getattr(self._advisor, "last_trace", None)
+                self.last_capability_assessments = tuple(
+                    getattr(trace, "capabilities", ())
+                )
+                self.last_analyzer_coverage = tuple(
+                    getattr(trace, "analyzer_coverage", ())
+                )
+                decisions.update(suggested)
 
         # 우선순위가 높은 분석 대상을 먼저 처리하도록 정렬한다.
         return tuple(
@@ -436,6 +531,12 @@ class RuleBasedVulnerabilityRouter:
             if surface.run_id == run.run_id
         }
         accepted: dict[tuple[str, str], RouteDecision] = {}
+        evidence_by_id = {
+            item.evidence_id: item
+            for item in evidence
+            if item.run_id == run.run_id
+            and item.evidence_type in {"observation", "http_response"}
+        }
         rejected = 0
         outcomes: list[tuple[int, str]] = []
         for index, suggestion in enumerate(suggestions):
@@ -459,15 +560,60 @@ class RuleBasedVulnerabilityRouter:
                 rejected += 1
                 outcomes.append((index, "state_changing_surface"))
                 continue
-            if not _supports_suggestion(surface, suggestion, evidence):
+            if not _supports_suggestion(
+                surface, suggestion, evidence, self._capabilities
+            ):
                 rejected += 1
                 outcomes.append((index, "incompatible_surface"))
                 continue
-            key = (suggestion.surface_id, suggestion.vulnerability_type)
-            # 규칙이 이미 정한 자리와 Advisor가 중복 제안한 자리는 모두 건너뛴다.
-            if key in decided or key in accepted:
-                outcomes.append((index, "rule_kept" if key in decided else "duplicate"))
+            if suggestion.reason_code and suggestion.reason_code not in CANDIDATE_REASON_CODES:
+                rejected += 1
+                outcomes.append((index, "unsupported_reason_code"))
                 continue
+            if (
+                len(set(suggestion.basis_evidence_ids))
+                != len(suggestion.basis_evidence_ids)
+                or any(
+                    evidence_by_id.get(evidence_id) is None
+                    or evidence_by_id[evidence_id].surface_id != surface.surface_id
+                    for evidence_id in suggestion.basis_evidence_ids
+                )
+            ):
+                rejected += 1
+                outcomes.append((index, "invalid_basis_observation"))
+                continue
+            if (
+                len(set(suggestion.required_evidence_types))
+                != len(suggestion.required_evidence_types)
+                or any(
+                    item not in CANDIDATE_EVIDENCE_TYPES
+                    for item in suggestion.required_evidence_types
+                )
+            ):
+                rejected += 1
+                outcomes.append((index, "unsupported_evidence_type"))
+                continue
+            capability_key = suggestion.capability_id or suggestion.vulnerability_type
+            key = (suggestion.surface_id, capability_key)
+            rule_key = (suggestion.surface_id, suggestion.vulnerability_type)
+            # 규칙이 이미 정한 자리와 Advisor가 중복 제안한 자리는 모두 건너뛴다.
+            if rule_key in decided or key in accepted:
+                outcomes.append(
+                    (index, "rule_kept" if rule_key in decided else "duplicate")
+                )
+                continue
+            capability = self._capabilities_by_id.get(suggestion.capability_id)
+            if capability is None:
+                capability = next(
+                    (
+                        item
+                        for item in self._capabilities
+                        if item.agent_type == suggestion.agent_type
+                        and item.vulnerability_type == suggestion.vulnerability_type
+                        and capability_matches(item, surface, evidence)
+                    ),
+                    None,
+                )
             candidate = Candidate(
                 candidate_id=f"candidate-{self._id_factory()}",
                 run_id=run.run_id,
@@ -475,22 +621,41 @@ class RuleBasedVulnerabilityRouter:
                 vulnerability_type=suggestion.vulnerability_type,
                 hypothesis=(
                     f"{suggestion.vulnerability_type} candidate suggested by router advisor"
+                    + (
+                        f" ({suggestion.reason_code})"
+                        if suggestion.reason_code
+                        else ""
+                    )
                 ),
                 assigned_agent=suggestion.agent_type,
-                # Advisor의 판단은 Claim이므로 관측 Evidence를 근거로 달지 않는다.
-                evidence_ids=(),
+                # Agentic mode의 ID는 LLM 주장 자체가 아니라 Router가 현재 Run과
+                # Surface 소속을 재검증한 직접 Observation만 가리킨다.
+                evidence_ids=suggestion.basis_evidence_ids,
                 exploration_parameters=(
-                    (
-                        _path_traversal_post_parameters(surface, evidence)
-                        if surface.method.upper() == "POST"
-                        else tuple(dict.fromkeys(surface.parameters))
-                    )
-                    if suggestion.vulnerability_type == "Path Traversal"
+                    exploration_parameters(capability, surface, evidence)
+                    if capability is not None
                     else ()
                 ),
+                required_evidence_types=suggestion.required_evidence_types,
+                routing_capability_id=(
+                    capability.capability_id if capability is not None else ""
+                ),
+                routing_confidence=suggestion.confidence,
+                routing_priority=suggestion.priority_label,
+                analysis_strategy_id=(
+                    suggestion.analysis_strategy_id
+                    or capability.strategy_ids[0]
+                    if capability is not None
+                    else ""
+                ),
             )
+            priority = {
+                "high": 0.45,
+                "normal": self._advisor_priority,
+                "low": max(0.01, self._advisor_priority / 2),
+            }.get(suggestion.priority_label, self._advisor_priority)
             accepted[key] = RouteDecision(
-                candidate=candidate, priority=self._advisor_priority
+                candidate=candidate, priority=priority
             )
             outcomes.append((index, "candidate_added"))
         self.last_advisor_outcomes = tuple(outcomes)

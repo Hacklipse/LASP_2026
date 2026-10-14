@@ -46,6 +46,7 @@ class RouterComparisonTests(unittest.TestCase):
         args = argparse.Namespace(
             profile="llm",
             recon="hybrid",
+            recon_entry="base-url",
             surface_collection="deterministic",
             router="hybrid",
             router_review="ambiguous",
@@ -62,6 +63,7 @@ class RouterComparisonTests(unittest.TestCase):
         )
 
         self.assertEqual(profile.analysis_profile, "llm")
+        self.assertEqual(profile.recon_entry_mode, "base-url")
         self.assertEqual(profile.surface_collection_mode, "deterministic")
         self.assertEqual(profile.router_review, "ambiguous")
         self.assertTrue(profile.compare_routers)
@@ -116,6 +118,24 @@ class RouterComparisonTests(unittest.TestCase):
                 latest_run(args.routing_log, "missing-mode")
             changed_scope = dict(hybrid, configuration=dict(hybrid["configuration"], vulnerability_types="SQLi"))
             self.assertFalse(compare_records(baseline, changed_scope)["same_vulnerability_scope"])
+            changed_entry = dict(
+                hybrid,
+                configuration=dict(hybrid["configuration"], recon_entry_mode="base-url"),
+            )
+            entry_comparison = compare_records(baseline, changed_entry)
+            self.assertFalse(entry_comparison["same_recon_entry_mode"])
+            self.assertIn("not a controlled", entry_comparison["comparison_warning"])
+            changed_collection = dict(
+                hybrid,
+                configuration=dict(
+                    hybrid["configuration"], surface_collection_mode="deterministic"
+                ),
+            )
+            self.assertFalse(
+                compare_records(baseline, changed_collection)[
+                    "same_surface_collection_mode"
+                ]
+            )
 
             raw_only = dict(hybrid, input_fingerprint="dynamic-response-body")
             raw_comparison = compare_records(baseline, raw_only)
@@ -171,15 +191,58 @@ class RouterComparisonTests(unittest.TestCase):
             replay(args)
             baseline, _ = latest_run(args.routing_log, "heuristic")
             hybrid, _ = latest_run(args.routing_log, "hybrid")
-            left = {"finding_count": 0, "requests_used": 3, "candidate_status_counts": {"blocked": 1}}
-            right = {"finding_count": 1, "requests_used": 5, "candidate_status_counts": {"confirmed": 1}}
+            hybrid = dict(hybrid, run_id="independent-run")
+            left = {"finding_count": 0, "requests_used": 3, "request_budget": 10,
+                    "state_changing_approved": False, "authenticated": False,
+                    "phase": "done", "execution_profile_recorded": True,
+                    "code_version": "test-version",
+                    "candidate_status_counts": {"blocked": 1}}
+            right = {"finding_count": 1, "requests_used": 5, "request_budget": 10,
+                     "state_changing_approved": False, "authenticated": False,
+                     "phase": "done", "execution_profile_recorded": True,
+                     "code_version": "test-version",
+                     "candidate_status_counts": {"confirmed": 1}}
             result = compare_records(baseline, hybrid, left, right)
             self.assertTrue(result["analysis_comparison_available"])
+            self.assertEqual(result["comparison_axis"], "router_mode")
+            self.assertEqual(result["analysis_unavailable_reasons"], [])
             self.assertEqual(result["analysis_delta"], {
                 "finding_count": 1, "requests_used": 2,
                 "candidate_status_counts": {"blocked": -1, "confirmed": 1},
             })
             self.assertIsNone(compare_records(baseline, hybrid, left, None)["analysis_delta"])
+            changed_budget = dict(right, request_budget=20)
+            mismatch = compare_records(baseline, hybrid, left, changed_budget)
+            self.assertFalse(mismatch["analysis_comparison_available"])
+            self.assertIsNone(mismatch["analysis_delta"])
+            changed_approval = dict(right, state_changing_approved=True)
+            self.assertFalse(compare_records(
+                baseline, hybrid, left, changed_approval
+            )["analysis_comparison_available"])
+            for change, reason in (
+                ({"phase": "failed"}, "run_incomplete"),
+                ({"code_version": ""}, "code_version_missing"),
+                ({"code_version": "new-version"}, "code_version_mismatch"),
+                ({"authenticated": True}, "authentication_mismatch"),
+                ({"execution_profile_recorded": False}, "execution_profile_missing"),
+            ):
+                with self.subTest(change=change):
+                    rejected = compare_records(baseline, hybrid, left, dict(right, **change))
+                    self.assertFalse(rejected["analysis_comparison_available"])
+                    self.assertIsNone(rejected["analysis_delta"])
+                    self.assertIn(reason, rejected["analysis_unavailable_reasons"])
+            self.assertFalse(compare_records(
+                baseline, dict(hybrid, input_fingerprint="different-raw-input"), left, right,
+            )["analysis_comparison_available"])
+            changed_manifest = json.loads(json.dumps(hybrid["routing_input_manifest"]))
+            changed_manifest["surfaces"][0]["method"] = "POST"
+            changed_input = compare_records(
+                baseline, dict(hybrid, routing_input_manifest=changed_manifest), left, right,
+            )
+            self.assertIn("router_input_mismatch", changed_input["analysis_unavailable_reasons"])
+            self.assertFalse(compare_records(
+                baseline, dict(hybrid, status="failed"), left, right,
+            )["analysis_comparison_available"])
 
     def test_fingerprint_ignores_generated_ids_but_detects_input_changes(self):
         run = Run(run_id="first", target_url="http://localhost/", policy_profile="safe",
@@ -223,6 +286,7 @@ class RouterComparisonTests(unittest.TestCase):
                 execution_profile=RunExecutionProfile(
                     analysis_profile="llm",
                     recon_mode="hybrid",
+                    recon_entry_mode="base-url",
                     surface_collection_mode="deterministic",
                     router_mode="hybrid",
                     router_review="ambiguous",
@@ -234,6 +298,7 @@ class RouterComparisonTests(unittest.TestCase):
                     llm_provider="fixture",
                     llm_model="fixture-model",
                     llm_rpm_limit=7,
+                    code_version="feat/test",
                 ),
             )
             # 실제 실행에서는 Orchestrator.start가 예산을 초기화한다.
@@ -254,6 +319,7 @@ class RouterComparisonTests(unittest.TestCase):
             self.assertTrue(record["execution_profile_recorded"])
             self.assertEqual(record["analysis_profile"], "llm")
             self.assertEqual(record["recon_mode"], "hybrid")
+            self.assertEqual(record["recon_entry_mode"], "base-url")
             self.assertEqual(record["surface_collection_mode"], "deterministic")
             self.assertEqual(record["router_mode"], "hybrid")
             self.assertEqual(record["router_review"], "ambiguous")
@@ -265,6 +331,8 @@ class RouterComparisonTests(unittest.TestCase):
             self.assertEqual(record["llm_provider"], "fixture")
             self.assertEqual(record["llm_model"], "fixture-model")
             self.assertEqual(record["llm_rpm_limit"], 7)
+            self.assertEqual(record["code_version"], "feat/test")
+            self.assertFalse(record["authenticated"])
             self.assertNotIn("private-value", json.dumps(record))
 
     def test_comparison_cli_appends_results(self):

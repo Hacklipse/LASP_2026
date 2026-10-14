@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets as secrets_module
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -103,9 +104,10 @@ ENGINE_BY_ID = {engine["id"]: engine for engine in ENGINES}
 
 # 고급 실행 조건. 화면·검증·기본값이 모두 이 표 하나에서 나온다.
 ADVANCED_CHOICES = (
-    {"field": "recon", "label": "Recon", "choices": ("heuristic", "hybrid"), "llm": ("hybrid",)},
+    {"field": "recon", "label": "Recon", "choices": ("heuristic", "hybrid", "agentic"), "llm": ("hybrid", "agentic")},
+    {"field": "recon_entry", "label": "Recon 시작", "choices": ("targeted", "base-url"), "llm": ()},
     {"field": "surface_collection", "label": "Surface 수집", "choices": ("adaptive", "deterministic"), "llm": ()},
-    {"field": "router", "label": "Router", "choices": ("heuristic", "hybrid"), "llm": ("hybrid",)},
+    {"field": "router", "label": "Router", "choices": ("heuristic", "hybrid", "agentic"), "llm": ("hybrid", "agentic")},
     {"field": "router_review", "label": "Router review", "choices": ("weak", "ambiguous"), "llm": ()},
     {"field": "orchestrator", "label": "Orchestrator", "choices": ("heuristic", "hybrid"), "llm": ("hybrid",)},
     {"field": "budget_allocation", "label": "예산 배분", "choices": ("off", "heuristic", "hybrid"), "llm": ("hybrid",)},
@@ -189,11 +191,16 @@ def parse_run_payload(payload, defaults: RunOptions) -> tuple[RunOptions, RunSec
             f"{engine['label']}를 쓰려면 {engine['key_env']} 환경변수가 필요하다."
         )
 
+    code_version = _require_str(payload, "code_version", max_length=80).strip()
+    if code_version and re.fullmatch(r"[A-Za-z0-9._/-]{1,80}", code_version) is None:
+        raise RequestRejected("code_version 은 짧은 버전 또는 브랜치 이름이어야 한다.")
+
     options = RunOptions(
         target=_require_str(payload, "target", default=defaults.target).strip(),
         mode=_require_choice(payload, "mode", MODES, default=MODE_GENERIC),
         vuln=_require_choice(payload, "vuln", VULN_CHOICES, default="all"),
         budget=_require_budget(payload),
+        code_version=code_version,
         profile="llm" if engine["provider"] else "heuristic",
         llm_provider=engine["provider"] or "gemini",
         llm_model=_require_str(payload, "llm_model", max_length=120).strip(),
@@ -330,7 +337,16 @@ def make_handler(supervisor: RunSupervisor, options: argparse.Namespace, csrf_to
                     {"id": MODE_JUICE_SHOP, "label": "Juice Shop"},
                 ],
                 "vulns": [
-                    {"id": name, "label": ("전체 5종" if name == "all" else name)}
+                    {
+                        "id": name,
+                        "label": (
+                            "전체 5종"
+                            if name == "all"
+                            else "자동 탐색 (정답 비노출)"
+                            if name == "auto"
+                            else name
+                        ),
+                    }
                     for name in VULN_CHOICES
                 ],
                 # 키 "값"은 내보내지 않는다. 고를 수 있는지 여부와 왜 못 고르는지만.

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 from hacklipse.adapters.llm_rate_limit import SlidingWindowLlmClient
+from hacklipse.ports.errors import LlmTimeout
 from hacklipse.ports.llm import LlmMessage, LlmRequest, LlmResponse
 
 
@@ -25,9 +27,11 @@ class _Delegate:
     def __init__(self, *, error: Exception | None = None) -> None:
         self.calls = 0
         self.error = error
+        self.timeouts: list[float] = []
 
     def complete(self, request: LlmRequest) -> LlmResponse:
         self.calls += 1
+        self.timeouts.append(request.timeout_seconds)
         if self.error is not None:
             error, self.error = self.error, None
             raise error
@@ -49,11 +53,26 @@ class SlidingWindowLlmClientTests(unittest.TestCase):
         )
 
         for _ in range(15):
-            client.complete(_REQUEST)
+            client.complete(replace(_REQUEST, timeout_seconds=120))
 
         self.assertEqual(delegate.calls, 15)
         self.assertEqual(len(clock.sleeps), 1)
         self.assertAlmostEqual(clock.sleeps[0], 60.1)
+        self.assertAlmostEqual(delegate.timeouts[-1], 59.9)
+
+    def test_wait_cannot_outlive_request_timeout(self) -> None:
+        clock = _Clock()
+        delegate = _Delegate()
+        client = SlidingWindowLlmClient(
+            delegate, max_calls=1, clock=clock, sleeper=clock.sleep
+        )
+
+        client.complete(_REQUEST)
+        with self.assertRaises(LlmTimeout):
+            client.complete(replace(_REQUEST, timeout_seconds=5))
+
+        self.assertEqual(delegate.calls, 1)
+        self.assertEqual(clock.sleeps, [])
 
     def test_only_the_remaining_part_of_the_window_is_slept(self) -> None:
         clock = _Clock()

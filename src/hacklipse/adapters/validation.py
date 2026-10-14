@@ -23,6 +23,7 @@ from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 
 from .probing import build_probe_requests, matching_evidence, probe_marker
 from .path_traversal_analysis import (
+    HIDDEN_BODY_CAPABILITY,
     PATH_TRAVERSAL_BYPASS_OBSERVATION,
     PATH_TRAVERSAL_OBSERVATION,
     PATH_TRAVERSAL_TOOL,
@@ -509,6 +510,18 @@ class ValidationAgent:
         """고정된 비민감 파일 읽기를 현재 Validation 세션에서 독립 재현한다."""
 
         surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        if candidate.routing_capability_id == HIDDEN_BODY_CAPABILITY:
+            return self._validate_hidden_body_parameter(
+                task, candidate, surface, evidence, reproduction
+            )
+        if surface.method.upper() == "POST":
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=(),
+                reason="valid POST request template and safe proof target are unavailable",
+                reason_code=ValidationReasonCode.POST_REQUEST_TEMPLATE_MISSING,
+            )
         if is_restricted_file_surface(evidence, surface):
             return self._validate_path_traversal_bypass(
                 task, candidate, surface, evidence, reproduction
@@ -598,6 +611,24 @@ class ValidationAgent:
             evidence=reproduced,
             reason="independent probe did not reproduce the safe-file read",
             reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+        )
+
+    def _validate_hidden_body_parameter(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        surface,
+        evidence: Sequence[Evidence],
+        reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """Never replay a hidden POST without a verified normal request template."""
+
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.BLOCKED,
+            evidence=(),
+            reason="valid POST request template and session refresh are unavailable",
+            reason_code=ValidationReasonCode.POST_REQUEST_TEMPLATE_MISSING,
         )
 
     def _validate_path_traversal_bypass(

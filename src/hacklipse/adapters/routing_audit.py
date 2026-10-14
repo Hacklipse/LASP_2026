@@ -75,9 +75,22 @@ class AuditedVulnerabilityRouter:
             key: _text(value) for key, value in (metadata or {}).items()
             if key in {
                 "analysis_profile", "llm_provider", "llm_model", "vulnerability_types",
-                "recon_mode", "router_review",
+                "recon_mode", "recon_entry_mode", "surface_collection_mode",
+                "router_review", "state_changing_approved",
             }
         }
+
+    @property
+    def last_capability_assessments(self) -> tuple[object, ...]:
+        """Orchestrator가 감사 wrapper 너머의 coverage gap을 읽게 한다."""
+
+        return tuple(getattr(self.router, "last_capability_assessments", ()))
+
+    @property
+    def last_analyzer_coverage(self) -> tuple[object, ...]:
+        """CLI와 Orchestrator가 wrapper 너머의 Analyzer 계약 gap을 읽게 한다."""
+
+        return tuple(getattr(self.router, "last_analyzer_coverage", ()))
 
     def route(
         self, run: Run, surfaces: Sequence[Surface], evidence: Sequence[Evidence],
@@ -102,10 +115,24 @@ class AuditedVulnerabilityRouter:
             )
             advisor = getattr(routed, "_advisor", None) if routed else None
             advisor_trace = getattr(advisor, "last_trace", None)
+            capabilities = tuple(
+                getattr(advisor_trace, "capabilities", ())
+                if advisor_trace else ()
+            )
+            analyzer_coverage = tuple(
+                getattr(advisor_trace, "analyzer_coverage", ())
+                if advisor_trace else ()
+            )
+            excluded_surfaces = dict(
+                advisor_trace.excluded_surfaces if advisor_trace else ()
+            )
             router_advisor_status = (
                 routed.last_advisor_status if routed else "not_configured"
             )
-            advisor_failed = router_advisor_status.startswith("advisor_failed:")
+            advisor_failed = "advisor_failed:" in router_advisor_status
+            agentic_fallback = router_advisor_status.startswith(
+                "agentic_fallback:"
+            )
             baseline = routed.last_rule_decisions if routed else decisions
             original = {item.candidate.candidate_id: item for item in baseline}
             outcomes = dict(routed.last_advisor_outcomes) if routed else {}
@@ -126,6 +153,11 @@ class AuditedVulnerabilityRouter:
                             final.priority if final is not None else ADVISOR_PRIORITY
                         ),
                         "reason": _text(item.reason),
+                        "reason_code": item.reason_code,
+                        "basis_evidence_ids": list(item.basis_evidence_ids),
+                        "required_evidence_types": list(
+                            item.required_evidence_types
+                        ),
                         "outcome": outcomes.get(index, "not_merged"),
                     })
             self._audit.append({
@@ -152,7 +184,11 @@ class AuditedVulnerabilityRouter:
                             "advisor_review"
                             if advisor_trace
                             and surface.surface_id in advisor_trace.offered_surface_ids
-                            else "heuristic_mode" if advisor is None else "not_offered"
+                            else "heuristic_mode"
+                            if advisor is None
+                            else excluded_surfaces.get(
+                                surface.surface_id, "not_offered"
+                            )
                         ),
                         "selected": bool(
                             advisor_trace
@@ -166,16 +202,21 @@ class AuditedVulnerabilityRouter:
                     for item in baseline
                 ],
                 "llm": {
+                    "selection_policy": (
+                        "analyzer_capability"
+                        if self._mode == "agentic" else "advisor_suggestion"
+                    ),
+                    "hypotheses_advisory_only": self._mode == "agentic",
                     "source": (
                         "deterministic_fallback"
-                        if advisor_failed
+                        if advisor_failed or agentic_fallback
                         else advisor_trace.source
                         if advisor_trace
                         else "error" if error_type else "skipped"
                     ),
                     "status": (
                         router_advisor_status
-                        if advisor_failed
+                        if advisor_failed or agentic_fallback
                         else advisor_trace.status
                         if advisor_trace
                         else error_type or "heuristic_mode"
@@ -193,6 +234,75 @@ class AuditedVulnerabilityRouter:
                     ),
                     "model": _text(advisor_trace.model) if advisor_trace else "",
                     "elapsed_ms": advisor_trace.elapsed_ms if advisor_trace else None,
+                    "offered_pair_count": (
+                        advisor_trace.offered_pair_count if advisor_trace else 0
+                    ),
+                    "offered_surface_count": (
+                        len(advisor_trace.offered_surface_ids) if advisor_trace else 0
+                    ),
+                    "coverage_surface_count": len(capabilities),
+                    "capability_counts": {
+                        status: sum(
+                            item.status == status for item in capabilities
+                        )
+                        for status in (
+                            "routable", "blocked", "unsupported", "excluded"
+                        )
+                    },
+                    "capabilities": [
+                        {
+                            "surface_id": item.surface_id,
+                            "status": item.status,
+                            "reason_code": item.reason_code,
+                            "routable_types": list(item.routable_types),
+                            "missing_requirements": list(
+                                item.missing_requirements
+                            ),
+                        }
+                        for item in capabilities
+                    ],
+                    "analyzer_coverage": [
+                        {
+                            "capability_id": item.capability_id,
+                            "vulnerability_type": item.vulnerability_type,
+                            "agent_type": item.agent_type,
+                            "status": item.status,
+                            "matched_surface_count": item.matched_surface_count,
+                            "missing_requirements": list(
+                                item.missing_requirements
+                            ),
+                        }
+                        for item in analyzer_coverage
+                    ],
+                    "hypothesis_counts": {
+                        status: sum(
+                            item.status == status
+                            for item in (
+                                advisor_trace.hypotheses if advisor_trace else ()
+                            )
+                        )
+                        for status in ("planned", "unanswered")
+                    },
+                    "hypotheses": [
+                        {
+                            "surface_id": item.surface_id,
+                            "capability_id": item.capability_id,
+                            "vulnerability_type": item.vulnerability_type,
+                            "agent_type": item.agent_type,
+                            "status": item.status,
+                            "confidence": item.confidence,
+                            "priority": item.priority,
+                            "reason_code": item.reason_code,
+                            "analysis_strategy_id": item.analysis_strategy_id,
+                            "basis_evidence_ids": list(item.basis_evidence_ids),
+                            "required_evidence_types": list(
+                                item.required_evidence_types
+                            ),
+                        }
+                        for item in (
+                            advisor_trace.hypotheses if advisor_trace else ()
+                        )
+                    ],
                     "rejected_items": [
                         {"index": index, "index_scope": "raw_items", "reason": reason}
                         for index, reason in (
@@ -235,6 +345,7 @@ def _decision(
         "source": source, "reason": _text(candidate.hypothesis),
         "evidence_ids": list(candidate.evidence_ids),
         "exploration_parameters": list(candidate.exploration_parameters),
+        "required_evidence_types": list(candidate.required_evidence_types),
     }
 
 

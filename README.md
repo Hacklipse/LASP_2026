@@ -16,9 +16,31 @@ The code is split by dependency direction:
   reporting, budgets, retries, and the execution safety boundary
 - `bootstrap`: composition root; this is the only place that assembles adapters
 
-There are no runtime dependencies outside the Python 3.10+ standard library.
+The core uses the Python 3.10+ standard library; Recon and browser adapters
+also require the packages listed in `pyproject.toml`.
 The default execution runtime rejects every external tool call. Real Recon,
 Analysis, and Validation agents must be explicitly registered by the caller.
+
+Juice Shop runs default to 20 requests for one vulnerability type and 80 for
+discovery or all-type scans. Larger experiments must set `--request-budget`
+explicitly; the Dashboard accepts an explicit budget up to 500. For benchmark
+runs, pass `--code-version` (or fill in **Code version** in the Dashboard).
+The run profile and JSONL result record that label, execution modes, approval
+and authentication flags, request ceiling, and requests used. Compare runs
+under the same budget and target state.
+Router analysis deltas require two completed, independent runs with matching
+Recon inputs, execution conditions, and a nonempty matching code version. A
+different Router mode is the intended comparison axis; changing code versions
+requires a separate experiment. Authentication is recorded only as a flag, so
+the operator must still verify the same principal and target state externally.
+
+Agentic Recon limits LLM decisions to three calls of at most 15 seconds each,
+using the task's remaining time for each call. It then visits remaining safe
+surfaces in deterministic order and records unvisited surface IDs and the stop
+reason. Its collection summary separates attempted URLs, HTTP responses,
+successful fetches, and parsed responses. POST Path Traversal probes remain
+unavailable until a verified normal request template and safe proof target
+exist. Stored POST candidates are blocked without sending a synthesized request.
 
 Run the local verification suite with:
 

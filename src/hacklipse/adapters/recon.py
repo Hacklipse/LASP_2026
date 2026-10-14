@@ -13,14 +13,17 @@ URL을 만들어야 하므로 경로가 소스에 리터럴로 박힌다. 브라
 브라우저를 띄우지 않으므로 동적으로 조립되는 URL과 코드 스플리팅된 청크는 놓친다.
 그건 헤드리스 Runtime의 몫으로 남긴다.
 
-LLM을 쓰지 않는다: 크롤링과 폼 추출은 결정적 작업이라 판단 품질이 오르지 않고, 이 버전
-자체가 이후 LLM 기반 Recon과 비교할 연구 대조군이 된다.
+크롤링과 폼 추출은 결정적이다. 선택한 모드에서만 LLM이 다음 방문 순서를 제안하며,
+실행과 시간·요청 한도는 이 Agent가 통제한다.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
+import time
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from urllib.parse import parse_qsl, urljoin, urlsplit
 from uuid import uuid4
 
@@ -37,7 +40,15 @@ from hacklipse.domain import (
     TaskEnvelope,
 )
 from hacklipse.ports import EvidenceStore, SurfaceStore
+from hacklipse.ports import IterativeReconPlanner, ReconAction, ReconObservation
 
+from .llm_iterative_recon import (
+    AGENTIC_RECON_PLANNER,
+    build_recon_action_observation,
+    find_stored_recon_action,
+    recon_action_status_detail,
+)
+from .llm_parameter_names import alias_parameter_names
 from .llm_recon_planner import (
     RECON_PLANNER,
     ReconCandidate,
@@ -57,6 +68,9 @@ RECON_TOOL = "http_get"
 
 DEFAULT_MAX_PAGES = 10
 DEFAULT_MAX_SCRIPTS = 3
+_RECON_DEADLINE_RESERVE_SECONDS = 5.0
+_MAX_AGENTIC_LLM_CALLS = 3
+_MAX_AGENTIC_LLM_CALL_SECONDS = 15.0
 
 # 남은 예산의 이 비율까지만 정찰에 쓴다. 정찰이 예산을 다 먹으면 뒤의 Analysis가
 # 아무것도 못 한다 — 찾기만 하고 확인은 못 하는 상태가 된다.
@@ -105,6 +119,7 @@ _FILE_OR_URL_PARAM_HINTS = (
 _JS_DIRECTORY = re.compile(
     r"""["'`](?:\$\{[^}]{0,60}\})?(/[A-Za-z0-9][A-Za-z0-9._~/-]{0,100}/)[A-Za-z0-9._~-]{0,40}\$\{"""
 )
+_JS_BARE_NUMERIC_PATH = re.compile(r"/\d+")
 # SPA 클라이언트 라우트와 그 query 파라미터. 라우트 이동과 파라미터 선언이 서로
 # 앞뒤 어느 쪽에도 올 수 있어 좁은 창 안에서 함께 나타나는 짝만 취한다.
 # 따옴표 종류는 큰따옴표로 고정하지 않는다 — Angular 컴파일러 버전에 따라 배열 리터럴을
@@ -140,6 +155,12 @@ _RESTRICTED_FILE_EXTENSIONS = (
 _UNLINKED_RENDER_PARAMETERS = ("layout",)
 
 _MAX_SCRIPT_BYTES = 4 * 1024 * 1024
+# 한 round에서 모델이 비교할 좌표를 제한한다. 선택된 좌표는 다음 round의 창으로
+# 이동하므로 이 값 밖의 Surface가 영구히 사라지는 것은 아니다. 응답 전체를 매번 다시
+# 보내지 않고 현재 선택지와 직전 실행 문맥만 전달해 반복 prompt 비용을 제한한다.
+_MAX_AGENTIC_SELECTABLE = 32
+_MAX_AGENTIC_CONTEXT = 2
+_MAX_AGENTIC_OBSERVATIONS = _MAX_AGENTIC_SELECTABLE + _MAX_AGENTIC_CONTEXT
 _PATH_OBJECT_ID = re.compile(r"^[0-9]{1,10}$")
 _PATH_RESOURCE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
 _SINGULAR_OBJECT_RESOURCES = frozenset(
@@ -234,13 +255,18 @@ class ReconAgent:
         max_scripts: int = DEFAULT_MAX_SCRIPTS,
         surface_collection_mode: str = "adaptive",
         seed_urls: Sequence[str] = (),
+        infer_unlinked_render_parameters: bool = True,
         id_factory: Callable[[], str] | None = None,
         planner: ReconPlanner | None = None,
+        iterative_planner: IterativeReconPlanner | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         if max_pages < 1:
             raise ValueError("recon must fetch at least one page")
         if surface_collection_mode not in {"adaptive", "deterministic"}:
             raise ValueError("unsupported surface collection mode")
+        if planner is not None and iterative_planner is not None:
+            raise ValueError("only one recon planner may be configured")
         self._collector = collector
         self._evidence = evidence_store
         self._surfaces = surface_store
@@ -248,10 +274,13 @@ class ReconAgent:
         self._max_scripts = max_scripts
         self._surface_collection_mode = surface_collection_mode
         self._seed_urls = tuple(dict.fromkeys(seed_urls))
+        self._infer_unlinked_render_parameters = infer_unlinked_render_parameters
         self._id_factory = id_factory or (lambda: str(uuid4()))
         # None이면(휴리스틱 프로필) 아래 두 번째 crawl() 직전 분기 자체가 실행되지
         # 않아 기존 결정적 동작과 한 줄도 다르지 않다.
         self._planner = planner
+        self._iterative_planner = iterative_planner
+        self._clock = clock or time.monotonic
 
     def handle(self, task: TaskEnvelope) -> AgentResult:
         """예산 안에서 크롤링하며 Surface·Evidence를 채운다."""
@@ -273,6 +302,11 @@ class ReconAgent:
             ):
                 raise AgentContractError("targeted recon requires an existing simple GET surface")
         page_budget = 1 if targeted else self._page_budget(task)
+        reserve = min(_RECON_DEADLINE_RESERVE_SECONDS, task.timeout_seconds / 10)
+        work_deadline = self._clock() + task.timeout_seconds - reserve
+
+        def remaining_work() -> float:
+            return max(0.0, work_deadline - self._clock())
 
         for seed_url in self._seed_urls:
             if not _same_origin(seed_url, origin):
@@ -285,7 +319,13 @@ class ReconAgent:
             if targeted
             else list(dict.fromkeys((task.target_url, *self._seed_urls)))
         )
+        pending_discovery_types: dict[str, set[str]] = {
+            url: {"seed"} for url in pending
+        }
         fetched: set[str] = set()
+        responded: set[str] = set()
+        successful: set[str] = set()
+        parsed: set[str] = set()
         scripts: list[str] = []
         document_pages: set[str] = set()
         if targeted:
@@ -312,12 +352,27 @@ class ReconAgent:
         # pending에 오른 URL의 surface_id. Planner 후보를 만들 때 URL로 Store를 다시
         # 뒤지지 않고 이 dict로 바로 대응시킨다.
         pending_surface_ids: dict[str, str] = {}
+        surface_discovery_types: dict[str, set[str]] = {}
+        recently_fetched_surface_ids: list[str] = []
+        deadline_exhausted = False
+        stop_reason: str | None = None
+
+        def record_response(url: str, evidence: Evidence) -> None:
+            status = evidence.observation.get("status")
+            if (
+                evidence.evidence_type == "http_response"
+                and type(status) is int and 100 <= status <= 599
+            ):
+                responded.add(url)
+                if 200 <= status < 300:
+                    successful.add(url)
 
         def remember(
             url: str,
             method: str,
             names: tuple[str, ...],
             observed: tuple[tuple[str, str], ...] = (),
+            discovery_types: Sequence[str] = (),
         ) -> str:
             clean_url = url.split("?", 1)[0]
             path_identifier = _path_identifier(clean_url)
@@ -325,9 +380,15 @@ class ReconAgent:
             key = (key_url, method, names)
             existing = surfaces.get(key)
             if existing is not None:
+                surface_discovery_types.setdefault(existing, set()).update(
+                    discovery_types
+                )
                 return existing
             surface_id = f"surface-{self._id_factory()}"
             surfaces[key] = surface_id
+            surface_discovery_types.setdefault(surface_id, set()).update(
+                discovery_types
+            )
             self._store_surface(
                 task.run_id,
                 surface_id,
@@ -336,6 +397,7 @@ class ReconAgent:
                 names,
                 observed=observed,
                 path_identifier=path_identifier,
+                discovery_types=tuple(dict.fromkeys(discovery_types)),
             )
             evidence_ids.extend(
                 self._flag_suspect_parameters(task.run_id, surface_id, names)
@@ -346,27 +408,73 @@ class ReconAgent:
                 )
             return surface_id
 
-        def crawl(*, protected: Sequence[str] | set[str] = ()) -> None:
+        def crawl(
+            *,
+            protected: Sequence[str] | set[str] = (),
+            max_visits: int | None = None,
+        ) -> int:
+            nonlocal deadline_exhausted
+            visited = 0
             while pending and len(fetched) < page_budget:
+                if remaining_work() < 1.0:
+                    deadline_exhausted = True
+                    break
+                if max_visits is not None and visited >= max_visits:
+                    break
                 if self._surface_collection_mode == "deterministic":
                     pending[:] = _deterministic_pending(pending, protected)
                 url = pending.pop(0)
                 if url in fetched:
                     continue
                 fetched.add(url)
+                visited += 1
 
-                surface_id = remember(url, "GET", _query_names(url), _query_pairs(url))
-                evidence_id, evidence = self._fetch(task, url, surface_id)
+                surface_id = remember(
+                    url,
+                    "GET",
+                    _query_names(url),
+                    _query_pairs(url),
+                    tuple(sorted(pending_discovery_types.get(url, {"discovered"}))),
+                )
+                pending_surface_ids[url] = surface_id
+                evidence_id, evidence = self._fetch(
+                    task, url, surface_id, timeout_seconds=remaining_work()
+                )
+                record_response(url, evidence)
                 evidence_ids.append(evidence_id)
+                recently_fetched_surface_ids.append(surface_id)
+                del recently_fetched_surface_ids[:-_MAX_AGENTIC_CONTEXT]
 
                 body = evidence.observation.get("body")
-                if not isinstance(body, str) or not body:
+                if url not in successful or not isinstance(body, str) or not body:
+                    continue
+                if not _is_html_response(evidence):
+                    # JSON/API 응답 안의 escaped HTML 조각을 실제 링크나 폼으로 오인하면
+                    # `/api/\"https:/...` 같은 실행 불가능한 Surface가 생긴다. API 본문은
+                    # status/content-type 관찰로 남기되 HTML parser에는 넣지 않는다.
                     continue
 
                 links, forms, sources = _parse_page(body, url)
-                for form_url, method, names in forms:
-                    form_surface_id = remember(form_url, method, names)
-                    if method == "POST" and url in document_pages:
+                parsed.add(url)
+                for form_url, method, names, content_type in forms:
+                    form_surface_id = remember(
+                        form_url, method, names, discovery_types=("html_form",)
+                    )
+                    if (
+                        method == "POST"
+                        and names
+                        and content_type == "application/x-www-form-urlencoded"
+                    ):
+                        evidence_ids.append(
+                            self._flag_post_form_structure(
+                                task.run_id, form_surface_id, names
+                            )
+                        )
+                    if (
+                        self._infer_unlinked_render_parameters
+                        and method == "POST"
+                        and url in document_pages
+                    ):
                         evidence_ids.extend(
                             self._flag_unlinked_render_parameters(
                                 task.run_id, form_surface_id
@@ -377,16 +485,26 @@ class ReconAgent:
                         continue
                     # 예산과 무관하게 표면으로 기록하고, 여유가 있으면 크롤링까지 한다.
                     pending_surface_ids[link] = remember(
-                        link, "GET", _query_names(link), _query_pairs(link)
+                        link,
+                        "GET",
+                        _query_names(link),
+                        _query_pairs(link),
+                        discovery_types=("html_link",),
                     )
+                    pending_discovery_types.setdefault(link, set()).add("html_link")
                     if link not in fetched and link not in pending:
                         pending.append(link)
                 for source in sources:
                     if source not in scripts and _same_origin(source, origin):
                         scripts.append(source)
+            return visited
 
         # 비교 모드에서도 사용자가 지정한 시작 URL은 항상 먼저 본다.
-        crawl(protected=(task.target_url,))
+        initial_urls = tuple(pending)
+        crawl(
+            protected=initial_urls,
+            max_visits=(len(initial_urls) if self._iterative_planner is not None else None),
+        )
 
         # 번들 분석은 크롤링 뒤에 한다. 남은 예산 안에서만 스크립트를 받는다.
         affordable = max(min(self._max_scripts, page_budget - len(fetched)), 0)
@@ -396,11 +514,24 @@ class ReconAgent:
             else scripts
         )
         for source in script_sources[:affordable]:
+            if remaining_work() < 1.0:
+                deadline_exhausted = True
+                break
             fetched.add(source)
-            for url, names, should_crawl, is_navigation in self._discover_from_script(
-                task, source, origin
-            ):
-                pending_surface_ids[url] = remember(url, "GET", names)
+            script_paths, script_evidence, script_parsed = self._discover_from_script(
+                task, source, origin, timeout_seconds=remaining_work()
+            )
+            record_response(source, script_evidence)
+            if script_parsed:
+                parsed.add(source)
+            for url, names, should_crawl, is_navigation in script_paths:
+                discovery_type = (
+                    "browser_navigation" if is_navigation else "script_literal"
+                )
+                pending_surface_ids[url] = remember(
+                    url, "GET", names, discovery_types=(discovery_type,)
+                )
+                pending_discovery_types.setdefault(url, set()).add(discovery_type)
                 # 번들이 가리킨 디렉터리와 서버 문서 navigation은 실제 응답을 봐야
                 # 내부 파일이나 HTML 폼을 발견할 수 있다.
                 if should_crawl:
@@ -409,10 +540,83 @@ class ReconAgent:
                 # 디렉터리 추측과 달리 여기에 서버 렌더링 폼이 실제로 들어 있다.
                 if is_navigation:
                     navigation_pages.add(url)
-                if should_crawl and url not in fetched and url not in pending:
+                # 기존 heuristic/hybrid는 문서·디렉터리만 방문한다. Agentic 경로는
+                # 정답 seed 없이도 실제 JS/API 관찰에서 다음 GET을 고를 수 있어야
+                # 하므로, 동일 origin에서 발견한 모든 GET Surface를 frontier에 둔다.
+                if (
+                    should_crawl or self._iterative_planner is not None
+                ) and url not in fetched and url not in pending:
                     pending.append(url)
 
-        if self._planner is not None and pending and not targeted:
+        if self._iterative_planner is not None and pending and not targeted:
+            round_index = 0
+            llm_calls = 0
+            provider_fallback_status: str | None = None
+            while pending and len(fetched) < page_budget:
+                if remaining_work() < 1.0:
+                    deadline_exhausted = True
+                    break
+                if llm_calls >= _MAX_AGENTIC_LLM_CALLS and provider_fallback_status is None:
+                    provider_fallback_status = "fallback:llm_call_limit"
+                if self._surface_collection_mode == "deterministic" or provider_fallback_status:
+                    pending[:] = _deterministic_pending(pending, navigation_pages)
+                remaining_budget = max(page_budget - len(fetched), 0)
+                candidates = self._recon_candidates(
+                    task.run_id, pending, pending_surface_ids
+                )
+                selectable_surface_ids = tuple(
+                    dict.fromkeys(candidate.surface_id for candidate in candidates)
+                )[:_MAX_AGENTIC_SELECTABLE]
+                if not selectable_surface_ids:
+                    stop_reason = "no_available_surface"
+                    break
+                observations = self._recon_observations(
+                    task.run_id,
+                    surface_discovery_types,
+                    fetched,
+                    selectable_surface_ids,
+                    context_surface_ids=tuple(recently_fetched_surface_ids),
+                )
+                llm_timeout = min(
+                    _MAX_AGENTIC_LLM_CALL_SECONDS, remaining_work() / 2
+                )
+                planner_task = replace(task, timeout_seconds=2 * llm_timeout)
+                action, action_evidence_id, executed_surface_id, llm_called = self._next_action(
+                    planner_task,
+                    observations,
+                    selectable_surface_ids,
+                    remaining_budget,
+                    round_index,
+                    provider_fallback_status=provider_fallback_status,
+                )
+                llm_calls += int(llm_called)
+                if action.status in {
+                    "fallback:timeout", "fallback:transport_error", "fallback:refused"
+                }:
+                    provider_fallback_status = action.status
+                evidence_ids.append(action_evidence_id)
+                planner_status = recon_action_status_detail(action)
+                if action.action == "stop" or executed_surface_id is None:
+                    stop_reason = "planner_stop"
+                    break
+
+                url_by_surface_id: dict[str, str] = {}
+                for url in pending:
+                    surface_id = pending_surface_ids.get(url)
+                    if surface_id is not None:
+                        url_by_surface_id.setdefault(surface_id, url)
+                selected_url = url_by_surface_id.get(executed_surface_id)
+                if selected_url is None:
+                    stop_reason = "selected_surface_missing"
+                    break
+                pending.remove(selected_url)
+                pending.insert(0, selected_url)
+                if crawl(max_visits=1) != 1:
+                    stop_reason = "time_budget" if deadline_exhausted else "visit_unavailable"
+                    break
+                round_index += 1
+
+        elif self._planner is not None and pending and not targeted:
             remaining_budget = max(page_budget - len(fetched), 0)
             candidates = self._recon_candidates(task.run_id, pending, pending_surface_ids)
             if candidates:
@@ -429,7 +633,59 @@ class ReconAgent:
                     )
 
         # 번들에서 찾은 디렉터리 목록(또는 Planner가 고른 순서)을 남은 예산 안에서 마저 본다.
-        crawl(protected=navigation_pages)
+        if self._iterative_planner is None:
+            crawl(protected=navigation_pages)
+
+        if deadline_exhausted and self._iterative_planner is not None:
+            planner_status = "agentic_recon:fallback:time_budget"
+
+        if self._iterative_planner is not None and pending and not targeted:
+            unfetched_ids = tuple(dict.fromkeys(
+                pending_surface_ids[url] for url in pending
+                if url not in fetched and url in pending_surface_ids
+            ))
+            unregistered_hashes = tuple(dict.fromkeys(
+                hashlib.sha256(url.encode("utf-8")).hexdigest()
+                for url in pending
+                if url not in fetched and url not in pending_surface_ids
+            ))
+            if unfetched_ids or unregistered_hashes:
+                summary = {
+                    "type": "recon_collection_summary",
+                    "attempted_url_count": len(fetched),
+                    "response_url_count": len(responded),
+                    "fetched_url_count": len(successful),
+                    "parsed_url_count": len(parsed),
+                    "llm_call_count": llm_calls,
+                    "fetched_surface_ids": sorted({
+                        pending_surface_ids[url] for url in successful
+                        if url in pending_surface_ids
+                    }),
+                    "unfetched_surface_ids": list(unfetched_ids),
+                    "unfetched_url_hashes": list(unregistered_hashes),
+                    "unfetched_count": len(unfetched_ids) + len(unregistered_hashes),
+                    "reason": (
+                        "time_budget" if deadline_exhausted else
+                        stop_reason or
+                        ("request_budget" if len(fetched) >= page_budget else "not_selected")
+                    ),
+                    "fallback_status": provider_fallback_status,
+                }
+                existing_summary = next((
+                    item for item in self._evidence.list_by_run(task.run_id)
+                    if item.created_by == AGENTIC_RECON_PLANNER
+                    and item.observation == summary
+                ), None)
+                if existing_summary is None:
+                    summary_id = f"evi-{self._id_factory()}"
+                    self._evidence.append(Evidence(
+                        evidence_id=summary_id, run_id=task.run_id,
+                        surface_id=None, created_by=AGENTIC_RECON_PLANNER,
+                        evidence_type="observation", observation=summary,
+                    ))
+                else:
+                    summary_id = existing_summary.evidence_id
+                evidence_ids.append(summary_id)
 
         surface_ids = list(surfaces.values())
         return AgentResult(
@@ -449,7 +705,8 @@ class ReconAgent:
         return max(min(self._max_pages, share), 1)
 
     def _fetch(
-        self, task: TaskEnvelope, url: str, surface_id: str | None
+        self, task: TaskEnvelope, url: str, surface_id: str | None,
+        *, timeout_seconds: float | None = None,
     ) -> tuple[str, Evidence]:
         """중앙 수집 경계를 거쳐 한 문서를 가져온다."""
 
@@ -463,7 +720,7 @@ class ReconAgent:
                 suggested_tool=RECON_TOOL,
             ),
             task_id=task.task_id,
-            timeout_seconds=task.timeout_seconds,
+            timeout_seconds=min(task.timeout_seconds, timeout_seconds or task.timeout_seconds),
             # Recon은 특정 취약점 Agent가 아니므로 Run 기본 세션을 쓴다. TaskFactory가
             # 선택한 참조를 전달하지 않으면 다중 취약점 Run에서 무인증으로 바뀐다.
             credential_ref=task.credential_ref,
@@ -471,14 +728,20 @@ class ReconAgent:
         return evidence_id, self._evidence.get(task.run_id, evidence_id)
 
     def _discover_from_script(
-        self, task: TaskEnvelope, source: str, origin
-    ) -> list[tuple[str, tuple[str, ...], bool]]:
+        self, task: TaskEnvelope, source: str, origin,
+        *, timeout_seconds: float | None = None,
+    ) -> tuple[list[tuple[str, tuple[str, ...], bool, bool]], Evidence, bool]:
         """JS 번들을 받아 경로 리터럴에서 Surface 후보를 만든다."""
 
-        _, evidence = self._fetch(task, source, None)
+        _, evidence = self._fetch(task, source, None, timeout_seconds=timeout_seconds)
+        status = evidence.observation.get("status")
         body = evidence.observation.get("body")
-        if not isinstance(body, str) or not body or len(body) > _MAX_SCRIPT_BYTES:
-            return []
+        if (
+            evidence.evidence_type != "http_response"
+            or type(status) is not int or not 200 <= status < 300
+            or not isinstance(body, str) or not body or len(body) > _MAX_SCRIPT_BYTES
+        ):
+            return [], evidence, False
 
         parameters: dict[str, set[str]] = {}
         for match in _JS_PATH_PARAM.finditer(body):
@@ -489,6 +752,19 @@ class ReconAgent:
         paths = {match.group(1) for match in _JS_PATH.finditer(body)}
         paths.update(parameters)
         paths.update(match.group(1) for match in _JS_DIRECTORY.finditer(body))
+        # Angular 템플릿의 글자 수 표시는 ``value.length/10``을 렌더링하면서
+        # ``/10`` 같은 문자열 리터럴을 만든다. 명시적 query 좌표나 실제 navigation이
+        # 아닌 단일 숫자 루트 경로만 제거한다. ``/users/10``과
+        # ``location.assign('/10')``은 각각 정상 REST/탐색 좌표이므로 보존한다.
+        paths = {
+            path
+            for path in paths
+            if not (
+                _JS_BARE_NUMERIC_PATH.fullmatch(path)
+                and path not in parameters
+                and path not in document_paths
+            )
+        }
 
         base = f"{origin.scheme}://{origin.netloc}"
         # 실제 문서 이동을 먼저 방문한다. 일반 경로 수십 개를 정렬한 뒤 예산이
@@ -507,7 +783,7 @@ class ReconAgent:
             (f"{base}/#/{route}", names, False, False)
             for route, names in sorted(_client_routes(body).items())
         )
-        return found
+        return found, evidence, True
 
     def _store_surface(
         self,
@@ -519,6 +795,7 @@ class ReconAgent:
         *,
         observed: tuple[tuple[str, str], ...] = (),
         path_identifier: tuple[str, int, str] | None = None,
+        discovery_types: tuple[str, ...] = (),
     ) -> None:
         path_name, path_index, path_value = path_identifier or (None, None, None)
         self._surfaces.add(
@@ -532,6 +809,7 @@ class ReconAgent:
                 path_identifier=path_name,
                 path_identifier_index=path_index,
                 observed_path_identifier=path_value,
+                discovery_types=discovery_types,
             )
         )
 
@@ -576,6 +854,30 @@ class ReconAgent:
             )
             evidence_ids.append(evidence_id)
         return evidence_ids
+
+    def _flag_post_form_structure(
+        self, run_id: str, surface_id: str, names: tuple[str, ...]
+    ) -> str:
+        """Record a form-declared POST shape, not a submitted request or hidden field."""
+
+        evidence_id = f"evi-{self._id_factory()}"
+        self._evidence.append(
+            Evidence(
+                evidence_id=evidence_id,
+                run_id=run_id,
+                surface_id=surface_id,
+                created_by="recon",
+                evidence_type="observation",
+                observation={
+                    "type": "post_form_body_structure",
+                    "source": "html_form",
+                    "content_type": "application/x-www-form-urlencoded",
+                    "field_names": list(names),
+                    "observed_request": False,
+                },
+            )
+        )
+        return evidence_id
 
     def _flag_unlinked_render_parameters(
         self, run_id: str, surface_id: str
@@ -638,6 +940,177 @@ class ReconAgent:
                 )
             )
         return tuple(candidates)
+
+    def _recon_observations(
+        self,
+        run_id: str,
+        discovery_types: dict[str, set[str]],
+        fetched_urls: set[str],
+        focus_surface_ids: tuple[str, ...],
+        *,
+        context_surface_ids: tuple[str, ...] = (),
+    ) -> tuple[ReconObservation, ...]:
+        """Build the bounded answer-blind view for one action decision.
+
+        The model receives every currently selectable coordinate plus only the most recent
+        fetched coordinates. Older non-selectable observations remain in Evidence storage
+        and the replay trace, but repeating them in every prompt does not help choose the
+        next member of ``selectable_surface_ids``.
+        """
+
+        response_metadata: dict[str, tuple[int | None, str | None]] = {}
+        for item in self._evidence.list_by_run(run_id):
+            if item.surface_id is None or item.evidence_type != "http_response":
+                continue
+            status = item.observation.get("status")
+            if type(status) is not int or not 100 <= status <= 599:
+                status = None
+            content_type = item.observation.get("content_type")
+            if isinstance(content_type, str):
+                content_type = _safe_recon_text(
+                    content_type.split(";", 1)[0].strip().lower(), 100
+                ) or None
+            else:
+                content_type = None
+            response_metadata[item.surface_id] = (status, content_type)
+
+        fetched_surface_urls = {
+            _canonical_surface_url(
+                url.split("?", 1)[0], _path_identifier(url.split("?", 1)[0])
+            )
+            for url in fetched_urls
+        }
+        observations: list[ReconObservation] = []
+        for surface in self._surfaces.list_by_run(run_id):
+            # A resumed run may already contain surfaces discovered in later rounds of a
+            # previous attempt. Do not let that future state leak into an earlier round.
+            if surface.surface_id not in discovery_types:
+                continue
+            metadata = (
+                response_metadata.get(surface.surface_id)
+                if surface.url in fetched_surface_urls
+                else None
+            )
+            parsed = urlsplit(surface.url)
+            path = parsed.path or "/"
+            if parsed.fragment:
+                path = f"{path}#{parsed.fragment}"
+            path = _safe_recon_text(path, 512)
+            if not path.startswith("/"):
+                path = "/"
+            observations.append(
+                ReconObservation(
+                    observation_id=f"recon-observation:{surface.surface_id}",
+                    surface_id=surface.surface_id,
+                    path=path,
+                    method=surface.method.upper(),
+                    parameter_names=alias_parameter_names(
+                        surface.parameters
+                    ).prompt_names,
+                    discovery_types=tuple(
+                        sorted(discovery_types.get(surface.surface_id, {"discovered"}))
+                    ),
+                    state="fetched" if metadata is not None else "discovered",
+                    status_code=metadata[0] if metadata is not None else None,
+                    content_type=metadata[1] if metadata is not None else None,
+                )
+            )
+        focus = set(focus_surface_ids)
+        context = set(context_surface_ids)
+        observations = [
+            item
+            for item in observations
+            if item.surface_id in focus or item.surface_id in context
+        ]
+        observations.sort(
+            key=lambda item: (
+                item.surface_id not in focus,
+                item.surface_id not in context,
+                item.state != "fetched",
+                not bool(item.parameter_names),
+            )
+        )
+        return tuple(observations[:_MAX_AGENTIC_OBSERVATIONS])
+
+    def _next_action(
+        self,
+        task: TaskEnvelope,
+        observations: tuple[ReconObservation, ...],
+        selectable_surface_ids: tuple[str, ...],
+        remaining_budget: int,
+        round_index: int,
+        *,
+        provider_fallback_status: str | None = None,
+    ) -> tuple[ReconAction, str, str | None, bool]:
+        """Restore or persist exactly one policy-checked iterative Recon action."""
+
+        stored = find_stored_recon_action(
+            self._evidence.list_by_run(task.run_id),
+            observations,
+            selectable_surface_ids,
+            round_index=round_index,
+        )
+        if stored is not None:
+            return (*stored, False)
+
+        if self._surface_collection_mode == "deterministic" or provider_fallback_status:
+            selected = selectable_surface_ids[0]
+            basis = next(
+                (
+                    (item.observation_id,)
+                    for item in observations
+                    if item.surface_id == selected
+                ),
+                (),
+            )
+            action = ReconAction(
+                action="visit_surface",
+                surface_id=selected,
+                basis_observation_ids=basis,
+                reason_code=(
+                    "planner_failure" if provider_fallback_status else "expand_coverage"
+                ),
+                source="deterministic_fallback",
+                status=provider_fallback_status or "fallback:deterministic_collection",
+            )
+        else:
+            action = _policy_checked_recon_action(
+                self._iterative_planner.decide(
+                    task=task,
+                    observations=observations,
+                    selectable_surface_ids=selectable_surface_ids,
+                    remaining_budget=remaining_budget,
+                    round_index=round_index,
+                ),
+                observations,
+                selectable_surface_ids,
+            )
+
+        executed_surface_id = (
+            action.surface_id if action.action == "visit_surface" else None
+        )
+        evidence_id = f"evi-{self._id_factory()}"
+        self._evidence.append(
+            Evidence(
+                evidence_id=evidence_id,
+                run_id=task.run_id,
+                surface_id=None,
+                created_by=AGENTIC_RECON_PLANNER,
+                evidence_type="observation",
+                observation=build_recon_action_observation(
+                    action,
+                    observations,
+                    selectable_surface_ids,
+                    round_index=round_index,
+                    remaining_budget=remaining_budget,
+                    executed_surface_id=executed_surface_id,
+                ),
+            )
+        )
+        return action, evidence_id, executed_surface_id, (
+            self._surface_collection_mode != "deterministic"
+            and provider_fallback_status is None
+        )
 
     def _plan(
         self,
@@ -714,9 +1187,24 @@ class ReconAgent:
         return [*protected_order, *ranked]
 
 
+def _is_html_response(evidence: Evidence) -> bool:
+    """Return whether a textual response is eligible for HTML structure parsing.
+
+    Missing content type stays compatible with simple runtimes and old fixtures. An
+    explicit non-HTML media type is authoritative: its body can still be observed, but
+    HTML-looking strings inside JSON or JavaScript are data rather than page structure.
+    """
+
+    content_type = evidence.observation.get("content_type")
+    if not isinstance(content_type, str) or not content_type.strip():
+        return True
+    media_type = content_type.split(";", 1)[0].strip().casefold()
+    return media_type in {"text/html", "application/xhtml+xml"}
+
+
 def _parse_page(
     body: str, base_url: str
-) -> tuple[list[str], list[tuple[str, str, tuple[str, ...]]], list[str]]:
+) -> tuple[list[str], list[tuple[str, str, tuple[str, ...], str]], list[str]]:
     """HTML에서 링크·폼·스크립트 출처를 뽑는다.
 
     lxml 파서는 닫는 태그가 없는 폼처럼 깨진 HTML도 복구한다 — 취약한 대상일수록
@@ -748,6 +1236,8 @@ def _parse_page(
                 urljoin(base_url, action).split("?", 1)[0],
                 (form.get("method") or "GET").upper(),
                 names,
+                (form.get("enctype") or "application/x-www-form-urlencoded")
+                .split(";", 1)[0].strip().casefold(),
             )
         )
 
@@ -814,3 +1304,50 @@ def _canonical_surface_url(
 def _same_origin(url: str, origin) -> bool:
     parsed = urlsplit(url)
     return parsed.scheme in ("http", "https") and parsed.netloc == origin.netloc
+
+
+def _safe_recon_text(value: str, limit: int) -> str:
+    """Keep target-controlled labels printable and bounded before LLM serialization."""
+
+    return "".join(character if character.isprintable() else "\ufffd" for character in value)[
+        :limit
+    ]
+
+
+def _policy_checked_recon_action(
+    proposed: object,
+    observations: tuple[ReconObservation, ...],
+    selectable_surface_ids: tuple[str, ...],
+) -> ReconAction:
+    """Enforce the current-run coordinate allowlist independently of the planner."""
+
+    observation_ids = {item.observation_id for item in observations}
+    valid = isinstance(proposed, ReconAction) and all(
+        item in observation_ids for item in proposed.basis_observation_ids
+    )
+    if valid and proposed.action == "stop":
+        return proposed
+    if valid and proposed.surface_id in selectable_surface_ids:
+        return proposed
+
+    selected = selectable_surface_ids[0]
+    basis = next(
+        (
+            (item.observation_id,)
+            for item in observations
+            if item.surface_id == selected
+        ),
+        (),
+    )
+    rejected = ()
+    if isinstance(proposed, ReconAction) and proposed.surface_id:
+        rejected = (proposed.surface_id,)
+    return ReconAction(
+        action="visit_surface",
+        surface_id=selected,
+        basis_observation_ids=basis,
+        reason_code="planner_failure",
+        source="deterministic_fallback",
+        status="fallback:invalid_response",
+        rejected_surface_ids=rejected,
+    )

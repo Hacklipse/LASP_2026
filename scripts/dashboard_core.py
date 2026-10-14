@@ -58,6 +58,7 @@ from hacklipse.ports.errors import LlmCredentialsMissing, RecordNotFound
 # CLI 와 공유하는 실행 옵션 계약. Namespace 하나로 같은 함수를 먹인다.
 from routing_options import (
     NoLlmUsage,
+    append_run_result,
     build_run_router,
     execution_profile_from_args,
     needs_llm,
@@ -85,10 +86,11 @@ from run_juice_shop_baseline import (
     _authenticate_access_control_accounts,
     _cleanup_provisioned_accounts,
     _provision_path_traversal_account,
+    _recon_entry_points,
     _resolve_juice_shop_db,
 )
 
-VULN_CHOICES = (*_VULN_TARGETS, "all")
+VULN_CHOICES = (*_VULN_TARGETS, "auto", "all")
 MODE_GENERIC = "generic"
 MODE_JUICE_SHOP = "juice-shop"
 MODES = (MODE_GENERIC, MODE_JUICE_SHOP)
@@ -108,8 +110,10 @@ class RunOptions:
     mode: str = MODE_GENERIC
     vuln: str = "all"
     budget: int = 0  # 0 = 유형별 기본값을 쓴다
+    code_version: str = ""
     profile: str = "heuristic"
     recon: str = "heuristic"
+    recon_entry: str = "targeted"
     surface_collection: str = "adaptive"
     router: str = "heuristic"
     router_review: str = "weak"
@@ -137,6 +141,7 @@ class RunOptions:
         return argparse.Namespace(
             profile=self.profile,
             recon=self.recon,
+            recon_entry=self.recon_entry,
             surface_collection=self.surface_collection,
             router=self.router,
             router_review=self.router_review,
@@ -150,6 +155,7 @@ class RunOptions:
             llm_provider=self.llm_provider,
             llm_model=self.llm_model or None,
             llm_rpm_limit=self.llm_rpm_limit,
+            code_version=self.code_version,
         )
 
     @property
@@ -159,6 +165,10 @@ class RunOptions:
     @property
     def run_all(self) -> bool:
         return self.is_juice_shop and self.vuln == "all"
+
+    @property
+    def broad_scan(self) -> bool:
+        return self.is_juice_shop and self.vuln in {"auto", "all"}
 
     @property
     def needs_browser(self) -> bool:
@@ -191,7 +201,7 @@ class RunOptions:
             return self.budget
         if not self.is_juice_shop:
             return _ALL_MODE_BUDGET
-        return _ALL_MODE_BUDGET if self.vuln in _BUNDLE_DISCOVERY_VULNS else _DEFAULT_BUDGET
+        return _ALL_MODE_BUDGET if self.broad_scan else _DEFAULT_BUDGET
 
     def resolved_model(self) -> str:
         if not needs_llm(self.to_namespace()):
@@ -452,6 +462,14 @@ class RunSupervisor:
         if options.validation_review and options.profile != "llm":
             # CLI 와 같은 규칙이다.
             return "Validation review는 Analysis 프로필이 llm일 때만 쓸 수 있다."
+        if options.router == "agentic" and options.compare_routers:
+            return "Agentic Router는 현재 Router 쌍 비교와 함께 사용할 수 없다."
+        if (
+            options.is_juice_shop
+            and options.vuln == "auto"
+            and options.recon_entry != "base-url"
+        ):
+            return "자동 탐색은 Recon 시작 방식을 base-url로 선택해야 한다."
         if needs_llm(options.to_namespace()) and not options.resolved_model():
             return "LLM 구성을 골랐지만 모델을 정할 수 없다."
         if options.needs_access_accounts:
@@ -477,6 +495,8 @@ class RunSupervisor:
         if self.state.running:
             raise RuntimeError("이미 실행 중인 Run이 있다.")
         self.state.begin(options, engine_label=_engine_label(options))
+        if options.vuln in {"path_traversal", "all", "auto"}:
+            self.state.note("검증된 정상 요청 템플릿이 없어 POST Path Traversal 탐침은 차단됩니다.")
         self._current_agent = None
         self._usage = None
         self._app = None
@@ -538,6 +558,9 @@ class RunSupervisor:
         if options.needs_path_account:
             cleanup_database = _resolve_juice_shop_db(options.juice_shop_db or None)
 
+        plan = _preparation_plan(options, secrets)
+        namespace.approve_state_changing = bool(plan.approvals)
+
         try:
             router = build_run_router(
                 namespace,
@@ -551,7 +574,6 @@ class RunSupervisor:
             )
             return
 
-        plan = _preparation_plan(options, secrets)
         resolver = InMemoryCredentialResolver(plan.credentials)
         http_runtime = HttpExecutionRuntime(credential_resolver=resolver)
         # SPA 의 DOM sink 는 브라우저로만 관측된다. 필요할 때만 감싸 다른 유형의
@@ -597,6 +619,7 @@ class RunSupervisor:
             config=OrchestratorConfig(
                 browser_xss_validation=options.needs_browser,
                 budget_allocation_enabled=options.budget_allocation != "off",
+                max_evidence_rounds=2 if options.router == "agentic" else 1,
             ),
         )
         self._app = app
@@ -634,7 +657,10 @@ class RunSupervisor:
                     ("actor", _ACTOR_CREDENTIAL_REF),
                     ("owner", _OWNER_CREDENTIAL_REF),
                 )
-                if options.run_all:
+                if options.recon_entry == "base-url":
+                    target_url = base_url
+                    run_credential_ref = _ACTOR_CREDENTIAL_REF
+                elif options.run_all:
                     # 임의 ID 열거 대신 로그인으로 확인한 Actor basket 만 seed 로 준다.
                     recon_seed_urls = _all_mode_recon_seeds(
                         base_url,
@@ -668,8 +694,15 @@ class RunSupervisor:
                     agent_credentials += (("SSTI", _TEMP_SSTI_CREDENTIAL_REF),)
                 self.state.note("임시 계정 생성 및 보안 답변 등록 완료")
 
-            needs_discovery = (
-                options.vuln in _BUNDLE_DISCOVERY_VULNS if options.is_juice_shop else True
+            target_url, recon_seed_urls = _recon_entry_points(
+                base_url,
+                target_url,
+                recon_seed_urls,
+                mode=options.recon_entry,
+            )
+            needs_discovery = True if not options.is_juice_shop else (
+                options.recon_entry == "base-url"
+                or options.vuln in _BUNDLE_DISCOVERY_VULNS
             )
             register_standard_agents(
                 app,
@@ -680,9 +713,13 @@ class RunSupervisor:
                 recon_max_pages=_ALL_MODE_RECON_PAGES if needs_discovery else 1,
                 recon_surface_collection_mode=options.surface_collection,
                 recon_seed_urls=recon_seed_urls,
+                recon_infer_unlinked_render_parameters=(
+                    options.recon_entry == "targeted"
+                ),
                 actor_object_id=actor_object_id,
                 owner_object_id=owner_object_id,
                 validation_review=options.validation_review,
+                agentic_probe_enabled=options.router == "agentic",
             )
 
             try:
@@ -729,6 +766,16 @@ class RunSupervisor:
             _release(http_runtime, resolver, preparation_run_ids, run)
             self.state.note("세션 credential 메모리 참조 폐기 완료")
 
+        try:
+            completed_run = (
+                app.stores.runs.get(workflow_error.run_id)
+                if workflow_error is not None else run
+            )
+            if completed_run is not None:
+                append_run_result(namespace, app, completed_run)
+        except Exception as error:  # noqa: BLE001 - 기록 실패가 Run 결과를 뒤집지 않는다
+            self.state.note(f"실행 조건 기록 실패: {type(error).__name__}")
+
         self._refresh()
         if workflow_error is not None:
             detail = f"Run 실패: {workflow_error}"
@@ -751,7 +798,7 @@ class RunSupervisor:
     def _vulnerability_types(options: RunOptions):
         """Router 가 만들 Candidate 유형을 제한한다. 전체 모드는 제한하지 않는다."""
 
-        if not options.is_juice_shop or options.vuln == "all":
+        if not options.is_juice_shop or options.broad_scan:
             return None
         return (_VULN_TARGETS[options.vuln].label,)
 
@@ -857,12 +904,19 @@ def _preparation_plan(options: RunOptions, secrets: RunSecrets) -> _PreparationP
                 PATH_TRAVERSAL_POST_APPROVAL_REF,
                 SSTI_APPROVAL_REF,
             ),
-            recon_seed_urls=_all_mode_recon_seeds(base_url, include_ssti=True),
+            recon_seed_urls=(
+                ()
+                if options.recon_entry == "base-url"
+                else _all_mode_recon_seeds(base_url, include_ssti=True)
+            ),
             agent_credentials=(),
             principal_credentials=(),
             run_credential_ref=None,
             target_url=base_url,
         )
+
+    if options.vuln == "auto":
+        return _PreparationPlan({}, (), (), (), (), None, base_url)
 
     target = _VULN_TARGETS[options.vuln]
     if options.vuln == "access_control":
@@ -885,12 +939,20 @@ def _preparation_plan(options: RunOptions, secrets: RunSecrets) -> _PreparationP
             agent_credentials=(),
             principal_credentials=(),
             run_credential_ref=_CREDENTIAL_REF,
-            target_url=urljoin(base_url, target.seed_path or ""),
+            target_url=(
+                base_url
+                if options.recon_entry == "base-url"
+                else urljoin(base_url, target.seed_path or "")
+            ),
         )
     # sqli, xss — 인증도 정리도 필요 없다.
     return _PreparationPlan(
         {}, (), (), (), (), None,
-        base_url if target.seed_path is None else urljoin(base_url, target.seed_path),
+        (
+            base_url
+            if options.recon_entry == "base-url" or target.seed_path is None
+            else urljoin(base_url, target.seed_path)
+        ),
     )
 
 

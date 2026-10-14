@@ -47,6 +47,7 @@ from hacklipse.ports import (
 )
 from hacklipse.ports.errors import (
     AgentUnavailable,
+    ApprovalRequired,
     BudgetExceeded,
     DuplicateRecord,
     RecordNotFound,
@@ -438,9 +439,23 @@ class Orchestrator:
         return run.with_updates(candidate_ids=tuple(dict.fromkeys(candidate_ids)))
 
     def _select_extra_recon(self, run: Run) -> Surface | None:
-        """Accept only a known, unread GET surface; advice never authorizes execution."""
+        """Capability gap 중 안전한 미관측 GET만 한 번 Recon으로 되돌린다.
 
-        if self._orchestration_advisor is None:
+        Router는 요청을 실행하지 않는다. 이 메서드가 기존 Scope·Policy·예산 검사를
+        모두 통과한 Surface만 Recon 대상으로 정해 역할 경계를 유지한다.
+        """
+
+        capabilities = tuple(
+            getattr(self._router, "last_capability_assessments", ())
+        )
+        blocked_surface_ids = {
+            item.surface_id
+            for item in capabilities
+            if getattr(item, "status", None) == "blocked"
+            and "http_observation"
+            in getattr(item, "missing_requirements", ())
+        }
+        if self._orchestration_advisor is None and not blocked_surface_ids:
             return None
         if run.extra_recon_rounds >= self._config.max_extra_recon_rounds:
             return None
@@ -463,6 +478,8 @@ class Orchestrator:
         for surface in self._surfaces.list_by_run(run.run_id):
             if surface.surface_id not in run.surface_ids or surface.surface_id in visited:
                 continue
+            if blocked_surface_ids and surface.surface_id not in blocked_surface_ids:
+                continue
             parsed = urlsplit(surface.url)
             if (
                 surface.run_id != run.run_id
@@ -482,8 +499,14 @@ class Orchestrator:
             self._emit_orchestration_decision(run, "skipped", "no_options")
             return None
         # Bounded input also bounds prompt size and makes offered-set checks cheap.
-        options.sort(key=lambda item: (urlsplit(item.url).path, item.surface_id))
+        options.sort(key=_extra_recon_priority)
         options = options[:20]
+        if self._orchestration_advisor is None:
+            selected = options[0]
+            self._emit_orchestration_decision(
+                run, "capability", "recon", selected
+            )
+            return selected
         try:
             decision = self._orchestration_advisor.decide(run, tuple(options), remaining)
         except Exception:
@@ -990,6 +1013,24 @@ class Orchestrator:
 
         if isinstance(error, _CANDIDATE_FATAL_ERRORS):
             raise error
+        if isinstance(error, ApprovalRequired):
+            # 사용자가 실행 권한을 주지 않아 멈춘 것은 Agent/대상 실패가 아니다.
+            # 취약하지 않다는 판정도 아니므로 BLOCKED로 명확히 분리한다.
+            candidate = self._candidates.get(run.run_id, candidate_id)
+            self._candidates.save(
+                candidate.set_status(
+                    CandidateStatus.BLOCKED,
+                    reason="state-changing request approval required",
+                )
+            )
+            self._emit(
+                run,
+                ProgressEventKind.CANDIDATE_FAILED,
+                agent_type=candidate.assigned_agent,
+                candidate=candidate,
+                detail="ApprovalRequired",
+            )
+            return run
         if isinstance(error, BudgetExceeded):
             # 예산 부족은 대상의 문제도 Agent의 결함도 아니다. 실행하지 못한 것이다.
             return self._skip_candidate_for_budget(
@@ -1195,6 +1236,59 @@ def _path_only(url: str | None) -> str | None:
 _UNSAFE_RECON_PATH_PARTS = frozenset(
     {"create", "delete", "disable", "enable", "erase", "logout", "purchase", "remove", "reset", "transfer", "update", "upload"}
 )
+
+_RECON_DISCOVERY_PRIORITY = {
+    "browser_navigation": 0,
+    "html_form": 1,
+    "html_link": 2,
+    "script_literal": 3,
+    "seed": 4,
+    "discovered": 5,
+}
+_RECON_SEMANTIC_PATH_TOKENS = frozenset(
+    {
+        "account", "admin", "auth", "basket", "cart", "document", "download",
+        "file", "item", "order", "product", "profile", "report", "search",
+        "security", "session", "template", "user",
+    }
+)
+
+
+def _extra_recon_priority(surface: Surface) -> tuple[object, ...]:
+    """신뢰할 수 있는 발견 출처와 의미 있는 서버 경로를 먼저 관찰한다."""
+
+    path = urlsplit(surface.url).path or "/"
+    segments = tuple(part for part in path.split("/") if part)
+    discovery_rank = min(
+        (
+            _RECON_DISCOVERY_PRIORITY.get(value, 6)
+            for value in surface.discovery_types
+        ),
+        default=6,
+    )
+    tokens = {
+        token
+        for segment in segments
+        for token in re.split(
+            r"[^a-z0-9]+",
+            re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", segment).casefold(),
+        )
+        if token
+    }
+    return (
+        bool(re.fullmatch(r"/\d+", path)),
+        discovery_rank,
+        (
+            0
+            if segments
+            and segments[0].casefold() in {"api", "rest", "graphql"}
+            else 1
+        ),
+        0 if tokens & _RECON_SEMANTIC_PATH_TOKENS else 1,
+        -len(segments),
+        path,
+        surface.surface_id,
+    )
 
 
 def _unsafe_recon_path(path: str) -> bool:

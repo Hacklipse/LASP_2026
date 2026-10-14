@@ -161,7 +161,7 @@
       <div class="scan-meta mode"><span class="meta-label">Mode</span><select class="control-input" id="mode-select" aria-label="Run mode"></select></div>
       <div class="scan-meta tight" id="vuln-field" hidden><span class="meta-label">Vuln</span><select class="control-input" id="vuln-select" aria-label="Vulnerability type"></select></div>
       <div class="scan-meta wide"><span class="meta-label">Engine</span><select class="control-input" id="engine-select" aria-label="Analysis engine"></select></div>
-      <div class="scan-meta tight"><span class="meta-label">Budget</span><input class="control-input" id="budget-input" type="number" min="1" max="500" placeholder="auto" aria-label="Request budget"></div>
+      <div class="scan-meta tight"><span class="meta-label">Budget</span><input class="control-input" id="budget-input" type="number" min="1" max="500" placeholder="auto" title="기본: Juice Shop 단일 유형 20회, 범용·전체·자동 탐색 80회" aria-label="Request budget"></div>
       <div class="scan-meta tight"><span class="meta-label">Run ID</span><span class="meta-value" id="run-id">—</span></div>
       <div class="scan-meta tight"><span class="meta-label">Agent</span><span class="meta-value" id="current-agent">—</span></div>
       <div class="scan-actions"><button class="ghost-btn" id="setup-toggle" type="button" aria-expanded="false" aria-controls="setup-body">SETUP</button><button class="start-btn" id="start-btn" type="button">START SCAN</button></div>
@@ -179,6 +179,7 @@
       </div>
       <div class="setup-body" id="setup-body" hidden>
         <div class="field-grid" id="advanced-grid"></div>
+        <div class="field-grid"><label>Code version (benchmark)<input class="control-input" id="code-version-input" type="text" maxlength="80" autocomplete="off" placeholder="e.g. feat/capability-driven-routing"></label></div>
         <div class="field-grid" id="llm-grid" hidden></div>
         <div class="field-grid checks" id="boolean-grid"></div>
         <div id="credential-block" hidden>

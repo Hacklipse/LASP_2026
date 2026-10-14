@@ -6,23 +6,26 @@ from collections.abc import Callable, Sequence
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from hacklipse.application.errors import AgentContractError
+from hacklipse.application.errors import AgentContractError, LlmOutputContractError
 from hacklipse.domain import AgentResult, AgentResultStatus, Evidence, Surface, TaskEnvelope
 from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.ports import CandidateStore, EvidenceStore, LlmClient, SurfaceStore
 from hacklipse.ports.llm import LlmMessage, LlmRequest
 
 from .path_traversal_analysis import (
+    HIDDEN_BODY_CAPABILITY,
     PATH_TRAVERSAL_FORM_PROBE_PATH,
     PATH_TRAVERSAL_PROBE_PATH,
     PATH_TRAVERSAL_TOOL,
     bounded_render_parameters_from_evidence,
     build_path_traversal_requests,
     handle_path_traversal_bypass,
+    handle_hidden_body_parameter,
     is_restricted_file_surface,
     path_parameter_candidates,
     record_path_traversal_observations,
 )
+from .hidden_parameter_planner import HiddenParameterPlanner
 from .knowledge_prompt import (
     knowledge_system_prompt,
     render_knowledge_hints,
@@ -85,6 +88,24 @@ class LlmPathTraversalAnalyzer:
             allowed_methods=("GET", "POST"),
         )
         evidence = tuple(self._evidence.get_many(task.run_id, task.evidence_ids))
+        if candidate.routing_capability_id == HIDDEN_BODY_CAPABILITY:
+            return handle_hidden_body_parameter(
+                task=task,
+                candidate=candidate,
+                surface=surface,
+                evidence=evidence,
+                evidence_store=self._evidence,
+                planner=HiddenParameterPlanner(self._llm),
+                created_by=LLM_PATH_TRAVERSAL_ANALYZER,
+                id_factory=self._id_factory,
+            )
+        if surface.method.upper() == "POST":
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.COMPLETED,
+                candidate_ids=(candidate.candidate_id,),
+                message="post_request_template_unavailable",
+            )
         if is_restricted_file_surface(evidence, surface):
             # 선택할 파라미터가 없는 결정적 검증이므로 LLM 호출 없이 고정 접미사만 쓴다.
             return handle_path_traversal_bypass(
@@ -212,7 +233,7 @@ class LlmPathTraversalAnalyzer:
         )
         reason = response.payload.get("reason")
         if not isinstance(reason, str):
-            raise AgentContractError("llm path traversal plan reason must be a string")
+            raise LlmOutputContractError("llm path traversal plan reason must be a string")
         llm_selected = selected
         selected = tuple(dict.fromkeys((*recon_parameters, *llm_selected)))
         if recon_parameters:

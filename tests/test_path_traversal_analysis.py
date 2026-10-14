@@ -27,6 +27,7 @@ from hacklipse.bootstrap import (
 from hacklipse.domain import (
     AgentResultStatus,
     Candidate,
+    CandidateStatus,
     DomainInvariantError,
     Evidence,
     ExecutionRequest,
@@ -371,7 +372,7 @@ class _ServerRenderedFormRuntime:
 
 
 class ServerRenderedFormPathTraversalEndToEndTests(unittest.TestCase):
-    def test_recon_to_finding_without_a_product_specific_seed(self) -> None:
+    def test_post_form_without_valid_request_is_blocked(self) -> None:
         runtime = _ServerRenderedFormRuntime()
         app = build_local_application(
             {},
@@ -407,21 +408,17 @@ class ServerRenderedFormPathTraversalEndToEndTests(unittest.TestCase):
         ]
         self.assertEqual([item.observation["parameter"] for item in inferred], ["layout"])
         findings = app.stores.findings.list_by_run(run.run_id)
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].vulnerability_type, "Path Traversal")
+        self.assertEqual(len(findings), 0)
+        post_candidates = [item for item in app.stores.candidates.list_by_run(run.run_id)
+                           if item.surface_id == form.surface_id]
+        self.assertEqual(len(post_candidates), 1)
+        self.assertIs(post_candidates[0].status, CandidateStatus.BLOCKED)
         probes = [
             request
             for request in runtime.requests
             if request.method.upper() == "POST"
         ]
-        self.assertEqual(len(probes), 2)
-        self.assertTrue(
-            all(
-                PATH_TRAVERSAL_FORM_PROBE_PATH
-                in dict(parse_qsl(request.body or "")).values()
-                for request in probes
-            )
-        )
+        self.assertEqual(probes, [])
 
 
 if __name__ == "__main__":

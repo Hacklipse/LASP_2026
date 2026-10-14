@@ -39,7 +39,13 @@ from hacklipse.adapters import (
     SensitiveDataSanitizer,
     ValidationAgent,
 )
-from hacklipse.adapters.llm_router_advisor import AnalyzerChoice, LlmRouterAdvisor
+from hacklipse.adapters.llm_router_advisor import LlmRouterAdvisor
+from hacklipse.adapters.analyzer_capabilities import DEFAULT_ANALYZER_CAPABILITIES
+from hacklipse.adapters.agentic_probe import AgenticHttpProbeAgent
+from hacklipse.adapters.analysis_llm_fallback import (
+    BoundedAnalysisLlmClient,
+    FallbackAnalysisAgent,
+)
 from hacklipse.adapters.reporting import RunLlmUsageSource
 from hacklipse.adapters.reserved_budget import ReservedBudgetManager
 from hacklipse.adapters.reviewing_validation import build_llm_reviewing_validation_agent
@@ -51,6 +57,7 @@ from hacklipse.adapters.routing import (
 )
 from hacklipse.adapters.routing_audit import AuditedVulnerabilityRouter, RoutingAuditSink
 from hacklipse.adapters.paired_routing import PairedVulnerabilityRouter
+from hacklipse.adapters.llm_iterative_recon import LlmIterativeReconPlanner
 from hacklipse.adapters.llm_recon_planner import LlmReconPlanner, ReconPlanner
 from hacklipse.adapters.recon import DEFAULT_MAX_PAGES
 from hacklipse.application import (
@@ -66,6 +73,8 @@ from hacklipse.domain import TaskEnvelope
 from hacklipse.ports import (
     ProgressSink,
     Agent,
+    AnalyzerCapability,
+    AnalyzerCapabilityRegistry,
     BudgetManager,
     ApprovalGate,
     CandidateStore,
@@ -79,6 +88,7 @@ from hacklipse.ports import (
     RunStore,
     SurfaceStore,
     LlmClient,
+    IterativeReconPlanner,
     CredentialResolver,
     TaskStore,
     KnowledgeBase,
@@ -174,6 +184,7 @@ def build_local_application(
     evidence_sanitizer: EvidenceSanitizer | None = None,
     audit_log: ExecutionAuditLog | None = None,
     approval_gate: ApprovalGate | None = None,
+    default_approval_ref: str | None = None,
     agent_allowed_tools: Mapping[str, tuple[str, ...]] | None = None,
     task_progress_callback: Callable[[str, TaskEnvelope, int, float], None]
     | None = None,
@@ -215,6 +226,7 @@ def build_local_application(
         runtime=selected_runtime,
         evidence_sanitizer=selected_sanitizer,
         audit_log=selected_audit,
+        default_approval_ref=default_approval_ref,
     )
 
     for agent_type, agent in agents.items():
@@ -348,6 +360,9 @@ IMPLEMENTED_ANALYZERS = (
 def standard_router(
     vulnerability_types: Collection[str] | None = None,
     *,
+    analyzer_capabilities: Sequence[AnalyzerCapability]
+    | AnalyzerCapabilityRegistry
+    | None = None,
     mode: str = "heuristic",
     llm_client: LlmClient | None = None,
     audit_log: RoutingAuditSink | None = None,
@@ -367,21 +382,27 @@ def standard_router(
 
     if router_advisor:
         mode = "hybrid"
-    if mode not in {"heuristic", "hybrid"}:
-        raise ValueError("router mode must be heuristic or hybrid")
-    if (mode == "hybrid" or compare) and llm_client is None:
-        raise LlmCredentialsMissing("hybrid router requires an explicit LlmClient")
+    if mode not in {"heuristic", "hybrid", "agentic"}:
+        raise ValueError("router mode must be heuristic, hybrid, or agentic")
+    if mode == "agentic" and compare:
+        raise ValueError("paired router comparison does not yet support agentic mode")
+    if (mode in {"hybrid", "agentic"} or compare) and llm_client is None:
+        raise LlmCredentialsMissing(
+            f"{mode} router requires an explicit LlmClient"
+        )
     if review_policy not in {"weak", "ambiguous"}:
         raise ValueError("review policy must be weak or ambiguous")
     if compare:
         return PairedVulnerabilityRouter(
             primary=mode,
             heuristic=standard_router(
-                vulnerability_types, mode="heuristic", audit_log=audit_log,
+                vulnerability_types, analyzer_capabilities=analyzer_capabilities,
+                mode="heuristic", audit_log=audit_log,
                 audit_metadata=audit_metadata, review_policy=review_policy,
             ),
             hybrid=standard_router(
-                vulnerability_types, mode="hybrid", llm_client=llm_client,
+                vulnerability_types, analyzer_capabilities=analyzer_capabilities,
+                mode="hybrid", llm_client=llm_client,
                 audit_log=audit_log, audit_metadata=audit_metadata, review_policy=review_policy,
             ),
         )
@@ -400,16 +421,35 @@ def standard_router(
         if rule.agent_type in IMPLEMENTED_ANALYZERS
         and (selected_types is None or rule.vulnerability_type in selected_types)
     )
+    registered_capabilities = (
+        analyzer_capabilities.snapshot()
+        if isinstance(analyzer_capabilities, AnalyzerCapabilityRegistry)
+        else tuple(analyzer_capabilities)
+        if analyzer_capabilities is not None
+        else DEFAULT_ANALYZER_CAPABILITIES
+    )
+    capabilities = tuple(
+        capability
+        for capability in registered_capabilities
+        if (
+            selected_types is None
+            or capability.vulnerability_type in selected_types
+        )
+    )
     router: VulnerabilityRouter = RuleBasedVulnerabilityRouter(
         rules=rules,
         surface_rules=surface_rules,
+        capabilities=capabilities,
         advisor=_build_router_advisor(
             rules=rules,
             surface_rules=surface_rules,
+            capabilities=capabilities,
             llm_client=llm_client,
-            requested=mode == "hybrid",
+            requested=mode in {"hybrid", "agentic"},
+            hypothesis_mode=mode == "agentic",
         ),
         review_policy=review_policy,
+        advisor_mode="primary" if mode == "agentic" else "supplemental",
     )
     if audit_log is not None:
         router = AuditedVulnerabilityRouter(
@@ -469,8 +509,10 @@ def _build_router_advisor(
     *,
     rules: Sequence[RoutingRule],
     surface_rules: Sequence[SurfaceRoutingRule],
+    capabilities: Sequence[AnalyzerCapability],
     llm_client: LlmClient | None,
     requested: bool,
+    hypothesis_mode: bool = False,
 ) -> LlmRouterAdvisor | None:
     """Advisor를 요청받았을 때만 만들고, 만들 수 없으면 조용히 넘어가지 않는다.
 
@@ -489,37 +531,30 @@ def _build_router_advisor(
             "router advisor was requested without an LlmClient; "
             "pass one or drop the router advisor option"
         )
-    # 제안 가능 범위를 이미 필터링된 규칙에서 그대로 도출한다. 별도 목록을 두면
-    # --vuln 필터와 IMPLEMENTED_ANALYZERS 필터를 두 번 관리하게 되고, 어긋나는 순간
-    # Dispatcher가 AgentUnavailable로 Run을 죽인다.
-    analyzers = tuple(
-        dict.fromkeys(
-            AnalyzerChoice(
-                vulnerability_type=rule.vulnerability_type,
-                agent_type=rule.agent_type,
-                client_route=getattr(rule, "client_route", False),
-            )
-            for rule in (*rules, *surface_rules)
-        )
-    )
-    if not analyzers:
+    if not capabilities:
         # --vuln 필터가 모든 규칙을 걷어낸 경우다. 제안할 유형이 없으므로 Advisor를
         # 만들지 않는다. 이것은 구성 오류가 아니라 선택의 결과다.
         return None
-    return LlmRouterAdvisor(llm_client=llm_client, analyzers=analyzers)
+    return LlmRouterAdvisor(
+        llm_client=llm_client,
+        capabilities=capabilities,
+        hypothesis_mode=hypothesis_mode,
+    )
 
 
 def register_standard_agents(
     app: LocalApplication,
     *,
     llm_client: LlmClient | None = None,
-    recon_planner: ReconPlanner | None = None,
+    recon_planner: ReconPlanner | IterativeReconPlanner | None = None,
     recon_max_pages: int = DEFAULT_MAX_PAGES,
     recon_surface_collection_mode: str = "adaptive",
     recon_seed_urls: tuple[str, ...] = (),
+    recon_infer_unlinked_render_parameters: bool = True,
     actor_object_id: str | None = None,
     owner_object_id: str | None = None,
     validation_review: bool = False,
+    agentic_probe_enabled: bool = False,
 ) -> str:
     """Recon/Analysis/Validation을 표준 배선으로 등록하고 구성 이름을 돌려준다.
 
@@ -542,7 +577,17 @@ def register_standard_agents(
             max_pages=recon_max_pages,
             surface_collection_mode=recon_surface_collection_mode,
             seed_urls=recon_seed_urls,
-            planner=recon_planner,
+            infer_unlinked_render_parameters=recon_infer_unlinked_render_parameters,
+            planner=(
+                None
+                if callable(getattr(recon_planner, "decide", None))
+                else recon_planner
+            ),
+            iterative_planner=(
+                recon_planner
+                if callable(getattr(recon_planner, "decide", None))
+                else None
+            ),
         ),
         allowed_tools=("http_get",),
     )
@@ -581,26 +626,27 @@ def register_standard_agents(
         )
         profile = "heuristic"
     else:
+        analysis_llm_client = BoundedAnalysisLlmClient(llm_client)
         xss_analyzer = LlmXssAnalyzer(
-            llm_client=llm_client,
+            llm_client=analysis_llm_client,
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
         sqli_analyzer = LlmSqliAnalyzer(
-            llm_client=llm_client,
+            llm_client=analysis_llm_client,
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
         path_traversal_analyzer = LlmPathTraversalAnalyzer(
-            llm_client=llm_client,
+            llm_client=analysis_llm_client,
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
         access_control_analyzer = LlmAccessControlAnalyzer(
-            llm_client=llm_client,
+            llm_client=analysis_llm_client,
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
@@ -608,18 +654,89 @@ def register_standard_agents(
             owner_object_id=owner_object_id,
         )
         ssti_analyzer = LlmSstiAnalyzer(
-            llm_client=llm_client,
+            llm_client=analysis_llm_client,
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
         browser_xss_analyzer = LlmBrowserXssAnalyzer(
-            llm_client=llm_client,
+            llm_client=analysis_llm_client,
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
+        xss_analyzer = FallbackAnalysisAgent(
+            xss_analyzer,
+            HeuristicXssAnalyzer(
+                candidate_store=app.stores.candidates,
+                surface_store=app.stores.surfaces,
+                evidence_store=app.stores.evidence,
+            ),
+            app.stores.evidence,
+        )
+        sqli_analyzer = FallbackAnalysisAgent(
+            sqli_analyzer,
+            HeuristicSqliAnalyzer(
+                candidate_store=app.stores.candidates,
+                surface_store=app.stores.surfaces,
+                evidence_store=app.stores.evidence,
+            ),
+            app.stores.evidence,
+        )
+        path_traversal_analyzer = FallbackAnalysisAgent(
+            path_traversal_analyzer,
+            HeuristicPathTraversalAnalyzer(
+                candidate_store=app.stores.candidates,
+                surface_store=app.stores.surfaces,
+                evidence_store=app.stores.evidence,
+            ),
+            app.stores.evidence,
+        )
+        access_control_analyzer = FallbackAnalysisAgent(
+            access_control_analyzer,
+            HeuristicAccessControlAnalyzer(
+                candidate_store=app.stores.candidates,
+                surface_store=app.stores.surfaces,
+                evidence_store=app.stores.evidence,
+                actor_object_id=actor_object_id,
+                owner_object_id=owner_object_id,
+            ),
+            app.stores.evidence,
+        )
+        ssti_analyzer = FallbackAnalysisAgent(
+            ssti_analyzer,
+            HeuristicSstiAnalyzer(
+                candidate_store=app.stores.candidates,
+                surface_store=app.stores.surfaces,
+                evidence_store=app.stores.evidence,
+            ),
+            app.stores.evidence,
+        )
+        browser_xss_analyzer = FallbackAnalysisAgent(
+            browser_xss_analyzer,
+            BrowserXssAnalyzer(
+                candidate_store=app.stores.candidates,
+                surface_store=app.stores.surfaces,
+                evidence_store=app.stores.evidence,
+            ),
+            app.stores.evidence,
+        )
         profile = "llm"
+    if agentic_probe_enabled:
+        xss_analyzer = AgenticHttpProbeAgent(
+            analyzer=xss_analyzer,
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+            llm_client=analysis_llm_client if llm_client is not None else None,
+        )
+        sqli_analyzer = AgenticHttpProbeAgent(
+            analyzer=sqli_analyzer,
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+            llm_client=analysis_llm_client if llm_client is not None else None,
+        )
     app.dispatcher.register(
         "xss_analyzer", xss_analyzer, allowed_tools=("http_get",)
     )
@@ -681,12 +798,14 @@ def register_standard_agents(
 
 def standard_recon_planner(
     *, mode: str = "heuristic", llm_client: LlmClient | None = None,
-) -> ReconPlanner | None:
+) -> ReconPlanner | IterativeReconPlanner | None:
     """Analysis/Router 프로필과 독립적으로 Recon 판단 모듈을 선택한다."""
     if mode == "heuristic":
         return None
-    if mode != "hybrid":
-        raise ValueError("recon mode must be heuristic or hybrid")
+    if mode not in {"hybrid", "agentic"}:
+        raise ValueError("recon mode must be heuristic, hybrid, or agentic")
     if llm_client is None:
-        raise LlmCredentialsMissing("hybrid recon requires an explicit LlmClient")
+        raise LlmCredentialsMissing(f"{mode} recon requires an explicit LlmClient")
+    if mode == "agentic":
+        return LlmIterativeReconPlanner(llm_client=llm_client)
     return LlmReconPlanner(llm_client=llm_client)

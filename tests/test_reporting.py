@@ -152,10 +152,12 @@ class ReportingTests(unittest.TestCase):
         )
         self.assertIn("## 실행 조건", content)
         for line in (
-            "- Analysis: `llm`", "- Recon: `hybrid` · Surface 수집 `adaptive`",
+            "- Analysis: `llm`",
+            "- Recon: `hybrid` · 시작 `targeted` · Surface 수집 `adaptive`",
             "- Router: `hybrid` · review `ambiguous`",
             "- Orchestrator: `hybrid` · 예산 배분 `heuristic`",
             "- Validation: `llm`", "- Report: `llm`",
+            "- 상태 변경 가능 요청: 차단",
             "- LLM: `gemini` / `gemini-3.5-flash-lite`",
             "- LLM 분당 호출 제한: 14",
         ):

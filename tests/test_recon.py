@@ -337,9 +337,15 @@ _PAGE_TWO = """
 class _RoutingCollector:
     """URL별로 다른 응답을 돌려주는 대역. 크롤링 동작 검증에 쓴다."""
 
-    def __init__(self, evidence_store, bodies: dict[str, str]) -> None:
+    def __init__(
+        self,
+        evidence_store,
+        bodies: dict[str, str],
+        content_types: dict[str, str] | None = None,
+    ) -> None:
         self._evidence = evidence_store
         self._bodies = bodies
+        self._content_types = content_types or {}
         self.calls: list[str] = []
         self.credential_refs: list[str | None] = []
 
@@ -368,6 +374,11 @@ class _RoutingCollector:
                     "type": "http_response",
                     "status": 200,
                     "body": self._bodies.get(target_url, "<html></html>"),
+                    **(
+                        {"content_type": self._content_types[target_url]}
+                        if target_url in self._content_types
+                        else {}
+                    ),
                 },
             )
         )
@@ -377,7 +388,8 @@ class _RoutingCollector:
 def _crawling_agent(bodies: dict[str, str], **kwargs):
     evidence_store = InMemoryEvidenceStore()
     surface_store = InMemorySurfaceStore()
-    collector = _RoutingCollector(evidence_store, bodies)
+    content_types = kwargs.pop("content_types", None)
+    collector = _RoutingCollector(evidence_store, bodies, content_types)
     counter = iter(range(10_000))
     agent = ReconAgent(
         collector=collector,
@@ -390,6 +402,32 @@ def _crawling_agent(bodies: dict[str, str], **kwargs):
 
 
 class ReconCrawlTests(unittest.TestCase):
+    def test_does_not_parse_html_looking_strings_inside_json_as_surfaces(self) -> None:
+        api_url = "http://localhost/api/items"
+        agent, collector, surfaces = _crawling_agent(
+            {
+                "http://localhost/": '<a href="/api/items">items</a>',
+                api_url: (
+                    '{"description":"<a href=\\"/not-a-page\\">x</a>'
+                    '<form action=\\"/not-a-form\\" method=\\"post\\">"}'
+                ),
+            },
+            content_types={
+                "http://localhost/": "text/html; charset=utf-8",
+                api_url: "application/json; charset=utf-8",
+            },
+            max_pages=3,
+        )
+
+        agent.handle(
+            replace(_task("run-json-data", "http://localhost/"), request_budget=10)
+        )
+
+        self.assertIn(api_url, collector.calls)
+        urls = {item.url for item in surfaces.list_by_run("run-json-data")}
+        self.assertNotIn("http://localhost/not-a-page", urls)
+        self.assertNotIn("http://localhost/not-a-form", urls)
+
     def test_fetches_an_authenticated_additional_seed_with_the_recon_credential(
         self,
     ) -> None:
@@ -476,6 +514,36 @@ class ReconCrawlTests(unittest.TestCase):
         # 외부 URL의 경로 조각이 표면으로 새어 들어오면 안 된다.
         self.assertTrue(all("twitter.com" not in url for url in found))
 
+    def test_ignores_numeric_character_counters_but_keeps_real_numeric_routes(self) -> None:
+        bundle = (
+            "render(`${value.length || 0}/160`);"
+            "const objectRoute = '/users/10';"
+            "const numericQueryEndpoint = '/10?q=';"
+            "location.assign('/20');"
+        )
+        agent, _, surfaces = _crawling_agent(
+            {"http://localhost/": _SPA_HTML, "http://localhost/main.js": bundle}
+        )
+
+        agent.handle(_task("run-numeric-js", "http://localhost/"))
+
+        found = {
+            surface.url: surface
+            for surface in surfaces.list_by_run("run-numeric-js")
+        }
+        self.assertNotIn("http://localhost/160", found)
+        self.assertIn("http://localhost/users/10", found)
+        self.assertEqual(found["http://localhost/10"].parameters, ("q",))
+        self.assertIn("http://localhost/20", found)
+        self.assertEqual(
+            found["http://localhost/users/10"].discovery_types,
+            ("script_literal",),
+        )
+        self.assertEqual(
+            found["http://localhost/20"].discovery_types,
+            ("browser_navigation",),
+        )
+
     def test_discovers_a_spa_route_navigated_with_backtick_quotes(self) -> None:
         """실제 Juice Shop 빌드는 navigate 배열 리터럴을 백틱으로 내보낸다.
 
@@ -544,6 +612,39 @@ class ReconCrawlTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_answer_blind_recon_does_not_inject_unobserved_layout_parameter(self) -> None:
+        agent, collector, surfaces = _crawling_agent(
+            {
+                "http://localhost/": _SPA_HTML,
+                "http://localhost/main.js": _DOCUMENT_NAVIGATION_BUNDLE,
+                "http://localhost/account/export": _SERVER_RENDERED_FORM,
+            },
+            max_pages=4,
+            infer_unlinked_render_parameters=False,
+        )
+
+        agent.handle(
+            replace(
+                _task("run-answer-blind", "http://localhost/"),
+                request_budget=10,
+            )
+        )
+
+        form = next(
+            surface
+            for surface in surfaces.list_by_run("run-answer-blind")
+            if surface.url == "http://localhost/account/export"
+            and surface.method == "POST"
+        )
+        inferred = [
+            item
+            for item in collector._evidence.list_by_run("run-answer-blind")
+            if item.surface_id == form.surface_id
+            and item.observation.get("type")
+            == "unlinked_render_parameter_candidate"
+        ]
+        self.assertEqual(inferred, [])
 
     def test_leaves_request_budget_for_later_phases(self) -> None:
         chain = {

@@ -347,6 +347,27 @@ class CandidateFailureIsolationTests(unittest.TestCase):
         self.assertEqual(by_type["SQLi"].status, "rejected")
         self.assertIsNone(by_type["SQLi"].last_error)
 
+    def test_missing_state_change_approval_blocks_only_its_candidate(self) -> None:
+        from hacklipse.ports.errors import ApprovalRequired
+
+        app = _application(
+            _RaisingAnalyzer(ApprovalRequired("untrusted response detail"))
+        )
+
+        run = _start(app)
+
+        by_type = {
+            item.vulnerability_type: item
+            for item in app.stores.candidates.list_by_run(run.run_id)
+        }
+        self.assertEqual(by_type["XSS"].status, "blocked")
+        self.assertEqual(
+            by_type["XSS"].last_error,
+            "state-changing request approval required",
+        )
+        self.assertNotIn("untrusted", by_type["XSS"].last_error or "")
+        self.assertEqual(by_type["SQLi"].status, "rejected")
+
     def test_contract_violation_still_fails_the_whole_run(self) -> None:
         """Agent가 계약을 어긴 것은 대상 실패가 아니다. 나머지 결과도 신뢰할 수 없다."""
 
@@ -902,6 +923,75 @@ class _FixtureRuntime:
             evidence_type="http_response",
             observation={"type": "http_response", "status": 200},
         )
+
+
+class ExplicitStateChangeApprovalTests(unittest.TestCase):
+    def test_default_run_approval_allows_state_changing_surface(self) -> None:
+        from hacklipse.adapters import StaticApprovalGate
+        from hacklipse.bootstrap import build_local_application
+        from hacklipse.domain import EvidenceRequest, HttpRequestSpec
+
+        approval_ref = "approved-local-state-change"
+        runtime = _FixtureRuntime()
+        app = build_local_application(
+            {},
+            runtime=runtime,
+            approval_gate=StaticApprovalGate((approval_ref,)),
+            default_approval_ref=approval_ref,
+        )
+        run = _run()
+        app.stores.runs.add(run)
+        app.budget_manager.open_run(run.run_id, run.request_budget)
+
+        app.collector.collect(
+            run.run_id,
+            "http://127.0.0.1:3000/rest/user/change-password",
+            EvidenceRequest(
+                evidence_type="http_response",
+                surface_id="surface-change-password",
+                reason="explicitly approved probe",
+                suggested_tool="http_get",
+                http_request=HttpRequestSpec(method="GET"),
+            ),
+            task_id="task-approved",
+        )
+
+        self.assertEqual(len(runtime.requests), 1)
+        self.assertEqual(runtime.requests[0].approval_ref, approval_ref)
+
+    def test_explicit_request_approval_is_not_replaced_by_run_default(self) -> None:
+        from hacklipse.adapters import StaticApprovalGate
+        from hacklipse.bootstrap import build_local_application
+        from hacklipse.domain import EvidenceRequest, HttpRequestSpec
+        from hacklipse.ports.errors import ApprovalRequired
+
+        runtime = _FixtureRuntime()
+        app = build_local_application(
+            {},
+            runtime=runtime,
+            approval_gate=StaticApprovalGate(("approved-run-default",)),
+            default_approval_ref="approved-run-default",
+        )
+        run = _run()
+        app.stores.runs.add(run)
+        app.budget_manager.open_run(run.run_id, run.request_budget)
+
+        with self.assertRaises(ApprovalRequired):
+            app.collector.collect(
+                run.run_id,
+                "http://127.0.0.1:3000/rest/user/change-password",
+                EvidenceRequest(
+                    evidence_type="http_response",
+                    surface_id="surface-change-password",
+                    reason="narrow approval must win",
+                    suggested_tool="http_get",
+                    http_request=HttpRequestSpec(method="GET"),
+                ),
+                task_id="task-not-approved",
+                approval_ref="different-narrow-approval",
+            )
+
+        self.assertEqual(runtime.requests, [])
 
 
 class _EvidenceSeekingAnalyzer:

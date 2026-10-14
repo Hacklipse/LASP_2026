@@ -47,6 +47,23 @@ class _Runtime:
         )
 
 
+class _PriorityRuntime(_Runtime):
+    def execute(self, request):
+        path = urlsplit(request.resolved_url).path
+        self.paths.append(path)
+        body = (
+            '<a href="/10">counter-like</a>'
+            '<a href="/api/catalog">catalog</a>'
+            if path == "/"
+            else "<html>observed</html>"
+        )
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            evidence_type="http_response",
+            observation={"type": "http_response", "status": 200, "body": body},
+        )
+
+
 class _Router:
     def route(self, run, surfaces, evidence):
         visited = {
@@ -70,6 +87,32 @@ class _Router:
             for surface in surfaces
             if surface.surface_id in visited
         )
+
+
+class _CapabilityRouter(_Router):
+    """미관측 Surface를 capability gap으로 노출하는 Router 대역."""
+
+    def __init__(self) -> None:
+        self.last_capability_assessments = ()
+
+    def route(self, run, surfaces, evidence):
+        visited = {
+            item.surface_id
+            for item in evidence
+            if item.created_by == "execution_runtime:http_get"
+        }
+        self.last_capability_assessments = tuple(
+            SimpleNamespace(
+                surface_id=surface.surface_id,
+                status="blocked",
+                missing_requirements=(
+                    "http_observation", "supported_input_coordinate"
+                ),
+            )
+            for surface in surfaces
+            if surface.surface_id not in visited and not surface.parameters
+        )
+        return super().route(run, surfaces, evidence)
 
 
 class _Analyzer:
@@ -117,11 +160,11 @@ class _Model:
         )
 
 
-def _application(*, advisor=None, runtime=None, stores=None, budget=None):
+def _application(*, advisor=None, runtime=None, stores=None, budget=None, router=None):
     runtime = runtime or _Runtime()
     app = build_local_application(
         {"xss_analyzer": _Analyzer(), "validation": _Validator()},
-        router=_Router(),
+        router=router or _Router(),
         runtime=runtime,
         stores=stores,
         budget_manager=budget,
@@ -170,6 +213,7 @@ class LlmOrchestrationTests(unittest.TestCase):
         self.assertEqual(run.extra_recon_rounds, 1)
         self.assertIsNone(run.recon_target_surface_id)
         self.assertEqual(len(model.requests), 1)
+        self.assertEqual(model.requests[0].timeout_seconds, 60)
         self.assertEqual(len(run.candidate_ids), 2)
         self.assertEqual(len(app.stores.candidates.list_by_run(run.run_id)), 2)
         self.assertEqual(len(app.stores.reports.list_by_run(run.run_id)), 1)
@@ -258,6 +302,40 @@ class LlmOrchestrationTests(unittest.TestCase):
         )
         self.assertIs(run.phase, RunPhase.DONE)
         self.assertEqual(runtime.paths, ["/"])
+
+    def test_capability_gap_triggers_bounded_recon_without_llm_advisor(self):
+        app, runtime = _application(router=_CapabilityRouter())
+        run = app.orchestrator.start(
+            RunRequest(
+                target_url="http://localhost/",
+                scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+                request_budget=10,
+            )
+        )
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(runtime.paths, ["/", "/deep"])
+        self.assertEqual(run.extra_recon_rounds, 1)
+        decisions = [
+            event for event in app.progress_log.list_by_run(run.run_id)
+            if event.kind is ProgressEventKind.ORCHESTRATION_DECIDED
+        ]
+        self.assertEqual([item.detail for item in decisions], ["capability:recon"])
+
+    def test_capability_recon_prefers_semantic_path_over_bare_numeric_path(self):
+        runtime = _PriorityRuntime()
+        app, _ = _application(runtime=runtime, router=_CapabilityRouter())
+
+        run = app.orchestrator.start(
+            RunRequest(
+                target_url="http://localhost/",
+                scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+                request_budget=10,
+            )
+        )
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(runtime.paths, ["/", "/api/catalog"])
 
     def test_sqlite_resume_uses_saved_target_without_asking_again(self):
         with tempfile.TemporaryDirectory() as directory:

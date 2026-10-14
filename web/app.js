@@ -531,6 +531,7 @@ async function start() {
       vuln: $('vuln-select').value,
       engine: $('engine-select').value,
       budget: Number($('budget-input').value) || 0,
+      code_version: $('code-version-input').value.trim(),
       access_accounts: {},
     };
     for (const select of document.querySelectorAll('#advanced-grid select')) {

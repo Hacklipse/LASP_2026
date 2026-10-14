@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
-from hacklipse.application.errors import AgentContractError
+from hacklipse.application.errors import AgentContractError, LlmOutputContractError
 from hacklipse.domain import (
     Candidate,
     Evidence,
@@ -111,19 +111,19 @@ def validate_probe_selection(
     control 한 건이 항상 필요하므로 선택 가능한 probe 수는 남은 예산보다 하나 적다.
     브라우저 DOM 반사처럼 control 요청이 없는 흐름은 ``control_requests=0``을 넘긴다 —
     값이 DOM 에 있는지 없는지가 그 자체로 차이라 비교 대상 요청이 필요 없다.
-    존재하지 않는 파라미터는 조용히 버리지 않고 Agent 계약 위반으로 처리한다.
+    존재하지 않는 파라미터는 조용히 버리지 않고 복구 가능한 LLM 출력 오류로 처리한다.
     """
 
     if not isinstance(raw, list):
-        raise AgentContractError(f"{analyzer_name} plan did not return a parameter list")
+        raise LlmOutputContractError(f"{analyzer_name} plan did not return a parameter list")
     selected: list[str] = []
     for name in raw:
         if not isinstance(name, str):
-            raise AgentContractError(
+            raise LlmOutputContractError(
                 f"{analyzer_name} plan returned a non-string parameter"
             )
         if name not in offered:
-            raise AgentContractError(
+            raise LlmOutputContractError(
                 f"{analyzer_name} plan named a parameter that is not on the surface: "
                 f"{name}"
             )

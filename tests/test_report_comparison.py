@@ -51,10 +51,13 @@ def run_result(run_id, mode, *, facts_hash, comparable=_UNSET, findings=2, narra
     profile = {
         "execution_profile_recorded": True,
         "analysis_profile": "heuristic", "recon_mode": "heuristic",
-        "surface_collection_mode": "deterministic", "router_mode": "heuristic",
+        "recon_entry_mode": "targeted", "surface_collection_mode": "deterministic",
+        "router_mode": "heuristic",
         "router_review": "weak", "compare_routers": False,
         "orchestrator_mode": "heuristic", "budget_allocation_mode": "off",
-        "validation_mode": "heuristic", "request_budget": 100,
+        "validation_mode": "heuristic", "state_changing_approved": False,
+        "request_budget": 100,
+        "code_version": "test-version",
         "llm_provider": "gemini" if mode == "llm" else "",
         "llm_model": "gemini-3.5-flash-lite" if mode == "llm" else "",
         "llm_rpm_limit": 14 if mode == "llm" else None,
@@ -295,6 +298,7 @@ class LogsTests(unittest.TestCase):
         for changed in (
             {"analysis_profile": "llm"},
             {"recon_mode": "hybrid"},
+            {"recon_entry_mode": "base-url"},
             {"surface_collection_mode": "adaptive"},
             {"router_mode": "hybrid"},
             {"router_review": "ambiguous"},
@@ -303,6 +307,7 @@ class LogsTests(unittest.TestCase):
             {"budget_allocation_mode": "heuristic"},
             {"validation_mode": "llm"},
             {"request_budget": 200},
+            {"code_version": "different-version"},
         ):
             with self.subTest(changed=changed), self.assertRaises(ValueError):
                 self.logs([
@@ -311,7 +316,10 @@ class LogsTests(unittest.TestCase):
                 ])
 
     def test_unrecorded_or_incomplete_conditions_are_refused(self):
-        for changed in ({"execution_profile_recorded": False}, {"phase": "failed"}):
+        for changed in (
+            {"execution_profile_recorded": False}, {"phase": "failed"},
+            {"code_version": ""},
+        ):
             with self.subTest(changed=changed), self.assertRaises(ValueError):
                 self.logs([
                     run_result("run-off", "heuristic", facts_hash="a" * 64),
@@ -319,6 +327,10 @@ class LogsTests(unittest.TestCase):
                 ])
         old = run_result("run-off", "heuristic", facts_hash="a" * 64)
         del old["router_mode"]
+        with self.assertRaises(ValueError):
+            self.logs([old, run_result("run-on", "llm", facts_hash="a" * 64)])
+        old = run_result("run-off", "heuristic", facts_hash="a" * 64)
+        del old["code_version"]
         with self.assertRaises(ValueError):
             self.logs([old, run_result("run-on", "llm", facts_hash="a" * 64)])
 

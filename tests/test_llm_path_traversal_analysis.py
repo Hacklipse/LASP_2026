@@ -481,47 +481,17 @@ class LlmPathTraversalAnalyzerTests(unittest.TestCase):
             signal.observation["bypass"], PATH_TRAVERSAL_BYPASS_OBSERVATION
         )
 
-    def test_llm_can_select_bounded_unlinked_post_form_parameter(self) -> None:
+    def test_post_form_without_valid_request_does_not_call_llm_or_probe(self) -> None:
         agent, app, llm, runtime, task = _post_form_fixture()
 
-        requested = agent.handle(task)
-        result = agent.handle(_collect(requested, app, task))
+        result = agent.handle(task)
 
         self.assertIs(result.status, AgentResultStatus.COMPLETED)
-        self.assertEqual(len(llm.requests), 1)
-        self.assertIn("layout", llm.requests[0].messages[0].content)
-        self.assertEqual(
-            [request.method.upper() for request in runtime.requests],
-            ["GET", "POST"],
-        )
-        signal = next(
-            item
-            for item in app.stores.evidence.list_by_run(_RUN_ID)
-            if item.observation.get("type") == PATH_TRAVERSAL_OBSERVATION
-        )
-        self.assertEqual(signal.observation["parameter"], "layout")
-        self.assertEqual(signal.observation["selection_source"], "llm")
+        self.assertEqual(result.evidence_requests, ())
+        self.assertEqual(result.message, "post_request_template_unavailable")
+        self.assertEqual(llm.requests, [])
+        self.assertEqual(runtime.requests, [])
 
-    def test_empty_llm_response_cannot_drop_bounded_layout_recon_signal(self) -> None:
-        agent, app, llm, runtime, task = _post_form_fixture()
-        llm.payload = {"parameters": [], "reason": "looks presentation-only"}
-
-        requested = agent.handle(task)
-        result = agent.handle(_collect(requested, app, task))
-
-        self.assertIs(result.status, AgentResultStatus.COMPLETED)
-        self.assertIn(
-            "Current-run structured Recon signals (the caller will retain these): layout",
-            llm.requests[0].messages[0].content,
-        )
-        self.assertEqual(len(runtime.requests), 2)
-        signal = next(
-            item
-            for item in app.stores.evidence.list_by_run(_RUN_ID)
-            if item.observation.get("type") == PATH_TRAVERSAL_OBSERVATION
-        )
-        self.assertEqual(signal.observation["parameter"], "layout")
-        self.assertEqual(signal.observation["selection_source"], "recon")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 
 _STATE_CHANGE_TOKENS = frozenset(
@@ -22,6 +23,9 @@ _STATE_CHANGE_TOKENS = frozenset(
         "update",
         "upload",
     }
+)
+_ACTION_PARAMETER_NAMES = frozenset(
+    {"action", "button", "cmd", "command", "mode", "op", "operation", "submit", "task"}
 )
 
 
@@ -43,6 +47,26 @@ def has_state_changing_parameters(parameters: Sequence[str]) -> bool:
         if tokens & _STATE_CHANGE_TOKENS:
             return True
     return False
+
+
+def has_state_changing_get(url: str, parameters: Sequence[str] = ()) -> bool:
+    """GET의 경로·기존/추가 query를 함께 검사한다.
+
+    검색어에 'delete'가 등장한 것만으로는 차단하지 않지만, action=delete처럼
+    동작 선택 필드의 값이 상태 변경을 지시하면 승인 없는 자동 실행을 막는다.
+    """
+
+    parsed = urlsplit(url)
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    if has_state_changing_parameters((
+        unquote(unquote(parsed.path)), *(name for name, _ in query), *parameters
+    )):
+        return True
+    return any(
+        name.casefold() in _ACTION_PARAMETER_NAMES
+        and has_state_changing_parameters((unquote(value),))
+        for name, value in query
+    )
 
 
 # 객체 식별자로 볼 수 있는 파라미터 이름. Access Control은 "다른 사람의 객체를 가리키는

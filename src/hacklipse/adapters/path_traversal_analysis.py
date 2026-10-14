@@ -8,7 +8,7 @@ control에는 없고 probe에만 나타나는지 비교한다. Agent는 요청�
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from urllib.parse import parse_qsl, urlencode, urlsplit
+from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
 from hacklipse.application.errors import AgentContractError
@@ -40,6 +40,7 @@ from .probing import (
     response_body,
 )
 from .request_safety import has_state_changing_parameters
+from .hidden_parameter_planner import HiddenParameterPlanner
 
 PATH_TRAVERSAL_TOOL = "path_traversal_probe"
 HEURISTIC_PATH_TRAVERSAL_ANALYZER = "heuristic_path_traversal_analyzer"
@@ -57,6 +58,9 @@ RESTRICTED_FILE_OBSERVATION = "restricted_file_path"
 UNLINKED_RENDER_PARAMETER_OBSERVATION = "unlinked_render_parameter_candidate"
 PATH_TRAVERSAL_POST_APPROVAL_REF = "approved-path-traversal-form-probe"
 _INFERRED_PARAMETER_SOURCE = "bounded_unlinked_render_parameter"
+HIDDEN_BODY_CAPABILITY = "path_traversal.hidden_body_parameter"
+HIDDEN_PLAN_OBSERVATION = "hidden_body_parameter_plan"
+_HIDDEN_BENIGN_PATH = "package.json"
 
 
 def validate_path_traversal_request(request: ExecutionRequest) -> None:
@@ -66,17 +70,27 @@ def validate_path_traversal_request(request: ExecutionRequest) -> None:
         raise ValueError("path traversal request must use its dedicated tool")
     method = request.method.upper()
     if method == "POST":
+        if request.approval_ref != PATH_TRAVERSAL_POST_APPROVAL_REF:
+            raise ValueError("path traversal POST requires its dedicated approval")
         if request.path_suffix is not None or request.query_parameters:
             raise ValueError("path traversal form probe cannot alter the URL")
-        if request.request_kind is not HttpRequestKind.PATH_TRAVERSAL_PROBE:
-            raise ValueError("path traversal POST must be a safe-file probe")
+        if request.request_kind not in {
+            HttpRequestKind.CONTROL, HttpRequestKind.PATH_TRAVERSAL_PROBE
+        }:
+            raise ValueError("path traversal POST must be a control or safe-file probe")
         if request.headers != (("Content-Type", "application/x-www-form-urlencoded"),):
             raise ValueError("path traversal POST must use form-urlencoded content")
         fields = parse_qsl(request.body or "", keep_blank_values=True)
-        if len(fields) != 1 or not fields[0][0]:
-            raise ValueError("path traversal POST must change exactly one form field")
-        if not is_path_traversal_safe_form_probe_value(fields[0][1]):
-            raise ValueError("path traversal POST may only use the fixed safe path")
+        if not fields or any(not name for name, _ in fields):
+            raise ValueError("path traversal POST requires named form fields")
+        changed = [value for _, value in fields if value]
+        if request.request_kind is HttpRequestKind.CONTROL:
+            if changed:
+                raise ValueError("path traversal POST control must have blank field values")
+        elif len(changed) != 1 or changed[0] not in {
+            _HIDDEN_BENIGN_PATH, PATH_TRAVERSAL_FORM_PROBE_PATH
+        }:
+            raise ValueError("path traversal POST may change one fixed safe-file value")
         return
     if method != "GET" or request.body is not None or request.headers:
         raise ValueError("path traversal safe-file probe supports GET or approved POST")
@@ -142,6 +156,24 @@ class HeuristicPathTraversalAnalyzer:
             allowed_methods=("GET", "POST"),
         )
         evidence = tuple(self._evidence.get_many(task.run_id, task.evidence_ids))
+        if candidate.routing_capability_id == HIDDEN_BODY_CAPABILITY:
+            return handle_hidden_body_parameter(
+                task=task,
+                candidate=candidate,
+                surface=surface,
+                evidence=evidence,
+                evidence_store=self._evidence,
+                planner=HiddenParameterPlanner(None),
+                created_by=HEURISTIC_PATH_TRAVERSAL_ANALYZER,
+                id_factory=self._id_factory,
+            )
+        if surface.method.upper() == "POST":
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.COMPLETED,
+                candidate_ids=(candidate.candidate_id,),
+                message="post_request_template_unavailable",
+            )
         if is_restricted_file_surface(evidence, surface):
             return handle_path_traversal_bypass(
                 task=task,
@@ -472,9 +504,7 @@ def build_path_traversal_requests(
     if not selected_parameters:
         raise AgentContractError("path traversal plan must name at least one parameter")
     if surface.method.upper() == "POST":
-        return _build_path_traversal_form_requests(
-            surface, selected_parameters, purpose=purpose
-        )
+        raise AgentContractError("valid POST request template is required for path traversal")
     if not all_parameters:
         raise AgentContractError("path traversal plan must name at least one parameter")
     if any(parameter not in all_parameters for parameter in selected_parameters):
@@ -520,44 +550,55 @@ def build_path_traversal_requests(
     return tuple(requests)
 
 
-def _build_path_traversal_form_requests(
+def build_hidden_body_requests(
     surface: Surface,
-    selected: Sequence[str],
+    parameters: Sequence[str],
     *,
     purpose: str,
 ) -> tuple[EvidenceRequest, ...]:
-    """서버 렌더링 폼을 GET control과 승인된 POST safe-file probe로 비교한다."""
+    """Block blank-form probes until verified POST replay is implemented."""
 
-    requests = [
-        EvidenceRequest(
-            evidence_type="http_response",
-            surface_id=surface.surface_id,
-            reason=f"read-only form control for {purpose}",
-            suggested_tool=PATH_TRAVERSAL_TOOL,
-            http_request=HttpRequestSpec(
-                method="GET", request_kind=HttpRequestKind.CONTROL
-            ),
-        )
-    ]
-    for parameter in selected:
-        requests.append(
-            EvidenceRequest(
-                evidence_type="http_response",
-                surface_id=surface.surface_id,
-                reason=f"safe-file form probe for parameter {parameter} on {purpose}",
-                suggested_tool=PATH_TRAVERSAL_TOOL,
-                http_request=HttpRequestSpec(
-                    method="POST",
-                    headers=(
-                        ("Content-Type", "application/x-www-form-urlencoded"),
-                    ),
-                    body=urlencode(((parameter, PATH_TRAVERSAL_FORM_PROBE_PATH),)),
-                    request_kind=HttpRequestKind.PATH_TRAVERSAL_PROBE,
-                ),
-                approval_ref=PATH_TRAVERSAL_POST_APPROVAL_REF,
-            )
-        )
-    return tuple(requests)
+    raise AgentContractError("valid POST request template is required for hidden-body probes")
+
+
+def hidden_body_signal(control: Evidence, benign: Evidence, traversal: Evidence) -> bool:
+    """A 2xx marker in traversal only is required; error pages never confirm."""
+
+    control_body = response_body(control) or ""
+    benign_body = response_body(benign) or ""
+    traversal_body = response_body(traversal) or ""
+    status = traversal.observation.get("status")
+    return bool(
+        isinstance(status, int)
+        and 200 <= status < 300
+        and all(marker in traversal_body for marker in PATH_TRAVERSAL_FORM_PROOF_MARKERS)
+        and all(marker not in control_body for marker in PATH_TRAVERSAL_FORM_PROOF_MARKERS)
+        and all(marker not in benign_body for marker in PATH_TRAVERSAL_FORM_PROOF_MARKERS)
+        and benign_body != traversal_body
+    )
+
+
+def handle_hidden_body_parameter(
+    *,
+    task: TaskEnvelope,
+    candidate: Candidate,
+    surface: Surface,
+    evidence: Sequence[Evidence],
+    evidence_store: EvidenceStore,
+    planner: HiddenParameterPlanner,
+    created_by: str,
+    id_factory: Callable[[], str],
+) -> AgentResult:
+    """Report an untestable candidate without sending a synthetic blank POST."""
+
+    # Field names are not a replayable request. This gate also protects candidates
+    # restored from a database written before automatic routing was disabled.
+    return AgentResult(
+        task_id=task.task_id,
+        status=AgentResultStatus.COMPLETED,
+        candidate_ids=(candidate.candidate_id,),
+        message="hidden_post_request_template_unavailable",
+    )
 
 
 def path_traversal_signal(control: Evidence, probe: Evidence) -> bool:

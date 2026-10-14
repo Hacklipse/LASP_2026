@@ -23,10 +23,14 @@ from run_juice_shop_baseline import (  # noqa: E402
     _ProvisionedAccount,
     _all_mode_recon_seeds,
     _authenticate_access_control_accounts,
+    _blocked_analyzer_gaps,
     _cleanup_provisioned_accounts,
     _knowledge_database_path,
     _print_execution_preview,
     _prompt_access_control_accounts,
+    _prompt_optional_session_cookie,
+    _parse_session_cookie,
+    _recon_entry_points,
     _recon_planner_summary,
     _resolve_juice_shop_db,
 )
@@ -40,6 +44,46 @@ from hacklipse.ports.errors import CredentialNotFound  # noqa: E402
 
 
 class JuiceShopAllModeTests(unittest.TestCase):
+    def test_blocked_capability_is_shown_even_with_other_routable_capability(self) -> None:
+        query = SimpleNamespace(
+            capability_id="path_traversal.http.query",
+            vulnerability_type="Path Traversal",
+            status="routable",
+        )
+        form = SimpleNamespace(
+            capability_id="path_traversal.bounded_render_form",
+            vulnerability_type="Path Traversal",
+            status="blocked",
+        )
+        router = SimpleNamespace(last_analyzer_coverage=(query, form))
+
+        self.assertEqual(_blocked_analyzer_gaps(router), (form,))
+
+    def test_base_url_entry_discards_target_specific_start_urls_and_seeds(self) -> None:
+        target, seeds = _recon_entry_points(
+            "http://127.0.0.1:3000/",
+            "http://127.0.0.1:3000/rest/products/search?q=seed",
+            (
+                "http://127.0.0.1:3000/profile",
+                "http://127.0.0.1:3000/rest/basket/7",
+            ),
+            mode="base-url",
+        )
+
+        self.assertEqual(target, "http://127.0.0.1:3000/")
+        self.assertEqual(seeds, ())
+
+    def test_targeted_entry_preserves_existing_start_policy(self) -> None:
+        target, seeds = _recon_entry_points(
+            "http://127.0.0.1:3000/",
+            "http://127.0.0.1:3000/profile",
+            ("http://127.0.0.1:3000/profile",),
+            mode="targeted",
+        )
+
+        self.assertEqual(target, "http://127.0.0.1:3000/profile")
+        self.assertEqual(seeds, ("http://127.0.0.1:3000/profile",))
+
     def test_execution_preview_groups_configuration_scope_and_cleanup(self) -> None:
         args = SimpleNamespace(
             vuln="all",
@@ -174,6 +218,31 @@ class _AccessLoginRuntime:
 
 
 class JuiceShopAccessCredentialBrokerTests(unittest.TestCase):
+    def test_optional_session_cookie_accepts_header_without_exposing_values(self) -> None:
+        credential = _parse_session_cookie(
+            "Cookie: token=private.jwt.value; language=ko"
+        )
+
+        self.assertEqual(
+            credential.cookies,
+            (("token", "private.jwt.value"), ("language", "ko")),
+        )
+        self.assertNotIn("private.jwt.value", repr(credential))
+        self.assertIsNone(
+            _prompt_optional_session_cookie(password_fn=lambda _: "")
+        )
+
+    def test_optional_session_cookie_rejects_malformed_or_duplicate_values(self) -> None:
+        for value in (
+            "token-without-equals",
+            "token=",
+            "token=one; token=two",
+            "Cookie: ",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError) as error:
+                _parse_session_cookie(value)
+            self.assertNotIn(value, str(error.exception))
+
     def test_prompt_hides_passwords_and_rejects_the_same_account(self) -> None:
         emails = iter(("actor@example.test", "owner@example.test"))
         passwords = iter(("actor-password", "owner-password"))

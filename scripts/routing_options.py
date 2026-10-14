@@ -41,8 +41,15 @@ class NoLlmUsage:
 
 def add_routing_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--recon", choices=("heuristic", "hybrid"), default="heuristic",
-        help="Recon planner mode, independent of --profile and --router",
+        "--code-version", default="", type=_code_version,
+        help="version or branch label to record with benchmark runs",
+    )
+    parser.add_argument(
+        "--recon", choices=("heuristic", "hybrid", "agentic"), default="heuristic",
+        help=(
+            "Recon mode: heuristic crawl, hybrid one-shot ranking, or agentic "
+            "answer-blind iterative actions"
+        ),
     )
     parser.add_argument(
         "--surface-collection",
@@ -54,8 +61,13 @@ def add_routing_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--router", choices=("heuristic", "hybrid"), default="heuristic",
-        help="routing mode, independent of --profile (default: heuristic)",
+        "--router",
+        choices=("heuristic", "hybrid", "agentic"),
+        default="heuristic",
+        help=(
+            "heuristic rules, hybrid rule-preserving LLM advice, or agentic "
+            "observation-grounded LLM hypotheses with deterministic fallback"
+        ),
     )
     parser.add_argument(
         "--report", choices=("heuristic", "llm"), default="heuristic",
@@ -95,10 +107,16 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _code_version(value: str) -> str:
+    if value and re.fullmatch(r"[A-Za-z0-9._/-]{1,80}", value) is None:
+        raise argparse.ArgumentTypeError("code version must be a short version or branch label")
+    return value
+
+
 def needs_llm(args: argparse.Namespace) -> bool:
     return (
-        args.profile == "llm" or args.router == "hybrid"
-        or args.recon == "hybrid" or args.compare_routers
+        args.profile == "llm" or args.router in {"hybrid", "agentic"}
+        or args.recon in {"hybrid", "agentic"} or args.compare_routers
         or getattr(args, "orchestrator", "heuristic") == "hybrid"
         or getattr(args, "budget_allocation", "off") == "hybrid"
         or getattr(args, "validation_review", False)
@@ -117,6 +135,7 @@ def execution_profile_from_args(
     return RunExecutionProfile(
         analysis_profile=getattr(args, "profile", "heuristic"),
         recon_mode=getattr(args, "recon", "heuristic"),
+        recon_entry_mode=getattr(args, "recon_entry", "targeted"),
         surface_collection_mode=getattr(args, "surface_collection", "adaptive"),
         router_mode=getattr(args, "router", "heuristic"),
         router_review=getattr(args, "router_review", "weak"),
@@ -130,6 +149,10 @@ def execution_profile_from_args(
         llm_provider=getattr(args, "llm_provider", "") if selected_model else "",
         llm_model=selected_model,
         llm_rpm_limit=llm_rpm_limit,
+        code_version=getattr(args, "code_version", ""),
+        state_changing_approved=getattr(
+            args, "approve_state_changing", False
+        ),
     )
 
 
@@ -146,9 +169,13 @@ def build_run_router(
             "llm_provider": args.llm_provider if llm_client is not None else "",
             "llm_model": selected_model,
             "recon_mode": args.recon,
+            "recon_entry_mode": getattr(args, "recon_entry", "targeted"),
             "surface_collection_mode": getattr(
                 args, "surface_collection", "adaptive"
             ),
+            "state_changing_approved": str(
+                getattr(args, "approve_state_changing", False)
+            ).lower(),
         },
     )
     # 계정 생성/로그인/HTTP 실행 전에 쓰기 실패를 확인한다. 기존 로그는 보존한다.
@@ -177,6 +204,7 @@ def append_run_result(args, app, run) -> None:
         "compare_routers": profile.compare_routers,
         "analysis_profile": profile.analysis_profile,
         "recon_mode": profile.recon_mode,
+        "recon_entry_mode": profile.recon_entry_mode,
         "surface_collection_mode": profile.surface_collection_mode,
         "orchestrator_mode": profile.orchestrator_mode,
         "extra_recon_rounds": run.extra_recon_rounds,
@@ -186,6 +214,11 @@ def append_run_result(args, app, run) -> None:
         "llm_provider": profile.llm_provider,
         "llm_model": profile.llm_model,
         "llm_rpm_limit": profile.llm_rpm_limit,
+        "code_version": profile.code_version,
+        "state_changing_approved": profile.state_changing_approved,
+        "authenticated": bool(
+            run.credential_ref or run.principal_credentials or run.agent_credentials
+        ),
         "budget_validation_reserve": run.budget_validation_reserve,
         "budget_allocation_source": run.budget_allocation_source,
         "budget_candidate_order": list(run.budget_candidate_order),
@@ -202,6 +235,7 @@ def append_run_result(args, app, run) -> None:
             "vulnerability_type": c.vulnerability_type, "agent_type": c.assigned_agent,
             "status": c.status.value, "evidence_count": len(c.evidence_ids),
             "exploration_parameters": list(c.exploration_parameters),
+            "required_evidence_types": list(c.required_evidence_types),
         } for c in candidates],
     })
 

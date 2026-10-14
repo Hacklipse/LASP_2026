@@ -87,12 +87,15 @@ def _execution_lines(execution: RunExecutionProfile | None) -> list[str]:
     )
     lines.extend([
         f"- Analysis: {_code(execution.analysis_profile)}",
-        f"- Recon: {_code(execution.recon_mode)} · Surface 수집 {_code(execution.surface_collection_mode)}",
+        f"- Recon: {_code(execution.recon_mode)} · 시작 {_code(execution.recon_entry_mode)} "
+        f"· Surface 수집 {_code(execution.surface_collection_mode)}",
         f"- Router: {_code(execution.router_mode)} · review {_code(execution.router_review)}"
         + (" · 두 Router 비교" if execution.compare_routers else ""),
         f"- Orchestrator: {_code(execution.orchestrator_mode)} · 예산 배분 {_code(execution.budget_allocation_mode)}",
         f"- Validation: {_code(execution.validation_mode)}",
         f"- Report: {_code(execution.report_mode)}",
+        "- 상태 변경 가능 요청: "
+        + ("명시적으로 승인" if execution.state_changing_approved else "차단"),
         f"- LLM: {model}",
     ])
     if execution.llm_rpm_limit is not None:

@@ -22,7 +22,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from uuid import uuid4
 
-from hacklipse.application.errors import AgentContractError
+from hacklipse.application.errors import AgentContractError, LlmOutputContractError
 from hacklipse.domain import AgentResult, Evidence, TaskEnvelope
 from hacklipse.ports import CandidateStore, EvidenceStore, LlmClient, SurfaceStore
 from hacklipse.ports.llm import LlmMessage, LlmRequest
@@ -200,13 +200,13 @@ def _validate_selection(raw: object, offered: tuple[str, ...]) -> str | None:
     """LLM이 고른 이름이 실재하고 식별자 형태인지 확인한다."""
 
     if not isinstance(raw, list):
-        raise AgentContractError("llm access control selection was not a list")
+        raise LlmOutputContractError("llm access control selection was not a list")
     for name in raw:
         if not isinstance(name, str):
-            raise AgentContractError("llm access control selection was not a string")
+            raise LlmOutputContractError("llm access control selection was not a string")
         if name not in offered:
             # 존재하지 않는 파라미터를 만들어낸 것은 계약 위반이다. 조용히 버리지 않는다.
-            raise AgentContractError(
+            raise LlmOutputContractError(
                 f"llm named a parameter that is not on the surface: {name}"
             )
         if not (
@@ -214,7 +214,7 @@ def _validate_selection(raw: object, offered: tuple[str, ...]) -> str | None:
             and is_object_identifier_parameter(name.removeprefix("path:"))
         ) and not is_object_identifier_parameter(name):
             # action·token·submit을 객체 식별자로 취급하면 엉뚱한 값을 바꿔가며 찌른다.
-            raise AgentContractError(
+            raise LlmOutputContractError(
                 f"llm selected a parameter that does not identify an object: {name}"
             )
         return name

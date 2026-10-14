@@ -75,17 +75,94 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
     same_profile = baseline["configuration"].get("analysis_profile") == hybrid["configuration"].get("analysis_profile")
     same_scope = baseline["configuration"].get("vulnerability_types") == hybrid["configuration"].get("vulnerability_types")
     same_recon = baseline["configuration"].get("recon_mode") == hybrid["configuration"].get("recon_mode")
+    same_recon_entry = (
+        baseline["configuration"].get("recon_entry_mode", "targeted")
+        == hybrid["configuration"].get("recon_entry_mode", "targeted")
+    )
+    same_surface_collection = (
+        baseline["configuration"].get("surface_collection_mode", "adaptive")
+        == hybrid["configuration"].get("surface_collection_mode", "adaptive")
+    )
     same_review = baseline["configuration"].get("router_review") == hybrid["configuration"].get("router_review")
     paired = baseline["run_id"] == hybrid["run_id"]
+    same_budget = bool(
+        baseline_result and hybrid_result
+        and baseline_result.get("request_budget") is not None
+        and baseline_result.get("request_budget") == hybrid_result.get("request_budget")
+    )
+    same_approval = bool(
+        baseline_result and hybrid_result
+        and baseline_result.get("state_changing_approved") is not None
+        and baseline_result.get("state_changing_approved")
+        == hybrid_result.get("state_changing_approved")
+    )
+    same_authentication = bool(
+        baseline_result and hybrid_result
+        and baseline_result.get("authenticated") is not None
+        and baseline_result.get("authenticated") == hybrid_result.get("authenticated")
+    )
+    code_versions = (
+        baseline_result.get("code_version") if baseline_result else None,
+        hybrid_result.get("code_version") if hybrid_result else None,
+    )
+    versions_recorded = all(
+        isinstance(version, str) and bool(version.strip()) for version in code_versions
+    )
+    same_code_version = bool(versions_recorded and code_versions[0] == code_versions[1])
+    routing_completed = baseline["status"] == hybrid["status"] == "completed"
+    routing_controls_match = all((
+        same_input, same_profile, same_scope, same_recon, same_recon_entry,
+        same_surface_collection, same_review,
+    ))
+    analysis_unavailable_reasons = []
+    if not baseline_result or not hybrid_result:
+        analysis_unavailable_reasons.append("run_result_missing")
+    else:
+        checks = (
+            (routing_completed, "routing_incomplete"),
+            (baseline_result.get("phase") == hybrid_result.get("phase") == "done", "run_incomplete"),
+            (baseline_result.get("execution_profile_recorded") is True
+             and hybrid_result.get("execution_profile_recorded") is True, "execution_profile_missing"),
+            (versions_recorded, "code_version_missing"),
+            (not versions_recorded or same_code_version, "code_version_mismatch"),
+            (same_input, "router_input_mismatch"),
+            (same_raw_input, "recon_input_mismatch"),
+            (same_profile, "analysis_profile_mismatch"),
+            (same_scope, "vulnerability_scope_mismatch"),
+            (same_recon, "recon_mode_mismatch"),
+            (same_recon_entry, "recon_entry_mismatch"),
+            (same_surface_collection, "surface_collection_mismatch"),
+            (same_review, "review_policy_mismatch"),
+            (same_budget, "request_budget_mismatch"),
+            (same_approval, "approval_mismatch"),
+            (same_authentication, "authentication_mismatch"),
+            (not paired, "paired_run_has_one_analysis_branch"),
+        )
+        analysis_unavailable_reasons = [reason for passed, reason in checks if not passed]
+    analysis_available = bool(
+        baseline_result and hybrid_result and not analysis_unavailable_reasons
+    )
     return {
         "schema_version": 1, "event": "router_comparison",
         "baseline_run_id": baseline["run_id"], "hybrid_run_id": hybrid["run_id"],
         "same_router_input": same_input, "same_analysis_profile": same_profile,
         "same_raw_recon_input": same_raw_input,
         "same_vulnerability_scope": same_scope,
-        "same_recon_mode": same_recon, "same_review_policy": same_review,
+        "same_recon_mode": same_recon,
+        "same_recon_entry_mode": same_recon_entry,
+        "same_surface_collection_mode": same_surface_collection,
+        "same_review_policy": same_review,
+        "same_request_budget": same_budget if baseline_result and hybrid_result else None,
+        "same_state_changing_approval": same_approval if baseline_result and hybrid_result else None,
+        "same_authentication": same_authentication if baseline_result and hybrid_result else None,
+        "same_code_version": same_code_version if baseline_result and hybrid_result else None,
+        "comparison_axis": "router_mode",
+        "analysis_unavailable_reasons": analysis_unavailable_reasons,
+        "code_versions": {
+            "heuristic": code_versions[0], "hybrid": code_versions[1],
+        },
         "paired_run": paired,
-        "routing_completed": baseline["status"] == hybrid["status"] == "completed",
+        "routing_completed": routing_completed,
         "input_manifest_delta": _manifest_delta(
             baseline.get("routing_input_manifest"),
             hybrid.get("routing_input_manifest"),
@@ -109,7 +186,7 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
             "note": "Router token/time telemetry only, not total Recon/Analysis cost. Missing usage is unknown; fixture responses are not real billing.",
         },
         "analysis_results": {"heuristic": baseline_result, "hybrid": hybrid_result},
-        "analysis_comparison_available": bool(baseline_result and hybrid_result),
+        "analysis_comparison_available": analysis_available,
         "analysis_delta": {
             "finding_count": hybrid_result["finding_count"] - baseline_result["finding_count"],
             "requests_used": hybrid_result["requests_used"] - baseline_result["requests_used"],
@@ -119,14 +196,21 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
                 for status in sorted(set(baseline_result["candidate_status_counts"])
                                      | set(hybrid_result["candidate_status_counts"]))
             },
-        } if baseline_result and hybrid_result else None,
+        } if analysis_available else None,
         "comparison_warning": (
-            "Inputs/profiles differ; differences are not a controlled Router ablation."
-            if not all((same_input, same_profile, same_scope, same_recon, same_review)) else
             "Paired Router comparison uses one Recon input. Only the selected Router's candidates execute analyzers; this is not a two-branch analysis comparison."
             if paired else
-            "Normalized Router inputs match. Analyzer results came from separate target runs; inspect same_raw_recon_input before causal interpretation."
-            if baseline_result and hybrid_result else
+            "Analysis results are not a controlled Router comparison: "
+            + ", ".join(analysis_unavailable_reasons)
+            if baseline_result and hybrid_result and analysis_unavailable_reasons else
+            "Run result is missing; analysis cannot be compared."
+            if baseline_result or hybrid_result else
+            "Router execution is incomplete; analysis cannot be compared."
+            if not routing_completed else
+            "Inputs/profiles differ; differences are not a controlled Router ablation."
+            if not routing_controls_match else
+            "Router inputs match. Analyzer results came from separate target runs; target state and principal identity still require external verification."
+            if analysis_available else
             "Replay does not execute analyzers."
         ),
     }

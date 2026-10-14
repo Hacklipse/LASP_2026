@@ -68,6 +68,7 @@ class ValidationReasonCode(str, Enum):
 
     UNSPECIFIED = "unspecified"
     ANALYSIS_SIGNAL_MISSING = "analysis_signal_missing"
+    POST_REQUEST_TEMPLATE_MISSING = "post_request_template_missing"
     CONTROL_SIGNAL_PRESENT = "control_signal_present"
     PROBE_SIGNAL_NOT_REPRODUCED = "probe_signal_not_reproduced"
     REPRODUCTION_EXECUTION_ERROR = "reproduction_execution_error"
@@ -209,6 +210,7 @@ class RunExecutionProfile:
     recorded: bool = True
     analysis_profile: str = "heuristic"
     recon_mode: str = "heuristic"
+    recon_entry_mode: str = "targeted"
     surface_collection_mode: str = "adaptive"
     router_mode: str = "heuristic"
     router_review: str = "weak"
@@ -222,16 +224,27 @@ class RunExecutionProfile:
     llm_provider: str = ""
     llm_model: str = ""
     llm_rpm_limit: int | None = None
+    code_version: str = ""
+    # 안전 프로필은 유지하되, 사용자가 이 Run에서 상태 변경 가능 요청을 명시적으로
+    # 승인했는지 기록한다. 승인 참조 문자열 자체는 실행 구성에 저장하지 않는다.
+    state_changing_approved: bool = False
 
     def __post_init__(self) -> None:
         modes = {
             "analysis profile": (self.analysis_profile, {"heuristic", "llm"}),
-            "recon mode": (self.recon_mode, {"heuristic", "hybrid"}),
+            "recon mode": (self.recon_mode, {"heuristic", "hybrid", "agentic"}),
+            "recon entry mode": (
+                self.recon_entry_mode,
+                {"targeted", "base-url"},
+            ),
             "surface collection mode": (
                 self.surface_collection_mode,
                 {"adaptive", "deterministic"},
             ),
-            "router mode": (self.router_mode, {"heuristic", "hybrid"}),
+            "router mode": (
+                self.router_mode,
+                {"heuristic", "hybrid", "agentic"},
+            ),
             "router review": (self.router_review, {"weak", "ambiguous"}),
             "orchestrator mode": (self.orchestrator_mode, {"heuristic", "hybrid"}),
             "budget allocation mode": (
@@ -248,6 +261,10 @@ class RunExecutionProfile:
             raise DomainInvariantError("recorded execution profile flag must be boolean")
         if type(self.compare_routers) is not bool:
             raise DomainInvariantError("compare routers flag must be boolean")
+        if type(self.state_changing_approved) is not bool:
+            raise DomainInvariantError(
+                "state-changing approval flag must be boolean"
+            )
         if (
             self.llm_rpm_limit is not None
             and (type(self.llm_rpm_limit) is not int or self.llm_rpm_limit <= 0)
@@ -261,12 +278,16 @@ class RunExecutionProfile:
                 value and (not value.strip() or not value.isprintable())
             ):
                 raise DomainInvariantError(f"{label} must be a short printable string")
+        if not isinstance(self.code_version, str) or (
+            self.code_version and re.fullmatch(r"[A-Za-z0-9._/-]{1,80}", self.code_version) is None
+        ):
+            raise DomainInvariantError("code version must be a short version or branch label")
         if bool(self.llm_provider) != bool(self.llm_model):
             raise DomainInvariantError("LLM provider and model must be stored together")
         uses_llm = (
             self.analysis_profile == "llm"
-            or self.recon_mode == "hybrid"
-            or self.router_mode == "hybrid"
+            or self.recon_mode in {"hybrid", "agentic"}
+            or self.router_mode in {"hybrid", "agentic"}
             or self.compare_routers
             or self.orchestrator_mode == "hybrid"
             or self.budget_allocation_mode == "hybrid"
@@ -724,8 +745,22 @@ class Surface:
     path_identifier: str | None = None
     path_identifier_index: int | None = None
     observed_path_identifier: str | None = None
+    # Recon이 이 좌표를 처음 발견한 구조적 출처. 추가 Recon 우선순위에만 사용하며
+    # 취약점 여부나 Analyzer 판정 근거로 취급하지 않는다.
+    discovery_types: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if (
+            not isinstance(self.discovery_types, tuple)
+            or len(set(self.discovery_types)) != len(self.discovery_types)
+            or any(
+                not isinstance(value, str) or not value
+                for value in self.discovery_types
+            )
+        ):
+            raise DomainInvariantError(
+                "surface discovery types must be unique non-empty strings"
+            )
         values = (
             self.path_identifier,
             self.path_identifier_index,
@@ -791,6 +826,16 @@ class Candidate:
     # Router가 관측된 Surface에서 고른 탐색 입력 이름. 관측/성공 Evidence가 아니다.
     # Analyzer는 사용 전에 실제 Surface 소속과 실행 정책을 다시 검증해야 한다.
     exploration_parameters: tuple[str, ...] = ()
+    # Agentic Router가 이 가설을 검증하려면 필요하다고 제안한 Evidence 종류다.
+    # 실행 요청이나 proof가 아니라 감사 가능한 계획 메타데이터이며, 실제 Analyzer와
+    # Validation은 기존 정책·proof 계약을 독립적으로 적용한다.
+    required_evidence_types: tuple[str, ...] = ()
+    # Router LLM의 판단을 실행 결과와 분리해 보존하는 계획 메타데이터다. 실제 probe와
+    # 최종 판정 권한은 Analysis/Validation 계약에 그대로 남는다.
+    routing_capability_id: str = ""
+    routing_confidence: str = ""
+    routing_priority: str = ""
+    analysis_strategy_id: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.exploration_parameters, tuple) or any(
@@ -800,6 +845,26 @@ class Candidate:
             raise DomainInvariantError("candidate exploration parameters must be names")
         if len(set(self.exploration_parameters)) != len(self.exploration_parameters):
             raise DomainInvariantError("candidate exploration parameters must be unique")
+        if not isinstance(self.required_evidence_types, tuple) or any(
+            not isinstance(name, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", name) is None
+            for name in self.required_evidence_types
+        ):
+            raise DomainInvariantError("candidate required evidence types must be names")
+        if len(set(self.required_evidence_types)) != len(
+            self.required_evidence_types
+        ):
+            raise DomainInvariantError(
+                "candidate required evidence types must be unique"
+            )
+        if self.routing_confidence not in {"", "low", "medium", "high"}:
+            raise DomainInvariantError("candidate routing confidence is invalid")
+        if self.routing_priority not in {"", "low", "normal", "high"}:
+            raise DomainInvariantError("candidate routing priority is invalid")
+        for field_name in ("routing_capability_id", "analysis_strategy_id"):
+            value = getattr(self, field_name)
+            if value and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}", value) is None:
+                raise DomainInvariantError(f"candidate {field_name} is invalid")
         # 저장소에서 문자열로 복원한 값도 같은 검사를 통과시킨다. 알 수 없는 상태는
         # 조용히 통과시키지 않고 여기서 막는다.
         for field_name in ("status", "resume_status"):
