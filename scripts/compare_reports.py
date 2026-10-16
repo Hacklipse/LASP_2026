@@ -42,6 +42,7 @@ FIXTURE_MODEL = "fixture-not-a-real-model"
 CONFIG = NarratorFingerprintConfig(model=FIXTURE_MODEL, prompt_version="llm-report-narrative-v1")
 _COMPARISON_FIELDS = (
     "analysis_profile", "recon_mode", "recon_entry_mode", "surface_collection_mode",
+    "browser_recon_enabled",
     "router_mode", "router_review", "compare_routers",
     "orchestrator_mode", "budget_allocation_mode", "validation_mode",
     "state_changing_approved", "request_budget",
@@ -52,6 +53,7 @@ _LEGACY_CONDITION_DEFAULTS = {
     "code_version": "",
     "recon_entry_mode": "targeted",
     "state_changing_approved": False,
+    "browser_recon_enabled": False,
 }
 _FAILURES = {
     "timeout": LlmTimeout,

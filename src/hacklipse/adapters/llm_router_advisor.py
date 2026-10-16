@@ -49,8 +49,9 @@ from hacklipse.ports.llm import LlmClient, LlmMessage, LlmRequest, LlmUsage
 from .request_safety import has_state_changing_parameters
 from .llm_parameter_names import alias_parameter_names
 from .analyzer_capabilities import (
+    AnalyzerCapabilityCoverage,
     DEFAULT_ANALYZER_CAPABILITIES,
-    capability_missing_requirements,
+    analyzer_capability_coverage,
     capability_matches,
 )
 from .routing import (
@@ -241,18 +242,6 @@ class SurfaceCapability:
     status: Literal["routable", "blocked", "unsupported", "excluded"]
     reason_code: str
     routable_types: tuple[str, ...] = ()
-    missing_requirements: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class AnalyzerCapabilityCoverage:
-    """등록된 Analyzer capability 하나가 현재 Run에서 실행 가능한지 나타낸다."""
-
-    capability_id: str
-    vulnerability_type: str
-    agent_type: str
-    status: Literal["routable", "blocked"]
-    matched_surface_count: int = 0
     missing_requirements: tuple[str, ...] = ()
 
 
@@ -845,36 +834,7 @@ class LlmRouterAdvisor:
     ) -> tuple[AnalyzerCapabilityCoverage, ...]:
         """Capability별 실행 가능 Surface 수와 가장 작은 계약 gap을 계산한다."""
 
-        run_surfaces = tuple(
-            surface for surface in surfaces if surface.run_id == run.run_id
-        )
-        coverage: list[AnalyzerCapabilityCoverage] = []
-        for capability in self._capabilities:
-            gaps = tuple(
-                capability_missing_requirements(capability, surface, evidence)
-                for surface in run_surfaces
-            )
-            matched = sum(not gap for gap in gaps)
-            if matched:
-                coverage.append(AnalyzerCapabilityCoverage(
-                    capability_id=capability.capability_id,
-                    vulnerability_type=capability.vulnerability_type,
-                    agent_type=capability.agent_type,
-                    status="routable",
-                    matched_surface_count=matched,
-                ))
-                continue
-            closest = min(gaps, key=lambda value: (len(value), value)) if gaps else (
-                "surface",
-            )
-            coverage.append(AnalyzerCapabilityCoverage(
-                capability_id=capability.capability_id,
-                vulnerability_type=capability.vulnerability_type,
-                agent_type=capability.agent_type,
-                status="blocked",
-                missing_requirements=closest,
-            ))
-        return tuple(coverage)
+        return analyzer_capability_coverage(self._capabilities, run, surfaces, evidence)
 
     @staticmethod
     def _observations_by_surface(

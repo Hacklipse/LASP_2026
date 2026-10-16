@@ -42,6 +42,56 @@ successful fetches, and parsed responses. POST Path Traversal probes remain
 unavailable until a verified normal request template and safe proof target
 exist. Stored POST candidates are blocked without sending a synthesized request.
 
+Recon prioritizes application/page/layout chunks over framework runtime scripts,
+within a limit of eight scripts and the existing crawl budget. Pass
+`--browser-recon` to either CLI runner, or enable **브라우저 Recon** in the
+Dashboard, to also inspect Chromium-rendered links and SPA routes, menus, tabs,
+detail/edit controls, filters, and forms. Install Chromium once with
+`.venv/bin/python -m playwright install chromium`.
+
+Browser Recon intercepts fetch/XHR and page resources. Each actual HTTP request,
+including redirect hops, passes through the shared Collector's policy, budget,
+session, sanitizer and audit log. It restricts traffic to the exact target origin
+and Run path scope; service workers, WebSockets and binary/streaming resources
+are blocked. Static assets may be reused in memory during a browser session.
+The browser gets the remaining Recon share (at most half the Task request
+budget), up to six page visits, twelve UI actions and 45 seconds. These are
+bounded discovery limits, not a claim of exhaustive UI coverage.
+
+Form inspection uses neutral inputs and captures attempted method, content type,
+and query/body field names. Mutating requests are aborted before transmission;
+their evidence says `sent=false`. Body values, credentials and tokens are not
+stored in request-shape observations. These observations do not constitute a
+verified normal POST template and do not enable POST Path Traversal probes.
+The browser option is persisted in the Run profile and comparison logs, and its
+summary distinguishes partial/unavailable/budget-limited discovery.
+On visited HTML pages without a query or existing fragment, browser Recon may
+check whether a harmless hash marker reaches the DOM. Such an active observation
+creates a client Surface; XSS Analysis checks reflection and independent
+Validation must reproduce script execution before a Finding is confirmed.
+Browser XSS page dependencies also pass through the shared Collector and consume
+the Run request budget; mutating subrequests are blocked.
+
+For a local benchmark smoke (replace the URL with `dynast-bench target nextjs`):
+
+```bash
+.venv/bin/python scripts/run_dynast_baseline.py http://127.0.0.1:13322/ \
+  --code-version YOUR_CODE_VERSION
+```
+
+The DynAST runner defaults to `auto/base-url`, browser Recon enabled, heuristic
+Recon/Router/Analysis and a request ceiling of 80. It writes a unique Markdown
+report and JSONL log per run under `artifacts/dynast-bench/`; `--report-out` and
+`--routing-log` override these paths. Use `--no-browser-recon` for a static crawl.
+The existing LLM, budget and approval options remain available. The entry point
+shares the common auto workflow but rejects targeted modes and account/database
+setup options. It does not start/reset the benchmark or read its answer keys;
+prepare the app with the DynAST CLI first. These artifacts are diagnostic reports,
+not DynAST scorer-format exports.
+The CLI and routing log report Analyzer capability gaps in heuristic runs too;
+a zero-Candidate result can mean that the discovered surfaces have no supported
+input coordinate, even when browser Recon collected pages successfully.
+
 Run the local verification suite with:
 
 ```bash

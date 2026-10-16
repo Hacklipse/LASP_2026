@@ -39,7 +39,9 @@ class NoLlmUsage:
     output_tokens: int = 0
 
 
-def add_routing_arguments(parser: argparse.ArgumentParser) -> None:
+def add_routing_arguments(
+    parser: argparse.ArgumentParser, *, artifact_directory: Path | None = None,
+) -> None:
     parser.add_argument(
         "--code-version", default="", type=_code_version,
         help="version or branch label to record with benchmark runs",
@@ -61,6 +63,10 @@ def add_routing_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--browser-recon", action="store_true",
+        help="observe rendered links, UI controls and fetch/XHR request structure with Chromium",
+    )
+    parser.add_argument(
         "--router",
         choices=("heuristic", "hybrid", "agentic"),
         default="heuristic",
@@ -75,11 +81,15 @@ def add_routing_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--report-out",
-        help="생성된 Markdown 보고서를 저장할 경로 (기본: 저장하지 않음)",
+        help=(f"보고서 경로 (기본: {artifact_directory}/ 아래 실행별 Markdown)"
+              if artifact_directory is not None else
+              "생성된 Markdown 보고서를 저장할 경로 (기본: 저장하지 않음)"),
     )
     parser.add_argument(
-        "--routing-log", default="artifacts/routing-decisions.jsonl",
-        help="append-only routing decision JSONL (default: artifacts/routing-decisions.jsonl)",
+        "--routing-log", default=None if artifact_directory is not None else "artifacts/routing-decisions.jsonl",
+        help=(f"판단 기록 경로 (기본: {artifact_directory}/ 아래 실행별 JSONL)"
+              if artifact_directory is not None else
+              "append-only routing decision JSONL (default: artifacts/routing-decisions.jsonl)"),
     )
     parser.add_argument(
         "--router-review", choices=("weak", "ambiguous"), default="weak",
@@ -137,6 +147,7 @@ def execution_profile_from_args(
         recon_mode=getattr(args, "recon", "heuristic"),
         recon_entry_mode=getattr(args, "recon_entry", "targeted"),
         surface_collection_mode=getattr(args, "surface_collection", "adaptive"),
+        browser_recon_enabled=getattr(args, "browser_recon", False),
         router_mode=getattr(args, "router", "heuristic"),
         router_review=getattr(args, "router_review", "weak"),
         compare_routers=getattr(args, "compare_routers", False),
@@ -176,6 +187,7 @@ def build_run_router(
             "state_changing_approved": str(
                 getattr(args, "approve_state_changing", False)
             ).lower(),
+            "browser_recon_enabled": str(getattr(args, "browser_recon", False)).lower(),
         },
     )
     # 계정 생성/로그인/HTTP 실행 전에 쓰기 실패를 확인한다. 기존 로그는 보존한다.
@@ -206,6 +218,9 @@ def append_run_result(args, app, run) -> None:
         "recon_mode": profile.recon_mode,
         "recon_entry_mode": profile.recon_entry_mode,
         "surface_collection_mode": profile.surface_collection_mode,
+        "browser_recon_enabled": profile.browser_recon_enabled,
+        "browser_recon": [dict(item.observation) for item in app.stores.evidence.list_by_run(run.run_id)
+                          if item.observation.get("type") == "browser_recon_summary"],
         "orchestrator_mode": profile.orchestrator_mode,
         "extra_recon_rounds": run.extra_recon_rounds,
         "budget_allocation_mode": profile.budget_allocation_mode,

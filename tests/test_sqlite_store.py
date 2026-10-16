@@ -64,6 +64,7 @@ class SQLiteStoreTests(unittest.TestCase):
                 analysis_profile="llm",
                 recon_mode="hybrid",
                 surface_collection_mode="deterministic",
+                browser_recon_enabled=True,
                 router_mode="hybrid",
                 router_review="ambiguous",
                 compare_routers=True,
@@ -259,6 +260,7 @@ class SQLiteStoreTests(unittest.TestCase):
             stored = json.loads(row[0])
             stored["execution_profile"].pop("surface_collection_mode")
             stored["execution_profile"].pop("recon_entry_mode")
+            stored["execution_profile"].pop("browser_recon_enabled")
             connection.execute(
                 "UPDATE runs SET data = ? WHERE run_id = ?",
                 (json.dumps(stored), "run-1"),
@@ -272,6 +274,7 @@ class SQLiteStoreTests(unittest.TestCase):
             "adaptive",
         )
         self.assertEqual(restored.execution_profile.recon_entry_mode, "targeted")
+        self.assertFalse(restored.execution_profile.browser_recon_enabled)
 
     def test_finding_proof_facts_round_trip_and_legacy_json_defaults(self) -> None:
         proved = replace(

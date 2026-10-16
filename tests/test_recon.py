@@ -402,6 +402,19 @@ def _crawling_agent(bodies: dict[str, str], **kwargs):
 
 
 class ReconCrawlTests(unittest.TestCase):
+    def test_application_chunk_is_not_starved_by_framework_scripts(self) -> None:
+        base = "http://localhost"
+        agent, collector, surfaces = _crawling_agent({
+            base + "/": ''.join(f'<script src="{p}"></script>' for p in (
+                "/runtime.js", "/vendor.js", "/framework.js", "/chunks/app/page-feature.js")),
+            base + "/chunks/app/page-feature.js": 'fetch("/api/find?q=")',
+        }, max_scripts=1)
+        agent.handle(replace(_task("script-priority", base + "/"), request_budget=20))
+        self.assertIn(base + "/chunks/app/page-feature.js", collector.calls)
+        self.assertNotIn(base + "/runtime.js", collector.calls)
+        self.assertTrue(any(s.url == base + "/api/find" and s.parameters == ("q",)
+                            for s in surfaces.list_by_run("script-priority")))
+
     def test_does_not_parse_html_looking_strings_inside_json_as_surfaces(self) -> None:
         api_url = "http://localhost/api/items"
         agent, collector, surfaces = _crawling_agent(

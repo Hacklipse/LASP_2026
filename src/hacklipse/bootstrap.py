@@ -40,6 +40,8 @@ from hacklipse.adapters import (
     ValidationAgent,
 )
 from hacklipse.adapters.llm_router_advisor import LlmRouterAdvisor
+from hacklipse.adapters.browser_recon import PlaywrightRecon
+from hacklipse.adapters.browser_runtime import PlaywrightBrowserRuntime
 from hacklipse.adapters.analyzer_capabilities import DEFAULT_ANALYZER_CAPABILITIES
 from hacklipse.adapters.agentic_probe import AgenticHttpProbeAgent
 from hacklipse.adapters.analysis_llm_fallback import (
@@ -228,6 +230,8 @@ def build_local_application(
         audit_log=selected_audit,
         default_approval_ref=default_approval_ref,
     )
+    if isinstance(selected_runtime, PlaywrightBrowserRuntime):
+        selected_runtime.bind_collector(collector)
 
     for agent_type, agent in agents.items():
         # 실제 Recon/Analysis/Validation Agent는 호출자가 명시적으로 제공해야 한다.
@@ -551,6 +555,7 @@ def register_standard_agents(
     recon_surface_collection_mode: str = "adaptive",
     recon_seed_urls: tuple[str, ...] = (),
     recon_infer_unlinked_render_parameters: bool = True,
+    recon_browser_enabled: bool = False,
     actor_object_id: str | None = None,
     owner_object_id: str | None = None,
     validation_review: bool = False,
@@ -578,6 +583,10 @@ def register_standard_agents(
             surface_collection_mode=recon_surface_collection_mode,
             seed_urls=recon_seed_urls,
             infer_unlinked_render_parameters=recon_infer_unlinked_render_parameters,
+            browser_recon=(PlaywrightRecon(
+                collector=app.collector, run_store=app.stores.runs,
+                session_cookies=getattr(app.runtime, "session_cookies", None),
+            ) if recon_browser_enabled else None),
             planner=(
                 None
                 if callable(getattr(recon_planner, "decide", None))

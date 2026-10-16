@@ -48,6 +48,7 @@ class RouterComparisonTests(unittest.TestCase):
             recon="hybrid",
             recon_entry="base-url",
             surface_collection="deterministic",
+            browser_recon=True,
             router="hybrid",
             router_review="ambiguous",
             compare_routers=True,
@@ -65,6 +66,7 @@ class RouterComparisonTests(unittest.TestCase):
         self.assertEqual(profile.analysis_profile, "llm")
         self.assertEqual(profile.recon_entry_mode, "base-url")
         self.assertEqual(profile.surface_collection_mode, "deterministic")
+        self.assertTrue(profile.browser_recon_enabled)
         self.assertEqual(profile.router_review, "ambiguous")
         self.assertTrue(profile.compare_routers)
         self.assertEqual(profile.budget_allocation_mode, "hybrid")
@@ -118,6 +120,8 @@ class RouterComparisonTests(unittest.TestCase):
                 latest_run(args.routing_log, "missing-mode")
             changed_scope = dict(hybrid, configuration=dict(hybrid["configuration"], vulnerability_types="SQLi"))
             self.assertFalse(compare_records(baseline, changed_scope)["same_vulnerability_scope"])
+            changed_browser = dict(hybrid, configuration=dict(hybrid["configuration"], browser_recon_enabled="true"))
+            self.assertFalse(compare_records(baseline, changed_browser)["same_browser_recon_enabled"])
             changed_entry = dict(
                 hybrid,
                 configuration=dict(hybrid["configuration"], recon_entry_mode="base-url"),

@@ -98,6 +98,25 @@ class _Log:
 
 
 class RoutingAuditTests(unittest.TestCase):
+    def test_heuristic_audit_records_analyzer_gaps_without_llm(self):
+        log = _Log()
+        surface = replace(_SURFACE, url="http://localhost/", parameters=())
+
+        decisions = standard_router(mode="heuristic", audit_log=log).route(
+            _RUN, (surface,), ()
+        )
+
+        self.assertEqual(decisions, ())
+        coverage = {
+            item["capability_id"]: item
+            for item in log.records[0]["llm"]["analyzer_coverage"]
+        }
+        self.assertEqual(coverage["xss.http.query"]["status"], "blocked")
+        self.assertIn("input_parameter", coverage["xss.http.query"]["missing_requirements"])
+        self.assertNotIn("method", coverage["xss.browser.fragment"]["missing_requirements"])
+        self.assertIn("required_observation", coverage["path_traversal.hidden_body_parameter"]["missing_requirements"])
+        self.assertEqual(log.records[0]["llm"]["calls"], 0)
+
     def test_default_bootstrap_stays_rule_based_without_llm(self):
         llm = _Llm()
         router = standard_router(llm_client=llm)

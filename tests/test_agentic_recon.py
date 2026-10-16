@@ -8,6 +8,7 @@ import unittest
 from dataclasses import replace
 
 from hacklipse.adapters.llm_iterative_recon import LlmIterativeReconPlanner
+from hacklipse.adapters.browser_recon import BrowserReconResult
 from hacklipse.adapters import BoundedRetryPolicy, InMemoryBudgetManager, LocalTaskDispatcher
 from hacklipse.adapters.memory import InMemoryEvidenceStore, InMemorySurfaceStore
 from hacklipse.adapters.memory import InMemoryTaskStore
@@ -285,6 +286,62 @@ class _CaptureStopPlanner:
 
 
 class AgenticReconIntegrationTests(unittest.TestCase):
+    def test_browser_choice_uses_reserved_third_recon_llm_call(self) -> None:
+        class FirstOfferedLlm:
+            calls = 0
+
+            def complete(self, request):
+                self.calls += 1
+                offered = json.loads(request.messages[0].content)["selectable_surface_ids"]
+                return LlmResponse(payload={
+                    "action": "visit_surface", "surface_id": offered[0],
+                    "basis_observation_ids": [], "reason_code": "expand_coverage",
+                })
+
+        class BrowserFrontier:
+            selected = None
+
+            def discover(self, task, *, remember, request_budget, timeout_seconds, select_next):
+                options = tuple(
+                    (task.target_url + path, remember(
+                        task.target_url + path, "GET", (), (), ("browser_dom",)
+                    ))
+                    for path in ("browser-a", "browser-b")
+                )
+                self.selected = select_next(options, request_budget, timeout_seconds)
+                return BrowserReconResult((), ((None, {
+                    "type": "browser_recon_summary", "status": "completed",
+                }),))
+
+        bodies = {"http://localhost/": "".join(
+            f'<a href="/p{i}">page</a>' for i in range(8)
+        )}
+        bodies.update({f"http://localhost/p{i}": "<p>page</p>" for i in range(8)})
+        evidence_store = InMemoryEvidenceStore()
+        llm = FirstOfferedLlm()
+        browser = BrowserFrontier()
+        agent = ReconAgent(
+            collector=_Collector(evidence_store, bodies),
+            evidence_store=evidence_store, surface_store=InMemorySurfaceStore(),
+            iterative_planner=LlmIterativeReconPlanner(llm_client=llm),
+            browser_recon=browser, max_pages=4,
+        )
+
+        agent.handle(_TASK)
+
+        self.assertEqual(llm.calls, 3)
+        self.assertEqual(browser.selected, "http://localhost/browser-a")
+        traces = [item.observation for item in evidence_store.list_by_run(_TASK.run_id)]
+        self.assertTrue(any(
+            item.get("type") == "recon_action"
+            and item.get("status") == "fallback:browser_call_reserve"
+            for item in traces
+        ))
+        summary = next(
+            item for item in traces if item.get("type") == "browser_recon_summary"
+        )
+        self.assertEqual(summary["planner_llm_call_count"], 1)
+
     def test_replayed_actions_do_not_consume_new_llm_call_limit(self) -> None:
         class FirstOfferedLlm:
             def __init__(self):

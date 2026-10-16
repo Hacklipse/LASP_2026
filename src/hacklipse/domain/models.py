@@ -212,6 +212,7 @@ class RunExecutionProfile:
     recon_mode: str = "heuristic"
     recon_entry_mode: str = "targeted"
     surface_collection_mode: str = "adaptive"
+    browser_recon_enabled: bool = False
     router_mode: str = "heuristic"
     router_review: str = "weak"
     compare_routers: bool = False
@@ -261,6 +262,8 @@ class RunExecutionProfile:
             raise DomainInvariantError("recorded execution profile flag must be boolean")
         if type(self.compare_routers) is not bool:
             raise DomainInvariantError("compare routers flag must be boolean")
+        if type(self.browser_recon_enabled) is not bool:
+            raise DomainInvariantError("browser recon flag must be boolean")
         if type(self.state_changing_approved) is not bool:
             raise DomainInvariantError(
                 "state-changing approval flag must be boolean"

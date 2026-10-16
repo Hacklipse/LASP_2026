@@ -52,6 +52,11 @@ def _defaults() -> RunOptions:
 
 
 class BudgetDefaultTests(unittest.TestCase):
+    def test_browser_recon_option_is_parsed_and_recorded(self) -> None:
+        options, _ = sd.parse_run_payload({"target": "http://127.0.0.1:3000/", "browser_recon": True}, _defaults())
+        self.assertTrue(options.browser_recon)
+        self.assertTrue(execution_profile_from_args(options.to_namespace()).browser_recon_enabled)
+
     def test_cli_and_dashboard_use_conservative_defaults(self) -> None:
         self.assertEqual(juice_cli._DEFAULT_BUDGET, 20)
         self.assertEqual(juice_cli._ALL_MODE_BUDGET, 80)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from hacklipse.domain import ExecutionRequest, HttpRequestKind
 
@@ -13,6 +13,8 @@ XSS_EXECUTION_MARKER_PREFIX = "hacklipsexecution"
 # 문자가 없으므로 이 marker 로는 스크립트가 실행되지 않는다 — 실행 증명은 Validation
 # 만이 만들 수 있어야 하기 때문이다.
 XSS_REFLECTION_MARKER_PREFIX = "hacklipsreflection"
+RAW_HASH_CANARY = "hacklipsehashcontrol"
+RAW_HASH_PARAMETER = "fragment"
 _WINDOW_SLOT = "__hacklipse_xss_probe__"
 _MARKER = re.compile(rf"^{XSS_EXECUTION_MARKER_PREFIX}[A-Za-z0-9_-]+$")
 _REFLECTION_MARKER = re.compile(rf"^{XSS_REFLECTION_MARKER_PREFIX}[A-Za-z0-9_-]+$")
@@ -25,6 +27,11 @@ def validate_browser_xss_request(request: ExecutionRequest) -> None:
         raise ValueError("request is not assigned to the browser XSS tool")
     if request.method.upper() != "GET" or request.body is not None or request.headers:
         raise ValueError("browser XSS execution supports headerless GET requests only")
+    if urlsplit(request.target_url).fragment == RAW_HASH_CANARY and (
+        len(request.query_parameters) != 1
+        or request.query_parameters[0][0] != RAW_HASH_PARAMETER
+    ):
+        raise ValueError("raw hash probe must change only the observed fragment")
 
     markers = _execution_markers(request)
     reflections = _reflection_markers(request)
@@ -90,6 +97,10 @@ def _browser_url(request: ExecutionRequest, replacements: dict[str, str]) -> str
     """
 
     parsed = urlsplit(request.target_url)
+    if parsed.fragment == RAW_HASH_CANARY:
+        value = request.query_parameters[0][1]
+        fragment = quote(replacements.get(value, value), safe="")
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, fragment))
     encoded = [
         (name, replacements.get(value, value))
         for name, value in request.query_parameters

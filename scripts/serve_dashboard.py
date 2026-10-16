@@ -117,6 +117,7 @@ BOOLEAN_OPTIONS = (
     {"field": "validation_review", "label": "Validation review", "llm": True},
     {"field": "compare_routers", "label": "Router 비교", "llm": True},
     {"field": "browser", "label": "브라우저 검증", "llm": False},
+    {"field": "browser_recon", "label": "브라우저 Recon", "llm": False},
 )
 
 _STATIC = {

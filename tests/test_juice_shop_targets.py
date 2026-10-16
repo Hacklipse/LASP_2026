@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import unittest
+from dataclasses import replace
 
 from hacklipse.adapters import BrowserXssAnalyzer, HeuristicPathTraversalAnalyzer
 from hacklipse.adapters.browser_xss_analysis import BROWSER_XSS_ANALYZER
@@ -28,6 +29,8 @@ from hacklipse.adapters.recon import _client_routes, _looks_like_restricted_file
 from hacklipse.adapters.routing import DEFAULT_SURFACE_RULES
 from hacklipse.adapters.xss_execution import (
     BROWSER_XSS_TOOL,
+    RAW_HASH_CANARY,
+    RAW_HASH_PARAMETER,
     XSS_EXECUTION_MARKER_PREFIX,
     XSS_REFLECTION_MARKER_PREFIX,
     browser_navigation_url,
@@ -139,6 +142,27 @@ class ClientRouteNavigationTests(unittest.TestCase):
 
         self.assertIsNone(marker)
         self.assertIsNone(reflection_marker(request))
+
+    def test_observed_raw_hash_uses_the_fragment_without_a_query(self) -> None:
+        target = f"http://{_HOST}/posts#{RAW_HASH_CANARY}"
+        reflected = replace(
+            _request(url=target, value=f"{XSS_REFLECTION_MARKER_PREFIX}abc"),
+            query_parameters=((RAW_HASH_PARAMETER, f"{XSS_REFLECTION_MARKER_PREFIX}abc"),),
+        )
+        url, marker = browser_navigation_url(reflected)
+        self.assertEqual(url, f"http://{_HOST}/posts#{XSS_REFLECTION_MARKER_PREFIX}abc")
+        self.assertIsNone(marker)
+
+        execution = replace(
+            _request(url=target),
+            query_parameters=((RAW_HASH_PARAMETER, f"{XSS_EXECUTION_MARKER_PREFIX}abc"),),
+        )
+        url, marker = browser_navigation_url(execution)
+        self.assertEqual(marker, f"{XSS_EXECUTION_MARKER_PREFIX}abc")
+        self.assertIn("/posts#%3Cimg", url)
+        self.assertNotIn("?fragment=", url)
+        with self.assertRaises(ValueError):
+            validate_browser_xss_request(_request(url=target))
 
 
 class ClientRouteDiscoveryTests(unittest.TestCase):

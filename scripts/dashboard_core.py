@@ -123,6 +123,7 @@ class RunOptions:
     validation_review: bool = False
     report: str = "heuristic"
     browser: bool = False
+    browser_recon: bool = False
     llm_provider: str = "gemini"
     llm_model: str = ""
     llm_rpm_limit: int | None = None
@@ -143,6 +144,7 @@ class RunOptions:
             recon=self.recon,
             recon_entry=self.recon_entry,
             surface_collection=self.surface_collection,
+            browser_recon=self.browser_recon,
             router=self.router,
             router_review=self.router_review,
             compare_routers=self.compare_routers,
@@ -712,6 +714,7 @@ class RunSupervisor:
                 ),
                 recon_max_pages=_ALL_MODE_RECON_PAGES if needs_discovery else 1,
                 recon_surface_collection_mode=options.surface_collection,
+                recon_browser_enabled=options.browser_recon,
                 recon_seed_urls=recon_seed_urls,
                 recon_infer_unlinked_render_parameters=(
                     options.recon_entry == "targeted"

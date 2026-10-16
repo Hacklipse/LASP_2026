@@ -25,4 +25,5 @@ AGENTS.md
 .codex/
 .gitattributes
 /artifacts/*.md
+/artifacts/*
 docs/

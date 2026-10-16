@@ -39,6 +39,7 @@ _STORED_STATUSES = {
     "fallback:invalid_response",
     "fallback:deterministic_collection",
     "fallback:llm_call_limit",
+    "fallback:browser_call_reserve",
 }
 _MAX_LLM_CALL_SECONDS = 60.0
 

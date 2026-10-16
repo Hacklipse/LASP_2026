@@ -120,8 +120,8 @@ class AuditedVulnerabilityRouter:
                 if advisor_trace else ()
             )
             analyzer_coverage = tuple(
-                getattr(advisor_trace, "analyzer_coverage", ())
-                if advisor_trace else ()
+                getattr(routed, "last_analyzer_coverage", ())
+                if routed else ()
             )
             excluded_surfaces = dict(
                 advisor_trace.excluded_surfaces if advisor_trace else ()

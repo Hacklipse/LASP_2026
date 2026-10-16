@@ -83,6 +83,10 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
         baseline["configuration"].get("surface_collection_mode", "adaptive")
         == hybrid["configuration"].get("surface_collection_mode", "adaptive")
     )
+    same_browser_recon = (
+        baseline["configuration"].get("browser_recon_enabled", "false")
+        == hybrid["configuration"].get("browser_recon_enabled", "false")
+    )
     same_review = baseline["configuration"].get("router_review") == hybrid["configuration"].get("router_review")
     paired = baseline["run_id"] == hybrid["run_id"]
     same_budget = bool(
@@ -112,7 +116,7 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
     routing_completed = baseline["status"] == hybrid["status"] == "completed"
     routing_controls_match = all((
         same_input, same_profile, same_scope, same_recon, same_recon_entry,
-        same_surface_collection, same_review,
+        same_surface_collection, same_browser_recon, same_review,
     ))
     analysis_unavailable_reasons = []
     if not baseline_result or not hybrid_result:
@@ -132,6 +136,7 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
             (same_recon, "recon_mode_mismatch"),
             (same_recon_entry, "recon_entry_mismatch"),
             (same_surface_collection, "surface_collection_mismatch"),
+            (same_browser_recon, "browser_recon_mismatch"),
             (same_review, "review_policy_mismatch"),
             (same_budget, "request_budget_mismatch"),
             (same_approval, "approval_mismatch"),
@@ -151,6 +156,7 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
         "same_recon_mode": same_recon,
         "same_recon_entry_mode": same_recon_entry,
         "same_surface_collection_mode": same_surface_collection,
+        "same_browser_recon_enabled": same_browser_recon,
         "same_review_policy": same_review,
         "same_request_budget": same_budget if baseline_result and hybrid_result else None,
         "same_state_changing_approval": same_approval if baseline_result and hybrid_result else None,

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import time
+import posixpath
 from collections.abc import Sequence
 from typing import Protocol
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
-from hacklipse.domain import ExecutionRequest, ExecutionResult, RunScope
+from hacklipse.application import RuntimeEvidenceCollector
+from hacklipse.domain import ExecutionRequest, ExecutionResult, RunScope, TaskEnvelope
 from hacklipse.ports.errors import ExternalExecutionDisabled
 
 from .http_runtime import HttpExecutionRuntime
@@ -52,7 +54,11 @@ class PlaywrightBrowserRuntime:
         browser_runner: BrowserProbeRunner | None = None,
     ) -> None:
         self._http = http_runtime
-        self._browser_runner = browser_runner or self._run_playwright
+        self._browser_runner = browser_runner
+        self._collector: RuntimeEvidenceCollector | None = None
+
+    def bind_collector(self, collector: RuntimeEvidenceCollector) -> None:
+        self._collector = collector
 
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
         if request.tool != BROWSER_XSS_TOOL:
@@ -60,12 +66,18 @@ class PlaywrightBrowserRuntime:
 
         navigation_url, marker = browser_navigation_url(request)
         cookies = self._http.session_cookies(request)
-        return self._browser_runner(
-            request, navigation_url, marker or reflection_marker(request), cookies
+        expected = marker or reflection_marker(request)
+        if self._browser_runner is not None:
+            return self._browser_runner(request, navigation_url, expected, cookies)
+        return self._run_playwright(
+            request, navigation_url, expected, cookies, collector=self._collector
         )
 
     def close_session(self, run_id: str) -> None:
         self._http.close_session(run_id)
+
+    def session_cookies(self, request: ExecutionRequest) -> tuple[tuple[str, str], ...]:
+        return self._http.session_cookies(request)
 
     @staticmethod
     def _run_playwright(
@@ -73,6 +85,8 @@ class PlaywrightBrowserRuntime:
         navigation_url: str,
         expected_marker: str | None,
         cookies: Sequence[tuple[str, str]],
+        *,
+        collector: RuntimeEvidenceCollector | None = None,
     ) -> ExecutionResult:
         try:
             from playwright.sync_api import Error as PlaywrightError
@@ -89,6 +103,7 @@ class PlaywrightBrowserRuntime:
 
         started = time.perf_counter()
         blocked_requests = 0
+        transport = None
         try:
             with sync_playwright() as playwright:
                 try:
@@ -100,7 +115,9 @@ class PlaywrightBrowserRuntime:
                     ) from error
 
                 try:
-                    context = browser.new_context()
+                    context = browser.new_context(service_workers="block", accept_downloads=False)
+                    context.route_web_socket("**/*", lambda ws: ws.close())
+                    context.add_init_script("window.RTCPeerConnection = undefined; window.webkitRTCPeerConnection = undefined;")
                     if cookies:
                         origin = _origin(navigation_url)
                         context.add_cookies(
@@ -116,13 +133,34 @@ class PlaywrightBrowserRuntime:
                         nonlocal blocked_requests
                         if _url_in_scope(
                             route.request.url, request.scope, allowed_origin
-                        ):
+                        ) and route.request.method.upper() in {"GET", "HEAD", "OPTIONS"}:
                             route.continue_()
                         else:
                             blocked_requests += 1
                             route.abort("blockedbyclient")
 
-                    page.route("**/*", enforce_scope)
+                    if collector is not None:
+                        from .browser_recon import _CollectorTransport
+
+                        transport = _CollectorTransport(
+                            collector=collector,
+                            task=TaskEnvelope(
+                                task_id=request.task_id, run_id=request.run_id,
+                                agent_type="browser_xss_runtime",
+                                target_url=request.target_url,
+                                allowed_tools=("http_get",),
+                                credential_ref=request.credential_ref,
+                            ),
+                            scope=request.scope,
+                            remember=lambda *_: request.surface_id,
+                            limit=64,
+                            deadline=time.monotonic() + request.timeout_seconds,
+                            evidence_type="browser_xss_subrequest",
+                            reason="load browser XSS page dependency",
+                        )
+                        page.route("**/*", transport.handle)
+                    else:
+                        page.route("**/*", enforce_scope)
                     response = page.goto(
                         navigation_url,
                         wait_until="domcontentloaded",
@@ -167,7 +205,8 @@ class PlaywrightBrowserRuntime:
                 # marker 원문은 무해한 canary이며 proof가 어떤 실행을 관측했는지 묶는다.
                 "execution_marker": expected_marker if executed else None,
                 "reflection_marker": expected_marker if reflected else None,
-                "blocked_request_count": blocked_requests,
+                "blocked_request_count": blocked_requests + (transport.blocked if transport else 0),
+                "subrequest_count": transport.sent if transport else None,
                 "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
             },
         )
@@ -230,7 +269,8 @@ def _origin(url: str) -> str:
 
 def _origin_key(url: str) -> tuple[str, str, int | None]:
     parsed = urlsplit(url)
-    return parsed.scheme.casefold(), (parsed.hostname or "").casefold(), parsed.port
+    scheme = parsed.scheme.casefold()
+    return scheme, (parsed.hostname or "").casefold(), parsed.port or (443 if scheme == "https" else 80)
 
 
 def _url_in_scope(
@@ -239,7 +279,7 @@ def _url_in_scope(
     allowed_origin: tuple[str, str, int | None],
 ) -> bool:
     parsed = urlsplit(url)
-    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+    if parsed.scheme not in {"http", "https"} or parsed.hostname is None or parsed.username is not None or parsed.password is not None:
         return False
     if _origin_key(url) != allowed_origin:
         return False
@@ -247,4 +287,10 @@ def _url_in_scope(
     if parsed.hostname.casefold().rstrip(".") not in allowed_hosts:
         return False
     path = parsed.path or "/"
-    return any(path.startswith(prefix) for prefix in scope.allowed_path_prefixes)
+    decoded = unquote(unquote(path)).replace("\\", "/")
+    normalized = posixpath.normpath(decoded)
+    return any(
+        path.startswith(prefix) and
+        (normalized == prefix.rstrip("/") or normalized.startswith(prefix))
+        for prefix in scope.allowed_path_prefixes
+    )

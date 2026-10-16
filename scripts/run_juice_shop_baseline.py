@@ -31,6 +31,7 @@ import sqlite3
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
@@ -211,6 +212,7 @@ def _print_execution_preview(
     target_label: str,
     selected_model: str,
     rpm_limit: int | None,
+    runner_name: str = "Juice Shop",
 ) -> None:
     """실행 직전 설정과 통합 검사의 안전 조치를 읽기 쉽게 표시한다."""
 
@@ -225,12 +227,13 @@ def _print_execution_preview(
         else "끔"
     )
     print("=" * 58)
-    print("  Juice Shop 실행 전 확인")
+    print(f"  {runner_name} 실행 전 확인")
     print("=" * 58)
     print("\n[실행 구성]")
     print(f"  검사 대상       {'통합 검사 (5종)' if run_all else target_label}")
     print(f"  Analysis        {analysis}")
     print(f"  Recon           {args.recon}")
+    print(f"  브라우저 Recon  {'사용' if getattr(args, 'browser_recon', False) else '끔'}")
     print(f"  Recon 시작      {getattr(args, 'recon_entry', 'targeted')}")
     print(f"  Surface 수집    {getattr(args, 'surface_collection', 'adaptive')}")
     router_detail = (
@@ -783,24 +786,38 @@ def _provision_path_traversal_account(
         raise
 
 
-def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    add_routing_arguments(parser)
+def main(
+    argv: list[str], *, auto_runner_name: str | None = None,
+    artifact_directory: Path | None = None,
+) -> int:
+    # 다른 로컬 대상 실행기는 auto 경로만 공유한다. 대상별 준비/seed 선택은 금지한다.
+    auto_only = auto_runner_name is not None
+    runner_name = auto_runner_name or "Juice Shop"
+    parser = argparse.ArgumentParser(
+        description=(
+            f"{runner_name} 로컬 웹앱을 base URL에서 자동 탐색한다. "
+            "대상별 seed·계정 준비 없이 공용 Recon/Router/Analysis/Validation을 실행한다. "
+            "기본값: auto/base-url, 브라우저 Recon 켬, heuristic, 요청 상한 80."
+            if auto_only else __doc__
+        )
+    )
+    add_routing_arguments(parser, artifact_directory=artifact_directory)
     parser.add_argument(
         "--recon-entry",
-        choices=("targeted", "base-url"),
-        default="targeted",
+        choices=("base-url",) if auto_only else ("targeted", "base-url"),
+        default="base-url" if auto_only else "targeted",
         help=(
+            "starts Recon only from the supplied base URL" if auto_only else
             "targeted keeps the existing vulnerability-specific start URL/seeds; "
             "base-url starts Recon only from the supplied base URL"
         ),
     )
-    parser.add_argument("base_url", help="localhost/127.0.0.1 Juice Shop base URL")
+    parser.add_argument("base_url", help=f"localhost/127.0.0.1 {runner_name} base URL")
     parser.add_argument(
         "--vuln",
-        choices=(*_VULN_TARGETS, "auto", "all"),
-        default="ssti",
-        help="취약점 유형 (default: ssti)",
+        choices=("auto",) if auto_only else (*_VULN_TARGETS, "auto", "all"),
+        default="auto" if auto_only else "ssti",
+        help="취약점 유형 자동 판별" if auto_only else "취약점 유형 (default: ssti)",
     )
     parser.add_argument(
         "--profile",
@@ -835,13 +852,20 @@ def main(argv: list[str]) -> int:
         help="LLM provider for Analysis, Recon, Router, Orchestrator, allocation or Report (default: gemini)",
     )
     parser.add_argument("--llm-model", help="provider model id")
-    parser.add_argument(
-        "--juice-shop-db",
-        help=(
-            "Path Traversal용 임시 계정 정리에 사용할 Juice Shop "
-            "juiceshop.sqlite 경로"
-        ),
-    )
+    if not auto_only:
+        parser.add_argument(
+            "--juice-shop-db",
+            help=(
+                "Path Traversal용 임시 계정 정리에 사용할 Juice Shop "
+                "juiceshop.sqlite 경로"
+            ),
+        )
+    if auto_only:
+        parser.add_argument(
+            "--no-browser-recon", dest="browser_recon", action="store_false",
+            help="브라우저 Recon을 끄고 정적 HTML/JS 수집만 사용한다",
+        )
+        parser.set_defaults(browser_recon=True)
     parser.add_argument(
         "--knowledge-db",
         help=(
@@ -853,8 +877,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--request-budget",
         type=int,
-        help="Run 전체 HTTP 요청 상한 (기본: 단일 유형 %d, 전체 모드 %d)"
-        % (_DEFAULT_BUDGET, _ALL_MODE_BUDGET),
+        help=(f"Run 전체 HTTP 요청 상한 (기본: {_ALL_MODE_BUDGET})" if auto_only else
+              "Run 전체 HTTP 요청 상한 (기본: 단일 유형 %d, 전체 모드 %d)"
+              % (_DEFAULT_BUDGET, _ALL_MODE_BUDGET)),
     )
     parser.add_argument(
         "--approve-state-changing",
@@ -876,6 +901,11 @@ def main(argv: list[str]) -> int:
         help="LLM prompt와 구조화 응답 출력",
     )
     args = parser.parse_args(argv[1:])
+    if artifact_directory is not None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        stem = artifact_directory / f"dynast-{stamp}-{uuid4().hex[:8]}"
+        args.report_out = args.report_out or f"{stem}.md"
+        args.routing_log = args.routing_log or f"{stem}.jsonl"
     if args.request_budget is not None and args.request_budget <= 0:
         print("거부: --request-budget는 양수여야 합니다.")
         return 2
@@ -896,7 +926,7 @@ def main(argv: list[str]) -> int:
     parsed = urlsplit(base_url)
     host = (parsed.hostname or "").casefold()
     if parsed.scheme not in {"http", "https"} or host not in _LOCAL_HOSTS:
-        print("거부: 이 실행기는 localhost/127.0.0.1의 Juice Shop만 허용합니다.")
+        print(f"거부: 이 실행기는 localhost/127.0.0.1의 {runner_name} 대상만 허용합니다.")
         return 2
     run_all = args.vuln == "all"
     auto_scan = args.vuln == "auto"
@@ -986,6 +1016,7 @@ def main(argv: list[str]) -> int:
         target_label=target_label,
         selected_model=selected_model,
         rpm_limit=rpm_limit,
+        runner_name=runner_name,
     )
     if broad_scan:
         print("참고: 검증된 정상 요청 템플릿이 없어 POST Path Traversal 탐침은 차단됩니다.")
@@ -1005,7 +1036,7 @@ def main(argv: list[str]) -> int:
                 "이 검증은 알려진 취약점 유형·endpoint·대상별 계정 준비 없이 루트 URL에서\n"
                 "지원되는 Analyzer 후보를 자동 분류합니다. 인증과 상태 변경 승인은 제공하지 않습니다."
             )
-        confirmation = "로컬 Juice Shop 자동 탐색을 시작할까요? [y/N] "
+        confirmation = f"로컬 {runner_name} 자동 탐색을 시작할까요? [y/N] "
         credentials = {}
         approvals = ()
         run_credential_ref = None
@@ -1289,6 +1320,7 @@ def main(argv: list[str]) -> int:
             recon_planner=standard_recon_planner(mode=args.recon, llm_client=llm_client),
             recon_max_pages=_ALL_MODE_RECON_PAGES if needs_discovery else 1,
             recon_surface_collection_mode=args.surface_collection,
+            recon_browser_enabled=args.browser_recon,
             recon_seed_urls=recon_seed_urls,
             recon_infer_unlinked_render_parameters=args.recon_entry == "targeted",
             actor_object_id=actor_object_id,
@@ -1383,7 +1415,7 @@ def main(argv: list[str]) -> int:
 
     print()
     print("=" * 54)
-    print(f"  Juice Shop {target_label} 실행 결과")
+    print(f"  {runner_name} {target_label} 실행 결과")
     print("=" * 54)
     print()
     print("[실행 정보]")
@@ -1396,6 +1428,15 @@ def main(argv: list[str]) -> int:
             f"{'사용' if run.credential_ref == _AUTO_SESSION_CREDENTIAL_REF else '미사용'}"
         )
     print(f"  추가 Recon      {run.extra_recon_rounds}회")
+    if args.browser_recon:
+        for item in app.stores.evidence.list_by_run(run.run_id):
+            if item.observation.get("type") == "browser_recon_summary":
+                print(f"  브라우저 Recon  {item.observation.get('status')} · "
+                      f"요청 {item.observation.get('request_count', 0)}회 · "
+                      f"UI 동작 {item.observation.get('action_count', 0)}회 · "
+                      f"해시 확인 {item.observation.get('hash_probe_count', 0)}회/"
+                      f"반사 {item.observation.get('hash_reflection_count', 0)}개 · "
+                      f"중단 {item.observation.get('stop_reason', 'unknown')}")
     if run.budget_candidate_order:
         print(
             "  예산 배분       "
@@ -1482,7 +1523,12 @@ def main(argv: list[str]) -> int:
                 "/rest/basket/{id} 응답을 읽지 못했을 수 있습니다."
             )
         elif broad_scan:
-            print("  참고: Candidate가 없으면 Recon이 Surface를 찾지 못했을 수 있습니다.")
+            if snapshot.surface_count and analyzer_gaps and len(analyzer_gaps) == len(getattr(router, "last_analyzer_coverage", ())):
+                print("  참고: Surface는 발견했지만 현재 Analyzer 실행 조건을 만족하는 입력 좌표가 없습니다.")
+            elif snapshot.surface_count:
+                print("  참고: 발견한 Surface가 Router에서 Candidate로 채택되지 않았습니다.")
+            else:
+                print("  참고: Recon에서 Surface를 발견하지 못했습니다.")
         elif args.vuln == "sqli":
             print(f"  참고: Candidate가 없으면 {vuln.seed_path} 응답을 읽지 못했을 수 있습니다.")
         else:

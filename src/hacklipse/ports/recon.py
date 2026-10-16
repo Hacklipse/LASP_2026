@@ -29,6 +29,10 @@ _DISCOVERY_TYPES = {
     "html_link",
     "html_form",
     "browser_navigation",
+    "browser_dom",
+    "browser_request",
+    "browser_form",
+    "browser_hash_probe",
     "script_literal",
     "discovered",
 }
@@ -41,6 +45,7 @@ _ACTION_STATUSES = {
     "fallback:invalid_response",
     "fallback:deterministic_collection",
     "fallback:llm_call_limit",
+    "fallback:browser_call_reserve",
 }
 
 

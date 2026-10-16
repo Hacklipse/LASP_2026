@@ -671,6 +671,7 @@ def main(argv: list[str]) -> int:
     # 시작 Surface가 아닌 크롤링 순서에 좌우된다. 대상 페이지 한 장만 열거한다.
     profile = register_standard_agents(
         app,
+        recon_browser_enabled=args.browser_recon,
         llm_client=llm_client if args.profile == "llm" else None,
         recon_planner=standard_recon_planner(mode=args.recon, llm_client=llm_client),
         recon_max_pages=1,

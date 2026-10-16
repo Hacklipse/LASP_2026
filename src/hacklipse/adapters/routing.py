@@ -13,6 +13,7 @@ from hacklipse.ports import AnalyzerCapability
 
 from .analyzer_capabilities import (
     DEFAULT_ANALYZER_CAPABILITIES,
+    analyzer_capability_coverage,
     capability_matches,
     exploration_parameters,
 )
@@ -358,7 +359,9 @@ class RuleBasedVulnerabilityRouter:
         self.last_advisor_suggestions = ()
         self.last_advisor_outcomes = ()
         self.last_capability_assessments = ()
-        self.last_analyzer_coverage = ()
+        self.last_analyzer_coverage = analyzer_capability_coverage(
+            self._capabilities, run, surfaces, evidence
+        )
         self.last_advisor_status = (
             "not_configured" if self._advisor is None else "not_called"
         )
@@ -438,9 +441,8 @@ class RuleBasedVulnerabilityRouter:
                 self.last_capability_assessments = tuple(
                     getattr(trace, "capabilities", ())
                 )
-                self.last_analyzer_coverage = tuple(
-                    getattr(trace, "analyzer_coverage", ())
-                )
+                if trace is not None:
+                    self.last_analyzer_coverage = tuple(trace.analyzer_coverage)
                 adapter_fallback = (
                     getattr(trace, "source", None) == "deterministic_fallback"
                 )
@@ -473,9 +475,8 @@ class RuleBasedVulnerabilityRouter:
                 self.last_capability_assessments = tuple(
                     getattr(trace, "capabilities", ())
                 )
-                self.last_analyzer_coverage = tuple(
-                    getattr(trace, "analyzer_coverage", ())
-                )
+                if trace is not None:
+                    self.last_analyzer_coverage = tuple(trace.analyzer_coverage)
                 decisions.update(suggested)
 
         # 우선순위가 높은 분석 대상을 먼저 처리하도록 정렬한다.

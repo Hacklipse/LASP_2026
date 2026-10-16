@@ -49,6 +49,7 @@ from .llm_iterative_recon import (
     recon_action_status_detail,
 )
 from .llm_parameter_names import alias_parameter_names
+from .browser_recon import PlaywrightRecon
 from .llm_recon_planner import (
     RECON_PLANNER,
     ReconCandidate,
@@ -67,7 +68,7 @@ from .path_traversal_analysis import (
 RECON_TOOL = "http_get"
 
 DEFAULT_MAX_PAGES = 10
-DEFAULT_MAX_SCRIPTS = 3
+DEFAULT_MAX_SCRIPTS = 8
 _RECON_DEADLINE_RESERVE_SECONDS = 5.0
 _MAX_AGENTIC_LLM_CALLS = 3
 _MAX_AGENTIC_LLM_CALL_SECONDS = 15.0
@@ -223,6 +224,19 @@ def _deterministic_url_key(url: str) -> tuple[str, str, str, str, str, str]:
     )
 
 
+def _script_priority(url: str) -> int:
+    """공통 런타임이 작은 수집 창을 독점하지 않도록 앱 청크를 먼저 읽는다."""
+
+    path = urlsplit(url).path.casefold()
+    name = path.rsplit("/", 1)[-1]
+    if re.search(r"(?:^|[/_.-])(app|page|layout|route|feature)(?:[/_.-]|$)", path):
+        if not name.startswith("main-app"):
+            return 0
+    if re.match(r"(?:webpack|runtime|polyfills?|vendor|framework|main-app|\d+[.-])", name):
+        return 2
+    return 1
+
+
 def _deterministic_pending(
     urls: Sequence[str], protected: Sequence[str] | set[str] = ()
 ) -> list[str]:
@@ -260,6 +274,7 @@ class ReconAgent:
         planner: ReconPlanner | None = None,
         iterative_planner: IterativeReconPlanner | None = None,
         clock: Callable[[], float] | None = None,
+        browser_recon: PlaywrightRecon | None = None,
     ) -> None:
         if max_pages < 1:
             raise ValueError("recon must fetch at least one page")
@@ -281,6 +296,7 @@ class ReconAgent:
         self._planner = planner
         self._iterative_planner = iterative_planner
         self._clock = clock or time.monotonic
+        self._browser_recon = browser_recon
 
     def handle(self, task: TaskEnvelope) -> AgentResult:
         """예산 안에서 크롤링하며 Surface·Evidence를 채운다."""
@@ -508,10 +524,13 @@ class ReconAgent:
 
         # 번들 분석은 크롤링 뒤에 한다. 남은 예산 안에서만 스크립트를 받는다.
         affordable = max(min(self._max_scripts, page_budget - len(fetched)), 0)
-        script_sources = (
-            sorted(scripts, key=_deterministic_url_key)
-            if self._surface_collection_mode == "deterministic"
-            else scripts
+        script_sources = sorted(
+            scripts,
+            key=lambda source: (
+                _script_priority(source),
+                _deterministic_url_key(source)
+                if self._surface_collection_mode == "deterministic" else scripts.index(source),
+            ),
         )
         for source in script_sources[:affordable]:
             if remaining_work() < 1.0:
@@ -548,16 +567,27 @@ class ReconAgent:
                 ) and url not in fetched and url not in pending:
                     pending.append(url)
 
+        round_index = 0
+        provider_fallback_status: str | None = None
+        browser_llm_reserve = int(
+            self._browser_recon is not None
+            and not targeted
+            and self._surface_collection_mode != "deterministic"
+        )
         if self._iterative_planner is not None and pending and not targeted:
-            round_index = 0
             llm_calls = 0
-            provider_fallback_status: str | None = None
             while pending and len(fetched) < page_budget:
                 if remaining_work() < 1.0:
                     deadline_exhausted = True
                     break
-                if llm_calls >= _MAX_AGENTIC_LLM_CALLS and provider_fallback_status is None:
-                    provider_fallback_status = "fallback:llm_call_limit"
+                if (
+                    llm_calls >= _MAX_AGENTIC_LLM_CALLS - browser_llm_reserve
+                    and provider_fallback_status is None
+                ):
+                    provider_fallback_status = (
+                        "fallback:browser_call_reserve"
+                        if browser_llm_reserve else "fallback:llm_call_limit"
+                    )
                 if self._surface_collection_mode == "deterministic" or provider_fallback_status:
                     pending[:] = _deterministic_pending(pending, navigation_pages)
                 remaining_budget = max(page_budget - len(fetched), 0)
@@ -686,6 +716,84 @@ class ReconAgent:
                 else:
                     summary_id = existing_summary.evidence_id
                 evidence_ids.append(summary_id)
+
+        if self._browser_recon is not None and not targeted:
+            browser_budget = max(0, int(task.request_budget * _RECON_BUDGET_SHARE) - len(fetched))
+            if browser_budget and remaining_work() > 1.0:
+                browser_decisions = 0
+                browser_llm_calls = 0
+
+                def select_browser_page(
+                    options: tuple[tuple[str, str], ...],
+                    remaining_budget: int,
+                    browser_seconds: float,
+                ) -> str | None:
+                    nonlocal browser_decisions, browser_llm_calls, planner_status
+                    if (
+                        self._iterative_planner is None
+                        or self._surface_collection_mode == "deterministic"
+                        or browser_decisions >= 1
+                        or provider_fallback_status in {
+                            "fallback:timeout", "fallback:transport_error", "fallback:refused"
+                        }
+                    ):
+                        return None
+                    llm_timeout = min(
+                        _MAX_AGENTIC_LLM_CALL_SECONDS,
+                        remaining_work() / 2,
+                        browser_seconds / 2,
+                    )
+                    if llm_timeout < 1.0:
+                        return None
+                    offered = options[:_MAX_AGENTIC_SELECTABLE]
+                    surface_ids = tuple(dict.fromkeys(sid for _, sid in offered))
+                    observations = self._recon_observations(
+                        task.run_id, surface_discovery_types, fetched,
+                        surface_ids,
+                        context_surface_ids=tuple(recently_fetched_surface_ids),
+                    )
+                    action, evidence_id, selected_id, called = self._next_action(
+                        replace(task, timeout_seconds=2 * llm_timeout),
+                        observations, surface_ids, remaining_budget,
+                        round_index + browser_decisions,
+                    )
+                    browser_decisions += 1
+                    browser_llm_calls += int(called)
+                    evidence_ids.append(evidence_id)
+                    planner_status = recon_action_status_detail(action)
+                    if action.source != "llm" or selected_id is None:
+                        return None
+                    return next((url for url, sid in offered if sid == selected_id), None)
+
+                discovery = self._browser_recon.discover(
+                    task, remember=remember, request_budget=browser_budget,
+                    timeout_seconds=remaining_work(),
+                    select_next=(
+                        select_browser_page if self._iterative_planner is not None else None
+                    ),
+                )
+                evidence_ids.extend(discovery.evidence_ids)
+                observations = tuple(
+                    (surface_id, {
+                        **observation,
+                        "planner_llm_call_count": browser_llm_calls,
+                    } if observation.get("type") == "browser_recon_summary" else observation)
+                    for surface_id, observation in discovery.observations
+                )
+            else:
+                observations = ((None, {
+                    "type": "browser_recon_summary", "status": "skipped",
+                    "stop_reason": "request_budget" if not browser_budget else "time_budget",
+                }),)
+            for surface_id, observation in observations:
+                evidence_id = f"evi-{self._id_factory()}"
+                self._evidence.append(Evidence(
+                    evidence_id=evidence_id, run_id=task.run_id,
+                    surface_id=surface_id, created_by="browser_recon",
+                    evidence_type="observation", source_task_id=task.task_id,
+                    observation=observation,
+                ))
+                evidence_ids.append(evidence_id)
 
         surface_ids = list(surfaces.values())
         return AgentResult(
@@ -1068,7 +1176,12 @@ class ReconAgent:
                 surface_id=selected,
                 basis_observation_ids=basis,
                 reason_code=(
-                    "planner_failure" if provider_fallback_status else "expand_coverage"
+                    "expand_coverage"
+                    if provider_fallback_status in {
+                        None, "fallback:browser_call_reserve",
+                        "fallback:deterministic_collection",
+                    }
+                    else "planner_failure"
                 ),
                 source="deterministic_fallback",
                 status=provider_fallback_status or "fallback:deterministic_collection",

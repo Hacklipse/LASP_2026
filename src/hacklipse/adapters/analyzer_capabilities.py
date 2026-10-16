@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Literal
 from urllib.parse import urlsplit
 
-from hacklipse.domain import Evidence, Surface
+from hacklipse.domain import Evidence, Run, Surface
 from hacklipse.ports import AnalyzerCapability, ObservationRequirement
 
 from .request_safety import has_state_changing_parameters, object_identifier_parameters
@@ -125,6 +127,63 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         default_priority=0.35,
     ),
 )
+
+
+@dataclass(frozen=True, slots=True)
+class AnalyzerCapabilityCoverage:
+    """등록된 Analyzer capability의 현재 Run 실행 가능 여부."""
+
+    capability_id: str
+    vulnerability_type: str
+    agent_type: str
+    status: Literal["routable", "blocked"]
+    matched_surface_count: int = 0
+    missing_requirements: tuple[str, ...] = ()
+
+
+def analyzer_capability_coverage(
+    capabilities: Sequence[AnalyzerCapability],
+    run: Run,
+    surfaces: Sequence[Surface],
+    evidence: Sequence[Evidence],
+) -> tuple[AnalyzerCapabilityCoverage, ...]:
+    """Router 모드와 무관하게 capability별 가장 작은 계약 gap을 계산한다."""
+
+    run_surfaces = tuple(surface for surface in surfaces if surface.run_id == run.run_id)
+    evidence_by_surface: dict[str, list[Evidence]] = {}
+    for item in evidence:
+        if item.run_id == run.run_id and item.surface_id is not None:
+            evidence_by_surface.setdefault(item.surface_id, []).append(item)
+    coverage: list[AnalyzerCapabilityCoverage] = []
+    for capability in capabilities:
+        gaps = tuple(
+            capability_missing_requirements(
+                capability, surface, evidence_by_surface.get(surface.surface_id, ())
+            )
+            for surface in run_surfaces
+        )
+        matched = sum(not gap for gap in gaps)
+        if matched:
+            coverage.append(AnalyzerCapabilityCoverage(
+                capability_id=capability.capability_id,
+                vulnerability_type=capability.vulnerability_type,
+                agent_type=capability.agent_type,
+                status="routable",
+                matched_surface_count=matched,
+            ))
+        else:
+            coverage.append(AnalyzerCapabilityCoverage(
+                capability_id=capability.capability_id,
+                vulnerability_type=capability.vulnerability_type,
+                agent_type=capability.agent_type,
+                status="blocked",
+                missing_requirements=(
+                    min(gaps, key=lambda gap: (
+                        len(gap), "method" in gap, "surface_kind" in gap, gap
+                    )) if gaps else ("surface",)
+                ),
+            ))
+    return tuple(coverage)
 
 
 def observation_parameters(
