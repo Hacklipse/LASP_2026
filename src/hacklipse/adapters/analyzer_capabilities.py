@@ -259,6 +259,24 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         default_priority=0.20,
     ),
     AnalyzerCapability(
+        capability_id="ssti.http.query",
+        agent_type="ssti_analyzer",
+        vulnerability_type="SSTI",
+        methods=("GET",),
+        surface_kind="server",
+        # username 힌트를 걸지 않는다. 템플릿에 렌더링되는 좌표의 이름은 대상마다 달라
+        # name·message·template 등으로 나타나며, heuristic_ssti_parameters가 이미
+        # SSTI_PARAMETER_HINTS로 한 번 좁힌다. 여기서 또 좁히면 선언과 분석기의
+        # 좁힘 기준이 두 곳으로 갈라진다.
+        exploration_parameter_source="surface",
+        supported_evidence_types=(
+            "control_response",
+            "template_execution_marker",
+        ),
+        strategy_ids=("compare_query_template_expressions",),
+        default_priority=0.25,
+    ),
+    AnalyzerCapability(
         capability_id="ssti.form.username",
         agent_type="ssti_analyzer",
         vulnerability_type="SSTI",

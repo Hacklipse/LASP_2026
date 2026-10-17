@@ -109,6 +109,7 @@ class LabResult:
     findings: int = 0
     gate_blocks: dict[str, int] = field(default_factory=dict)
     near_miss: list = field(default_factory=list)
+    surface_shapes: dict[str, int] = field(default_factory=dict)
     requests_used: int = 0
     phase: str = ""
     target_url: str = ""
@@ -311,15 +312,23 @@ def _gate_diagnosis(expected: str, surfaces, evidence) -> dict:
     Surface를 떨어뜨렸는지가 실제로 손댈 지점이다. Router가 쓰는 것과 같은 함수를
     불러 진단과 실행이 어긋나지 않게 한다.
 
-    near_miss는 막힌 이유가 가장 적은 (capability, 이유) 쌍이다. 게이트 하나만 풀면
-    후보가 설 수 있는 경우를 가려낸다.
+    near_miss는 막힌 이유가 가장 적은 (capability, 이유) 쌍이고, 그 쌍이 **어느 Surface**
+    에서 나왔는지까지 적는다. Surface를 빼면 읽는 사람이 오독한다: 파라미터 없는 GET
+    Surface가 많은 대상에서는 input_parameter가 늘 최소 블록으로 뽑히지만, 정작 취약한
+    입력은 다른 POST Surface에 있다. 실제로 XBEN-071에서 그렇게 잘못 읽었다.
+
+    surface_shapes는 Surface를 (method, 파라미터 유무)로 집계한다. 어떤 모양의 입력이
+    있는데도 못 쓰고 있는지가 capability 선언을 고칠 근거다.
     """
     wanted = [c for c in DEFAULT_ANALYZER_CAPABILITIES if c.vulnerability_type == expected]
+    shapes = Counter(
+        f"{s.method.upper()}{'+params' if s.parameters else ''}" for s in surfaces
+    )
     if not wanted or not surfaces:
-        return {"gate_blocks": {}, "near_miss": []}
+        return {"gate_blocks": {}, "near_miss": [], "surface_shapes": dict(shapes)}
 
     blocks: Counter[str] = Counter()
-    best: tuple[int, str, tuple[str, ...]] | None = None
+    best: tuple[int, str, tuple[str, ...], str] | None = None
     for capability in wanted:
         for surface in surfaces:
             reasons = capability_missing_requirements(capability, surface, evidence)
@@ -327,11 +336,20 @@ def _gate_diagnosis(expected: str, surfaces, evidence) -> dict:
                 continue  # 매칭됨 — 후보가 섰어야 한다
             for reason in reasons:
                 blocks[reason] += 1
-            if best is None or len(reasons) < best[0]:
-                best = (len(reasons), capability.capability_id, reasons)
+            # 파라미터를 가진 Surface를 우선한다. 입력이 있는 좌표에서의 near miss만
+            # 실제로 고칠 가치가 있다.
+            rank = (len(reasons), 0 if surface.parameters else 1)
+            if best is None or rank < (best[0], 0 if "+params" in best[3] else 1):
+                best = (
+                    len(reasons),
+                    capability.capability_id,
+                    reasons,
+                    f"{surface.method.upper()}{'+params' if surface.parameters else ''}",
+                )
     return {
         "gate_blocks": dict(blocks.most_common()),
-        "near_miss": [best[1], list(best[2])] if best else [],
+        "near_miss": [best[1], list(best[2]), best[3]] if best else [],
+        "surface_shapes": dict(shapes.most_common()),
     }
 
 
@@ -454,6 +472,7 @@ def measure(
         result.confirmed_types = metrics["confirmed_types"]
         result.gate_blocks = metrics.get("gate_blocks", {})
         result.near_miss = metrics.get("near_miss", [])
+        result.surface_shapes = metrics.get("surface_shapes", {})
         result.cause, result.detail = classify(expected, metrics)
 
     if not keep_up:
@@ -527,11 +546,16 @@ def report(results: list[LabResult]) -> None:
         for item in sorted(blocked, key=lambda i: len(i.near_miss[1]) if i.near_miss else 99):
             if not item.near_miss:
                 continue
-            capability_id, reasons = item.near_miss
+            capability_id, reasons, shape = item.near_miss
             print(
                 f"    {item.lab_id}  {item.expected_class:<16}{capability_id:<36}"
-                f"막힘={','.join(reasons)}"
+                f"막힘={','.join(reasons)}  (Surface {shape})"
             )
+        print("\n  정찰이 찾은 Surface 모양 — 입력이 있는데 못 쓰고 있는지 본다:")
+        for item in blocked:
+            if item.surface_shapes:
+                shapes = " ".join(f"{k}×{v}" for k, v in item.surface_shapes.items())
+                print(f"    {item.lab_id}  {shapes}")
 
     env = [i for i in results if i.cause == CAUSE_ENV]
     if env:
