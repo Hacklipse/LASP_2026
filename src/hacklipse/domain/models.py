@@ -90,6 +90,10 @@ class ValidationProofType(str, Enum):
     UNAUTHORIZED_OBJECT_ACCESS = "unauthorized_object_access"
     PATH_TRAVERSAL_FILE_READ = "path_traversal_file_read"
     SSTI_EXECUTION = "ssti_execution"
+    SENSITIVE_DATA_EXPOSURE = "sensitive_data_exposure"
+    SOURCE_MAP_EXPOSURE = "source_map_exposure"
+    OPEN_REDIRECT = "open_redirect"
+    CORS_ORIGIN_REFLECTION = "cors_origin_reflection"
 
 
 class HttpRequestKind(str, Enum):
@@ -97,6 +101,8 @@ class HttpRequestKind(str, Enum):
 
     CONTROL = "control"
     PROBE = "probe"
+    OPEN_REDIRECT_PROBE = "open_redirect_probe"
+    CORS_PROBE = "cors_probe"
     PATH_TRAVERSAL_PROBE = "path_traversal_probe"
     ACCESS_CONTROL_PROBE = "access_control_probe"
     SSTI_PROBE = "ssti_probe"
@@ -490,6 +496,14 @@ class HttpRequestSpec:
                     "probe query value must be a marker with allowed metacharacters "
                     f"({PROBE_METACHARACTERS}): {value!r}"
                 )
+            if self.request_kind is HttpRequestKind.OPEN_REDIRECT_PROBE and not (
+                value == "/" or re.fullmatch(
+                    r"http://127\.0\.0\.1:9/redirect[A-Za-z0-9z]{8,180}", value
+                )
+            ):
+                raise DomainInvariantError(
+                    "open redirect probe may only use the fixed loopback destination"
+                )
             if (
                 self.request_kind is HttpRequestKind.PATH_TRAVERSAL_PROBE
                 and _PROBE_VALUE.fullmatch(value) is None
@@ -509,6 +523,22 @@ class HttpRequestSpec:
                 )
         if self.request_kind is HttpRequestKind.ACCESS_CONTROL_PROBE:
             self._validate_access_control_probe()
+        if self.request_kind is HttpRequestKind.OPEN_REDIRECT_PROBE and (
+            self.method.upper() != "GET" or self.body is not None or self.headers
+            or not any(value.startswith("http://127.0.0.1:9/")
+                       for _, value in self.query_parameters)
+        ):
+            raise DomainInvariantError("open redirect probe must be a bounded GET request")
+        if self.request_kind is HttpRequestKind.CORS_PROBE and (
+            self.method.upper() != "GET" or self.body is not None
+            or self.query_parameters
+            or len(self.headers) != 1
+            or self.headers[0] not in {
+                ("Origin", "https://probe-a.invalid"),
+                ("Origin", "https://probe-b.invalid"),
+            }
+        ):
+            raise DomainInvariantError("CORS probe must use one fixed nonresident Origin")
 
         for name, value in self.headers:
             if not isinstance(name, str) or not isinstance(value, str):

@@ -198,12 +198,69 @@ def build_run_router(
 def append_run_result(args, app, run) -> None:
     """실제 Analysis/Validation 결과를 같은 Run ID로 연결한다. 증적 원문은 저장하지 않는다."""
     candidates = app.stores.candidates.list_by_run(run.run_id)
+    surfaces = app.stores.surfaces.list_by_run(run.run_id)
+    run_evidence = app.stores.evidence.list_by_run(run.run_id)
+    task_store = getattr(app.stores, "tasks", None)
+    task_records = task_store.list_by_run(run.run_id) if task_store is not None else ()
+    analysis_states: dict[str, set[str]] = {}
+    validation_states: dict[str, set[str]] = {}
+    for record in task_records:
+        envelope = record.envelope
+        if envelope.candidate_id is None or envelope.evidence_request is not None:
+            continue
+        states = validation_states if envelope.validation_id is not None else analysis_states
+        states.setdefault(envelope.candidate_id, set()).add(record.status.value)
+    attempted = {"running", "succeeded", "failed"}
+    candidate_surface_ids = {candidate.surface_id for candidate in candidates}
+    post_surfaces = [surface for surface in surfaces if surface.method.upper() == "POST"]
+    responded_surface_ids = {
+        item.surface_id for item in run_evidence
+        if item.surface_id is not None
+        and item.evidence_type == "http_response"
+        and type(item.observation.get("status")) is int
+        and 100 <= item.observation["status"] <= 599
+    }
+    stage_funnel = {
+        "discovered_surface_count": len(surfaces),
+        "schema_declared_surface_count": len({
+            surface.surface_id for surface in surfaces
+            if "openapi_schema" in surface.discovery_types
+        } | {
+            item.surface_id for item in run_evidence
+            if item.surface_id is not None
+            and item.observation.get("type") == "openapi_request_structure"
+        }),
+        "responded_surface_count": len(responded_surface_ids),
+        "candidate_surface_count": len(candidate_surface_ids),
+        "post_surface_count": len(post_surfaces),
+        "unrouted_post_surface_count": sum(
+            surface.surface_id not in candidate_surface_ids for surface in post_surfaces
+        ),
+        "candidate_count": len(candidates),
+        "task_history_available": task_store is not None,
+        "analysis_attempted_count": (
+            sum(bool(analysis_states.get(c.candidate_id, set()) & attempted)
+                for c in candidates) if task_store is not None else None
+        ),
+        "analysis_succeeded_count": (
+            sum("succeeded" in analysis_states.get(c.candidate_id, set())
+                for c in candidates) if task_store is not None else None
+        ),
+        "validation_attempted_count": (
+            sum(bool(validation_states.get(c.candidate_id, set()) & attempted)
+                for c in candidates) if task_store is not None else None
+        ),
+        "validation_succeeded_count": (
+            sum("succeeded" in validation_states.get(c.candidate_id, set())
+                for c in candidates) if task_store is not None else None
+        ),
+    }
     profile = run.execution_profile
     review = _validation_review_summary(app, run, candidates)
     report_narrative = _report_narrative_summary(app, run)
     keys = {
         surface.surface_id: surface_key(surface)
-        for surface in app.stores.surfaces.list_by_run(run.run_id)
+        for surface in surfaces
     }
     JsonlRoutingAuditLog(args.routing_log).append({
         "schema_version": 4, "event": "run_result", "run_id": run.run_id,
@@ -219,8 +276,10 @@ def append_run_result(args, app, run) -> None:
         "recon_entry_mode": profile.recon_entry_mode,
         "surface_collection_mode": profile.surface_collection_mode,
         "browser_recon_enabled": profile.browser_recon_enabled,
-        "browser_recon": [dict(item.observation) for item in app.stores.evidence.list_by_run(run.run_id)
+        "browser_recon": [dict(item.observation) for item in run_evidence
                           if item.observation.get("type") == "browser_recon_summary"],
+        "recon_frontier": [dict(item.observation) for item in run_evidence
+                           if item.observation.get("type") == "recon_frontier_summary"],
         "orchestrator_mode": profile.orchestrator_mode,
         "extra_recon_rounds": run.extra_recon_rounds,
         "budget_allocation_mode": profile.budget_allocation_mode,
@@ -240,6 +299,7 @@ def append_run_result(args, app, run) -> None:
         "budget_candidate_weights": list(run.budget_candidate_weights),
         "phase": run.phase.value,
         "candidate_status_counts": dict(Counter(c.status.value for c in candidates)),
+        "stage_funnel": stage_funnel,
         "validation_review": review,
         "report_narrative": report_narrative,
         "finding_count": len(app.stores.findings.list_by_run(run.run_id)),
@@ -249,6 +309,8 @@ def append_run_result(args, app, run) -> None:
             "candidate_id": c.candidate_id, "surface_key": keys.get(c.surface_id),
             "vulnerability_type": c.vulnerability_type, "agent_type": c.assigned_agent,
             "status": c.status.value, "evidence_count": len(c.evidence_ids),
+            "analysis_task_states": sorted(analysis_states.get(c.candidate_id, ())),
+            "validation_task_states": sorted(validation_states.get(c.candidate_id, ())),
             "exploration_parameters": list(c.exploration_parameters),
             "required_evidence_types": list(c.required_evidence_types),
         } for c in candidates],

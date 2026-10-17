@@ -18,6 +18,7 @@ from uuid import uuid4
 from hacklipse.domain import Evidence, RouteDecision, Run, Surface
 from hacklipse.ports.agents import VulnerabilityRouter
 
+from .analyzer_capabilities import capability_missing_requirements
 from .llm_router_advisor import surface_routing_summary
 from .routing import ADVISOR_PRIORITY, RuleBasedVulnerabilityRouter
 
@@ -140,6 +141,49 @@ class AuditedVulnerabilityRouter:
                 (item.candidate.surface_id, item.candidate.vulnerability_type): item
                 for item in decisions
             }
+            decisions_by_surface: dict[str, list[str]] = {}
+            for item in decisions:
+                decisions_by_surface.setdefault(item.candidate.surface_id, []).append(
+                    item.candidate.candidate_id
+                )
+            evidence_by_surface: dict[str, list[Evidence]] = {}
+            for item in evidence:
+                if item.run_id == run.run_id and item.surface_id is not None:
+                    evidence_by_surface.setdefault(item.surface_id, []).append(item)
+            surface_reviews = []
+            for surface in surfaces:
+                capability_gaps = {
+                    capability.capability_id: list(capability_missing_requirements(
+                        capability, surface,
+                        evidence_by_surface.get(surface.surface_id, ()),
+                    ))
+                    for capability in (routed._capabilities if routed else ())
+                }
+                candidate_ids = decisions_by_surface.get(surface.surface_id, [])
+                surface_reviews.append({
+                    "surface_id": surface.surface_id,
+                    "reason": (
+                        "advisor_review"
+                        if advisor_trace
+                        and surface.surface_id in advisor_trace.offered_surface_ids
+                        else "heuristic_mode"
+                        if advisor is None
+                        else excluded_surfaces.get(surface.surface_id, "not_offered")
+                    ),
+                    "selected": bool(
+                        advisor_trace
+                        and surface.surface_id in advisor_trace.offered_surface_ids
+                    ),
+                    "candidate_ids": candidate_ids,
+                    "capability_gaps": capability_gaps,
+                    "unrouted_reason": (
+                        None if candidate_ids else
+                        "routing_rule_unmatched"
+                        if any(not gaps for gaps in capability_gaps.values()) else
+                        "capability_requirements_unmet"
+                        if capability_gaps else "no_analyzer_capabilities"
+                    ),
+                })
             proposals = []
             if routed:
                 for index, item in enumerate(routed.last_advisor_suggestions):
@@ -177,26 +221,7 @@ class AuditedVulnerabilityRouter:
                     run, surfaces, evidence
                 ),
                 "routing_input_manifest": routing_input_manifest(surfaces, evidence),
-                "surface_reviews": [
-                    {
-                        "surface_id": surface.surface_id,
-                        "reason": (
-                            "advisor_review"
-                            if advisor_trace
-                            and surface.surface_id in advisor_trace.offered_surface_ids
-                            else "heuristic_mode"
-                            if advisor is None
-                            else excluded_surfaces.get(
-                                surface.surface_id, "not_offered"
-                            )
-                        ),
-                        "selected": bool(
-                            advisor_trace
-                            and surface.surface_id in advisor_trace.offered_surface_ids
-                        ),
-                    }
-                    for surface in surfaces
-                ],
+                "surface_reviews": surface_reviews,
                 "rule_decisions": [
                     _decision(item, "rule", surface_keys, routing_identities)
                     for item in baseline

@@ -39,7 +39,7 @@ from .access_control_analysis import (
     build_access_control_requests,
     unauthorized_object_exposed,
 )
-from .routing import DEFAULT_RULES
+from .routing import DEFAULT_RULES, OPTIONAL_SOURCE_MAP_RULES
 from .sqli_analysis import sql_error_signal
 from .ssti_analysis import (
     SSTI_OBSERVATION,
@@ -49,11 +49,26 @@ from .ssti_analysis import (
     ssti_execution_signal,
 )
 from .xss_execution import BROWSER_XSS_TOOL, XSS_EXECUTION_MARKER_PREFIX
+from .sensitive_exposure import EXPOSURE_TYPE, EXPOSURE_OBSERVATION, exposed_json_field_paths
+from .source_map_exposure import (
+    SOURCE_MAP_TYPE, SOURCE_MAP_OBSERVATION, exposed_source_map_signature,
+)
+from .open_redirect_analysis import (
+    REDIRECT_TYPE, REDIRECT_OBSERVATION, build_redirect_requests,
+    redirect_probe_url, redirected_to_probe,
+)
+from .cors_analysis import (
+    CORS_TYPE, CORS_OBSERVATION, CORS_VALIDATION_ORIGIN,
+    build_cors_requests, cors_reflection_signal,
+)
 
 # Router가 Candidate를 만들 때 쓴 것과 같은 taxonomy. Candidate가 알려진 취약점
 # 유형을 벗어나면(Router가 만들 수 없는 값) 계약 위반으로 간주한다. Analysis
 # Agent의 자유 서술 결론(hypothesis)은 여기서도 참고하지 않는다.
-_EXPECTED_SIGNAL = {rule.vulnerability_type: rule.observation_type for rule in DEFAULT_RULES}
+_EXPECTED_SIGNAL = {
+    rule.vulnerability_type: rule.observation_type
+    for rule in (*DEFAULT_RULES, *OPTIONAL_SOURCE_MAP_RULES)
+}
 
 # HttpExecutionRuntime(및 그 대역)이 실제 재현 요청 결과에 붙이는 Observation 유형.
 # 최초 Recon이 남긴 신호 관측(예: "url_or_file_parameter")과는 구분되는, Validator
@@ -142,6 +157,14 @@ class ValidationAgent:
 
         if candidate.vulnerability_type == "SQLi":
             return self._validate_sqli(task, candidate, evidence, reproduction)
+        if candidate.vulnerability_type == EXPOSURE_TYPE:
+            return self._validate_sensitive_exposure(task, candidate, evidence, reproduction)
+        if candidate.vulnerability_type == SOURCE_MAP_TYPE:
+            return self._validate_source_map_exposure(task, candidate, evidence, reproduction)
+        if candidate.vulnerability_type == REDIRECT_TYPE:
+            return self._validate_open_redirect(task, candidate, evidence, reproduction)
+        if candidate.vulnerability_type == CORS_TYPE:
+            return self._validate_cors(task, candidate, evidence, reproduction)
         if specialized_path_validation:
             return self._validate_path_traversal(
                 task, candidate, evidence, reproduction
@@ -161,6 +184,209 @@ class ValidationAgent:
                 task, candidate.surface_id, candidate.vulnerability_type
             )
         return self._decide(task, reproduction)
+
+    def _validate_cors(
+        self, task: TaskEnvelope, candidate: Candidate,
+        evidence: Sequence[Evidence], reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        analysis_signal = any(
+            item.surface_id == candidate.surface_id
+            and item.created_by == "cors_analyzer"
+            and item.observation.get("type") == CORS_OBSERVATION
+            for item in evidence
+        )
+        if not analysis_signal:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.REJECTED, evidence=(),
+                reason="analysis produced no reflected credentialed CORS signal",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        requests = build_cors_requests(
+            surface.surface_id, CORS_VALIDATION_ORIGIN,
+            f"CORS validation {task.validation_id}",
+        )
+        collected = tuple(matching_evidence(reproduction, surface.url, request)
+                          for request in requests)
+        missing = tuple(request for request, item in zip(requests, collected) if item is None)
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded("CORS validation lacks read-only request budget")
+            return AgentResult(task_id=task.task_id, status=AgentResultStatus.NEEDS_EVIDENCE,
+                               evidence_requests=missing)
+        if cors_reflection_signal(collected[0], collected[1], CORS_VALIDATION_ORIGIN):
+            proof_evidence = tuple(item for item in collected if item is not None)
+            proof = ValidationProof(
+                proof_type=ValidationProofType.CORS_ORIGIN_REFLECTION,
+                evidence_ids=tuple(item.evidence_id for item in proof_evidence),
+                summary="independent GET reproduced credentialed reflection of a second Origin",
+            )
+            return self._validation_result(
+                task, verdict=ValidationVerdict.CONFIRMED, evidence=proof_evidence,
+                reason="two distinct foreign origins were reflected with credentials allowed",
+                reason_code=ValidationReasonCode.CONFIRMED_PROOF, proof=proof,
+            )
+        return self._validation_result(
+            task, verdict=ValidationVerdict.REJECTED,
+            evidence=tuple(item for item in collected if item is not None),
+            reason="independent second Origin was not credentialed and reflected",
+            reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+        )
+
+    def _validate_open_redirect(
+        self, task: TaskEnvelope, candidate: Candidate,
+        evidence: Sequence[Evidence], reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        parameters = tuple(dict.fromkeys(
+            parameter for item in evidence
+            if item.surface_id == candidate.surface_id
+            and item.created_by == "open_redirect_analyzer"
+            and item.observation.get("type") == REDIRECT_OBSERVATION
+            and isinstance((parameter := item.observation.get("parameter")), str)
+            and parameter in surface.parameters
+        ))
+        if not parameters:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.REJECTED, evidence=(),
+                reason="analysis produced no redirect parameter signal",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        marker = probe_marker(f"{task.validation_id}{candidate.candidate_id}", prefix="redirect")
+        probe_url = redirect_probe_url(marker)
+        requests = build_redirect_requests(
+            surface, surface.parameters, parameters, probe_url=probe_url,
+            purpose=f"open redirect validation {task.validation_id}",
+        )
+        collected = tuple(matching_evidence(reproduction, surface.url, request)
+                          for request in requests)
+        missing = tuple(request for request, item in zip(requests, collected) if item is None)
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded("open redirect validation lacks read-only request budget")
+            return AgentResult(task_id=task.task_id, status=AgentResultStatus.NEEDS_EVIDENCE,
+                               evidence_requests=missing)
+        control = collected[0]
+        if control is None:
+            raise AgentContractError("open redirect control response missing")
+        if redirected_to_probe(control, probe_url):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.REJECTED, evidence=(control,),
+                reason="redirect control already contained the probe destination",
+                reason_code=ValidationReasonCode.CONTROL_SIGNAL_PRESENT,
+            )
+        for probe in collected[1:]:
+            if probe is not None and redirected_to_probe(probe, probe_url):
+                proof_evidence = (control, probe)
+                proof = ValidationProof(
+                    proof_type=ValidationProofType.OPEN_REDIRECT,
+                    evidence_ids=tuple(item.evidence_id for item in proof_evidence),
+                    summary="independent GET control/probe reproduced an off-origin Location",
+                )
+                return self._validation_result(
+                    task, verdict=ValidationVerdict.CONFIRMED, evidence=proof_evidence,
+                    reason="independent redirect Location matched local loopback probe origin",
+                    reason_code=ValidationReasonCode.CONFIRMED_PROOF, proof=proof,
+                )
+        return self._validation_result(
+            task, verdict=ValidationVerdict.REJECTED,
+            evidence=tuple(item for item in collected if item is not None),
+            reason="independent probe did not reproduce off-origin Location",
+            reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+        )
+
+    def _validate_sensitive_exposure(
+        self, task: TaskEnvelope, candidate: Candidate,
+        evidence: Sequence[Evidence], reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """Independently re-fetch HTML; never place credential values in proof."""
+
+        analysis_fields = {
+            path for item in evidence
+            if item.surface_id == candidate.surface_id
+            and item.created_by == "sensitive_exposure_analyzer"
+            and item.observation.get("type") == EXPOSURE_OBSERVATION
+            for path in item.observation.get("field_paths", ())
+            if isinstance(path, str)
+        }
+        if not analysis_fields:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.REJECTED, evidence=(),
+                reason="analysis did not reproduce sensitive embedded JSON fields",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        if not reproduction:
+            return self._needs_evidence(task, candidate.surface_id, EXPOSURE_TYPE)
+        response = reproduction[-1]
+        if response.evidence_type == "http_error":
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(response,),
+                reason="independent public HTML fetch failed",
+                reason_code=ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR,
+            )
+        repeated = analysis_fields.intersection(exposed_json_field_paths(response.observation))
+        if not repeated:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.REJECTED, evidence=(response,),
+                reason="independent fetch did not reproduce credential-shaped JSON fields",
+                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+            )
+        proof = ValidationProof(
+            proof_type=ValidationProofType.SENSITIVE_DATA_EXPOSURE,
+            evidence_ids=(response.evidence_id,),
+            summary="independent public HTML fetch reproduced credential-shaped JSON fields",
+        )
+        return self._validation_result(
+            task, verdict=ValidationVerdict.CONFIRMED, evidence=(response,),
+            reason="credential-shaped embedded JSON fields independently reproduced",
+            reason_code=ValidationReasonCode.CONFIRMED_PROOF, proof=proof,
+        )
+
+    def _validate_source_map_exposure(
+        self, task: TaskEnvelope, candidate: Candidate,
+        evidence: Sequence[Evidence], reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        analysis_signatures = {
+            (item.observation.get("content_digest"), item.observation.get("source_count"))
+            for item in evidence
+            if item.surface_id == candidate.surface_id
+            and item.created_by == "source_map_exposure_analyzer"
+            and item.observation.get("type") == SOURCE_MAP_OBSERVATION
+            and isinstance(item.observation.get("content_digest"), str)
+            and type(item.observation.get("source_count")) is int
+        }
+        if not analysis_signatures:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.REJECTED, evidence=(),
+                reason="analysis found no original source text in the public map",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        if not reproduction:
+            return self._needs_evidence(task, candidate.surface_id, SOURCE_MAP_TYPE)
+        response = reproduction[-1]
+        if response.evidence_type == "http_error":
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(response,),
+                reason="independent source map fetch failed",
+                reason_code=ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR,
+            )
+        signature = exposed_source_map_signature(response.observation)
+        if signature not in analysis_signatures:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.REJECTED, evidence=(response,),
+                reason="independent fetch did not reproduce the original source text",
+                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+            )
+        proof = ValidationProof(
+            proof_type=ValidationProofType.SOURCE_MAP_EXPOSURE,
+            evidence_ids=(response.evidence_id,),
+            summary="independent GET reproduced original source text in a public source map",
+        )
+        return self._validation_result(
+            task, verdict=ValidationVerdict.CONFIRMED, evidence=(response,),
+            reason="public source map original content independently reproduced",
+            reason_code=ValidationReasonCode.CONFIRMED_PROOF, proof=proof,
+        )
 
     def _validate_xss(
         self,

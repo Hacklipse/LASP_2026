@@ -109,6 +109,7 @@ def render_report_v2(
     facts: RunReportFacts, *, references: tuple[FindingReportReferences, ...] = (),
     execution: RunExecutionProfile | None = None,
     narrative: ReportNarrative | None = None,
+    unrouted_post_surface_count: int = 0,
 ) -> str:
     """같은 facts/참조에서 같은 bytes를 생성하는 offline renderer.
 
@@ -119,6 +120,8 @@ def render_report_v2(
     by_id = {reference.finding_id: reference for reference in references}
     if len(by_id) != len(references) or not set(by_id) <= {f.finding_id for f in facts.findings}:
         raise ValueError("report references must belong to unique offered findings")
+    if type(unrouted_post_surface_count) is not int or unrouted_post_surface_count < 0:
+        raise ValueError("unrouted POST surface count must be nonnegative")
     counts = dict(facts.candidate_counts)
     number = lambda value: "정보 없음" if value is None else str(value)
     lines = [
@@ -163,6 +166,13 @@ def render_report_v2(
     for status, explanation in explanations:
         if counts[status]:
             lines.append(f"- {explanation}: {counts[status]}개")
+    if unrouted_post_surface_count:
+        lines.extend([
+            "", "## 검사 불가 범위", "",
+            f"POST Surface {unrouted_post_surface_count}개는 분석 Candidate가 생성되지 않아 자동 검사 결과가 없습니다.",
+            "검증된 정상 요청과 승인된 실행 조건이 없는 POST는 전송하지 않았으며,",
+            "이 항목들을 취약점이 없는 것으로 해석하면 안 됩니다.",
+        ])
     lines.extend(["", "## 확정 Finding", ""])
     if not facts.findings:
         lines.append("해당 없음.")
@@ -370,6 +380,7 @@ class MarkdownReportAgent:
                 ),
                 execution=self._execution_profile(task),
                 narrative=narrative,
+                unrouted_post_surface_count=self._unrouted_post_surface_count(task),
             )
             if narrative is not None:
                 claim_id = self._record_narrative(
@@ -390,6 +401,19 @@ class MarkdownReportAgent:
             status=AgentResultStatus.COMPLETED,
             new_evidence_ids=new_evidence_ids,
             reports=(report,),
+        )
+
+    def _unrouted_post_surface_count(self, task: TaskEnvelope) -> int:
+        """Count discovered POST inputs without a Candidate, without exposing values."""
+
+        if self._surfaces is None or self._candidates is None:
+            return 0
+        candidate_surfaces = {
+            item.surface_id for item in self._candidates.list_by_run(task.run_id)
+        }
+        return sum(
+            surface.method.upper() == "POST" and surface.surface_id not in candidate_surfaces
+            for surface in self._surfaces.list_by_run(task.run_id)
         )
 
     def _record_narrative(

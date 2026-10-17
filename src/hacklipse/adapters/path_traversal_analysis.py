@@ -448,6 +448,7 @@ def path_parameters_from_evidence(
             and item.observation.get("type")
             in {
                 "url_or_file_parameter",
+                "file_serving_parameter",
                 UNLINKED_RENDER_PARAMETER_OBSERVATION,
             }
             and isinstance((parameter := item.observation.get("parameter")), str)

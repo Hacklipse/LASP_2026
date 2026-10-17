@@ -11,6 +11,7 @@ from hacklipse.adapters.routing import (
     OPTIONAL_RESTRICTED_FILE_BYPASS_RULES,
     RouteSuggestion,
     RoutingRule,
+    DiscoveredSurfaceRoutingRule,
     SurfaceRoutingRule,
 )
 from hacklipse.adapters.llm_router_advisor import LlmRouterAdvisor
@@ -55,6 +56,63 @@ def _surface(*, method: str = "GET", parameters: tuple[str, ...] = ("q",)) -> Su
 
 
 class SurfaceRoutingTests(unittest.TestCase):
+    def test_observed_browser_reflection_precedes_unproven_query_candidates(self) -> None:
+        surface = Surface(
+            surface_id="client", run_id="run-1",
+            url="http://localhost/posts#hacklipsehashcontrol", method="GET",
+            parameters=("fragment",), discovery_types=("browser_hash_probe",),
+        )
+        signal = Evidence(
+            evidence_id="evi-reflection", run_id="run-1", surface_id="client",
+            created_by="browser_recon", evidence_type="observation",
+            observation={"type": "browser_hash_reflection", "parameter": "fragment"},
+        )
+        router = RuleBasedVulnerabilityRouter(
+            id_factory=iter(map(str, range(20))).__next__,
+        )
+        decisions = router.route(_run(), (surface,), (signal,))
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].candidate.assigned_agent, "browser_xss_analyzer")
+        self.assertEqual(decisions[0].candidate.evidence_ids, ("evi-reflection",))
+        self.assertEqual(decisions[0].priority, 0.52)
+
+    def test_bounded_server_setting_sample_prefers_a_specific_discovered_get(self) -> None:
+        rule = DiscoveredSurfaceRoutingRule(
+            "CORS", "cors_analyzer", parameter_hints=("q",),
+            max_candidates_per_origin=1,
+        )
+        router = RuleBasedVulnerabilityRouter(
+            rules=(), surface_rules=(rule,), id_factory=iter(map(str, range(10))).__next__,
+        )
+        surfaces = (
+            Surface(surface_id="short", run_id="run-1", url="http://localhost/search",
+                    method="GET", parameters=("q",), discovery_types=("html_link",)),
+            Surface(surface_id="deep", run_id="run-1",
+                    url="http://localhost/api/posts/search", method="GET",
+                    parameters=("q",), discovery_types=("openapi_schema",)),
+        )
+        decisions = router.route(_run(), surfaces, ())
+        self.assertEqual([(item.candidate.vulnerability_type,
+                           item.candidate.surface_id) for item in decisions],
+                         [("CORS", "deep")])
+
+    def test_search_input_is_analyzed_before_generic_parameter_at_same_budget(self) -> None:
+        router = RuleBasedVulnerabilityRouter(
+            rules=(),
+            surface_rules=(SurfaceRoutingRule("XSS", "xss_analyzer", priority=0.3),),
+        )
+        generic = Surface(surface_id="generic", run_id="run-1",
+                          url="http://localhost/items", method="GET",
+                          parameters=("filename",))
+        search = Surface(surface_id="search", run_id="run-1",
+                         url="http://localhost/search", method="GET",
+                         parameters=("q",))
+
+        decisions = router.route(_run(), (generic, search), ())
+
+        self.assertEqual([item.candidate.surface_id for item in decisions], ["search", "generic"])
+        self.assertEqual([item.priority for item in decisions], [0.42, 0.3])
+
     def test_parameterized_get_surface_reaches_analysis_without_observation(self) -> None:
         router = RuleBasedVulnerabilityRouter(id_factory=iter(("1", "2", "3")).__next__)
 

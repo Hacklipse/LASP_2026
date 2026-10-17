@@ -127,6 +127,18 @@ class ReportingTests(unittest.TestCase):
         self.assertNotIn("취약점이 없습니다", content)
         self.assertNotIn("No confirmed findings were produced.", content)
 
+    def test_unrouted_post_surface_is_reported_as_unchecked_without_values(self):
+        self.stores.surfaces.add(Surface(
+            surface_id="surface-unrouted-post", run_id="run-1",
+            url="https://local.test/submit?token=post-secret", method="POST",
+            parameters=("email", "csrf_token"),
+        ))
+        content = self.reporter().handle(replace(self.task, finding_ids=())).reports[0].content
+        self.assertIn("## 검사 불가 범위", content)
+        self.assertIn("POST Surface 1개는 분석 Candidate가 생성되지 않아", content)
+        self.assertIn("취약점이 없는 것으로 해석하면 안 됩니다", content)
+        self.assertNotIn("post-secret", content)
+
     def test_missing_budget_measurement_is_unknown_not_zero(self):
         for manager in (None, InMemoryBudgetManager()):
             reporter = self.reporter(budget_manager=manager)

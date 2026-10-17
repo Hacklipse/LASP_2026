@@ -24,6 +24,8 @@ from hacklipse.domain import CandidateStatus, ValidationProofType
 CONTRACT_VERSION = "report-facts-v2"
 MAX_PATH_HINT_LENGTH = 160
 PROOF_DESCRIPTIONS = MappingProxyType({
+    ValidationProofType.CORS_ORIGIN_REFLECTION:
+        "독립 GET 요청에서 외부 Origin 반사와 credential 허용 확인",
     ValidationProofType.XSS_EXECUTION:
         "독립 browser control/probe 비교에서 probe 실행 신호 확인",
     ValidationProofType.SQLI_EFFECT:
@@ -34,6 +36,12 @@ PROOF_DESCRIPTIONS = MappingProxyType({
         "제한된 safe-file control/probe 비교에서 파일 읽기 확인",
     ValidationProofType.SSTI_EXECUTION:
         "고정 산술 control/probe 비교에서 서버 측 평가 확인",
+    ValidationProofType.SENSITIVE_DATA_EXPOSURE:
+        "독립 공개 HTML 재요청에서 자격증명 형태 JSON 필드 확인",
+    ValidationProofType.SOURCE_MAP_EXPOSURE:
+        "독립 GET 재요청에서 공개 source map의 원본 소스 확인",
+    ValidationProofType.OPEN_REDIRECT:
+        "독립 control/probe 비교에서 외부 origin 리다이렉트 확인",
 })
 PROOF_UNAVAILABLE = "검증 상세를 사용할 수 없음"
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")

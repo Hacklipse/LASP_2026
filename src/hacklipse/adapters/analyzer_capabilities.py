@@ -13,7 +13,48 @@ from hacklipse.ports import AnalyzerCapability, ObservationRequirement
 from .request_safety import has_state_changing_parameters, object_identifier_parameters
 
 
+OPTIONAL_SOURCE_MAP_CAPABILITIES = (
+    AnalyzerCapability(
+        capability_id="source_map.public_reference",
+        agent_type="source_map_exposure_analyzer",
+        vulnerability_type="Source Map Exposure",
+        methods=("GET",), surface_kind="server", requires_parameters=False,
+        observation_requirements=(ObservationRequirement("source_map_reference"),),
+        exploration_parameter_source="none",
+        supported_evidence_types=("http_response",),
+        strategy_ids=("independent_source_content_fetch",), default_priority=0.50,
+    ),
+)
+
+
 DEFAULT_ANALYZER_CAPABILITIES = (
+    AnalyzerCapability(
+        capability_id="cors.http.search_sample", agent_type="cors_analyzer",
+        vulnerability_type="CORS", methods=("GET",), surface_kind="server",
+        parameter_hints=("q", "query", "search", "term", "keyword"),
+        exploration_parameter_source="none", supported_evidence_types=("http_response",),
+        strategy_ids=("compare_fixed_origin_headers",), default_priority=0.43,
+    ),
+    AnalyzerCapability(
+        capability_id="open_redirect.http.query",
+        agent_type="open_redirect_analyzer",
+        vulnerability_type="Open Redirect",
+        methods=("GET",), surface_kind="server",
+        parameter_hints=("next", "return", "return_url", "redirect", "redirect_uri", "destination", "dest"),
+        exploration_parameter_source="surface",
+        supported_evidence_types=("http_redirect",),
+        strategy_ids=("compare_redirect_locations",), default_priority=0.50,
+    ),
+    AnalyzerCapability(
+        capability_id="sensitive_data.embedded_json",
+        agent_type="sensitive_exposure_analyzer",
+        vulnerability_type="Sensitive Data Exposure",
+        methods=("GET",), surface_kind="server",
+        requires_parameters=False, exploration_parameter_source="none",
+        observation_requirements=(ObservationRequirement("sensitive_json_exposure"),),
+        supported_evidence_types=("http_response",),
+        strategy_ids=("recheck_public_json_fields",), default_priority=0.45,
+    ),
     AnalyzerCapability(
         capability_id="xss.http.query",
         agent_type="xss_analyzer",

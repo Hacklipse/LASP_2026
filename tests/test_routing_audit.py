@@ -116,6 +116,10 @@ class RoutingAuditTests(unittest.TestCase):
         self.assertNotIn("method", coverage["xss.browser.fragment"]["missing_requirements"])
         self.assertIn("required_observation", coverage["path_traversal.hidden_body_parameter"]["missing_requirements"])
         self.assertEqual(log.records[0]["llm"]["calls"], 0)
+        review = log.records[0]["surface_reviews"][0]
+        self.assertEqual(review["candidate_ids"], [])
+        self.assertEqual(review["unrouted_reason"], "capability_requirements_unmet")
+        self.assertIn("input_parameter", review["capability_gaps"]["xss.http.query"])
 
     def test_default_bootstrap_stays_rule_based_without_llm(self):
         llm = _Llm()
@@ -143,6 +147,11 @@ class RoutingAuditTests(unittest.TestCase):
         self.assertEqual(record["llm"]["status"], "heuristic_mode")
         self.assertEqual(record["rule_decisions"], record["final_decisions"])
         self.assertEqual([d["candidate_id"] for d in record["final_decisions"]], [d.candidate.candidate_id for d in result])
+        self.assertEqual(
+            record["surface_reviews"][0]["candidate_ids"],
+            [item.candidate.candidate_id for item in result],
+        )
+        self.assertIsNone(record["surface_reviews"][0]["unrouted_reason"])
 
     def test_normalized_surface_identity_keeps_duplicate_occurrences_distinct(self):
         log = _Log()
@@ -182,7 +191,11 @@ class RoutingAuditTests(unittest.TestCase):
         record = log.records[0]
         self.assertEqual(record["status"], "completed")
         self.assertEqual(record["configuration"], {"analysis_profile": "heuristic", "vulnerability_types": "*", "router_review": "weak"})
-        self.assertEqual(record["surface_reviews"], [{"surface_id": "search", "reason": "advisor_review", "selected": True}])
+        review = record["surface_reviews"][0]
+        self.assertEqual(review["surface_id"], "search")
+        self.assertEqual(review["reason"], "advisor_review")
+        self.assertTrue(review["selected"])
+        self.assertEqual(len(review["candidate_ids"]), 3)
         self.assertEqual([d["source"] for d in record["final_decisions"]], ["rule", "rule", "llm"])
         self.assertEqual([d["outcome"] for d in record["llm"]["proposals"]], ["candidate_added"])
         self.assertEqual(record["llm"]["usage"]["input_tokens"], 100)
@@ -260,6 +273,7 @@ class RoutingAuditTests(unittest.TestCase):
         })
 
         result = standard_router(
+            ("XSS", "SQLi", "Path Traversal"),
             mode="agentic", llm_client=llm, audit_log=log
         ).route(_RUN, (_SURFACE,), ())
 
@@ -300,6 +314,7 @@ class RoutingAuditTests(unittest.TestCase):
         )
 
         result = standard_router(
+            ("XSS", "SQLi", "Path Traversal"),
             mode="agentic", llm_client=llm, audit_log=log
         ).route(_RUN, (_SURFACE,), ())
 
@@ -349,6 +364,7 @@ class RoutingAuditTests(unittest.TestCase):
             },
         )
         router = standard_router(
+            ("XSS", "SQLi", "Path Traversal"),
             mode="agentic", llm_client=llm, audit_log=log
         )
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import os
 import re
 import secrets
 import sqlite3
@@ -33,6 +34,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
 
@@ -182,6 +184,15 @@ def _prompt_optional_session_cookie(
     return _parse_session_cookie(value)
 
 
+def _read_session_cookie_stdin() -> ResolvedHttpCredential:
+    """Consume the explicitly requested credential from a private stdin pipe."""
+
+    value = sys.stdin.readline(_MAX_SESSION_COOKIE_LENGTH + 2)
+    if not value:
+        raise ValueError("stdin에 로그인 세션 Cookie가 없습니다")
+    return _parse_session_cookie(value)
+
+
 def _recon_planner_summary(evidence) -> str | None:
     """가장 최근 Recon 계획을 최종 결과용 안전 문구로 바꾼다."""
 
@@ -306,12 +317,15 @@ _VULN_TARGETS = {
     "access_control": _VulnTarget(
         "Access Control", None, "object_id_auth", "객체 권한 우회"
     ),
+    "source_map": _VulnTarget(
+        "Source Map Exposure", None, "source_map_content_exposure", "공개 source map 원본 소스"
+    ),
 }
 # 브라우저를 쓰는 유형. Playwright Runtime 과 브라우저 검증을 함께 켠다.
 _BROWSER_VULNS = frozenset({"xss", "auto", "all"})
 # 시작 URL 에 표면이 없고 JS 번들과 디렉터리 목록을 거쳐야 찾을 수 있는 유형.
 # 정찰 페이지 수와 예산을 전체 모드와 같게 준다.
-_BUNDLE_DISCOVERY_VULNS = frozenset({"xss", "path_traversal", "auto", "all"})
+_BUNDLE_DISCOVERY_VULNS = frozenset({"xss", "path_traversal", "source_map", "auto", "all"})
 
 
 @dataclass(slots=True)
@@ -789,6 +803,9 @@ def _provision_path_traversal_account(
 def main(
     argv: list[str], *, auto_runner_name: str | None = None,
     artifact_directory: Path | None = None,
+    configure_parser: Callable[[argparse.ArgumentParser], None] | None = None,
+    validate_args: Callable[[argparse.Namespace], str | None] | None = None,
+    on_completed: Callable[[argparse.Namespace, object, Run], None] | None = None,
 ) -> int:
     # 다른 로컬 대상 실행기는 auto 경로만 공유한다. 대상별 준비/seed 선택은 금지한다.
     auto_only = auto_runner_name is not None
@@ -866,6 +883,8 @@ def main(
             help="브라우저 Recon을 끄고 정적 HTML/JS 수집만 사용한다",
         )
         parser.set_defaults(browser_recon=True)
+    parser.add_argument("--browser-executable", metavar="PATH",
+                        help="설치된 Chromium 실행 파일의 명시적 경로")
     parser.add_argument(
         "--knowledge-db",
         help=(
@@ -900,7 +919,14 @@ def main(
         action="store_true",
         help="LLM prompt와 구조화 응답 출력",
     )
+    if configure_parser is not None:
+        configure_parser(parser)
     args = parser.parse_args(argv[1:])
+    if validate_args is not None:
+        rejection = validate_args(args)
+        if rejection is not None:
+            print(f"거부: {rejection}")
+            return 2
     if artifact_directory is not None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         stem = artifact_directory / f"dynast-{stamp}-{uuid4().hex[:8]}"
@@ -909,6 +935,12 @@ def main(
     if args.request_budget is not None and args.request_budget <= 0:
         print("거부: --request-budget는 양수여야 합니다.")
         return 2
+    if args.browser_executable:
+        browser_path = Path(args.browser_executable).expanduser()
+        if not browser_path.is_file() or not os.access(browser_path, os.X_OK):
+            print("거부: --browser-executable은 실행 가능한 로컬 파일이어야 합니다.")
+            return 2
+        args.browser_executable = str(browser_path.resolve())
     if args.validation_review and args.profile != "llm":
         print("거부: --validation-review는 --profile llm과 함께 사용해야 합니다.")
         return 2
@@ -1145,7 +1177,12 @@ def main(
         return 2
     if auto_scan:
         try:
-            session_credential = _prompt_optional_session_cookie()
+            if getattr(args, "anonymous", False):
+                session_credential = None
+            elif getattr(args, "session_cookie_stdin", False):
+                session_credential = _read_session_cookie_stdin()
+            else:
+                session_credential = _prompt_optional_session_cookie()
         except ValueError as error:
             print(f"취소: {error}")
             return 2
@@ -1175,7 +1212,9 @@ def main(
     # 실행 비용을 늘리지 않는다.
     needs_browser = args.vuln in _BROWSER_VULNS
     runtime = (
-        PlaywrightBrowserRuntime(http_runtime=http_runtime)
+        PlaywrightBrowserRuntime(
+            http_runtime=http_runtime, executable_path=args.browser_executable,
+        )
         if needs_browser
         else http_runtime
     )
@@ -1321,6 +1360,7 @@ def main(
             recon_max_pages=_ALL_MODE_RECON_PAGES if needs_discovery else 1,
             recon_surface_collection_mode=args.surface_collection,
             recon_browser_enabled=args.browser_recon,
+            recon_browser_executable_path=args.browser_executable,
             recon_seed_urls=recon_seed_urls,
             recon_infer_unlinked_render_parameters=args.recon_entry == "targeted",
             actor_object_id=actor_object_id,
@@ -1383,6 +1423,12 @@ def main(
         print(f"Run은 완료됐지만 임시 계정 정리에 실패했습니다: {cleanup_error}")
         return 1
     assert run is not None
+    if on_completed is not None:
+        try:
+            on_completed(args, app, run)
+        except (OSError, ValueError) as error:
+            print(f"Run은 완료됐지만 추가 산출물을 저장하지 못했습니다: {error}")
+            return 1
     progress.log(f"Run 완료: phase={_safe_log_value(run.phase.value)}")
 
     # 진행 상태 집계는 Store를 다시 세는 공용 계산을 쓴다. 실행기마다 따로 세면

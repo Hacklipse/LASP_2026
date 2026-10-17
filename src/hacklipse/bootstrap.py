@@ -42,7 +42,14 @@ from hacklipse.adapters import (
 from hacklipse.adapters.llm_router_advisor import LlmRouterAdvisor
 from hacklipse.adapters.browser_recon import PlaywrightRecon
 from hacklipse.adapters.browser_runtime import PlaywrightBrowserRuntime
-from hacklipse.adapters.analyzer_capabilities import DEFAULT_ANALYZER_CAPABILITIES
+from hacklipse.adapters.analyzer_capabilities import (
+    DEFAULT_ANALYZER_CAPABILITIES, OPTIONAL_SOURCE_MAP_CAPABILITIES,
+)
+from hacklipse.adapters.routing import OPTIONAL_SOURCE_MAP_RULES
+from hacklipse.adapters.sensitive_exposure import SensitiveExposureAnalyzer
+from hacklipse.adapters.open_redirect_analysis import OpenRedirectAnalyzer
+from hacklipse.adapters.cors_analysis import CorsAnalyzer
+from hacklipse.adapters.source_map_exposure import SourceMapExposureAnalyzer
 from hacklipse.adapters.agentic_probe import AgenticHttpProbeAgent
 from hacklipse.adapters.analysis_llm_fallback import (
     BoundedAnalysisLlmClient,
@@ -353,6 +360,10 @@ def build_local_application(
 # 실제로 구현된 Analysis Agent. Router가 이 목록 밖 Candidate를 만들면 Dispatcher가
 # AgentUnavailable로 Run 전체를 실패시키므로, 배선과 라우팅 규칙이 같은 목록을 봐야 한다.
 IMPLEMENTED_ANALYZERS = (
+    "source_map_exposure_analyzer",
+    "cors_analyzer",
+    "open_redirect_analyzer",
+    "sensitive_exposure_analyzer",
     "access_control_analyzer",
     "xss_analyzer",
     "browser_xss_analyzer",
@@ -415,7 +426,10 @@ def standard_router(
     )
     rules = tuple(
         rule
-        for rule in DEFAULT_RULES
+        for rule in (
+            *DEFAULT_RULES,
+            *(OPTIONAL_SOURCE_MAP_RULES if selected_types and "Source Map Exposure" in selected_types else ()),
+        )
         if rule.agent_type in IMPLEMENTED_ANALYZERS
         and (selected_types is None or rule.vulnerability_type in selected_types)
     )
@@ -430,7 +444,10 @@ def standard_router(
         if isinstance(analyzer_capabilities, AnalyzerCapabilityRegistry)
         else tuple(analyzer_capabilities)
         if analyzer_capabilities is not None
-        else DEFAULT_ANALYZER_CAPABILITIES
+        else (
+            *DEFAULT_ANALYZER_CAPABILITIES,
+            *(OPTIONAL_SOURCE_MAP_CAPABILITIES if selected_types and "Source Map Exposure" in selected_types else ()),
+        )
     )
     capabilities = tuple(
         capability
@@ -556,6 +573,7 @@ def register_standard_agents(
     recon_seed_urls: tuple[str, ...] = (),
     recon_infer_unlinked_render_parameters: bool = True,
     recon_browser_enabled: bool = False,
+    recon_browser_executable_path: str | None = None,
     actor_object_id: str | None = None,
     owner_object_id: str | None = None,
     validation_review: bool = False,
@@ -586,6 +604,7 @@ def register_standard_agents(
             browser_recon=(PlaywrightRecon(
                 collector=app.collector, run_store=app.stores.runs,
                 session_cookies=getattr(app.runtime, "session_cookies", None),
+                executable_path=recon_browser_executable_path,
             ) if recon_browser_enabled else None),
             planner=(
                 None
@@ -748,6 +767,42 @@ def register_standard_agents(
         )
     app.dispatcher.register(
         "xss_analyzer", xss_analyzer, allowed_tools=("http_get",)
+    )
+    app.dispatcher.register(
+        "sensitive_exposure_analyzer",
+        SensitiveExposureAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        ),
+        allowed_tools=("http_get",),
+    )
+    app.dispatcher.register(
+        "source_map_exposure_analyzer",
+        SourceMapExposureAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        ),
+        allowed_tools=("http_get",),
+    )
+    app.dispatcher.register(
+        "open_redirect_analyzer",
+        OpenRedirectAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        ),
+        allowed_tools=("http_get",),
+    )
+    app.dispatcher.register(
+        "cors_analyzer",
+        CorsAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        ),
+        allowed_tools=("http_get",),
     )
     # SPA 라우트의 DOM 반사는 브라우저로만 관측된다. 반사 여부 판정은 두 프로필이
     # 공유하지만 탐침 대상 선택은 프로필마다 다르다.

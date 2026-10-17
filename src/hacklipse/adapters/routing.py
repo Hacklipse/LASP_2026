@@ -21,6 +21,11 @@ from .request_safety import (
     has_state_changing_parameters,
     object_identifier_parameters,
 )
+from .open_redirect_analysis import REDIRECT_PARAMETER_HINTS
+from .cors_analysis import CORS_OBSERVATION
+from .source_map_exposure import SOURCE_MAP_REFERENCE, SOURCE_MAP_TYPE
+
+_SEARCH_INPUT_NAMES = frozenset({"q", "query", "search", "term", "keyword"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +51,7 @@ class SurfaceRoutingRule:
     requires_parameters: bool = True
     parameter_hints: tuple[str, ...] = ()
     priority: float = 0.25
+    max_candidates_per_origin: int | None = None
 
     # SPA 클라이언트 라우트(`/#/search`)는 HTTP 요청 대상이 아니다. fragment 는
     # 서버로 전송되지 않으므로 HTTP 기반 Analyzer 가 받으면 매번 같은 루트 문서만
@@ -68,6 +74,22 @@ class SurfaceRoutingRule:
             if not offered.intersection(hint.casefold() for hint in self.parameter_hints):
                 return False
         return True
+
+    def priority_for(self, surface: Surface) -> float:
+        """Spend a tight probe budget on general search inputs before opaque fields."""
+
+        if self.vulnerability_type in {"XSS", "SQLi"} and any(
+            name.casefold() in _SEARCH_INPUT_NAMES for name in surface.parameters
+        ):
+            return min(1.0, self.priority + 0.12)
+        return self.priority
+
+
+class DiscoveredSurfaceRoutingRule(SurfaceRoutingRule):
+    """Sample only surfaces with a recorded discovery source."""
+
+    def matches(self, surface: Surface) -> bool:
+        return bool(surface.discovery_types) and super().matches(surface)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +122,14 @@ class IdentifierSurfaceRoutingRule:
 
 # 첫 버전은 설명 가능하고 재현하기 쉬운 명시적 규칙으로 라우팅한다.
 DEFAULT_RULES = (
+    RoutingRule(CORS_OBSERVATION, "CORS", "cors_analyzer", 0.75),
+    RoutingRule("open_redirect", "Open Redirect", "open_redirect_analyzer", 0.75),
+    RoutingRule("sensitive_json_exposure", "Sensitive Data Exposure", "sensitive_exposure_analyzer", 0.75),
     RoutingRule("reflection", "XSS", "xss_analyzer", 0.8),
+    RoutingRule(
+        "browser_hash_reflection", "XSS", "browser_xss_analyzer",
+        0.52, methods=("GET",),
+    ),
     RoutingRule("sql_error", "SQLi", "sqli_analyzer", 0.8),
     RoutingRule("object_id_auth", "Access Control", "access_control_analyzer", 0.8),
     RoutingRule(
@@ -108,6 +137,13 @@ DEFAULT_RULES = (
         "Path Traversal",
         "path_traversal_analyzer",
         0.6,
+        methods=("GET",),
+    ),
+    RoutingRule(
+        "file_serving_parameter",
+        "Path Traversal",
+        "path_traversal_analyzer",
+        0.44,
         methods=("GET",),
     ),
     RoutingRule(
@@ -119,6 +155,14 @@ DEFAULT_RULES = (
     ),
     RoutingRule("template_error", "SSTI", "ssti_analyzer", 0.7),
     RoutingRule("template_execution", "SSTI", "ssti_analyzer", 0.9),
+)
+
+# Public source maps can be deliberately published for debugging or open
+# source applications. Keep the independently verified check available for
+# an explicit scan, without asserting a vulnerability in automatic mode.
+OPTIONAL_SOURCE_MAP_RULES = (
+    RoutingRule(SOURCE_MAP_REFERENCE, SOURCE_MAP_TYPE,
+                "source_map_exposure_analyzer", 0.22, methods=("GET",)),
 )
 
 # `/ftp/*.bak%2500.md` 같은 제한 확장자 필터 우회 구현은 이후 별도 취약점 유형으로
@@ -139,6 +183,16 @@ OPTIONAL_RESTRICTED_FILE_BYPASS_RULES = (
 # 실제 취약점 판정이 아니라 탐색 대상을 만드는 규칙이므로 기존 Evidence 규칙보다
 # 낮은 priority를 사용한다.
 DEFAULT_SURFACE_RULES = (
+    # Sample public, read-only search surfaces instead of probing every GET.
+    DiscoveredSurfaceRoutingRule(
+        "CORS", "cors_analyzer",
+        parameter_hints=tuple(sorted(_SEARCH_INPUT_NAMES)), priority=0.43,
+        max_candidates_per_origin=1,
+    ),
+    SurfaceRoutingRule(
+        "Open Redirect", "open_redirect_analyzer",
+        parameter_hints=REDIRECT_PARAMETER_HINTS, priority=0.50,
+    ),
     SurfaceRoutingRule("XSS", "xss_analyzer", priority=0.30),
     # SPA 라우트의 DOM sink 는 브라우저로만 관측된다.
     SurfaceRoutingRule(
@@ -398,10 +452,40 @@ class RuleBasedVulnerabilityRouter:
             )
             decisions[key] = RouteDecision(candidate=candidate, priority=rule.priority)
 
+        # Some checks describe a server-wide setting. Sample a bounded number
+        # of actual read surfaces per origin so these candidates cannot exhaust
+        # the budget ahead of parameter-specific probes. Rank by path depth and
+        # stable URL text; never consult benchmark labels or response verdicts.
+        limited_surface_ids: dict[int, set[str]] = {}
+        for index, rule in enumerate(self._surface_rules):
+            limit = getattr(rule, "max_candidates_per_origin", None)
+            if limit is None:
+                continue
+            offered: dict[tuple[str, str], list[Surface]] = {}
+            for surface in surfaces:
+                if surface.run_id != run.run_id or not rule.matches(surface):
+                    continue
+                parsed = urlsplit(surface.url)
+                offered.setdefault((parsed.scheme, parsed.netloc), []).append(surface)
+            limited_surface_ids[index] = {
+                surface.surface_id
+                for group in offered.values()
+                for surface in sorted(
+                    group,
+                    key=lambda item: (
+                        len([part for part in urlsplit(item.url).path.split("/") if part]),
+                        item.url,
+                    ),
+                    reverse=True,
+                )[:limit]
+            }
+
         for surface in surfaces:
             if surface.run_id != run.run_id:
                 continue
-            for rule in self._surface_rules:
+            for index, rule in enumerate(self._surface_rules):
+                if index in limited_surface_ids and surface.surface_id not in limited_surface_ids[index]:
+                    continue
                 if not rule.matches(surface):
                     continue
                 key = (surface.surface_id, rule.vulnerability_type)
@@ -420,7 +504,11 @@ class RuleBasedVulnerabilityRouter:
                     assigned_agent=rule.agent_type,
                     evidence_ids=(),
                 )
-                decisions[key] = RouteDecision(candidate=candidate, priority=rule.priority)
+                priority = (
+                    rule.priority_for(surface)
+                    if isinstance(rule, SurfaceRoutingRule) else rule.priority
+                )
+                decisions[key] = RouteDecision(candidate=candidate, priority=priority)
 
         self.last_rule_decisions = tuple(
             sorted(decisions.values(), key=lambda item: item.priority, reverse=True)

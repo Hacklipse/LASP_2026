@@ -60,6 +60,10 @@ from .task_factory import TaskFactory
 
 
 _PROOF_TYPE_BY_VULNERABILITY = {
+    "CORS": ValidationProofType.CORS_ORIGIN_REFLECTION,
+    "Open Redirect": ValidationProofType.OPEN_REDIRECT,
+    "Sensitive Data Exposure": ValidationProofType.SENSITIVE_DATA_EXPOSURE,
+    "Source Map Exposure": ValidationProofType.SOURCE_MAP_EXPOSURE,
     "XSS": ValidationProofType.XSS_EXECUTION,
     "SQLi": ValidationProofType.SQLI_EFFECT,
     "Access Control": ValidationProofType.UNAUTHORIZED_OBJECT_ACCESS,

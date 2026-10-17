@@ -31,6 +31,7 @@ from hacklipse.domain import (
     Candidate,
     CandidateStatus,
     DomainInvariantError,
+    Evidence,
     ExecutionResult,
     RunExecutionProfile,
     RunPhase,
@@ -190,6 +191,37 @@ class RouterPipelineTests(unittest.TestCase):
         self.assertEqual(model.roles, ["recon"])
         self.assertEqual(tuple(app.stores.candidates.list_by_run(run.run_id)), ())
         self.assertFalse(any(r.method.upper() == "POST" for r in runtime.requests))
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "post-routing.jsonl")
+            append_run_result(argparse.Namespace(routing_log=path), app, run)
+            result = next(
+                json.loads(line) for line in Path(path).read_text().splitlines()
+                if json.loads(line).get("event") == "run_result"
+            )
+            self.assertGreaterEqual(result["stage_funnel"]["post_surface_count"], 1)
+            self.assertEqual(
+                result["stage_funnel"]["unrouted_post_surface_count"],
+                result["stage_funnel"]["post_surface_count"],
+            )
+
+    def test_schema_count_includes_a_surface_first_seen_elsewhere(self):
+        app, run, _, _ = _execute(method="GET")
+        surface = next(iter(app.stores.surfaces.list_by_run(run.run_id)))
+        self.assertNotIn("openapi_schema", surface.discovery_types)
+        app.stores.evidence.append(Evidence(
+            evidence_id="evi-overlapping-schema", run_id=run.run_id,
+            surface_id=surface.surface_id, created_by="recon",
+            evidence_type="observation",
+            observation={"type": "openapi_request_structure", "method": "GET"},
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "schema-routing.jsonl")
+            append_run_result(argparse.Namespace(routing_log=path), app, run)
+            result = next(
+                json.loads(line) for line in Path(path).read_text().splitlines()
+                if json.loads(line).get("event") == "run_result"
+            )
+        self.assertEqual(result["stage_funnel"]["schema_declared_surface_count"], 1)
 
     def test_hidden_body_search_stays_disabled_with_or_without_approval(self):
         app, run, runtime, _ = _execute(method="POST", vulnerable=False)

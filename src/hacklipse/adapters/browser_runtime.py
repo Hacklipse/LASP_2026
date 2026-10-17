@@ -52,9 +52,11 @@ class PlaywrightBrowserRuntime:
         *,
         http_runtime: HttpExecutionRuntime,
         browser_runner: BrowserProbeRunner | None = None,
+        executable_path: str | None = None,
     ) -> None:
         self._http = http_runtime
         self._browser_runner = browser_runner
+        self._executable_path = executable_path
         self._collector: RuntimeEvidenceCollector | None = None
 
     def bind_collector(self, collector: RuntimeEvidenceCollector) -> None:
@@ -70,7 +72,8 @@ class PlaywrightBrowserRuntime:
         if self._browser_runner is not None:
             return self._browser_runner(request, navigation_url, expected, cookies)
         return self._run_playwright(
-            request, navigation_url, expected, cookies, collector=self._collector
+            request, navigation_url, expected, cookies, collector=self._collector,
+            executable_path=self._executable_path,
         )
 
     def close_session(self, run_id: str) -> None:
@@ -87,6 +90,7 @@ class PlaywrightBrowserRuntime:
         cookies: Sequence[tuple[str, str]],
         *,
         collector: RuntimeEvidenceCollector | None = None,
+        executable_path: str | None = None,
     ) -> ExecutionResult:
         try:
             from playwright.sync_api import Error as PlaywrightError
@@ -107,7 +111,8 @@ class PlaywrightBrowserRuntime:
         try:
             with sync_playwright() as playwright:
                 try:
-                    browser = playwright.chromium.launch(headless=True)
+                    launch_options = {"executable_path": executable_path} if executable_path else {}
+                    browser = playwright.chromium.launch(headless=True, **launch_options)
                 except PlaywrightError as error:
                     raise ExternalExecutionDisabled(
                         "Chromium is unavailable for browser XSS validation; "

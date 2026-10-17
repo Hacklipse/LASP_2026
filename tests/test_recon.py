@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import unittest
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from hacklipse.adapters import HttpExecutionRuntime
+from hacklipse.adapters.browser_recon import BrowserReconResult
 from hacklipse.adapters.memory import InMemoryEvidenceStore, InMemorySurfaceStore
-from hacklipse.adapters.recon import ReconAgent
+from hacklipse.adapters.recon import ReconAgent, _json_links_from_response
 from hacklipse.adapters.routing import RuleBasedVulnerabilityRouter
 from hacklipse.application.errors import AgentContractError, WorkflowExecutionError
 from hacklipse.bootstrap import build_local_application
@@ -107,6 +109,68 @@ def _task(
 
 
 class ReconAgentTests(unittest.TestCase):
+    def test_reuses_browser_fetched_javascript_without_another_request(self) -> None:
+        evidence_store = InMemoryEvidenceStore()
+        surface_store = InMemorySurfaceStore()
+        collector = _FakeCollector(evidence_store, body="<html></html>")
+
+        class BrowserScripts:
+            def discover(self, task, **kwargs):
+                del kwargs
+                for suffix, media, body in (
+                    ("/lazy.js", "application/javascript", 'fetch("/api/search?q=")'),
+                    ("/data.json", "application/json", '{"html":"/false?q=","navigation":["/api/linked?q=one"]}'),
+                ):
+                    evidence_store.append(Evidence(
+                        evidence_id="browser" + suffix,
+                        run_id=task.run_id,
+                        surface_id=None,
+                        created_by="execution_runtime:http_get",
+                        evidence_type="http_response",
+                        observation={
+                            "requested_url": "http://localhost" + suffix,
+                            "content_type": media,
+                            "status": 200,
+                            "body": body,
+                        },
+                    ))
+                return BrowserReconResult(
+                    ("browser/lazy.js", "browser/data.json"),
+                    ((None, {"type": "browser_recon_summary", "status": "completed"}),),
+                )
+
+        agent = ReconAgent(
+            collector=collector,
+            evidence_store=evidence_store,
+            surface_store=surface_store,
+            browser_recon=BrowserScripts(),
+        )
+        task = replace(_task("browser-script", "http://localhost/"), request_budget=80)
+        agent.handle(task)
+
+        self.assertEqual(
+            [url for _, url in collector.calls],
+            ["http://localhost/", "http://localhost/openapi.json"],
+        )
+        surfaces = surface_store.list_by_run(task.run_id)
+        self.assertTrue(any(
+            surface.url == "http://localhost/api/search"
+            and surface.parameters == ("q",)
+            for surface in surfaces
+        ))
+        self.assertFalse(any(surface.url == "http://localhost/false" for surface in surfaces))
+        self.assertTrue(any(
+            surface.url == "http://localhost/api/linked"
+            and surface.parameters == ("q",)
+            for surface in surfaces
+        ))
+        summary = next(
+            item.observation for item in evidence_store.list_by_run(task.run_id)
+            if item.observation.get("type") == "browser_recon_summary"
+        )
+        self.assertEqual(summary["parsed_script_count"], 1)
+        self.assertEqual(summary["parsed_json_link_response_count"], 1)
+
     def test_extracts_form_and_link_surfaces(self) -> None:
         agent, _, surfaces = _make_agent()
         result = agent.handle(_task("run-1", "http://localhost/index.php"))
@@ -150,6 +214,27 @@ class ReconAgentTests(unittest.TestCase):
         self.assertEqual(root.parameters, ("page",))
         observations = [item.observation for item in evidence.list_by_run("run-3")]
         self.assertTrue(any(o.get("type") == "url_or_file_parameter" for o in observations))
+
+    def test_file_serving_route_identifies_generic_filename_field(self) -> None:
+        body = (
+            '<a href="/api/attachments/download?name=report.pdf">file</a>'
+            '<a href="/api/profile?name=someone">profile</a>'
+        )
+        agent, evidence, surfaces = _make_agent(body=body)
+        agent.handle(_task("file-serving", "http://localhost/"))
+
+        observations = evidence.list_by_run("file-serving")
+        file_surface = next(surface for surface in surfaces.list_by_run("file-serving")
+                            if surface.url.endswith("/api/attachments/download"))
+        profile_surface = next(surface for surface in surfaces.list_by_run("file-serving")
+                               if surface.url.endswith("/api/profile"))
+        self.assertTrue(any(item.surface_id == file_surface.surface_id
+                            and item.observation.get("type") == "file_serving_parameter"
+                            and item.observation.get("parameter") == "name"
+                            for item in observations))
+        self.assertFalse(any(item.surface_id == profile_surface.surface_id
+                             and item.observation.get("type") == "file_serving_parameter"
+                             for item in observations))
 
     def test_extracts_numeric_rest_path_as_an_object_identifier(self) -> None:
         body = '<html><body><a href="/users/17">profile</a></body></html>'
@@ -402,6 +487,123 @@ def _crawling_agent(bodies: dict[str, str], **kwargs):
 
 
 class ReconCrawlTests(unittest.TestCase):
+    def test_heuristic_frontier_summary_names_unvisited_surfaces_and_stop_reason(self) -> None:
+        base = "http://localhost"
+        agent, collector, _ = _crawling_agent(
+            {base + "/": '<a href="/first">one</a><a href="/second">two</a>'},
+            max_pages=1,
+        )
+        agent.handle(replace(_task("frontier", base + "/"), request_budget=20))
+        summary = next(
+            item.observation for item in collector._evidence.list_by_run("frontier")
+            if item.observation.get("type") == "recon_frontier_summary"
+        )
+        self.assertEqual(summary["attempted_url_count"], 1)
+        self.assertEqual(summary["response_url_count"], 1)
+        self.assertEqual(summary["parsed_url_count"], 1)
+        self.assertEqual(summary["unvisited_count"], 2)
+        self.assertEqual(len(summary["unvisited_surface_ids"]), 2)
+        self.assertEqual(summary["discovered_without_response_surface_count"], 2)
+        self.assertEqual(
+            set(summary["discovered_without_response_surface_ids"]),
+            set(summary["unvisited_surface_ids"]),
+        )
+        self.assertEqual(summary["stop_reason"], "request_budget")
+        self.assertNotIn("/first", str(summary))
+
+    def test_crawled_openapi_link_is_parsed_without_guessing_a_second_location(self) -> None:
+        base = "http://localhost"
+        schema = {"openapi": "3.0.0", "paths": {
+            "/api/items": {"get": {"parameters": [{"in": "query", "name": "filter"}]}},
+            "/api/items/{item_id}": {"get": {}},
+            "/api/create": {"post": {
+                "parameters": [{"in": "query", "name": "mode"}],
+                "requestBody": {"content": {"application/json": {"schema": {
+                    "type": "object", "properties": {
+                        "email": {"type": "string", "example": "private@example.invalid"},
+                        "csrf_token": {"type": "string", "example": "secret-token-value"},
+                    },
+                }}}},
+            }},
+        }}
+        agent, collector, surfaces = _crawling_agent(
+            {base + "/": '<a href="/api/schema/">API</a>',
+             base + "/api/schema/": json.dumps(schema)},
+            content_types={base + "/api/schema/": "application/json"},
+        )
+        agent.handle(replace(_task("linked-openapi", base + "/"), request_budget=20))
+        self.assertEqual(collector.calls, [base + "/", base + "/api/schema/"])
+        self.assertTrue(any(
+            item.url == base + "/api/items" and item.parameters == ("filter",)
+            for item in surfaces.list_by_run("linked-openapi")
+        ))
+        post = next(
+            item for item in surfaces.list_by_run("linked-openapi")
+            if item.url == base + "/api/create" and item.method == "POST"
+        )
+        self.assertEqual(post.parameters, ("mode", "email", "csrf_token"))
+        shape = next(
+            item.observation for item in collector._evidence.list_by_run("linked-openapi")
+            if item.surface_id == post.surface_id
+            and item.observation.get("type") == "openapi_request_structure"
+        )
+        self.assertEqual(shape["body_parameter_names"], ["email", "csrf_token"])
+        self.assertEqual(shape["query_parameter_names"], ["mode"])
+        self.assertFalse(shape["request_template_available"])
+        self.assertNotIn("secret-token-value", str(shape))
+        self.assertNotIn("private@example.invalid", str(shape))
+        self.assertEqual(collector.calls, [base + "/", base + "/api/schema/"])
+
+    def test_public_openapi_adds_literal_request_shapes_without_mutations(self) -> None:
+        base = "http://localhost"
+        schema = {
+            "openapi": "3.0.0",
+            "paths": {
+                "/api/search": {
+                    "get": {"parameters": [
+                        {"in": "query", "name": "q"},
+                        {"in": "header", "name": "Authorization"},
+                    ]},
+                    "post": {"parameters": [{"in": "query", "name": "unsafe"}]},
+                },
+                "/api/items/{item_id}": {"get": {"parameters": []}},
+                "//outside.example/steal": {"get": {}},
+            },
+        }
+        agent, collector, surfaces = _crawling_agent(
+            {base + "/": "<html></html>",
+             base + "/openapi.json": json.dumps(schema)},
+            content_types={base + "/openapi.json": "application/json"},
+        )
+
+        agent.handle(replace(_task("openapi", base + "/"), request_budget=20))
+
+        self.assertEqual(collector.calls, [base + "/", base + "/openapi.json"])
+        discovered = surfaces.list_by_run("openapi")
+        self.assertTrue(any(
+            item.url == base + "/api/search" and item.method == "GET"
+            and item.parameters == ("q",)
+            for item in discovered
+        ))
+        self.assertTrue(any(
+            item.url == base + "/api/search" and item.method == "POST"
+            and item.parameters == ("unsafe",)
+            for item in discovered
+        ))
+        self.assertFalse(any("item_id" in item.url or "outside.example" in item.url
+                             for item in discovered))
+
+    def test_openapi_like_json_without_schema_contract_is_ignored(self) -> None:
+        base = "http://localhost"
+        agent, _, surfaces = _crawling_agent(
+            {base + "/": "<html></html>",
+             base + "/openapi.json": '{"paths":{"/api/private":{"get":{}}}}'},
+            content_types={base + "/openapi.json": "application/json"},
+        )
+        agent.handle(replace(_task("not-openapi", base + "/"), request_budget=20))
+        self.assertFalse(any(item.url == base + "/api/private"
+                             for item in surfaces.list_by_run("not-openapi")))
+
     def test_application_chunk_is_not_starved_by_framework_scripts(self) -> None:
         base = "http://localhost"
         agent, collector, surfaces = _crawling_agent({
@@ -440,6 +642,43 @@ class ReconCrawlTests(unittest.TestCase):
         urls = {item.url for item in surfaces.list_by_run("run-json-data")}
         self.assertNotIn("http://localhost/not-a-page", urls)
         self.assertNotIn("http://localhost/not-a-form", urls)
+
+    def test_json_navigation_links_are_bounded_and_same_origin(self) -> None:
+        base = "http://localhost"
+        document = {
+            "items": [
+                {"href": "/posts/7?view=full", "description": "<a href='/fake'>fake</a>"},
+                {"url": "https://elsewhere.invalid/private"},
+                {"path": "//elsewhere.invalid/private"},
+            ],
+            "navigation": ["/search?q=one", "/posts/7?view=full"],
+            "data": ["/not-a-link"],
+        }
+        evidence = Evidence(
+            evidence_id="evi-json-links", run_id="json-links", surface_id=None,
+            created_by="test", evidence_type="http_response",
+            observation={"status": 200, "content_type": "application/json",
+                         "body": json.dumps(document)},
+        )
+        self.assertEqual(_json_links_from_response(evidence, base + "/api/nav"), (
+            base + "/posts/7?view=full", base + "/search?q=one",
+        ))
+
+        agent, collector, surfaces = _crawling_agent(
+            {base + "/": '<a href="/api/nav">nav</a>',
+             base + "/api/nav": json.dumps(document),
+             base + "/posts/7?view=full": "<html></html>",
+             base + "/search?q=one": "<html></html>"},
+            content_types={base + "/api/nav": "application/json"},
+            max_pages=5,
+        )
+        agent.handle(replace(_task("json-links", base + "/"), request_budget=20))
+        urls = {item.url for item in surfaces.list_by_run("json-links")}
+        self.assertIn(base + "/posts/7", urls)
+        self.assertIn(base + "/search", urls)
+        self.assertNotIn(base + "/not-a-link", urls)
+        self.assertNotIn(base + "/fake", urls)
+        self.assertNotIn("https://elsewhere.invalid/private", collector.calls)
 
     def test_fetches_an_authenticated_additional_seed_with_the_recon_credential(
         self,
@@ -526,6 +765,24 @@ class ReconCrawlTests(unittest.TestCase):
         self.assertIn("http://localhost/api/Products", found)
         # 외부 URL의 경로 조각이 표면으로 새어 들어오면 안 된다.
         self.assertTrue(all("twitter.com" not in url for url in found))
+
+    def test_discovers_only_constant_concatenated_javascript_paths(self) -> None:
+        bundle = (
+            'fetch("/api/" + "items?term=" + "");'
+            'const dynamic = "/api/" + itemId;'
+            'const external = "//evil.example" + "/collect";'
+        )
+        agent, _, surfaces = _crawling_agent(
+            {"http://localhost/": _SPA_HTML, "http://localhost/main.js": bundle}
+        )
+        agent.handle(_task("run-constant-js", "http://localhost/"))
+        found = {
+            surface.url: surface.parameters
+            for surface in surfaces.list_by_run("run-constant-js")
+        }
+        self.assertEqual(found["http://localhost/api/items"], ("term",))
+        self.assertNotIn("http://localhost/api/itemId", found)
+        self.assertNotIn("http://localhost//evil.example/collect", found)
 
     def test_ignores_numeric_character_counters_but_keeps_real_numeric_routes(self) -> None:
         bundle = (

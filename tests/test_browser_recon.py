@@ -9,7 +9,10 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
-from hacklipse.adapters.browser_recon import PlaywrightRecon, _CollectorTransport, request_structure
+from hacklipse.adapters.browser_recon import (
+    PlaywrightRecon, _CollectorTransport, _page_family, _page_visit_cap,
+    _promote_unvisited_family, request_structure,
+)
 from hacklipse.adapters.browser_runtime import PlaywrightBrowserRuntime
 from hacklipse.adapters.http_runtime import HttpExecutionRuntime
 from hacklipse.adapters.recon import ReconAgent
@@ -20,7 +23,7 @@ from hacklipse.adapters.xss_execution import (
 )
 from hacklipse.bootstrap import build_local_application
 from hacklipse.domain import (
-    EvidenceRequest, ExecutionRequest, HttpRequestKind, HttpRequestSpec,
+    EvidenceRequest, ExecutionRequest, ExecutionResult, HttpRequestKind, HttpRequestSpec,
     Run, RunScope, TaskEnvelope,
 )
 from hacklipse.ports import ReconAction
@@ -50,6 +53,58 @@ class _Route:
 
 
 class BrowserRequestBoundaryTests(unittest.TestCase):
+    def test_extra_page_visits_require_spare_browser_request_budget(self):
+        self.assertEqual(_page_visit_cap(6, 30), 6)
+        self.assertEqual(_page_visit_cap(6, 50), 8)
+        self.assertEqual(_page_visit_cap(6, 100), 12)
+        self.assertEqual(_page_visit_cap(2, 100), 2)
+
+    def test_json_navigation_response_feeds_browser_frontier_without_extra_request(self):
+        app, task = _fixture()
+
+        class Collector:
+            def collect_with_result(self, *args, **kwargs):
+                return "evi-nav", ExecutionResult(
+                    execution_id="nav", evidence_type="http_response",
+                    observation={
+                        "status": 200, "content_type": "application/json",
+                        "headers": [["content-type", "application/json"]],
+                        "body": '{"navigation":[{"href":"/posts/search"}]}',
+                    },
+                )
+
+        transport = _CollectorTransport(
+            collector=Collector(), task=task,
+            scope=app.stores.runs.get(task.run_id).scope,
+            remember=lambda *args: "surface-nav", limit=3,
+            deadline=time.monotonic() + 3,
+        )
+        route = _Route("http://127.0.0.1/api/nav")
+        transport.handle(route)
+        self.assertEqual(transport.json_links, ["http://127.0.0.1/posts/search"])
+        self.assertEqual(transport.sent, 1)
+        self.assertEqual(route.outcome[0], "fulfill")
+
+    def test_page_family_prioritizes_new_routes_without_dropping_object_links(self):
+        base = "http://127.0.0.1:8080"
+        first = base + "/posts/1"
+        second = base + "/posts/2"
+        search = base + "/search?q=first"
+        self.assertEqual(_page_family(first), _page_family(second))
+        self.assertEqual(_page_family(search), _page_family(base + "/search?q=second"))
+        pending = [second, search]
+        _promote_unvisited_family(pending, {_page_family(first)})
+        self.assertEqual(pending, [search, second])
+
+    def test_input_page_precedes_plain_navigation_under_page_cap(self):
+        base = "http://127.0.0.1:8080"
+        pending = [base + "/about", base + "/posts/search", base + "/account?q=x"]
+        _promote_unvisited_family(pending, set())
+        self.assertEqual(pending[0], base + "/account?q=x")
+        remaining = pending[1:]
+        _promote_unvisited_family(remaining, set())
+        self.assertEqual(remaining[0], base + "/posts/search")
+
     def test_body_shapes_do_not_contain_values(self):
         shape = request_structure("http://127.0.0.1/a?q=hello&token=secret", "POST", "application/json", '{"name":"private","csrfToken":"secret"}')
         self.assertEqual(shape["body_parameter_names"], ["name", "csrfToken"])

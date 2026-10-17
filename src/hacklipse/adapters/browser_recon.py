@@ -16,6 +16,8 @@ from hacklipse.ports.errors import ApprovalRequired, BudgetExceeded, PolicyViola
 
 from .browser_runtime import _origin, _origin_key, _url_in_scope
 from .xss_execution import RAW_HASH_CANARY, RAW_HASH_PARAMETER
+from .report_contract import surface_path_hint
+from .discovery_links import json_links_from_observation
 
 _FIELD = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\[\]-]{0,79}$")
 _SECRET = re.compile(r"password|passwd|token|csrf|secret|session|authorization|credential|username|api.?key|email", re.I)
@@ -23,6 +25,59 @@ _ACTION = re.compile(r"menu|tab|detail|edit|new|create|register|search|filter|ad
 _DESTRUCTIVE = re.compile(r"delete|remove|logout|log out|sign out|save|submit|confirm|purchase|pay\b|삭제|제거|로그아웃|저장|결제|확정", re.I)
 _HEADERS = frozenset({"accept", "content-type", "rsc", "next-router-state-tree", "next-router-prefetch", "next-url", "x-requested-with"})
 _MAX_OBSERVATIONS = 200
+_PAGE_ID = re.compile(r"(?:[0-9]{1,12}|[0-9a-fA-F]{16,}|[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})\Z")
+
+
+def _page_family(url: str) -> tuple[str, str, str, tuple[str, ...], str]:
+    """Group concrete object links for visit priority without losing the links."""
+
+    parsed = urlsplit(url)
+    segments = parsed.path.split("/")
+    for index in range(1, len(segments)):
+        previous = segments[index - 1].casefold()
+        if previous.endswith("s") and _PAGE_ID.fullmatch(segments[index]):
+            segments[index] = "{id}"
+    fragment = parsed.fragment.split("?", 1)[0]
+    names = tuple(sorted({name for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}))
+    return parsed.scheme, parsed.netloc, "/".join(segments), names, fragment
+
+
+def _promote_unvisited_family(pending: list[str], visited_families: set[tuple]) -> None:
+    """Visit an input-bearing page before another inert page under a tight cap."""
+
+    offered = [
+        (index, url) for index, url in enumerate(pending)
+        if _page_family(url) not in visited_families
+    ]
+    if not offered:
+        return
+
+    def priority(url: str) -> int:
+        parsed = urlsplit(url)
+        names = {name.casefold() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+        if names:
+            return 2
+        path_parts = {part.casefold() for part in parsed.path.split("/")}
+        return int(bool(path_parts.intersection({"search", "filter", "query"})))
+
+    index, _ = max(offered, key=lambda item: (priority(item[1]), -item[0]))
+    if index:
+        pending.insert(0, pending.pop(index))
+
+
+def _page_visit_cap(base_pages: int, request_budget: int) -> int:
+    """Allow more distinct page families only when the browser has spare budget.
+
+    Reserve roughly six HTTP units per page for its scripts, API calls, and
+    navigation. Explicit small caps remain hard limits for narrow scans.
+    The main loop still stops at its request and time limits, and the extra
+    visits require a newly discovered route family.
+    """
+
+    if base_pages < 6:
+        return base_pages
+    extra = max(0, (request_budget - base_pages * 6) // 6)
+    return base_pages + min(base_pages, extra)
 
 
 def _names(values) -> tuple[str, ...]:
@@ -91,6 +146,7 @@ class _CollectorTransport:
         self.evidence_ids: list[str] = []
         self.observations: list[tuple[str | None, dict]] = []
         self.cache: dict[str, dict] = {}
+        self.json_links: list[str] = []
 
     def in_scope(self, url: str) -> bool:
         try:
@@ -166,6 +222,11 @@ class _CollectorTransport:
             self.sent += 1
             self.evidence_ids.append(evidence_id)
             response = dict(result.observation)
+            if (method == "GET" and type(response.get("status")) is int
+                    and 200 <= response["status"] < 300 and len(self.json_links) < 64):
+                for link in json_links_from_observation(response, req.url):
+                    if link not in self.json_links and len(self.json_links) < 64:
+                        self.json_links.append(link)
             if static and response.get("status") == 200 and not response.get("truncated"):
                 self.cache[req.url] = response
         if is_surface and len(self.observations) < _MAX_OBSERVATIONS:
@@ -199,12 +260,14 @@ _ACTION_SELECTOR = 'button,[role=tab],[role=button],summary,[aria-expanded]'
 
 class PlaywrightRecon:
     def __init__(self, *, collector: RuntimeEvidenceCollector, run_store: RunStore,
-                 session_cookies: Callable | None = None, max_pages: int = 6, max_actions: int = 12):
+                 session_cookies: Callable | None = None, max_pages: int = 6, max_actions: int = 12,
+                 executable_path: str | None = None):
         self._collector = collector
         self._runs = run_store
         self._cookies = session_cookies
         self._max_pages = max_pages
         self._max_actions = max_actions
+        self._executable_path = executable_path
 
     def discover(self, task: TaskEnvelope, *, remember: Callable,
                  request_budget: int, timeout_seconds: float,
@@ -221,7 +284,12 @@ class PlaywrightRecon:
         hash_probes = 0
         hash_reflections = 0
         planner_selections = 0
+        browser_version = None
         pending: list[str] = []
+        pending_surface_ids: dict[str, str] = {}
+        visited_families: set[tuple] = set()
+        duplicate_family_visits = 0
+        visit_cap = _page_visit_cap(self._max_pages, request_budget)
         try:
             from playwright.sync_api import Error, sync_playwright
         except ImportError:
@@ -231,7 +299,11 @@ class PlaywrightRecon:
             }),))
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=["--disable-background-networking"])
+                launch_options = {"executable_path": self._executable_path} if self._executable_path else {}
+                browser = p.chromium.launch(
+                    headless=True, args=["--disable-background-networking"], **launch_options,
+                )
+                browser_version = browser.version
                 try:
                     context = browser.new_context(service_workers="block", accept_downloads=False)
                     context.route("**/*", transport.handle)
@@ -248,11 +320,11 @@ class PlaywrightRecon:
                         context.add_cookies([{"name": k, "value": v, "url": _origin(task.target_url)} for k, v in cookies])
                     page = context.new_page()
                     pending = [task.target_url]
-                    pending_surface_ids: dict[str, str] = {}
                     visited: set[str] = set()
                     seen_actions: set[tuple] = set()
                     seen_forms: set[tuple] = set()
                     seen_filters: set[tuple[str, int]] = set()
+                    json_link_cursor = 0
 
                     def settle():
                         try:
@@ -261,6 +333,7 @@ class PlaywrightRecon:
                             pass
 
                     def snapshot():
+                        nonlocal json_link_cursor
                         data = page.evaluate(_SNAPSHOT)
                         if transport.in_scope(page.url):
                             remember(page.url, "GET", _names(k for k, _ in _query(page.url)), _query(page.url), ("browser_navigation",))
@@ -272,6 +345,23 @@ class PlaywrightRecon:
                                 )
                                 if url not in visited and url not in pending:
                                     pending.append(url)
+                        # Links returned by client-side navigation APIs must
+                        # enter this same browser frontier before the page cap
+                        # is reached. Recon still parses the stored response
+                        # later, so no extra network request is needed here.
+                        while json_link_cursor < len(transport.json_links):
+                            url = transport.json_links[json_link_cursor]
+                            json_link_cursor += 1
+                            if not transport.in_scope(url) or any(
+                                _SECRET.search(name) for name, _ in _query(url)
+                            ):
+                                continue
+                            pending_surface_ids[url] = remember(
+                                url, "GET", _names(k for k, _ in _query(url)),
+                                _query(url), ("browser_json_link",),
+                            )
+                            if url not in visited and url not in pending:
+                                pending.append(url)
                         for form in data["forms"]:
                             if transport.in_scope(form["url"]) and form["method"] in {"GET", "POST"}:
                                 names = _names(form["names"])
@@ -284,7 +374,12 @@ class PlaywrightRecon:
                                     }))
                         return data
 
-                    while pending and visits < self._max_pages and transport.attempts < request_budget and time.monotonic() < deadline:
+                    while pending and visits < visit_cap and transport.attempts < request_budget and time.monotonic() < deadline:
+                        if visits >= self._max_pages and not any(
+                            _page_family(url) not in visited_families for url in pending
+                        ):
+                            break
+                        planner_chosen = False
                         if select_next is not None and visits and len(pending) > 1:
                             options = tuple(
                                 (url, pending_surface_ids[url]) for url in pending
@@ -299,10 +394,16 @@ class PlaywrightRecon:
                                     pending.remove(selected)
                                     pending.insert(0, selected)
                                     planner_selections += 1
+                                    planner_chosen = True
+                        if not planner_chosen:
+                            _promote_unvisited_family(pending, visited_families)
                         url = pending.pop(0)
                         if url in visited:
                             continue
                         visited.add(url)
+                        family = _page_family(url)
+                        duplicate_family_visits += int(family in visited_families)
+                        visited_families.add(family)
                         visits += 1
                         try:
                             response = page.goto(url, wait_until="domcontentloaded", timeout=max(1, min(10000, int((deadline-time.monotonic())*1000))))
@@ -423,7 +524,7 @@ class PlaywrightRecon:
             stop_reason = "request_budget"
         elif pending and visits >= self._max_pages:
             status = "bounded"
-            stop_reason = "page_limit"
+            stop_reason = "page_limit" if visits >= visit_cap else "route_family_limit"
         elif actions >= self._max_actions:
             status = "bounded"
             stop_reason = "action_limit"
@@ -432,8 +533,23 @@ class PlaywrightRecon:
         transport.observations.append((None, {
             "type": "browser_recon_summary", "status": status,
             "page_count": visits, "action_count": actions,
+            "page_limit": visit_cap,
+            "visited_route_family_count": len(visited_families),
+            "duplicate_route_family_visits": duplicate_family_visits,
+            "unvisited_route_family_count": len({
+                _page_family(url) for url in pending
+                if _page_family(url) not in visited_families
+            }),
+            "unvisited_surface_ids": list(dict.fromkeys(
+                pending_surface_ids[url] for url in pending
+                if url in pending_surface_ids
+            ))[:32],
+            "unvisited_path_hints": list(dict.fromkeys(
+                surface_path_hint(url) for url in pending
+            ))[:32],
             "hash_probe_count": hash_probes, "hash_reflection_count": hash_reflections,
             "planner_selection_count": planner_selections,
+            "browser_version": browser_version,
             "request_count": transport.sent, "blocked_request_count": transport.blocked,
             "unvisited_page_count": len(pending), "stop_reason": stop_reason,
         }))

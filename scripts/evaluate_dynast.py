@@ -1,0 +1,397 @@
+"""Repeat answer-blind Hacklipse scans on freshly reset DynAST vuln/safe twins.
+
+The benchmark CLI owns target lifecycle and scoring. This script only passes its
+public target URL to Hacklipse; answer keys and trusted verifier tokens are never
+passed to the scanner. No git or software-install commands are used.
+"""
+
+from __future__ import annotations
+
+import argparse
+import http.client
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlsplit
+from uuid import uuid4
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_BENCH_ROOT = Path(__file__).resolve().parents[2] / "dynast-bench"
+
+
+def _positive_int(raw: str) -> int:
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be positive")
+    return value
+
+
+def _json_command(command: list[str], *, cwd: Path, env: dict[str, str]) -> dict:
+    completed = subprocess.run(
+        command, cwd=cwd, env=env, capture_output=True, text=True, check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"{command[1]} failed with exit code {completed.returncode}")
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{command[1]} returned invalid JSON") from error
+    if not isinstance(result, dict):
+        raise RuntimeError(f"{command[1]} returned a non-object result")
+    return result
+
+
+def _local_target(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("benchmark reset did not return a target URL")
+    parsed = urlsplit(value)
+    if (parsed.scheme not in {"http", "https"}
+            or parsed.hostname not in {"127.0.0.1", "localhost"}
+            or parsed.username or parsed.password or parsed.query or parsed.fragment):
+        raise ValueError("benchmark target must be a local HTTP URL without credentials or query")
+    return value
+
+
+def _scanner_env() -> dict[str, str]:
+    # Model credentials may be needed for a separately configured LLM scan, but
+    # benchmark answer keys and verifier tokens must never reach the scanner.
+    return {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("DYNAST_BENCH_")
+        and key not in {"BENCH_TARGET", "GROUND_TRUTH", "VERIFY_TOKEN"}
+    }
+
+
+def _nextjs_seeded_session(bench_root: Path, variant: str, target: str) -> str:
+    """Create a local test session without writing account or Cookie values."""
+
+    seed = bench_root / "vulnerable-apps" / "nextjs" / variant / "prisma" / "seed.mjs"
+    source = seed.read_text(encoding="utf-8")
+    accounts = re.findall(
+        r'\{\s*email:\s*"([^"\n]+)"\s*,\s*pw:\s*"([^"\n]+)"\s*,\s*role:\s*"user"',
+        source,
+    )
+    if not accounts:
+        raise RuntimeError("local NextJS test account is unavailable")
+    email, password = accounts[0]
+    parsed = urlsplit(target)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}:
+        raise RuntimeError("test login requires a local HTTP target")
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+    try:
+        connection.request(
+            "POST", "/api/auth/login",
+            body=json.dumps({"email": email, "password": password}),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        headers = response.getheaders()
+        response.read(1024)
+        if response.status != 200:
+            raise RuntimeError("local NextJS test login was rejected")
+    finally:
+        connection.close()
+    cookies: dict[str, str] = {}
+    for key, value in headers:
+        if key.casefold() != "set-cookie":
+            continue
+        pair = value.split(";", 1)[0]
+        if "=" not in pair:
+            continue
+        name, cookie_value = pair.split("=", 1)
+        if name in {"sid", "token"} and cookie_value:
+            cookies[name] = cookie_value
+    if set(cookies) != {"sid", "token"}:
+        raise RuntimeError("local NextJS login did not establish the expected session")
+    return "; ".join(f"{name}={cookies[name]}" for name in ("sid", "token"))
+
+
+def _run_summary(log_path: Path) -> dict:
+    records = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+    results = [item for item in records if item.get("event") == "run_result"]
+    if len(results) != 1:
+        raise ValueError("scanner log must contain exactly one run_result")
+    result = results[0]
+    return {
+        key: result.get(key) for key in (
+            "run_id", "phase", "code_version", "request_budget", "requests_used",
+            "finding_count", "candidate_status_counts", "browser_recon",
+            "recon_frontier",
+            "browser_recon_enabled", "authenticated", "state_changing_approved",
+            "stage_funnel", "budget_allocation_mode", "budget_validation_reserve",
+        )
+    }
+
+
+def _funnel_rates(funnel: object) -> dict[str, float | None]:
+    if not isinstance(funnel, dict):
+        return {}
+
+    def ratio(numerator: str, denominator: str) -> float | None:
+        count = funnel.get(numerator)
+        total = funnel.get(denominator)
+        if not isinstance(count, int) or not isinstance(total, int) or total <= 0:
+            return None
+        return round(count / total, 4)
+
+    return {
+        "surface_to_candidate": ratio("candidate_surface_count", "discovered_surface_count"),
+        "candidate_to_analysis": ratio("analysis_attempted_count", "candidate_count"),
+        "analysis_to_validation": ratio("validation_succeeded_count", "analysis_succeeded_count"),
+    }
+
+
+def _score_brief(score: dict) -> dict[str, int]:
+    """Read the benchmark's own counts, including findings emitted on its safe twin."""
+
+    counts = score.get("counts")
+    runs = score.get("runs")
+    if not isinstance(counts, dict) or not isinstance(runs, list):
+        raise ValueError("benchmark score lacks counts or runs")
+    brief = {}
+    for key in ("tp", "fp", "fn"):
+        value = counts.get(key)
+        if type(value) is not int or value < 0:
+            raise ValueError(f"benchmark score has invalid {key}")
+        brief[key] = value
+    safe_runs = [run for run in runs if isinstance(run, dict) and run.get("variant") == "safe"]
+    if len(safe_runs) != 1 or type(safe_runs[0].get("findings")) is not int or safe_runs[0]["findings"] < 0:
+        raise ValueError("benchmark score lacks one safe finding count")
+    brief["safe_findings"] = safe_runs[0]["findings"]
+    return brief
+
+
+def _print_score_brief(label: str, brief: dict[str, int]) -> None:
+    print(
+        f"{label}: TP {brief['tp']} | FP {brief['fp']} | FN {brief['fn']}"
+        f" | safe Finding {brief['safe_findings']}",
+        flush=True,
+    )
+
+
+def _write_json(path: Path, document: dict) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+        json.dump(document, output, ensure_ascii=False, sort_keys=True, indent=2)
+        output.write("\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("app", help="DynAST app name, e.g. nextjs")
+    parser.add_argument("--iterations", type=_positive_int, default=3)
+    parser.add_argument("--code-version", required=True)
+    parser.add_argument("--request-budget", type=_positive_int, default=80)
+    parser.add_argument("--budget-allocation", choices=("off", "heuristic"), default="off",
+                        help="candidate ordering and Validation request reservation")
+    parser.add_argument("--dynast-cli", default="dynast-bench")
+    parser.add_argument("--bench-root", type=Path, default=DEFAULT_BENCH_ROOT)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--no-browser-recon", action="store_true")
+    parser.add_argument("--browser-executable", type=Path)
+    parser.add_argument("--solo", action="store_true",
+                        help="use DynAST's single-container target when compose sidecars are unavailable")
+    parser.add_argument("--no-build", action="store_true",
+                        help="reuse previously built DynAST images while resetting target data")
+    parser.add_argument("--approve-state-changing", action="store_true",
+                        help="allow state-changing probes only on the reset local DynAST target")
+    parser.add_argument("--nextjs-test-session", action="store_true",
+                        help="log in a seeded local NextJS test user in memory for each reset twin")
+    args = parser.parse_args(argv)
+    if re.fullmatch(r"[a-z][a-z0-9-]{0,63}", args.app) is None:
+        parser.error("app must be a short lowercase DynAST app name")
+    if re.fullmatch(r"[A-Za-z0-9._/-]{1,80}", args.code_version) is None:
+        parser.error("code version must be a short label")
+    if args.nextjs_test_session and (args.app != "nextjs" or not args.approve_state_changing):
+        parser.error("--nextjs-test-session requires nextjs and --approve-state-changing")
+    executable = shutil.which(args.dynast_cli)
+    if executable is None:
+        parser.error("DynAST CLI is unavailable; provide an existing --dynast-cli path")
+    bench_root = args.bench_root.resolve()
+    if not (bench_root / "dynast-bench" / "dynast-bench.ts").is_file():
+        parser.error("--bench-root does not contain the DynAST checkout")
+    if args.browser_executable is not None:
+        args.browser_executable = args.browser_executable.expanduser().resolve()
+        if not args.browser_executable.is_file() or not os.access(args.browser_executable, os.X_OK):
+            parser.error("--browser-executable must be an executable local file")
+    label = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8]
+    output_dir = (args.output_dir or PROJECT_ROOT / "artifacts" / "dynast-bench" / "evaluations" / label).resolve()
+    output_dir.mkdir(parents=True, exist_ok=False)
+    benchmark_env = os.environ.copy()
+    scanner_env = _scanner_env()
+    results: list[dict] = []
+    score_briefs: list[dict[str, int]] = []
+    failed = False
+    abort = False
+
+    for iteration in range(1, args.iterations + 1):
+        pair: dict[str, dict] = {}
+        for variant in ("vuln", "safe"):
+            print(f"[{iteration}/{args.iterations}] reset {args.app} {variant}", flush=True)
+            try:
+                reset_command = [executable, "reset", args.app, "--variant", variant, "--json"]
+                if args.solo:
+                    reset_command.append("--solo")
+                if args.no_build:
+                    reset_command.append("--no-build")
+                reset = _json_command(
+                    reset_command,
+                    cwd=bench_root, env=benchmark_env,
+                )
+                target = _local_target(reset.get("target"))
+                session_cookie = (
+                    _nextjs_seeded_session(bench_root, variant, target)
+                    if args.nextjs_test_session else None
+                )
+            except (RuntimeError, ValueError) as error:
+                print(f"reset 실패: {error}")
+                return 1
+
+            stem = output_dir / f"{iteration:02d}-{variant}"
+            report_path = stem.with_suffix(".md")
+            log_path = stem.with_suffix(".jsonl")
+            command = [
+                sys.executable, str(PROJECT_ROOT / "scripts" / "run_dynast_baseline.py"),
+                target, "--app", args.app, "--variant", variant,
+                "--code-version", args.code_version,
+                "--request-budget", str(args.request_budget),
+                "--budget-allocation", args.budget_allocation,
+                "--report-out", str(report_path), "--routing-log", str(log_path),
+            ]
+            if session_cookie is None:
+                command.append("--anonymous")
+            else:
+                command.append("--session-cookie-stdin")
+            if args.no_browser_recon:
+                command.append("--no-browser-recon")
+            if args.approve_state_changing:
+                command.append("--approve-state-changing")
+            if args.browser_executable is not None:
+                command.extend(("--browser-executable", str(args.browser_executable)))
+            scan_started = time.monotonic()
+            scan = subprocess.run(
+                command, cwd=PROJECT_ROOT, env=scanner_env,
+                input="y\n" + (session_cookie + "\n" if session_cookie else ""),
+                text=True, capture_output=True, check=False,
+            )
+            leg = {
+                "iteration": iteration, "variant": variant,
+                "scanner_exit": scan.returncode,
+                "scan_elapsed_seconds": round(time.monotonic() - scan_started, 3),
+            }
+            if scan.returncode == 0:
+                try:
+                    leg.update(_run_summary(log_path))
+                except (OSError, ValueError, json.JSONDecodeError) as error:
+                    leg["error"] = type(error).__name__
+                if not leg.get("error") and (
+                    leg.get("phase") != "done"
+                    or leg.get("code_version") != args.code_version
+                    or leg.get("request_budget") != args.request_budget
+                    or leg.get("authenticated") is not args.nextjs_test_session
+                    or leg.get("state_changing_approved") is not args.approve_state_changing
+                    or leg.get("budget_allocation_mode") != args.budget_allocation
+                    or leg.get("browser_recon_enabled") is not (not args.no_browser_recon)
+                ):
+                    leg["error"] = "run_conditions_mismatch"
+                if not leg.get("error") and not args.no_browser_recon:
+                    summaries = leg.get("browser_recon") or []
+                    if not any(
+                        item.get("status") in {"completed", "partial", "bounded"}
+                        and isinstance(item.get("page_count"), int)
+                        and item["page_count"] > 0
+                        and item.get("browser_version")
+                        for item in summaries if isinstance(item, dict)
+                    ):
+                        leg["error"] = "browser_recon_unavailable"
+            else:
+                leg["error"] = "scanner_failed"
+            if leg.get("error"):
+                failed = abort = True
+                print(f"[{iteration}/{args.iterations}] {variant} 검사 실패: {leg['error']}", flush=True)
+            pair[variant] = leg
+            results.append(leg)
+            if abort:
+                break
+
+        if abort:
+            break
+
+        if all(pair[variant].get("phase") == "done" for variant in ("vuln", "safe")):
+            vuln = output_dir / f"{iteration:02d}-vuln"
+            safe = output_dir / f"{iteration:02d}-safe"
+            try:
+                score = _json_command([
+                    executable, "score", args.app, str(vuln.with_suffix(".findings.json")),
+                    "--safe", str(safe.with_suffix(".findings.json")),
+                    "--endpoints", str(vuln.with_suffix(".endpoints.json")), "--json",
+                ], cwd=bench_root, env=benchmark_env)
+                brief = _score_brief(score)
+                coverage = _json_command([
+                    executable, "coverage", args.app, str(vuln.with_suffix(".endpoints.json")),
+                    "--findings", str(vuln.with_suffix(".findings.json")), "--json",
+                ], cwd=bench_root, env=benchmark_env)
+                safe_coverage = _json_command([
+                    executable, "coverage", args.app, str(safe.with_suffix(".endpoints.json")),
+                    "--findings", str(safe.with_suffix(".findings.json")),
+                    "--variant", "safe", "--json",
+                ], cwd=bench_root, env=benchmark_env)
+                track = coverage.get("tracks", {}).get("coverage", {})
+                diagnosis = {
+                    "iteration": iteration,
+                    "discovery_misses": track.get("discovery_misses", []),
+                    "analysis_misses": track.get("analysis_misses", []),
+                    "unmapped_vulns": track.get("unmapped_vulns", []),
+                    "candidate_status_counts": pair["vuln"].get("candidate_status_counts", {}),
+                    "vuln_stage_funnel": pair["vuln"].get("stage_funnel") or {},
+                    "safe_stage_funnel": pair["safe"].get("stage_funnel") or {},
+                    "vuln_stage_rates": _funnel_rates(pair["vuln"].get("stage_funnel")),
+                    "safe_stage_rates": _funnel_rates(pair["safe"].get("stage_funnel")),
+                }
+                for name, document in (
+                    ("score", score), ("vuln-coverage", coverage),
+                    ("safe-coverage", safe_coverage), ("diagnosis", diagnosis),
+                ):
+                    _write_json(output_dir / f"{iteration:02d}-{name}.json", document)
+                score_briefs.append(brief)
+                _print_score_brief(f"[{iteration}/{args.iterations}] 채점", brief)
+            except (RuntimeError, OSError, ValueError) as error:
+                failed = True
+                pair["vuln"]["scoring_error"] = type(error).__name__
+                print(f"[{iteration}/{args.iterations}] 채점 실패: {type(error).__name__}", flush=True)
+
+    score_totals = {
+        key: sum(brief[key] for brief in score_briefs)
+        for key in ("tp", "fp", "fn", "safe_findings")
+    }
+
+    summary = {
+        "app": args.app, "code_version": args.code_version,
+        "request_budget": args.request_budget, "browser_recon": not args.no_browser_recon,
+        "budget_allocation_mode": args.budget_allocation,
+        "target_mode": "solo" if args.solo else "compose",
+        "target_images_reused": args.no_build,
+        "state_changing_approved": args.approve_state_changing,
+        "authenticated_test_session": args.nextjs_test_session,
+        "browser_executable_configured": args.browser_executable is not None,
+        "iterations": args.iterations, "legs": results,
+        "scored_iterations": len(score_briefs), "score_totals": score_totals,
+    }
+    _write_json(output_dir / "summary.json", summary)
+    if len(score_briefs) > 1:
+        _print_score_brief(f"{len(score_briefs)}회 합계 (반복 검사 건수)", score_totals)
+    if score_briefs:
+        print("safe Finding은 FP에 포함될 수 있으므로 합산하지 마세요.")
+    print(f"평가 기록: {output_dir}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

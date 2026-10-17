@@ -20,6 +20,7 @@ URL을 만들어야 하므로 경로가 소스에 리터럴로 박힌다. 브라
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 from collections.abc import Callable, Sequence
@@ -50,6 +51,7 @@ from .llm_iterative_recon import (
 )
 from .llm_parameter_names import alias_parameter_names
 from .browser_recon import PlaywrightRecon
+from .discovery_links import json_links_from_observation
 from .llm_recon_planner import (
     RECON_PLANNER,
     ReconCandidate,
@@ -63,6 +65,8 @@ from .path_traversal_analysis import (
     RESTRICTED_FILE_OBSERVATION,
     UNLINKED_RENDER_PARAMETER_OBSERVATION,
 )
+from .sensitive_exposure import EXPOSURE_OBSERVATION, exposed_json_field_paths
+from .source_map_exposure import SOURCE_MAP_REFERENCE, source_map_urls
 
 # HttpExecutionRuntime이 GET 실행에 사용하는 도구 이름과 맞춘다(tests/test_http_runtime.py).
 RECON_TOOL = "http_get"
@@ -86,6 +90,13 @@ _JS_PATH = re.compile(
 _JS_PATH_PARAM = re.compile(
     r"""(?<![/A-Za-z0-9._~-])(/[A-Za-z0-9][A-Za-z0-9._~/-]{0,100})\?([A-Za-z0-9_]{1,40})="""
 )
+# Bundlers often build a path from adjacent constant fragments, for example
+# "/api/" + "items?term=". Only literal-to-literal addition is interpreted;
+# variable values and template interpolation are never evaluated.
+_JS_STRING_LITERAL = re.compile(r"""(["'`])([^"'`\\\r\n]{1,80})\1""")
+_JS_LITERAL_JOIN = re.compile(r"\s*\+\s*\Z")
+_JS_PATH_FRAGMENT = re.compile(r"[A-Za-z0-9._~/?=&-]{1,80}\Z")
+_JS_PARAMETER_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,39}\Z")
 # SPA가 서버 렌더링 문서로 빠져나갈 때 쓰는 navigation sink. 단순 경로 리터럴과
 # 달리 실제 HTML 문서일 가능성이 높으므로, 번들에서 발견한 뒤 예산 안에서 방문한다.
 # 특정 제품의 경로 이름이 아니라 브라우저 API와 상대경로의 결합만 본다.
@@ -156,6 +167,9 @@ _RESTRICTED_FILE_EXTENSIONS = (
 _UNLINKED_RENDER_PARAMETERS = ("layout",)
 
 _MAX_SCRIPT_BYTES = 4 * 1024 * 1024
+_MAX_API_SCHEMA_BYTES = 2 * 1024 * 1024
+_API_PATH = re.compile(r"/[A-Za-z0-9._~/-]{0,180}\Z")
+_API_FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,79}\Z")
 # 한 round에서 모델이 비교할 좌표를 제한한다. 선택된 좌표는 다음 round의 창으로
 # 이동하므로 이 값 밖의 Surface가 영구히 사라지는 것은 아니다. 응답 전체를 매번 다시
 # 보내지 않고 현재 선택지와 직전 실행 문맥만 전달해 반복 prompt 비용을 제한한다.
@@ -182,6 +196,186 @@ _SINGULAR_OBJECT_RESOURCES = frozenset(
 def _looks_like_file_or_url_parameter(name: str) -> bool:
     lowered = name.lower()
     return any(hint in lowered for hint in _FILE_OR_URL_PARAM_HINTS)
+
+
+def _looks_like_file_serving_parameter(url: str, name: str) -> bool:
+    """Use a file-serving route to disambiguate generic filename fields."""
+
+    if name.casefold() not in {"name", "filename"}:
+        return False
+    path_tokens = set(re.split(r"[/_-]+", urlsplit(url).path.casefold()))
+    return bool(path_tokens.intersection({
+        "attachment", "attachments", "download", "export", "file", "files", "media",
+    }))
+
+
+def _constant_js_paths(body: str) -> dict[str, tuple[str, ...]]:
+    """Find bounded HTTP paths made solely from adjacent JS string literals."""
+
+    literals = tuple(_JS_STRING_LITERAL.finditer(body))
+    found: dict[str, set[str]] = {}
+    for index, first in enumerate(literals):
+        value = first.group(2)
+        if not value.startswith("/") or value.startswith("//"):
+            continue
+        fragments = [value]
+        previous = first
+        for next_literal in literals[index + 1:index + 4]:
+            gap = body[previous.end():next_literal.start()]
+            fragment = next_literal.group(2)
+            if _JS_LITERAL_JOIN.fullmatch(gap) is None or _JS_PATH_FRAGMENT.fullmatch(fragment) is None:
+                break
+            fragments.append(fragment)
+            previous = next_literal
+        if len(fragments) < 2:
+            continue
+        assembled = "".join(fragments)
+        path, _, query = assembled.partition("?")
+        if (
+            len(path) > 120 or not path.startswith("/") or path.startswith("//")
+            or ".." in path.split("/") or not _JS_PATH_FRAGMENT.fullmatch(path)
+            or path.endswith("/")
+        ):
+            continue
+        names = found.setdefault(path, set())
+        for pair in query.split("&"):
+            name, separator, _ = pair.partition("=")
+            if separator and _JS_PARAMETER_NAME.fullmatch(name):
+                names.add(name)
+    return {path: tuple(sorted(names)) for path, names in found.items()}
+
+
+def _javascript_response(evidence: Evidence) -> bool:
+    """Accept browser-fetched scripts, never HTML or JSON with JS-looking data."""
+
+    observation = evidence.observation
+    source = observation.get("requested_url")
+    media = observation.get("content_type")
+    if not isinstance(source, str) or not isinstance(media, str):
+        return False
+    media_type = media.split(";", 1)[0].strip().casefold()
+    return media_type in {"application/javascript", "text/javascript", "application/x-javascript"} or (
+        not media_type and urlsplit(source).path.casefold().endswith((".js", ".mjs"))
+    )
+
+
+def _json_links_from_response(evidence: Evidence, base_url: str) -> tuple[str, ...]:
+    """Keep the Evidence wrapper for Recon callers and older adapter tests."""
+
+    return json_links_from_observation(evidence.observation, base_url)
+
+
+def _script_paths_from_body(body: str, origin) -> list[tuple[str, tuple[str, ...], bool, bool]]:
+    """Derive same-origin route candidates from a bounded script body."""
+
+    parameters: dict[str, set[str]] = {}
+    for match in _JS_PATH_PARAM.finditer(body):
+        parameters.setdefault(match.group(1), set()).add(match.group(2))
+    for path, names in _constant_js_paths(body).items():
+        parameters.setdefault(path, set()).update(names)
+    document_paths = {match.group(1) for match in _JS_DOCUMENT_NAVIGATION.finditer(body)}
+    paths = {match.group(1) for match in _JS_PATH.finditer(body)}
+    paths.update(parameters)
+    paths.update(match.group(1) for match in _JS_DIRECTORY.finditer(body))
+    paths = {
+        path for path in paths
+        if not (
+            _JS_BARE_NUMERIC_PATH.fullmatch(path)
+            and path not in parameters and path not in document_paths
+        )
+    }
+    base = f"{origin.scheme}://{origin.netloc}"
+    ordered_paths = (*sorted(document_paths), *sorted(paths - document_paths))
+    found = [
+        (f"{base}{path}", tuple(sorted(parameters.get(path, ()))),
+         path in document_paths or path.endswith("/"), path in document_paths)
+        for path in ordered_paths
+    ]
+    found.extend(
+        (f"{base}/#/{route}", names, False, False)
+        for route, names in sorted(_client_routes(body).items())
+    )
+    return found
+
+
+def _openapi_literal_surfaces(
+    evidence: Evidence, origin
+) -> list[tuple[str, str, tuple[str, ...], tuple[str, ...], str]]:
+    """Read literal API request shapes, without resolving refs or sending mutations."""
+
+    observation = evidence.observation
+    status = observation.get("status")
+    media = observation.get("content_type", "")
+    body = observation.get("body")
+    if (
+        evidence.evidence_type != "http_response"
+        or type(status) is not int or not 200 <= status < 300
+        or observation.get("truncated")
+        or not isinstance(media, str)
+        or media.split(";", 1)[0].strip().casefold() not in {
+            "application/json", "application/vnd.oai.openapi+json"
+        }
+        or not isinstance(body, str) or len(body) > _MAX_API_SCHEMA_BYTES
+    ):
+        return []
+    try:
+        document = json.loads(body)
+    except ValueError:
+        return []
+    if not isinstance(document, dict) or not isinstance(
+        document.get("openapi") or document.get("swagger"), str
+    ):
+        return []
+    paths = document.get("paths")
+    if not isinstance(paths, dict):
+        return []
+    base = f"{origin.scheme}://{origin.netloc}"
+    found: list[tuple[str, str, tuple[str, ...], tuple[str, ...], str]] = []
+    for path, operations in sorted(paths.items())[:200]:
+        if (
+            not isinstance(path, str) or not _API_PATH.fullmatch(path)
+            or path.startswith("//") or ".." in path.split("/")
+            or "{" in path or "}" in path
+            or not isinstance(operations, dict)
+        ):
+            continue
+        for method in ("get", "post", "put", "patch", "delete"):
+            operation = operations.get(method)
+            if not isinstance(operation, dict):
+                continue
+            query_names: list[str] = []
+            for source in (operations.get("parameters"), operation.get("parameters")):
+                if not isinstance(source, list):
+                    continue
+                for parameter in source[:64]:
+                    if not isinstance(parameter, dict) or parameter.get("in") != "query":
+                        continue
+                    name = parameter.get("name")
+                    if isinstance(name, str) and _API_FIELD.fullmatch(name):
+                        query_names.append(name)
+            body_names: list[str] = []
+            content_type = ""
+            request_body = operation.get("requestBody")
+            content = request_body.get("content") if isinstance(request_body, dict) else None
+            if isinstance(content, dict):
+                for media in ("application/json", "application/x-www-form-urlencoded"):
+                    entry = content.get(media)
+                    if not isinstance(entry, dict):
+                        continue
+                    schema = entry.get("schema")
+                    properties = schema.get("properties") if isinstance(schema, dict) else None
+                    if isinstance(properties, dict):
+                        body_names = [
+                            name for name in list(properties)[:64]
+                            if isinstance(name, str) and _API_FIELD.fullmatch(name)
+                        ]
+                    content_type = media
+                    break
+            found.append((
+                base + path, method.upper(), tuple(dict.fromkeys(query_names)),
+                tuple(dict.fromkeys(body_names)), content_type,
+            ))
+    return found
 
 
 def _client_routes(body: str) -> dict[str, tuple[str, ...]]:
@@ -342,6 +536,9 @@ class ReconAgent:
         responded: set[str] = set()
         successful: set[str] = set()
         parsed: set[str] = set()
+        sensitive_exposure_seen: set[tuple[str, ...]] = set()
+        source_map_refs_seen: set[str] = set()
+        api_schema_found = False
         scripts: list[str] = []
         document_pages: set[str] = set()
         if targeted:
@@ -416,7 +613,9 @@ class ReconAgent:
                 discovery_types=tuple(dict.fromkeys(discovery_types)),
             )
             evidence_ids.extend(
-                self._flag_suspect_parameters(task.run_id, surface_id, names)
+                self._flag_suspect_parameters(
+                    task.run_id, surface_id, names, clean_url, method
+                )
             )
             if _looks_like_restricted_file(clean_url):
                 evidence_ids.append(
@@ -424,12 +623,63 @@ class ReconAgent:
                 )
             return surface_id
 
+        def remember_schema(
+            shapes: Sequence[tuple[str, str, tuple[str, ...], tuple[str, ...], str]],
+            source_evidence_id: str,
+        ) -> None:
+            for url, method, query_names, body_names, content_type in shapes:
+                surface_id = remember(
+                    url, method, tuple(dict.fromkeys((*query_names, *body_names))),
+                    discovery_types=("openapi_schema",),
+                )
+                # A declaration supplies field names and media type, never a
+                # replayable normal request or permission to send a mutation.
+                shape_id = f"evi-{self._id_factory()}"
+                self._evidence.append(Evidence(
+                    evidence_id=shape_id, run_id=task.run_id,
+                    surface_id=surface_id, created_by="recon",
+                    evidence_type="observation", source_task_id=task.task_id,
+                    observation={
+                        "type": "openapi_request_structure",
+                        "schema_evidence_id": source_evidence_id,
+                        "method": method,
+                        "query_parameter_names": list(query_names),
+                        "body_parameter_names": list(body_names),
+                        "content_type": content_type,
+                        "request_template_available": False,
+                    },
+                ))
+                evidence_ids.append(shape_id)
+
+        def remember_source_maps(script_url: str, body: str, source_evidence_id: str) -> None:
+            for map_url in source_map_urls(script_url, body):
+                surface_id = remember(
+                    map_url, "GET", (), discovery_types=("source_map_reference",),
+                )
+                if map_url in source_map_refs_seen:
+                    continue
+                # Each independently verified map needs two additional GETs.
+                # Keep other linked maps as Surfaces without letting a large
+                # bundle consume the analysis budget before validation.
+                if len(source_map_refs_seen) >= 2:
+                    continue
+                source_map_refs_seen.add(map_url)
+                signal_id = f"evi-{self._id_factory()}"
+                self._evidence.append(Evidence(
+                    evidence_id=signal_id, run_id=task.run_id,
+                    surface_id=surface_id, created_by="recon",
+                    evidence_type="observation", source_task_id=task.task_id,
+                    observation={"type": SOURCE_MAP_REFERENCE,
+                                 "script_response_evidence_id": source_evidence_id},
+                ))
+                evidence_ids.append(signal_id)
+
         def crawl(
             *,
             protected: Sequence[str] | set[str] = (),
             max_visits: int | None = None,
         ) -> int:
-            nonlocal deadline_exhausted
+            nonlocal deadline_exhausted, api_schema_found
             visited = 0
             while pending and len(fetched) < page_budget:
                 if remaining_work() < 1.0:
@@ -468,10 +718,38 @@ class ReconAgent:
                     # JSON/API 응답 안의 escaped HTML 조각을 실제 링크나 폼으로 오인하면
                     # `/api/\"https:/...` 같은 실행 불가능한 Surface가 생긴다. API 본문은
                     # status/content-type 관찰로 남기되 HTML parser에는 넣지 않는다.
+                    schema_surfaces = _openapi_literal_surfaces(evidence, origin)
+                    if schema_surfaces:
+                        api_schema_found = True
+                        parsed.add(url)
+                        remember_schema(schema_surfaces, evidence_id)
+                    json_links = _json_links_from_response(evidence, url)
+                    if json_links:
+                        parsed.add(url)
+                    for link in json_links:
+                        pending_surface_ids[link] = remember(
+                            link, "GET", _query_names(link), _query_pairs(link),
+                            discovery_types=("json_link",),
+                        )
+                        pending_discovery_types.setdefault(link, set()).add("json_link")
+                        if link not in fetched and link not in pending:
+                            pending.append(link)
                     continue
 
                 links, forms, sources = _parse_page(body, url)
                 parsed.add(url)
+                exposed_fields = exposed_json_field_paths(evidence.observation)
+                if exposed_fields and exposed_fields not in sensitive_exposure_seen:
+                    sensitive_exposure_seen.add(exposed_fields)
+                    signal_id = f"evi-{self._id_factory()}"
+                    self._evidence.append(Evidence(
+                        evidence_id=signal_id, run_id=task.run_id,
+                        surface_id=surface_id, created_by="recon",
+                        evidence_type="observation", source_task_id=task.task_id,
+                        observation={"type": EXPOSURE_OBSERVATION,
+                                     "field_paths": list(exposed_fields)},
+                    ))
+                    evidence_ids.append(signal_id)
                 for form_url, method, names, content_type in forms:
                     form_surface_id = remember(
                         form_url, method, names, discovery_types=("html_form",)
@@ -543,6 +821,9 @@ class ReconAgent:
             record_response(source, script_evidence)
             if script_parsed:
                 parsed.add(source)
+                script_body = script_evidence.observation.get("body")
+                if isinstance(script_body, str):
+                    remember_source_maps(source, script_body, script_evidence.evidence_id)
             for url, names, should_crawl, is_navigation in script_paths:
                 discovery_type = (
                     "browser_navigation" if is_navigation else "script_literal"
@@ -566,6 +847,32 @@ class ReconAgent:
                     should_crawl or self._iterative_planner is not None
                 ) and url not in fetched and url not in pending:
                     pending.append(url)
+
+        # A public OpenAPI document provides request shapes without sending
+        # mutations. Probe one conventional location only for a root-scoped
+        # crawl with spare Recon budget. Declared body fields are not a valid
+        # request template and do not authorize POST analysis.
+        if (
+            not targeted and not pending and not api_schema_found
+            and origin.path in {"", "/"}
+            and not origin.query and not origin.fragment
+            and len(fetched) < page_budget and remaining_work() >= 1.0
+        ):
+            schema_url = f"{origin.scheme}://{origin.netloc}/openapi.json"
+            if schema_url not in fetched:
+                fetched.add(schema_url)
+                schema_evidence_id, schema_evidence = self._fetch(
+                    task, schema_url, None, timeout_seconds=remaining_work()
+                )
+                evidence_ids.append(schema_evidence_id)
+                record_response(schema_url, schema_evidence)
+                schema_surfaces = _openapi_literal_surfaces(schema_evidence, origin)
+                if schema_surfaces:
+                    api_schema_found = True
+                    parsed.add(schema_url)
+                    remember(schema_url, "GET", (),
+                             discovery_types=("openapi_document",))
+                    remember_schema(schema_surfaces, schema_evidence_id)
 
         round_index = 0
         provider_fallback_status: str | None = None
@@ -773,10 +1080,59 @@ class ReconAgent:
                     ),
                 )
                 evidence_ids.extend(discovery.evidence_ids)
+                # Browser-loaded scripts and JSON have already passed through
+                # the shared collector. Parse their bounded responses without
+                # another request or sending any form submission.
+                browser_scripts_parsed = 0
+                browser_json_link_responses = 0
+                browser_schema_responses = 0
+                for browser_evidence_id in discovery.evidence_ids:
+                    browser_evidence = self._evidence.get(task.run_id, browser_evidence_id)
+                    script_url = browser_evidence.observation.get("requested_url")
+                    body = browser_evidence.observation.get("body")
+                    status = browser_evidence.observation.get("status")
+                    if (
+                        browser_evidence.evidence_type != "http_response"
+                        or not isinstance(script_url, str)
+                        or not _same_origin(script_url, origin)
+                        or script_url in parsed
+                        or type(status) is not int or not 200 <= status < 300
+                        or browser_evidence.observation.get("truncated")
+                        or not isinstance(body, str) or not body
+                        or len(body) > _MAX_SCRIPT_BYTES
+                    ):
+                        continue
+                    if _javascript_response(browser_evidence):
+                        if browser_scripts_parsed >= self._max_scripts:
+                            continue
+                        parsed.add(script_url)
+                        browser_scripts_parsed += 1
+                        remember_source_maps(script_url, body, browser_evidence_id)
+                        for url, names, _, _ in _script_paths_from_body(body, origin):
+                            if _same_origin(url, origin):
+                                remember(url, "GET", names,
+                                         discovery_types=("browser_script_literal",))
+                        continue
+                    schema_surfaces = _openapi_literal_surfaces(browser_evidence, origin)
+                    if schema_surfaces:
+                        parsed.add(script_url)
+                        browser_schema_responses += 1
+                        remember_schema(schema_surfaces, browser_evidence_id)
+                        continue
+                    json_links = _json_links_from_response(browser_evidence, script_url)
+                    if json_links:
+                        parsed.add(script_url)
+                        browser_json_link_responses += 1
+                        for url in json_links:
+                            remember(url, "GET", _query_names(url), _query_pairs(url),
+                                     discovery_types=("browser_json_link",))
                 observations = tuple(
                     (surface_id, {
                         **observation,
                         "planner_llm_call_count": browser_llm_calls,
+                        "parsed_script_count": browser_scripts_parsed,
+                        "parsed_json_link_response_count": browser_json_link_responses,
+                        "parsed_schema_response_count": browser_schema_responses,
                     } if observation.get("type") == "browser_recon_summary" else observation)
                     for surface_id, observation in discovery.observations
                 )
@@ -794,6 +1150,56 @@ class ReconAgent:
                     observation=observation,
                 ))
                 evidence_ids.append(evidence_id)
+
+        # The agentic planner emits its own decision trace. This compact
+        # collection trace also covers heuristic runs and distinguishes URLs
+        # attempted, responded to, and actually parsed. Never store raw pending
+        # URLs, which can contain session or query values.
+        unvisited_ids = tuple(dict.fromkeys(
+            pending_surface_ids[url] for url in pending
+            if url not in fetched and url in pending_surface_ids
+        ))
+        unvisited_hashes = tuple(dict.fromkeys(
+            hashlib.sha256(url.encode("utf-8")).hexdigest()
+            for url in pending
+            if url not in fetched and url not in pending_surface_ids
+        ))
+        response_surface_ids = {
+            item.surface_id for item in self._evidence.list_by_run(task.run_id)
+            if item.surface_id is not None
+            and item.evidence_type == "http_response"
+            and type(item.observation.get("status")) is int
+            and 100 <= item.observation["status"] <= 599
+        }
+        discovered_without_response_ids = tuple(
+            surface.surface_id for surface in self._surfaces.list_by_run(task.run_id)
+            if surface.surface_id not in response_surface_ids
+        )
+        collection_summary = {
+            "type": "recon_frontier_summary",
+            "attempted_url_count": len(fetched),
+            "response_url_count": len(responded),
+            "successful_url_count": len(successful),
+            "parsed_url_count": len(parsed),
+            "unvisited_surface_ids": list(unvisited_ids),
+            "unvisited_url_hashes": list(unvisited_hashes),
+            "unvisited_count": len(unvisited_ids) + len(unvisited_hashes),
+            "discovered_without_response_surface_count": len(discovered_without_response_ids),
+            "discovered_without_response_surface_ids": list(discovered_without_response_ids[:200]),
+            "stop_reason": (
+                "time_budget" if deadline_exhausted else
+                "request_budget" if pending and len(fetched) >= page_budget else
+                stop_reason or "not_selected" if pending else "frontier_exhausted"
+            ),
+        }
+        summary_id = f"evi-{self._id_factory()}"
+        self._evidence.append(Evidence(
+            evidence_id=summary_id, run_id=task.run_id,
+            surface_id=None, created_by="recon",
+            evidence_type="observation", source_task_id=task.task_id,
+            observation=collection_summary,
+        ))
+        evidence_ids.append(summary_id)
 
         surface_ids = list(surfaces.values())
         return AgentResult(
@@ -851,47 +1257,7 @@ class ReconAgent:
         ):
             return [], evidence, False
 
-        parameters: dict[str, set[str]] = {}
-        for match in _JS_PATH_PARAM.finditer(body):
-            parameters.setdefault(match.group(1), set()).add(match.group(2))
-        document_paths = {
-            match.group(1) for match in _JS_DOCUMENT_NAVIGATION.finditer(body)
-        }
-        paths = {match.group(1) for match in _JS_PATH.finditer(body)}
-        paths.update(parameters)
-        paths.update(match.group(1) for match in _JS_DIRECTORY.finditer(body))
-        # Angular 템플릿의 글자 수 표시는 ``value.length/10``을 렌더링하면서
-        # ``/10`` 같은 문자열 리터럴을 만든다. 명시적 query 좌표나 실제 navigation이
-        # 아닌 단일 숫자 루트 경로만 제거한다. ``/users/10``과
-        # ``location.assign('/10')``은 각각 정상 REST/탐색 좌표이므로 보존한다.
-        paths = {
-            path
-            for path in paths
-            if not (
-                _JS_BARE_NUMERIC_PATH.fullmatch(path)
-                and path not in parameters
-                and path not in document_paths
-            )
-        }
-
-        base = f"{origin.scheme}://{origin.netloc}"
-        # 실제 문서 이동을 먼저 방문한다. 일반 경로 수십 개를 정렬한 뒤 예산이
-        # 소진되어 중요한 서버 렌더링 폼을 놓치는 일을 막는다.
-        ordered_paths = (*sorted(document_paths), *sorted(paths - document_paths))
-        found = [
-            (
-                f"{base}{path}",
-                tuple(sorted(parameters.get(path, ()))),
-                path in document_paths or path.endswith("/"),
-                path in document_paths,
-            )
-            for path in ordered_paths
-        ]
-        found.extend(
-            (f"{base}/#/{route}", names, False, False)
-            for route, names in sorted(_client_routes(body).items())
-        )
-        return found, evidence, True
+        return _script_paths_from_body(body, origin), evidence, True
 
     def _store_surface(
         self,
@@ -941,13 +1307,18 @@ class ReconAgent:
         return evidence_id
 
     def _flag_suspect_parameters(
-        self, run_id: str, surface_id: str, params: tuple[str, ...]
+        self, run_id: str, surface_id: str, params: tuple[str, ...],
+        url: str, method: str,
     ) -> list[str]:
-        """Router가 매칭할 수 있게 파일·URL로 보이는 파라미터만 Observation으로 남긴다."""
+        """Record named file inputs and weaker filename inputs on file-serving GETs."""
 
         evidence_ids: list[str] = []
         for name in params:
-            if not _looks_like_file_or_url_parameter(name):
+            if _looks_like_file_or_url_parameter(name):
+                observation_type = "url_or_file_parameter"
+            elif method.upper() == "GET" and _looks_like_file_serving_parameter(url, name):
+                observation_type = "file_serving_parameter"
+            else:
                 continue
             evidence_id = f"evi-{self._id_factory()}"
             self._evidence.append(
@@ -957,7 +1328,7 @@ class ReconAgent:
                     surface_id=surface_id,
                     created_by="recon",
                     evidence_type="observation",
-                    observation={"type": "url_or_file_parameter", "parameter": name},
+                    observation={"type": observation_type, "parameter": name},
                 )
             )
             evidence_ids.append(evidence_id)

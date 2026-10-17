@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import stat
 import sys
 import tempfile
 import unittest
@@ -51,6 +52,7 @@ class DynastRunnerTests(unittest.TestCase):
         self.assertIn("--vuln {auto}", help_text)
         self.assertIn("--recon-entry {base-url}", help_text)
         self.assertIn("--no-browser-recon", help_text)
+        self.assertIn("--anonymous", help_text)
         self.assertIn("실행별 Markdown", help_text)
         self.assertNotIn("Juice Shop", help_text)
         self.assertNotIn("--juice-shop-db", help_text)
@@ -90,6 +92,63 @@ class DynastRunnerTests(unittest.TestCase):
             setup.assert_not_called()
             login.assert_not_called()
 
+    def test_anonymous_option_skips_terminal_cookie_prompt(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(dynast, "DEFAULT_ARTIFACT_DIRECTORY", Path(directory)))
+            stack.enter_context(patch("builtins.input", return_value="y"))
+            getpass = stack.enter_context(patch.object(shared.getpass, "getpass"))
+            start = stack.enter_context(patch.object(Orchestrator, "start", side_effect=_Stop))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            with self.assertRaises(_Stop):
+                dynast.main(["dynast", "http://localhost:13322/", "--anonymous"])
+            getpass.assert_not_called()
+            self.assertIsNone(start.call_args.args[0].credential_ref)
+
+    def test_stdin_session_skips_terminal_prompt_and_binds_credential(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(dynast, "DEFAULT_ARTIFACT_DIRECTORY", Path(directory)))
+            stack.enter_context(patch("builtins.input", return_value="y"))
+            stack.enter_context(patch.object(shared.sys, "stdin", io.StringIO("sid=private-test-session\n")))
+            getpass = stack.enter_context(patch.object(shared.getpass, "getpass"))
+            start = stack.enter_context(patch.object(Orchestrator, "start", side_effect=_Stop))
+            output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            with self.assertRaises(_Stop):
+                dynast.main([
+                    "dynast", "http://localhost:13322/", "--session-cookie-stdin",
+                ])
+            getpass.assert_not_called()
+            self.assertEqual(start.call_args.args[0].credential_ref,
+                             shared._AUTO_SESSION_CREDENTIAL_REF)
+            self.assertNotIn("private-test-session", output.getvalue())
+
+    def test_session_stdin_and_anonymous_are_mutually_exclusive(self):
+        with patch.object(shared, "build_local_application") as build, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(dynast.main([
+                "dynast", "http://localhost:13322/", "--anonymous",
+                "--session-cookie-stdin",
+            ]), 2)
+        build.assert_not_called()
+
+    def test_explicit_browser_executable_reaches_common_browser_recon(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            executable = Path(directory) / "chromium"
+            executable.write_bytes(b"")
+            executable.chmod(0o700)
+            stack.enter_context(patch.object(dynast, "DEFAULT_ARTIFACT_DIRECTORY", Path(directory)))
+            stack.enter_context(patch("builtins.input", return_value="y"))
+            register = stack.enter_context(patch.object(
+                shared, "register_standard_agents", wraps=shared.register_standard_agents,
+            ))
+            stack.enter_context(patch.object(Orchestrator, "start", side_effect=_Stop))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            with self.assertRaises(_Stop):
+                dynast.main([
+                    "dynast", "http://localhost:13322/", "--anonymous",
+                    "--browser-executable", str(executable),
+                ])
+            self.assertEqual(register.call_args.kwargs["recon_browser_executable_path"],
+                             str(executable.resolve()))
+
     def test_completed_run_saves_dynast_artifacts_and_honors_static_override(self):
         runtime = _Runtime()
         with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
@@ -109,14 +168,52 @@ class DynastRunnerTests(unittest.TestCase):
             result = next(x for x in records if x["event"] == "run_result")
             self.assertEqual(result["phase"], "done")
             self.assertEqual(result["code_version"], "fixture")
-            self.assertEqual(result["requests_used"], 1)
+            self.assertEqual(result["requests_used"], 2)
             self.assertFalse(result["browser_recon_enabled"])
-            self.assertEqual(len(runtime.calls), 1)
+            self.assertEqual(result["stage_funnel"]["candidate_count"], 0)
+            self.assertEqual(result["stage_funnel"]["discovered_surface_count"], 1)
+            self.assertEqual(result["recon_frontier"][0]["attempted_url_count"], 2)
+            self.assertEqual(result["recon_frontier"][0]["unvisited_count"], 0)
+            self.assertEqual(len(runtime.calls), 2)
             self.assertEqual(runtime.closed, [result["run_id"]])
             self.assertIn("DynAST-Bench 자동 탐색 실행 결과", output.getvalue())
             self.assertIn("[실행하지 못한 Analyzer 계약]", output.getvalue())
             self.assertIn("Surface는 발견했지만 현재 Analyzer 실행 조건을 만족하는 입력 좌표가 없습니다.", output.getvalue())
             self.assertNotIn("Juice Shop", output.getvalue())
+
+    def test_scorer_export_requires_explicit_app_variant_and_code_version(self):
+        for extra in (
+            ["--app", "nextjs"],
+            ["--variant", "safe"],
+            ["--app", "nextjs", "--variant", "safe"],
+        ):
+            with self.subTest(extra=extra), patch.object(shared, "build_local_application") as build, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(dynast.main(["dynast", "http://localhost:13322/", *extra]), 2)
+                build.assert_not_called()
+
+    def test_completed_run_exports_explicit_safe_twin_scoring_files(self):
+        runtime = _Runtime()
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(dynast, "DEFAULT_ARTIFACT_DIRECTORY", Path(directory)))
+            stack.enter_context(patch.object(shared, "HttpExecutionRuntime", return_value=runtime))
+            stack.enter_context(patch("builtins.input", return_value="y"))
+            stack.enter_context(patch.object(shared.getpass, "getpass", return_value=""))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            self.assertEqual(dynast.main([
+                "dynast", "http://localhost:13322/", "--no-browser-recon",
+                "--app", "nextjs", "--variant", "safe", "--code-version", "fixture",
+            ]), 0)
+            findings_path, = Path(directory).glob("dynast-*.findings.json")
+            endpoints_path, = Path(directory).glob("dynast-*.endpoints.json")
+            findings = json.loads(findings_path.read_text())
+            endpoints = json.loads(endpoints_path.read_text())
+            self.assertEqual(findings["schema"], "dynast-bench.findings/v1")
+            self.assertEqual(findings["run"], {"app": "nextjs", "variant": "safe"})
+            self.assertEqual(findings["findings"], [])
+            self.assertEqual(endpoints["run"], findings["run"])
+            self.assertEqual(endpoints["endpoints"], [{"method": "GET", "path": "/"}])
+            self.assertEqual(stat.S_IMODE(findings_path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(endpoints_path.stat().st_mode), 0o600)
 
 
 if __name__ == "__main__":

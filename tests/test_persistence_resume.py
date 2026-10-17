@@ -93,7 +93,10 @@ class PersistenceResumeTests(unittest.TestCase):
             self.assertEqual(
                 [task.envelope.agent_type for task in tasks[1:]], ["recon", "report"]
             )
-            self.assertEqual(len(app.stores.evidence.list_by_run(run.run_id)), 1)
+            evidence = app.stores.evidence.list_by_run(run.run_id)
+            self.assertEqual(len(evidence), 2)
+            self.assertTrue(any(item.observation.get("type") == "recon_frontier_summary"
+                                for item in evidence))
             self.assertGreaterEqual(len(app.stores.surfaces.list_by_run(run.run_id)), 1)
             report_count = len(app.stores.reports.list_by_run(run.run_id))
             self.assertEqual(report_count, 1)

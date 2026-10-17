@@ -124,7 +124,9 @@ class _FakeLlmClient:
 
 def _run(*, llm_client=None, validation_review=False):
     runtime = _ReflectingRuntime()
-    app = build_local_application({}, runtime=runtime, router=standard_router())
+    app = build_local_application(
+        {}, runtime=runtime, router=standard_router(("XSS", "SQLi"))
+    )
     profile = register_standard_agents(
         app, llm_client=llm_client, validation_review=validation_review
     )
@@ -248,8 +250,7 @@ class LlmWiringEndToEndTests(unittest.TestCase):
         app, run, _, _ = _run(llm_client=_FakeLlmClient())
 
         types = {c.vulnerability_type for c in app.stores.candidates.list_by_run(run.run_id)}
-        # 구현된 Analyzer가 담당하는 유형만 나온다. SSTI·Path Traversal은 Router 규칙이
-        # 있어도 Analyzer가 없으므로 Candidate 자체가 만들어지지 않는다.
+        # 이 배선 테스트는 XSS·SQLi만 선택한다. 선택 밖 유형은 Candidate가 아니다.
         self.assertEqual(types, {"XSS", "SQLi"})
 
     def test_llm_sqli_reaches_independent_proof_and_finding(self) -> None:
