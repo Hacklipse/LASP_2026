@@ -49,6 +49,7 @@ from .llm_iterative_recon import (
     find_stored_recon_action,
     recon_action_status_detail,
 )
+from .hidden_parameter_planner import safe_hidden_name
 from .llm_parameter_names import alias_parameter_names
 from .browser_recon import PlaywrightRecon
 from .discovery_links import json_links_from_observation
@@ -223,6 +224,26 @@ _RESTRICTED_FILE_EXTENSIONS = (
 # Recon은 이를 관측값으로 가장하지 않고 ``source``가 붙은 추론 Evidence로 남긴다.
 # 능동 POST는 Analysis의 승인·고정 safe-file 경계 뒤에서만 일어난다.
 _UNLINKED_RENDER_PARAMETERS = ("layout",)
+
+# 링크도 폼도 선언하지 않는 GET 쿼리 좌표의 후보 이름. 추측을 Surface로 바꾸지 않고,
+# 마커를 실어 보낸 응답이 무파라미터 기준선과 달라졌을 때만 기록한다. 그래야 "이름을
+# 찍어봤다"가 아니라 "그 좌표가 응답을 바꾼다"는 관측이 된다.
+# 길이를 짧게 유지하는 이유는 비용이다. 한 이름이 요청 하나이고, 문서 페이지마다
+# 반복되므로 전체 예산을 정찰이 다 먹으면 분석 단계가 굶는다.
+_INFERRED_QUERY_PARAMETERS = (
+    "name",
+    "username",
+    "q",
+    "search",
+    "message",
+    "template",
+    "page",
+    "view",
+)
+_INFERENCE_MARKER = "hacklipse-probe-7193"
+# 추론에 쓸 문서 페이지 수와 페이지당 이름 수의 상한.
+_MAX_INFERENCE_PAGES = 2
+_MAX_INFERENCE_NAMES = 8
 
 _MAX_SCRIPT_BYTES = 4 * 1024 * 1024
 _MAX_INLINE_SCRIPT_BYTES = 256 * 1024
@@ -672,6 +693,7 @@ class ReconAgent:
         surface_collection_mode: str = "adaptive",
         seed_urls: Sequence[str] = (),
         infer_unlinked_render_parameters: bool = True,
+        infer_unlinked_query_parameters: bool = False,
         id_factory: Callable[[], str] | None = None,
         planner: ReconPlanner | None = None,
         iterative_planner: IterativeReconPlanner | None = None,
@@ -692,6 +714,10 @@ class ReconAgent:
         self._surface_collection_mode = surface_collection_mode
         self._seed_urls = tuple(dict.fromkeys(seed_urls))
         self._infer_unlinked_render_parameters = infer_unlinked_render_parameters
+        # 기본값을 끈 이유는 비용이다. 이름 하나가 요청 하나이므로 켜면 정찰이
+        # 쓰는 요청 수가 늘고, 그만큼 분석 단계 몫이 줄어든다. 켤 쪽이 그 교환을
+        # 알고 켜야 한다.
+        self._infer_unlinked_query_parameters = infer_unlinked_query_parameters
         self._id_factory = id_factory or (lambda: str(uuid4()))
         # None이면(휴리스틱 프로필) 아래 두 번째 crawl() 직전 분기 자체가 실행되지
         # 않아 기존 결정적 동작과 한 줄도 다르지 않다.
@@ -777,6 +803,9 @@ class ReconAgent:
         document_pages: set[str] = set()
         browser_document_seeds: dict[str, int] = {}
         unparameterized_search_pages: dict[str, str] = {}
+        # 쿼리 좌표 추론을 적용한 문서 페이지 수. 페이지마다 이름 목록을 다시 찍으면
+        # 정찰이 예산을 다 쓰고 분석 단계가 굶는다.
+        inference_pages = 0
         if targeted:
             # A second pass only visits this selected document. Preserve the
             # document-page form signal normally set during first-pass script discovery.
@@ -1095,6 +1124,7 @@ class ReconAgent:
             max_visits: int | None = None,
         ) -> int:
             nonlocal deadline_exhausted, api_schema_found, inline_path_count
+            nonlocal inference_pages
             visited = 0
             while pending and len(fetched) < page_budget:
                 if remaining_work() < 1.0:
@@ -1275,6 +1305,27 @@ class ReconAgent:
                                 task.run_id, form_surface_id
                             )
                         )
+                if (
+                    self._infer_unlinked_query_parameters
+                    and not _query_names(url)
+                    and inference_pages < _MAX_INFERENCE_PAGES
+                    and page_budget > len(fetched)
+                ):
+                    inference_pages += 1
+                    inferred, inferred_ids, spent = self._infer_query_parameters(
+                        task, url, evidence, page_budget - len(fetched)
+                    )
+                    visited += spent
+                    evidence_ids.extend(inferred_ids)
+                    for name, observed in inferred:
+                        remember(
+                            url,
+                            "GET",
+                            (name,),
+                            observed,
+                            discovery_types=("inferred_query_parameter",),
+                        )
+
                 for link in links:
                     if not _same_origin(link, origin):
                         continue
@@ -2186,6 +2237,51 @@ class ReconAgent:
             )
         )
         return evidence_id
+
+    def _infer_query_parameters(
+        self,
+        task: TaskEnvelope,
+        url: str,
+        baseline: Evidence,
+        remaining: int,
+    ) -> tuple[list[tuple[str, tuple[tuple[str, str], ...]]], list[str], int]:
+        """마커를 실어 보내 응답을 바꾸는 GET 쿼리 좌표만 찾아낸다.
+
+        링크나 폼이 이름을 선언해 주지 않는 좌표가 있다. XBEN-053은 ``/``에서
+        ``username``을 읽지만 어디에도 그 이름이 적혀 있지 않아 정찰이 파라미터 없는
+        Surface 하나만 남기고, 그러면 입력을 요구하는 모든 capability가
+        input_parameter에서 떨어진다.
+
+        이름을 찍어 Surface를 만들지는 않는다. 기준선과 비교해 마커가 응답에
+        나타나거나 상태 코드가 달라진 경우만 기록한다. 둘 다 아니면 애플리케이션이
+        그 좌표를 쓰지 않는다는 뜻이므로 버린다.
+        """
+
+        found: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+        evidence_ids: list[str] = []
+        base_status = baseline.observation.get("status")
+        base_body = baseline.observation.get("body")
+        base_body = base_body if isinstance(base_body, str) else ""
+        if _INFERENCE_MARKER in base_body:
+            # 기준선에 이미 마커가 있으면 차등 비교가 성립하지 않는다.
+            return found, evidence_ids, 0
+        spent = 0
+        for name in _INFERRED_QUERY_PARAMETERS[:_MAX_INFERENCE_NAMES]:
+            if spent >= remaining:
+                break
+            if not safe_hidden_name(name, ()):
+                continue
+            probe_url = f"{url}{'&' if '?' in url else '?'}{urlencode(((name, _INFERENCE_MARKER),))}"
+            evidence_id, probe = self._fetch(task, probe_url, None)
+            evidence_ids.append(evidence_id)
+            spent += 1
+            probe_body = probe.observation.get("body")
+            probe_body = probe_body if isinstance(probe_body, str) else ""
+            reflected = _INFERENCE_MARKER in probe_body
+            status_changed = probe.observation.get("status") != base_status
+            if reflected or status_changed:
+                found.append((name, ((name, _INFERENCE_MARKER),)))
+        return found, evidence_ids, spent
 
     def _flag_unlinked_render_parameters(
         self, run_id: str, surface_id: str

@@ -229,7 +229,13 @@ def _discover_url(lab: Lab) -> str | None:
                 best = (rank, int(published))
     if best is None:
         return None
-    return f"http://127.0.0.1:{best[1]}/"
+    # 127.0.0.1이 아니라 localhost로 접근한다. Host 헤더를 검사하는 프레임워크는
+    # 보통 localhost만 허용 목록에 둔다 — XBEN-009의 Django는
+    # ALLOWED_HOSTS = ['0.0.0.0', 'localhost']라서 127.0.0.1로 받으면 앱 대신
+    # DisallowedHost 에러 페이지를 돌려준다. 그 페이지는 200도 아니고 500도 아닌
+    # 400이어서 준비 검사를 통과하고, 폼도 파라미터도 없는 표면 하나만 남겨
+    # 탐지 실패처럼 보인다.
+    return f"http://localhost:{best[1]}/"
 
 
 def _wait_ready(url: str, timeout: int = READY_TIMEOUT) -> bool:
@@ -375,7 +381,14 @@ def run_lasp(
         router=standard_router(),
         config=OrchestratorConfig(browser_xss_validation=browser),
     )
-    register_standard_agents(app, llm_client=llm_client)
+    register_standard_agents(
+        app,
+        llm_client=llm_client,
+        # 링크도 폼도 이름을 선언하지 않는 쿼리 좌표를 찾는다. XBEN-053은 /에서
+        # username을 읽지만 어디에도 그 이름이 없어, 켜지 않으면 파라미터 없는
+        # Surface 하나만 남고 입력을 요구하는 모든 capability가 떨어진다.
+        recon_infer_unlinked_query_parameters=True,
+    )
     try:
         with _deadline(RUN_TIMEOUT):
             run = app.orchestrator.start(

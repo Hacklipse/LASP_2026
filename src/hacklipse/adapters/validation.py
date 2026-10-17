@@ -60,9 +60,11 @@ from .graphql_suggestions import (
 from .ssti_analysis import (
     SSTI_OBSERVATION,
     SSTI_TOOL,
+    build_ssti_query_requests,
     build_ssti_requests,
     matching_ssti_evidence,
     ssti_execution_signal,
+    ssti_query_execution_signal,
 )
 from .xss_execution import (
     BROWSER_XSS_TOOL, XSS_EXECUTION_MARKER_PREFIX, attribute_execution_marker,
@@ -1668,6 +1670,88 @@ class ValidationAgent:
             proof=proof,
         )
 
+    def _validate_ssti_query(
+        self,
+        task: TaskEnvelope,
+        surface: Surface,
+        signaled_parameters: Sequence[str],
+        reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """GET 쿼리 좌표의 평가를 Validation 세션에서 독립적으로 다시 확인한다.
+
+        POST 경로의 정리(cleanup) 검사를 쓰지 않는다. GET은 상태를 남기지 않으므로
+        복원할 것이 없고, 마지막 요청의 302/303을 요구하면 정상 응답(200)을 실패로
+        읽는다.
+        """
+
+        if not signaled_parameters:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no fixed-arithmetic SSTI signal to reproduce",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        parameter = signaled_parameters[0]
+        requests = build_ssti_query_requests(
+            surface,
+            parameter,
+            purpose=f"SSTI validation {task.validation_id}",
+        )
+        collected = tuple(
+            matching_ssti_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "SSTI query validation lacks budget for its independent request set"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+
+        reproduced = tuple(item for item in collected if item is not None)
+        if any(item.observation.get("type") == "http_error" for item in reproduced):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=reproduced,
+                reason="independent SSTI query sequence encountered an HTTP execution error",
+                reason_code=ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR,
+            )
+        dialect = ssti_query_execution_signal(collected)
+        if not dialect:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=reproduced,
+                reason="independent fixed arithmetic probe was not evaluated by the template",
+                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+            )
+
+        proof = ValidationProof(
+            proof_type=ValidationProofType.SSTI_EXECUTION,
+            evidence_ids=tuple(item.evidence_id for item in reproduced),
+            summary=(
+                "independent control/probe query comparison reproduced fixed server-side "
+                f"arithmetic evaluation through the {dialect} template dialect"
+            ),
+        )
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.CONFIRMED,
+            evidence=reproduced,
+            reason="independent control/probe comparison reproduced the SSTI effect",
+            reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+            proof=proof,
+        )
+
     def _validate_ssti(
         self,
         task: TaskEnvelope,
@@ -1688,6 +1772,11 @@ class ValidationAgent:
                 and parameter in surface.parameters
             )
         )
+        if surface.method.upper() == "GET":
+            return self._validate_ssti_query(
+                task, surface, signaled_parameters, reproduction
+            )
+
         if "username" not in signaled_parameters:
             return self._validation_result(
                 task,

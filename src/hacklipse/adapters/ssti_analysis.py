@@ -75,8 +75,9 @@ def validate_ssti_request(request: ExecutionRequest) -> None:
             raise ValueError("SSTI query probe must be a GET")
         if request.body is not None or request.headers:
             raise ValueError("SSTI query probe must carry no body or headers")
-        if request.approval_ref is not None:
-            raise ValueError("SSTI query probe is a read and takes no approval reference")
+        # approval_ref는 검사하지 않는다. 수집 경계가 Run 기본 승인 참조를 채워 넣을 수
+        # 있고(execution.py의 _default_approval_ref), 읽기 요청에 참조가 붙어 있다는
+        # 사실 자체는 해롭지 않다. 읽기임을 보장하는 것은 아래 좌표·값 제약이다.
         if len(request.query_parameters) != 1:
             raise ValueError("SSTI query probe sets exactly one coordinate")
         if request.query_parameters[0][1] not in SSTI_QUERY_VALUES:

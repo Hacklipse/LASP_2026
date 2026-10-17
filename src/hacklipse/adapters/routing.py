@@ -33,6 +33,7 @@ from .sensitive_exposure import CONFIG_ROUTE_OBSERVATION
 from .public_login_credentials import PUBLIC_LOGIN_OBSERVATION, PUBLIC_LOGIN_TYPE
 from .file_upload_analysis import UPLOAD_TYPE, UPLOAD_ANALYZER, UPLOAD_FORM
 
+from .ssti_analysis import SSTI_PARAMETER_HINTS
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +236,18 @@ DEFAULT_SURFACE_RULES = (
         "ssti_analyzer",
         methods=("POST",),
         parameter_hints=("username",),
+        priority=0.20,
+    ),
+    # GET 쿼리로 렌더링되는 좌표. POST 규칙과 나누는 이유는 힌트 폭이 다르기
+    # 때문이다. POST는 프로필 필드에 쓰므로 검증된 username 하나로 좁혀 두지만,
+    # GET은 읽기라서 그 제약이 필요 없고, 템플릿에 들어가는 좌표의 이름은 대상마다
+    # name·message·template 등으로 다르다. 힌트 목록은 분석기가 실제로 고를 때
+    # 쓰는 집합과 같은 상수를 참조해 두 곳으로 갈라지지 않게 한다.
+    SurfaceRoutingRule(
+        "SSTI",
+        "ssti_analyzer",
+        methods=("GET",),
+        parameter_hints=tuple(sorted(SSTI_PARAMETER_HINTS)),
         priority=0.20,
     ),
     IdentifierSurfaceRoutingRule(

@@ -588,6 +588,7 @@ def register_standard_agents(
     recon_infer_unlinked_render_parameters: bool = True,
     recon_browser_enabled: bool = False,
     recon_browser_executable_path: str | None = None,
+    recon_infer_unlinked_query_parameters: bool = False,
     actor_object_id: str | None = None,
     owner_object_id: str | None = None,
     validation_review: bool = False,
@@ -620,6 +621,7 @@ def register_standard_agents(
                 session_cookies=getattr(app.runtime, "session_cookies", None),
                 executable_path=recon_browser_executable_path,
             ) if recon_browser_enabled else None),
+            infer_unlinked_query_parameters=recon_infer_unlinked_query_parameters,
             planner=(
                 None
                 if callable(getattr(recon_planner, "decide", None))
