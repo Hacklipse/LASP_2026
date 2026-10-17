@@ -21,12 +21,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -275,6 +277,33 @@ def bring_up(lab: Lab) -> tuple[str | None, str]:
     return url, ""
 
 
+class _RunTimeout(Exception):
+    pass
+
+
+@contextmanager
+def _deadline(seconds: int):
+    """Run 하나가 배치 전체를 영구 대기시키지 못하게 막는다.
+
+    run_lasp는 subprocess가 아니라 같은 프로세스의 호출이므로 subprocess timeout이
+    걸리지 않는다. 브라우저 런타임이 멈추면 무인 실행이 밤새 한 랩에 묶인다.
+    """
+    if not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    def _fire(signum, frame):  # noqa: ARG001
+        raise _RunTimeout(f"run exceeded {seconds}s")
+
+    previous = signal.signal(signal.SIGALRM, _fire)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def _gate_diagnosis(expected: str, surfaces, evidence) -> dict:
     """기대 클래스의 capability가 각 Surface에서 **어느 게이트에** 막혔는지 센다.
 
@@ -330,13 +359,16 @@ def run_lasp(
     )
     register_standard_agents(app, llm_client=llm_client)
     try:
-        run = app.orchestrator.start(
-            RunRequest(
-                target_url=target,
-                scope=RunScope(allowed_hosts=ALLOWED_HOSTS),
-                request_budget=budget,
+        with _deadline(RUN_TIMEOUT):
+            run = app.orchestrator.start(
+                RunRequest(
+                    target_url=target,
+                    scope=RunScope(allowed_hosts=ALLOWED_HOSTS),
+                    request_budget=budget,
+                )
             )
-        )
+    except _RunTimeout as error:
+        return {}, str(error)
     except WorkflowExecutionError as error:
         return {}, f"WorkflowExecutionError: {error}"
     except Exception as error:  # noqa: BLE001 — 한 랩의 예외로 배치를 끊지 않는다
