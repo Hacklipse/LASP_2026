@@ -320,8 +320,11 @@ class GeminiCredentialInjectionTests(unittest.TestCase):
         self.assertIsInstance(client, GeminiLlmClient)
         self.assertNotIn(_API_KEY, repr(client))
 
-    def test_experiment_default_is_gemini_35_flash_lite(self) -> None:
-        self.assertEqual(DEFAULT_GEMINI_LLM_MODEL, "gemini-3.5-flash-lite")
+    def test_experiment_default_pins_an_explicit_gemini_version(self) -> None:
+        self.assertEqual(DEFAULT_GEMINI_LLM_MODEL, "gemini-3.8-flash")
+        # 부동 별칭을 기본값으로 두면 모델이 교체돼도 코드가 그대로여서 측정 간
+        # 비교가 조용히 깨진다. 기본값은 항상 버전이 박힌 이름이어야 한다.
+        self.assertNotIn("latest", DEFAULT_GEMINI_LLM_MODEL)
 
 
 if __name__ == "__main__":

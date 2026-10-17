@@ -123,7 +123,9 @@ API_KEY_ENV = ANTHROPIC_API_KEY_ENV
 # 주 실험은 단일 모델로 고정한다. 역할별로 모델을 섞으면 성능 차이가 아키텍처 덕인지
 # 모델 덕인지 분리되지 않는다. 더 강한 모델은 같은 배선에서 model만 바꿔 2차 실험으로 돌린다.
 DEFAULT_ANTHROPIC_LLM_MODEL = "claude-sonnet-5"
-DEFAULT_GEMINI_LLM_MODEL = "gemini-3.5-flash-lite"
+# 부동 별칭(gemini-flash-latest 등)은 쓰지 않는다. 모델이 밑에서 교체되면 지난 측정과
+# 이번 측정을 비교할 수 없어 벤치마크가 무의미해진다. 항상 명시 버전을 고정한다.
+DEFAULT_GEMINI_LLM_MODEL = "gemini-3.8-flash"
 # 기존 Anthropic builder의 기본값 이름을 호환성 목적으로 유지한다.
 DEFAULT_LLM_MODEL = DEFAULT_ANTHROPIC_LLM_MODEL
 
