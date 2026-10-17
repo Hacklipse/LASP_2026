@@ -43,8 +43,17 @@ from xben_inventory import (  # noqa: E402
     stratified_plan,
 )
 
-from hacklipse.adapters import HttpExecutionRuntime, SlidingWindowLlmClient  # noqa: E402
+from hacklipse.adapters import (  # noqa: E402
+    HttpExecutionRuntime,
+    PlaywrightBrowserRuntime,
+    SlidingWindowLlmClient,
+)
+from hacklipse.adapters.analyzer_capabilities import (  # noqa: E402
+    DEFAULT_ANALYZER_CAPABILITIES,
+    capability_missing_requirements,
+)
 from hacklipse.application.errors import WorkflowExecutionError  # noqa: E402
+from hacklipse.application.orchestrator import OrchestratorConfig  # noqa: E402
 from hacklipse.bootstrap import (  # noqa: E402
     DEFAULT_ANTHROPIC_LLM_MODEL,
     DEFAULT_GEMINI_LLM_MODEL,
@@ -96,6 +105,8 @@ class LabResult:
     candidate_statuses: dict[str, int] = field(default_factory=dict)
     surfaces: int = 0
     findings: int = 0
+    gate_blocks: dict[str, int] = field(default_factory=dict)
+    near_miss: list = field(default_factory=list)
     requests_used: int = 0
     phase: str = ""
     target_url: str = ""
@@ -264,10 +275,58 @@ def bring_up(lab: Lab) -> tuple[str | None, str]:
     return url, ""
 
 
-def run_lasp(target: str, budget: int, llm_client=None) -> tuple[dict, str]:
-    """1회 Run. llm_client가 None이면 결정론적 대조군. (지표, 오류) 반환."""
+def _gate_diagnosis(expected: str, surfaces, evidence) -> dict:
+    """기대 클래스의 capability가 각 Surface에서 **어느 게이트에** 막혔는지 센다.
+
+    no_candidate만으로는 다음에 뭘 고칠지 알 수 없다. capability 선언의 어느 조건이
+    Surface를 떨어뜨렸는지가 실제로 손댈 지점이다. Router가 쓰는 것과 같은 함수를
+    불러 진단과 실행이 어긋나지 않게 한다.
+
+    near_miss는 막힌 이유가 가장 적은 (capability, 이유) 쌍이다. 게이트 하나만 풀면
+    후보가 설 수 있는 경우를 가려낸다.
+    """
+    wanted = [c for c in DEFAULT_ANALYZER_CAPABILITIES if c.vulnerability_type == expected]
+    if not wanted or not surfaces:
+        return {"gate_blocks": {}, "near_miss": []}
+
+    blocks: Counter[str] = Counter()
+    best: tuple[int, str, tuple[str, ...]] | None = None
+    for capability in wanted:
+        for surface in surfaces:
+            reasons = capability_missing_requirements(capability, surface, evidence)
+            if not reasons:
+                continue  # 매칭됨 — 후보가 섰어야 한다
+            for reason in reasons:
+                blocks[reason] += 1
+            if best is None or len(reasons) < best[0]:
+                best = (len(reasons), capability.capability_id, reasons)
+    return {
+        "gate_blocks": dict(blocks.most_common()),
+        "near_miss": [best[1], list(best[2])] if best else [],
+    }
+
+
+def run_lasp(
+    target: str,
+    budget: int,
+    llm_client=None,
+    expected: str = "",
+    browser: bool = True,
+) -> tuple[dict, str]:
+    """1회 Run. llm_client가 None이면 결정론적 대조군. (지표, 오류) 반환.
+
+    브라우저 런타임과 browser_xss_validation을 켜는 것은 성능 튜닝이 아니라 하네스
+    정확성이다. 이 프로젝트의 다른 러너(run_dvwa_baseline, run_juice_shop_baseline)는
+    XSS 대상에 둘 다 켠다. 끄고 재면 최우선 capability(xss.browser.fragment, 0.40)의
+    확정 경로가 닫힌 채로 측정돼 XSS만 구조적으로 과소평가된다.
+    """
+    http_runtime = HttpExecutionRuntime()
+    runtime = PlaywrightBrowserRuntime(http_runtime=http_runtime) if browser else http_runtime
     app = build_local_application(
-        {}, runtime=HttpExecutionRuntime(), router=standard_router()
+        {},
+        runtime=runtime,
+        router=standard_router(),
+        config=OrchestratorConfig(browser_xss_validation=browser),
     )
     register_standard_agents(app, llm_client=llm_client)
     try:
@@ -287,6 +346,7 @@ def run_lasp(target: str, budget: int, llm_client=None) -> tuple[dict, str]:
     candidates = app.stores.candidates.list_by_run(run.run_id)
     findings = app.stores.findings.list_by_run(run.run_id)
     return {
+        **_gate_diagnosis(expected, surfaces, app.stores.evidence.list_by_run(run.run_id)),
         "phase": run.phase.value,
         "surfaces": len(surfaces),
         "findings": len(findings),
@@ -326,7 +386,12 @@ def classify(expected: str, metrics: dict) -> tuple[str, str]:
 
 
 def measure(
-    lab: Lab, expected: str, budget: int, keep_up: bool, llm_client=None
+    lab: Lab,
+    expected: str,
+    budget: int,
+    keep_up: bool,
+    llm_client=None,
+    browser: bool = True,
 ) -> LabResult:
     started = time.monotonic()
     result = LabResult(
@@ -343,7 +408,7 @@ def measure(
         return result
 
     result.target_url = url
-    metrics, error = run_lasp(url, budget, llm_client)
+    metrics, error = run_lasp(url, budget, llm_client, expected, browser)
     if error:
         result.cause = CAUSE_RUN_ERROR
         result.detail = error
@@ -355,6 +420,8 @@ def measure(
         result.candidate_types = metrics["candidate_types"]
         result.candidate_statuses = metrics["candidate_statuses"]
         result.confirmed_types = metrics["confirmed_types"]
+        result.gate_blocks = metrics.get("gate_blocks", {})
+        result.near_miss = metrics.get("near_miss", [])
         result.cause, result.detail = classify(expected, metrics)
 
     if not keep_up:
@@ -412,6 +479,28 @@ def report(results: list[LabResult]) -> None:
     for cause, n in causes.most_common():
         print(f"  {cause:<22}{n:>3}랩  {n / total * 100:>5.1f}%   {CAUSE_MEANING.get(cause, '')}")
 
+    blocked = [i for i in results if i.cause == CAUSE_NO_CANDIDATE and i.gate_blocks]
+    if blocked:
+        print("\n" + "=" * 86)
+        print("no_candidate 하위원인 — capability 선언의 어느 게이트가 Surface를 떨어뜨렸는가")
+        print("=" * 86)
+        totals: Counter[str] = Counter()
+        for item in blocked:
+            for reason, count in item.gate_blocks.items():
+                totals[reason] += count
+        for reason, count in totals.most_common():
+            labs = sum(1 for i in blocked if reason in i.gate_blocks)
+            print(f"  {reason:<24}{labs:>3}랩  (Surface×capability {count}건)")
+        print("\n  게이트 하나만 풀면 후보가 설 수 있는 랩 (near miss):")
+        for item in sorted(blocked, key=lambda i: len(i.near_miss[1]) if i.near_miss else 99):
+            if not item.near_miss:
+                continue
+            capability_id, reasons = item.near_miss
+            print(
+                f"    {item.lab_id}  {item.expected_class:<16}{capability_id:<36}"
+                f"막힘={','.join(reasons)}"
+            )
+
     env = [i for i in results if i.cause == CAUSE_ENV]
     if env:
         print(f"\n  환경 실패 {len(env)}랩은 분모에서 제외됨:")
@@ -441,6 +530,11 @@ def main() -> int:
     parser.add_argument("--budget", type=int, default=DEFAULT_BUDGET, help="랩당 요청 예산")
     parser.add_argument("--labs", nargs="+", metavar="LAB", help="특정 랩만 (XBEN-013-24)")
     parser.add_argument("--keep-up", action="store_true", help="측정 후 컨테이너 유지")
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="브라우저 런타임과 browser_xss_validation을 끈다 (XSS 확정 경로가 닫힌다)",
+    )
     parser.add_argument("--out", type=Path, help="결과 JSON 경로")
     parser.add_argument(
         "--llm",
@@ -508,6 +602,7 @@ def main() -> int:
         "llm_provider": args.llm,
         "llm_model": model_used,
         "llm_rpm_limit": rpm,
+        "browser_xss_validation": not args.no_browser,
         "labs": len(targets),
     }
     print(f"XBEN 베이스라인  랩 {len(targets)}개 / 클래스당 {args.per_class} / 예산 {args.budget}")
@@ -522,7 +617,9 @@ def main() -> int:
     results: list[LabResult] = []
     for index, (lab, expected) in enumerate(targets, start=1):
         print(f"[{index}/{len(targets)}] {lab.lab_id}  기대={expected}  L{lab.level}", flush=True)
-        result = measure(lab, expected, args.budget, args.keep_up, llm_client)
+        result = measure(
+            lab, expected, args.budget, args.keep_up, llm_client, not args.no_browser
+        )
         results.append(result)
         print(
             f"        → {result.cause}"
