@@ -439,11 +439,13 @@ def build_identities(target: str, verbose: bool = False):
             if url and url != target
         )
     )
+    # 계정명이 아니라 각 주체가 소유한 객체의 숫자 ID를 넘긴다. 분석기는 두 ID를
+    # 서로 바꿔 보내 응답이 갈리는지 보므로, 숫자가 아니면 계약 위반으로 멈춘다.
     return (
         resolver,
         (("actor", _ACTOR_REF), ("owner", _OWNER_REF)),
-        provisioned.actor.username,
-        provisioned.owner.username,
+        provisioned.actor_object,
+        provisioned.owner_object,
         seeds,
     )
 

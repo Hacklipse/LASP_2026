@@ -106,7 +106,8 @@ class Provisioned:
     # 로그인 후 실제로 도착한 주소. 세션이 섰는지 확인할 좌표로 쓴다.
     actor_landing: str
     owner_landing: str
-    # owner가 소유하게 만든 객체의 좌표. 없으면 비교할 대상이 없다는 뜻이다.
+    # 두 주체가 각각 소유한 객체의 숫자 ID. 분석기가 이 둘을 서로 바꿔 보낸다.
+    actor_object: str | None
     owner_object: str | None
 
 
@@ -286,12 +287,25 @@ OWNER_OBJECT_MARKER = "lasp-owner-object-4417"
 _CREATE_HINTS = ("create", "new", "add", "post", "write", "compose", "upload")
 
 
-def _seed_owner_object(
+_NUMERIC_PATH = re.compile(r"/([A-Za-z][A-Za-z0-9_-]{0,39})/(\d{1,10})(?![0-9])")
+
+
+def _object_ids(body: str) -> set[tuple[str, str]]:
+    """본문에서 `/<리소스>/<숫자>` 쌍을 모은다."""
+
+    return set(_NUMERIC_PATH.findall(body))
+
+
+def _seed_object(
     opener: urllib.request.OpenerDirector,
     landing: str,
+    label: str,
     verbose: bool = False,
 ) -> str | None:
-    """owner 세션으로 객체 하나를 만든다. 만든 좌표(또는 착지 주소)를 돌려준다.
+    """한 주체의 세션으로 객체 하나를 만들고 그 **숫자 ID**를 돌려준다.
+
+    접근 통제 분석기는 숫자 객체 ID를 요구한다 — 두 주체의 ID를 서로 바꿔 보내
+    응답이 갈리는지 보기 때문이다. 계정명은 ID가 아니다.
 
     계정만 있으면 "접근 통제가 깨졌나"를 물을 대상이 없다. XBEN-090에서 두 계정을
     만들고도 /edit_draft/<id>가 표면에 올라오지 않은 이유가 이것이다 — 아무도 draft를
@@ -302,6 +316,7 @@ def _seed_owner_object(
     status, body, _final = _send(opener, landing)
     if status == 0 or not body:
         return None
+    before = _object_ids(body)
 
     # 생성 폼으로 가는 링크를 착지 페이지에서 찾는다. 경로 이름을 추측하지 않는다.
     candidates: list[str] = []
@@ -345,15 +360,17 @@ def _seed_owner_object(
             if verbose:
                 print(f"  객체 생성 {shape.action}: status={status}")
             if status in {200, 201, 301, 302, 303}:
-                # 실제로 owner 자원에 나타났는지 확인한다. 폼이 받아들인 것처럼
-                # 보이면서 아무것도 만들지 않는 경우가 있다.
+                # 폼이 받아들인 것처럼 보이면서 아무것도 만들지 않는 경우가 있다.
+                # 주체 자신의 자원에 새 숫자 좌표가 생겼는지로 확인한다.
                 _s, check, _f = _send(opener, landing)
-                if OWNER_OBJECT_MARKER in check:
+                created = _object_ids(check) - before
+                if created:
+                    resource, value = sorted(created)[0]
                     if verbose:
-                        print("  객체 확인: owner 자원에 표식이 나타남")
-                    return final
+                        print(f"  객체 확인 [{label}]: /{resource}/{value} 생성됨")
+                    return value
                 if verbose:
-                    print("  객체 확인: 표식이 보이지 않음 — 다음 폼 시도")
+                    print(f"  객체 확인 [{label}]: 새 좌표가 없음 — 다음 폼 시도")
     if verbose:
         print("  객체 생성 폼을 찾지 못했다")
     return None
@@ -452,9 +469,16 @@ def provision(base_url: str, *, verbose: bool = False) -> Provisioned | None:
         login_shape=login_shape,
         actor_landing=landing.get(ACTOR_USERNAME, base_url),
         owner_landing=landing.get(OWNER_USERNAME, base_url),
-        owner_object=_seed_owner_object(
+        actor_object=_seed_object(
+            sessions[ACTOR_USERNAME],
+            landing.get(ACTOR_USERNAME, base_url),
+            "actor",
+            verbose=verbose,
+        ),
+        owner_object=_seed_object(
             sessions[OWNER_USERNAME],
             landing.get(OWNER_USERNAME, base_url),
+            "owner",
             verbose=verbose,
         ),
     )
@@ -470,7 +494,7 @@ def main(argv: list[str]) -> int:
         return 1
     print(f"\nactor={result.actor.username} owner={result.owner.username}")
     print(f"login_url={result.login_url}")
-    print(f"owner_object={result.owner_object}")
+    print(f"actor_object={result.actor_object}  owner_object={result.owner_object}")
     print(f"username_field={result.login_shape.username_field}")
     print(f"password_field={result.login_shape.password_field}")
     print(f"csrf_field={result.login_shape.csrf_field}")

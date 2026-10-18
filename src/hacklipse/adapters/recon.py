@@ -23,7 +23,7 @@ import hashlib
 import json
 import re
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit
 from uuid import uuid4
@@ -264,6 +264,15 @@ _MAX_AGENTIC_CONTEXT = 2
 _MAX_AGENTIC_OBSERVATIONS = _MAX_AGENTIC_SELECTABLE + _MAX_AGENTIC_CONTEXT
 _PATH_OBJECT_ID = re.compile(r"^[0-9]{1,10}$")
 _PATH_RESOURCE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
+# 숫자 세그먼트를 뒤에 달지만 객체 컬렉션이 아닌 좌표. 형제가 여럿이어도 식별자로
+# 보지 않는다 — 페이지네이션과 API 버전이 바로 이 모양이다.
+_NON_OBJECT_PATH_RESOURCES = frozenset(
+    {
+        "api", "page", "pages", "p", "offset", "limit", "size", "per_page",
+        "step", "part", "index", "v", "version", "ver", "rev",
+        "year", "month", "day", "week", "hour", "minute",
+    }
+)
 _SINGULAR_OBJECT_RESOURCES = frozenset(
     {
         "account",
@@ -801,6 +810,9 @@ class ReconAgent:
         deferred_inline_urls: list[str] = []
         inline_seen_shapes: set[tuple[str, tuple[str, ...]]] = set()
         inline_path_count = 0
+        # 리소스명 -> 관측된 숫자 세그먼트 값. 목록 페이지가 항목 링크를 형제로 함께
+        # 내보내므로, 저장 전에 같은 배치 안에서 형제 수를 셀 수 있다.
+        numeric_siblings: dict[str, set[str]] = {}
         document_pages: set[str] = set()
         browser_document_seeds: dict[str, int] = {}
         unparameterized_search_pages: dict[str, str] = {}
@@ -855,7 +867,7 @@ class ReconAgent:
             discovery_types: Sequence[str] = (),
         ) -> str:
             clean_url = url.split("?", 1)[0]
-            path_identifier = _path_identifier(clean_url)
+            path_identifier = _path_identifier(clean_url, numeric_siblings)
             key_url = _canonical_surface_url(clean_url, path_identifier)
             key = (key_url, method, names)
             def record_error_route(surface_id: str) -> None:
@@ -1336,6 +1348,13 @@ class ReconAgent:
                             observed,
                             discovery_types=("inferred_query_parameter",),
                         )
+
+                # 링크를 Surface로 만들기 전에 숫자 형제를 먼저 센다. remember가
+                # 저장 시점에 식별자를 확정하고, 저장된 Surface는 덮어쓸 수 없다.
+                for link in links:
+                    if not _same_origin(link, origin):
+                        continue
+                    _record_numeric_sibling(link, numeric_siblings)
 
                 for link in links:
                     if not _same_origin(link, origin):
@@ -2812,11 +2831,33 @@ def _query_pairs(url: str) -> tuple[tuple[str, str], ...]:
     return tuple(pairs.items())
 
 
-def _path_identifier(url: str) -> tuple[str, int, str] | None:
+def _record_numeric_sibling(url: str, siblings: dict[str, set[str]]) -> None:
+    """`/<리소스>/<숫자>` 형태에서 리소스별 숫자 값을 모은다."""
+
+    segments = urlsplit(url).path.split("/")
+    for index in range(len(segments) - 1, 1, -1):
+        value = segments[index]
+        resource = segments[index - 1]
+        if _PATH_OBJECT_ID.fullmatch(value) is None:
+            continue
+        if _PATH_RESOURCE.fullmatch(resource) is None:
+            continue
+        siblings.setdefault(resource.casefold(), set()).add(value)
+
+
+def _path_identifier(
+    url: str, numeric_siblings: Mapping[str, set[str]] | None = None
+) -> tuple[str, int, str] | None:
     """`/users/17` 형태에서 논리 식별자명·세그먼트 위치·관측값을 얻는다.
 
-    모든 숫자 경로를 객체로 보면 버전(`/v1/`)이나 연도까지 후보가 된다. 따라서 숫자
-    바로 앞이 복수형 리소스명인 경우만 결정적으로 인정한다.
+    모든 숫자 경로를 객체로 보면 버전(`/v1/`)이나 연도까지 후보가 된다. 그래서 숫자
+    바로 앞이 복수형 리소스명이거나 알려진 단수 객체명인 경우를 결정적으로 인정한다.
+
+    그 둘에 해당하지 않아도, **같은 리소스 아래 서로 다른 숫자 값이 둘 이상** 관측됐고
+    리소스가 페이지네이션·버전 이름이 아니면 객체 컬렉션으로 본다. 목록 페이지는 항목
+    링크를 형제로 함께 내보내므로(`/edit_draft/2`와 `/edit_draft/3`) 이 구조는 리소스
+    이름을 몰라도 판별된다. 이름 목록을 늘리는 방식은 대상마다 다른 이름을 계속
+    추가해야 하고, 그렇게 맞춘 목록은 그 대상에서만 동작한다.
     """
 
     segments = urlsplit(url).path.split("/")
@@ -2831,6 +2872,12 @@ def _path_identifier(url: str) -> tuple[str, int, str] | None:
         if lowered.endswith("s") and len(resource) > 1:
             singular = resource[:-1]
         elif lowered in _SINGULAR_OBJECT_RESOURCES:
+            singular = resource
+        elif (
+            numeric_siblings is not None
+            and lowered not in _NON_OBJECT_PATH_RESOURCES
+            and len(numeric_siblings.get(lowered, ())) >= 2
+        ):
             singular = resource
         else:
             continue
