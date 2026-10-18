@@ -857,11 +857,29 @@ def main(argv: list[str]) -> int:
         % (_DEFAULT_BUDGET, _ALL_MODE_BUDGET),
     )
     parser.add_argument(
+        "--recon-max-pages",
+        type=int,
+        help=(
+            "maximum documents/scripts Recon may fetch; defaults to the profile's "
+            "bounded discovery limit"
+        ),
+    )
+    parser.add_argument(
         "--approve-state-changing",
         action="store_true",
         help=(
             "현재 로컬 Run에서 상태 변경 가능성이 있는 요청을 명시적으로 승인한다. "
             "호스트·경로·도구·요청 예산 제한은 그대로 적용된다"
+        ),
+    )
+    parser.add_argument(
+        "--redirect-origin-alias",
+        action="append",
+        default=[],
+        metavar="HOST:PORT",
+        help=(
+            "treat an explicitly named upstream authority in Location headers as "
+            "the supplied local target origin (repeatable; useful behind a local proxy)"
         ),
     )
     parser.add_argument(
@@ -878,6 +896,9 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv[1:])
     if args.request_budget is not None and args.request_budget <= 0:
         print("거부: --request-budget는 양수여야 합니다.")
+        return 2
+    if args.recon_max_pages is not None and args.recon_max_pages <= 0:
+        print("거부: --recon-max-pages는 양수여야 합니다.")
         return 2
     if args.validation_review and args.profile != "llm":
         print("거부: --validation-review는 --profile llm과 함께 사용해야 합니다.")
@@ -1068,12 +1089,16 @@ def main(argv: list[str]) -> int:
             else ()
         )
     elif args.vuln == "sqli":
-        # 인증도 정리도 필요 없는 유일한 유형이다. 읽기 전용 GET에 메타문자 하나를
-        # 실어 control과의 오류 차이만 본다.
-        print(
-            "이 검증은 인증 없이 읽기 전용 GET만 보냅니다. "
-            "대상 상태를 바꾸지 않으므로 정리할 데이터도 없습니다."
-        )
+        if args.approve_state_changing:
+            print(
+                "이 검증은 인증 없이 GET과 발견된 HTML POST 폼에 최소 SQL 구문 탐침을 "
+                "보냅니다. 상태 변경 가능 요청을 명시적으로 승인한 구성입니다."
+            )
+        else:
+            print(
+                "이 검증은 인증 없이 읽기 전용 GET 탐침을 보냅니다. 발견된 POST 폼은 "
+                "후보로 기록하지만 중앙 정책에서 실행을 차단합니다."
+            )
         confirmation = "로컬 Juice Shop SQLi 검증을 실행할까요? [y/N] "
         credentials = {}
         run_credential_ref = None
@@ -1139,7 +1164,10 @@ def main(argv: list[str]) -> int:
             credential,
             allowed_origins=(base_url,),
         )
-    http_runtime = HttpExecutionRuntime(credential_resolver=resolver)
+    http_runtime = HttpExecutionRuntime(
+        credential_resolver=resolver,
+        redirect_origin_aliases=tuple(args.redirect_origin_alias),
+    )
     # SPA 의 DOM sink 는 브라우저로만 관측된다. 필요할 때만 감싸 다른 유형의
     # 실행 비용을 늘리지 않는다.
     needs_browser = args.vuln in _BROWSER_VULNS
@@ -1287,7 +1315,11 @@ def main(argv: list[str]) -> int:
             app,
             llm_client=llm_client if args.profile == "llm" else None,
             recon_planner=standard_recon_planner(mode=args.recon, llm_client=llm_client),
-            recon_max_pages=_ALL_MODE_RECON_PAGES if needs_discovery else 1,
+            recon_max_pages=(
+                args.recon_max_pages
+                if args.recon_max_pages is not None
+                else (_ALL_MODE_RECON_PAGES if needs_discovery else 1)
+            ),
             recon_surface_collection_mode=args.surface_collection,
             recon_seed_urls=recon_seed_urls,
             recon_infer_unlinked_render_parameters=args.recon_entry == "targeted",

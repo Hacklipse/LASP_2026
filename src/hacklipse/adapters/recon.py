@@ -20,6 +20,7 @@ URL을 만들어야 하므로 경로가 소스에 리터럴로 박힌다. 브라
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 from collections.abc import Callable, Sequence
@@ -90,6 +91,36 @@ _JS_PATH_PARAM = re.compile(
 # 특정 제품의 경로 이름이 아니라 브라우저 API와 상대경로의 결합만 본다.
 _JS_DOCUMENT_NAVIGATION = re.compile(
     r"""(?:window\.)?location\.(?:assign|replace)\([^)]{0,160}?["'`](/[A-Za-z0-9][A-Za-z0-9._~/-]{0,100})["'`]"""
+)
+
+# Browser JavaScript often contains the only complete description of an AJAX
+# request.  Keep these patterns deliberately structural: they recognize common
+# request APIs and object literals without depending on product or route names.
+_JS_GLOBAL_OBJECT = re.compile(
+    r"(?:\bvar\s+|\blet\s+|\bconst\s+|\bwindow\.)"
+    r"(?P<name>[A-Za-z_$][A-Za-z0-9_$]{0,80})\s*=\s*"
+    r"(?P<object>\{.{0,8192}?\})\s*;",
+    re.DOTALL,
+)
+_JS_AJAX_BLOCK = re.compile(
+    r"(?:jQuery|\$)\.ajax\s*\(\s*\{(?P<body>.{0,4096}?)\}\s*\)",
+    re.DOTALL,
+)
+_JS_OBJECT_ENTRY = re.compile(
+    r"[\"']?(?P<name>[A-Za-z_$][A-Za-z0-9_$\[\]-]{0,80})[\"']?\s*:"
+    r"\s*(?P<value>[\"'][^\"']{0,1024}[\"']|\[[^\]]{0,1024}\]|"
+    r"[A-Za-z_$][A-Za-z0-9_$.()]{0,160}|-?\d+(?:\.\d+)?)",
+    re.DOTALL,
+)
+_JS_URL_VALUE = re.compile(
+    r"\burl\s*:\s*(?P<value>[\"'][^\"']{1,2048}[\"']|"
+    r"[A-Za-z_$][A-Za-z0-9_$]*\.[A-Za-z_$][A-Za-z0-9_$]*)"
+)
+_JS_METHOD_VALUE = re.compile(r"\b(?:method|type)\s*:\s*[\"'](?P<method>GET|POST)[\"']", re.I)
+_JS_DATA_VALUE = re.compile(
+    r"\bdata\s*:\s*(?:eval\s*\(\s*)?(?P<value>\{.{0,2048}?\}|"
+    r"[A-Za-z_$][A-Za-z0-9_$]*)(?:\s*\))?\s*(?:,|$)",
+    re.DOTALL,
 )
 
 # 결정적 Recon 단계에서 실제 요청 없이도 판단할 수 있는 유일한 신호: 파라미터 "이름"이
@@ -333,6 +364,7 @@ class ReconAgent:
             # document-page form signal normally set during first-pass script discovery.
             document_pages.add(task.target_url)
         navigation_pages: set[str] = set()
+        javascript_globals: dict[tuple[str, str], str] = {}
         evidence_ids: list[str] = []
         planner_status: str | None = None
         # 발견과 수집은 다르다 — 크롤링 예산이 모자라도 발견한 URL은 Surface로 남긴다.
@@ -445,6 +477,28 @@ class ReconAgent:
                 recently_fetched_surface_ids.append(surface_id)
                 del recently_fetched_surface_ids[:-_MAX_AGENTIC_CONTEXT]
 
+                # Runtime은 Scope 우회를 막기 위해 리다이렉트를 자동으로 따라가지 않는다.
+                # Recon이 저장된 Location을 다시 정책 경계로 보내 같은 origin일 때만
+                # 별도 GET으로 방문한다. 외부 origin과 리다이렉트 순환은 여기서 제외된다.
+                if evidence.evidence_type == "http_redirect":
+                    location = evidence.observation.get("location")
+                    if isinstance(location, str) and location.strip():
+                        redirected = urljoin(url, location)
+                        if _same_origin(redirected, origin):
+                            pending_surface_ids[redirected] = remember(
+                                redirected,
+                                "GET",
+                                _query_names(redirected),
+                                _query_pairs(redirected),
+                                discovery_types=("http_redirect",),
+                            )
+                            pending_discovery_types.setdefault(
+                                redirected, set()
+                            ).add("http_redirect")
+                            if redirected not in fetched and redirected not in pending:
+                                pending.append(redirected)
+                    continue
+
                 body = evidence.observation.get("body")
                 if url not in successful or not isinstance(body, str) or not body:
                     continue
@@ -456,6 +510,19 @@ class ReconAgent:
 
                 links, forms, sources = _parse_page(body, url)
                 parsed.add(url)
+                javascript_globals.update(_javascript_globals(body))
+                for request_url, method, fields in _javascript_requests(
+                    body, url, javascript_globals
+                ):
+                    if not _same_origin(request_url, origin):
+                        continue
+                    remember(
+                        request_url,
+                        method,
+                        tuple(name for name, _ in fields),
+                        observed=fields,
+                        discovery_types=("javascript_request",),
+                    )
                 for form_url, method, names, content_type in forms:
                     form_surface_id = remember(
                         form_url, method, names, discovery_types=("html_form",)
@@ -518,8 +585,12 @@ class ReconAgent:
                 deadline_exhausted = True
                 break
             fetched.add(source)
-            script_paths, script_evidence, script_parsed = self._discover_from_script(
-                task, source, origin, timeout_seconds=remaining_work()
+            script_paths, script_requests, script_evidence, script_parsed = self._discover_from_script(
+                task,
+                source,
+                origin,
+                javascript_globals,
+                timeout_seconds=remaining_work(),
             )
             record_response(source, script_evidence)
             if script_parsed:
@@ -547,6 +618,16 @@ class ReconAgent:
                     should_crawl or self._iterative_planner is not None
                 ) and url not in fetched and url not in pending:
                     pending.append(url)
+            for request_url, method, fields in script_requests:
+                if not _same_origin(request_url, origin):
+                    continue
+                remember(
+                    request_url,
+                    method,
+                    tuple(name for name, _ in fields),
+                    observed=fields,
+                    discovery_types=("javascript_request",),
+                )
 
         if self._iterative_planner is not None and pending and not targeted:
             round_index = 0
@@ -728,9 +809,18 @@ class ReconAgent:
         return evidence_id, self._evidence.get(task.run_id, evidence_id)
 
     def _discover_from_script(
-        self, task: TaskEnvelope, source: str, origin,
+        self,
+        task: TaskEnvelope,
+        source: str,
+        origin,
+        javascript_globals: dict[tuple[str, str], str] | None = None,
         *, timeout_seconds: float | None = None,
-    ) -> tuple[list[tuple[str, tuple[str, ...], bool, bool]], Evidence, bool]:
+    ) -> tuple[
+        list[tuple[str, tuple[str, ...], bool, bool]],
+        list[tuple[str, str, tuple[tuple[str, str], ...]]],
+        Evidence,
+        bool,
+    ]:
         """JS 번들을 받아 경로 리터럴에서 Surface 후보를 만든다."""
 
         _, evidence = self._fetch(task, source, None, timeout_seconds=timeout_seconds)
@@ -741,7 +831,7 @@ class ReconAgent:
             or type(status) is not int or not 200 <= status < 300
             or not isinstance(body, str) or not body or len(body) > _MAX_SCRIPT_BYTES
         ):
-            return [], evidence, False
+            return [], [], evidence, False
 
         parameters: dict[str, set[str]] = {}
         for match in _JS_PATH_PARAM.finditer(body):
@@ -783,7 +873,8 @@ class ReconAgent:
             (f"{base}/#/{route}", names, False, False)
             for route, names in sorted(_client_routes(body).items())
         )
-        return found, evidence, True
+        requests = _javascript_requests(body, source, javascript_globals or {})
+        return found, requests, evidence, True
 
     def _store_surface(
         self,
@@ -1200,6 +1291,110 @@ def _is_html_response(evidence: Evidence) -> bool:
         return True
     media_type = content_type.split(";", 1)[0].strip().casefold()
     return media_type in {"text/html", "application/xhtml+xml"}
+
+
+def _javascript_globals(body: str) -> dict[tuple[str, str], str]:
+    """Extract scalar properties from localized JavaScript configuration objects.
+
+    Frameworks such as WordPress emit runtime URLs and CSRF nonces in an inline
+    object, while the request itself lives in an external script.  Returning a
+    `(object, property) -> value` map lets the two independently observed pieces
+    be joined without executing JavaScript.
+    """
+
+    values: dict[tuple[str, str], str] = {}
+    for match in _JS_GLOBAL_OBJECT.finditer(body):
+        object_name = match.group("name")
+        raw_object = match.group("object")
+        try:
+            decoded = json.loads(raw_object)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = None
+        if isinstance(decoded, dict):
+            for name, value in decoded.items():
+                if isinstance(name, str) and isinstance(value, (str, int, float, bool)):
+                    values[(object_name, name)] = str(value)
+            continue
+        for entry in _JS_OBJECT_ENTRY.finditer(raw_object):
+            value = _javascript_scalar(entry.group("value"), values)
+            if value is not None:
+                values[(object_name, entry.group("name"))] = value
+    return values
+
+
+def _javascript_scalar(
+    raw: str, globals_by_property: dict[tuple[str, str], str]
+) -> str | None:
+    value = raw.strip()
+    if len(value) >= 2 and value[0] in {"'", '"'} and value[-1] == value[0]:
+        return value[1:-1]
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", value):
+        return value
+    if "." in value:
+        object_name, property_name = value.split(".", 1)
+        resolved = globals_by_property.get((object_name, property_name))
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def _javascript_object_fields(
+    raw_object: str, globals_by_property: dict[tuple[str, str], str]
+) -> tuple[tuple[str, str], ...]:
+    fields: list[tuple[str, str]] = []
+    for entry in _JS_OBJECT_ENTRY.finditer(raw_object):
+        name = entry.group("name")
+        raw_value = entry.group("value").strip()
+        # Array-valued form fields need the conventional [] suffix when encoded
+        # as application/x-www-form-urlencoded so server frameworks reconstruct
+        # the observed collection shape.
+        if raw_value.startswith("[") or ".map(" in raw_value:
+            if not name.endswith("[]"):
+                name += "[]"
+        value = _javascript_scalar(raw_value, globals_by_property)
+        fields.append((name, value if value is not None else "1"))
+    return tuple(dict.fromkeys(fields))
+
+
+def _javascript_requests(
+    body: str,
+    base_url: str,
+    globals_by_property: dict[tuple[str, str], str],
+) -> list[tuple[str, str, tuple[tuple[str, str], ...]]]:
+    """Recover same-origin jQuery AJAX request templates from observed script text."""
+
+    object_fields = {
+        match.group("name"): _javascript_object_fields(
+            match.group("object"), globals_by_property
+        )
+        for match in _JS_GLOBAL_OBJECT.finditer(body)
+    }
+    requests: list[tuple[str, str, tuple[tuple[str, str], ...]]] = []
+    for match in _JS_AJAX_BLOCK.finditer(body):
+        block = match.group("body")
+        url_match = _JS_URL_VALUE.search(block)
+        if url_match is None:
+            continue
+        raw_url = url_match.group("value").strip()
+        url_value = _javascript_scalar(raw_url, globals_by_property)
+        if url_value is None:
+            continue
+        resolved = urljoin(base_url, url_value)
+        if urlsplit(resolved).scheme not in {"http", "https"}:
+            continue
+        method_match = _JS_METHOD_VALUE.search(block)
+        method = method_match.group("method").upper() if method_match else "GET"
+        data_match = _JS_DATA_VALUE.search(block)
+        fields: tuple[tuple[str, str], ...] = ()
+        if data_match is not None:
+            raw_data = data_match.group("value").strip()
+            fields = (
+                _javascript_object_fields(raw_data, globals_by_property)
+                if raw_data.startswith("{")
+                else object_fields.get(raw_data, ())
+            )
+        requests.append((resolved.split("#", 1)[0], method, fields))
+    return list(dict.fromkeys(requests))
 
 
 def _parse_page(

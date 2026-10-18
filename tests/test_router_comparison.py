@@ -80,7 +80,7 @@ class RouterComparisonTests(unittest.TestCase):
             self.assertTrue(comparison["same_raw_recon_input"])
             self.assertEqual(comparison["input_manifest_delta"]["surface_structure_equal"], True)
             self.assertTrue(comparison["same_analysis_profile"])
-            self.assertEqual(comparison["candidate_counts"], {"heuristic": 5, "hybrid": 6})
+            self.assertEqual(comparison["candidate_counts"], {"heuristic": 6, "hybrid": 7})
             self.assertEqual(len(comparison["added"]), 1)
             self.assertTrue(all(item["vulnerability_type"] == "Path Traversal" for item in comparison["added"]))
             self.assertEqual(comparison["removed"], [])
@@ -93,7 +93,7 @@ class RouterComparisonTests(unittest.TestCase):
     def test_timeout_replay_has_no_candidate_or_priority_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             comparison = replay(_args(directory, failure="timeout"))
-            self.assertEqual(comparison["candidate_counts"], {"heuristic": 5, "hybrid": 5})
+            self.assertEqual(comparison["candidate_counts"], {"heuristic": 6, "hybrid": 6})
             for key in ("added", "removed", "changed"):
                 self.assertEqual(comparison[key], [])
             self.assertEqual(comparison["router_cost"]["hybrid"]["llm"]["status"], "timeout")

@@ -699,6 +699,10 @@ class LlmRouterAdvisor:
             parsed = urlsplit(surface.url)
             client_route = bool(parsed.fragment)
             state_changing = has_state_changing_parameters(surface.parameters)
+            approval_missing = (
+                state_changing
+                and not run.execution_profile.state_changing_approved
+            )
             reviewable_types = tuple(sorted({
                 capability.vulnerability_type
                 for capability in self._capabilities
@@ -707,7 +711,7 @@ class LlmRouterAdvisor:
             # 후속 Analyzer의 메서드·파라미터·POST 안전 계약을 실제로 통과할 수 있는
             # 유형만 LLM에 제시한다. 구조적으로 실행 불가능한 조합은 LLM 판단 대상이
             # 아니며 capability ledger에 blocked/unsupported 사유로 남긴다.
-            assignable_capabilities = () if state_changing else tuple(
+            assignable_capabilities = () if approval_missing else tuple(
                 capability
                 for capability in self._capabilities
                 if capability_matches(capability, surface, evidence)
@@ -731,7 +735,7 @@ class LlmRouterAdvisor:
             if not allowed_capability_ids:
                 execution_blocker = (
                     "state_changing_surface"
-                    if state_changing
+                    if approval_missing
                     else "already_covered"
                     if assignable
                     else "no_compatible_route"
@@ -744,7 +748,7 @@ class LlmRouterAdvisor:
                             surface.surface_id, ()
                         )
                     )
-                    if state_changing:
+                    if approval_missing:
                         capabilities.append(SurfaceCapability(
                             surface_id=surface.surface_id,
                             status="unsupported",

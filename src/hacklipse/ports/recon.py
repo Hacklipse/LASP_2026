@@ -30,6 +30,8 @@ _DISCOVERY_TYPES = {
     "html_form",
     "browser_navigation",
     "script_literal",
+    "javascript_request",
+    "http_redirect",
     "discovered",
 }
 _ACTION_STATUSES = {

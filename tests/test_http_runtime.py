@@ -159,6 +159,7 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
         method: str = "GET",
         host: str | None = None,
         query_parameters: tuple[tuple[str, str], ...] = (),
+        form_parameters: tuple[tuple[str, str], ...] = (),
         headers: tuple[tuple[str, str], ...] = (),
         body: str | None = None,
         request_kind: HttpRequestKind = HttpRequestKind.CONTROL,
@@ -175,6 +176,7 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
             purpose="test",
             method=method,
             query_parameters=query_parameters,
+            form_parameters=form_parameters,
             headers=headers,
             body=body,
             request_kind=request_kind,
@@ -211,6 +213,19 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
         self.assertEqual(r.observation["location"], f"http://127.0.0.1:{TARGET_PORT}/landed")
         # 리다이렉트 대상 서버는 요청을 한 번도 받지 않아야 한다.
         self.assertEqual(REDIRECT_TARGET_HITS, before)
+
+    def test_configured_redirect_origin_alias_is_rewritten_to_request_origin(self) -> None:
+        runtime = HttpExecutionRuntime(
+            timeout_seconds=5.0,
+            redirect_origin_aliases=(f"127.0.0.1:{TARGET_PORT}",),
+        )
+
+        result = runtime.execute(self._req("/redirect"))
+
+        self.assertEqual(
+            result.observation["location"],
+            f"http://127.0.0.1:{self.port}/landed",
+        )
 
     # 4
     def test_304_is_response_not_redirect(self) -> None:
@@ -384,6 +399,24 @@ class HttpExecutionRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(r.observation["method"], "POST")
         self.assertEqual(r.observation["request_kind"], "probe")
+
+    def test_structured_form_parameters_are_urlencoded_in_the_post_body(self) -> None:
+        r = self.runtime.execute(
+            self._req(
+                "/echo-body",
+                tool="http_post",
+                method="POST",
+                form_parameters=(("category", "summer sale"), ("submit", "확인")),
+                request_kind=HttpRequestKind.CONTROL,
+            )
+        )
+
+        self.assertEqual(r.observation["status"], 200)
+        self.assertEqual(
+            r.observation["body"],
+            "TYPE=application/x-www-form-urlencoded;"
+            "BODY=category=summer+sale&submit=%ED%99%95%EC%9D%B8",
+        )
 
     # 추가: 환경변수 프록시를 무시하는지
     def test_env_proxy_ignored(self) -> None:

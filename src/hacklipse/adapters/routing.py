@@ -56,10 +56,6 @@ class SurfaceRoutingRule:
             return False
         if bool(urlsplit(surface.url).fragment) is not self.client_route:
             return False
-        # GET 폼이어도 비밀번호 변경·삭제 등은 상태를 바꿀 수 있다. 자동 Analysis
-        # Candidate를 만들지 않되 Surface 자체는 Recon 결과로 보존한다.
-        if has_state_changing_parameters(surface.parameters):
-            return False
         if self.requires_parameters and not surface.parameters:
             return False
         if self.parameter_hints:
@@ -87,9 +83,6 @@ class IdentifierSurfaceRoutingRule:
         if surface.method.upper() not in self.methods:
             return False
         if urlsplit(surface.url).fragment:
-            return False
-        # 비밀번호 변경·삭제처럼 상태를 바꾸는 GET 폼은 자동 탐침 대상에서 제외한다.
-        if has_state_changing_parameters(surface.parameters):
             return False
         return bool(
             object_identifier_parameters(surface.parameters)
@@ -145,6 +138,9 @@ DEFAULT_SURFACE_RULES = (
     ),
     SurfaceRoutingRule("SQLi", "sqli_analyzer", priority=0.30),
     SurfaceRoutingRule(
+        "SQLi", "sqli_analyzer", methods=("POST",), priority=0.30
+    ),
+    SurfaceRoutingRule(
         "SSTI",
         "ssti_analyzer",
         methods=("POST",),
@@ -166,6 +162,17 @@ _PATH_TRAVERSAL_POST_OBSERVATION = "unlinked_render_parameter_candidate"
 _PATH_TRAVERSAL_POST_SOURCE = "bounded_unlinked_render_parameter"
 _ROUTER_REVIEW_POLICIES = frozenset({"weak", "ambiguous"})
 _ADVISOR_MODES = frozenset({"supplemental", "primary"})
+
+
+def _requires_state_change_approval(surface: Surface) -> bool:
+    """입력 이름상 상태 변경 의도가 뚜렷해 선행 승인이 필요한지 계산한다.
+
+    POST 자체의 최종 승인 여부는 중앙 PolicyGate가 검사한다. Router는 기존처럼
+    비파괴적으로 보이는 POST 후보를 보존하되, 비밀번호 변경·삭제 같은 명시적 입력은
+    승인된 Run에서만 후보로 만든다.
+    """
+
+    return has_state_changing_parameters(surface.parameters)
 
 # Agentic hypothesis가 표현할 수 있는 근거와 후속 Evidence의 닫힌 vocabulary.
 # 자유 문자열을 실행 계획처럼 취급하지 않도록 Router와 LLM Adapter가 같은 목록을
@@ -368,18 +375,23 @@ class RuleBasedVulnerabilityRouter:
             rule = self._rules.get(observation_type)
             if rule is None or item.surface_id is None:
                 continue
-            if rule.methods is not None:
-                surface = next(
-                    (
-                        candidate_surface
-                        for candidate_surface in surfaces
-                        if candidate_surface.surface_id == item.surface_id
-                        and candidate_surface.run_id == run.run_id
-                    ),
-                    None,
-                )
-                if surface is None or surface.method.upper() not in rule.methods:
-                    continue
+            surface = next(
+                (
+                    candidate_surface
+                    for candidate_surface in surfaces
+                    if candidate_surface.surface_id == item.surface_id
+                    and candidate_surface.run_id == run.run_id
+                ),
+                None,
+            )
+            if surface is None:
+                continue
+            if _requires_state_change_approval(surface) and not (
+                run.execution_profile.state_changing_approved
+            ):
+                continue
+            if rule.methods is not None and surface.method.upper() not in rule.methods:
+                continue
             key = (item.surface_id, rule.vulnerability_type)
             # 동일 Surface와 취약점 유형 조합은 하나의 Candidate만 생성한다.
             if key in decisions:
@@ -397,6 +409,10 @@ class RuleBasedVulnerabilityRouter:
 
         for surface in surfaces:
             if surface.run_id != run.run_id:
+                continue
+            if _requires_state_change_approval(surface) and not (
+                run.execution_profile.state_changing_approved
+            ):
                 continue
             for rule in self._surface_rules:
                 if not rule.matches(surface):
@@ -556,7 +572,9 @@ class RuleBasedVulnerabilityRouter:
                 outcomes.append((index, "unsupported_route"))
                 continue
             # 규칙에 적용하는 안전 기준을 제안에도 똑같이 적용한다.
-            if has_state_changing_parameters(surface.parameters):
+            if _requires_state_change_approval(surface) and not (
+                run.execution_profile.state_changing_approved
+            ):
                 rejected += 1
                 outcomes.append((index, "state_changing_surface"))
                 continue

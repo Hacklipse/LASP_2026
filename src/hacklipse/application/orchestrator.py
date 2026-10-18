@@ -79,7 +79,7 @@ class OrchestratorConfig:
     evidence_collector_agent_type: str = "evidence_collector"
     report_agent_type: str = "report"
     authentication_agent_type: str = "session_authenticator"
-    max_evidence_rounds: int = 1
+    max_evidence_rounds: int = 2
     browser_xss_validation: bool = False
     knowledge_context_limit: int = 3
     max_extra_recon_rounds: int = 1
@@ -737,6 +737,7 @@ class Orchestrator:
                 current,
                 candidate,
                 target_url=surface.url,
+                surface_method=surface.method,
                 request_budget=self._budget.remaining(run.run_id),
                 knowledge_hints=knowledge_hints,
             )
@@ -881,6 +882,7 @@ class Orchestrator:
         current = run
         validation = None
         validation_id = f"validation-{self._id_factory()}"
+        surface = self._surfaces.get(run.run_id, candidate.surface_id)
         self._emit(
             run,
             ProgressEventKind.AGENT_STARTED,
@@ -896,6 +898,7 @@ class Orchestrator:
                 validation_id=validation_id,
                 agent_type=self._config.validation_agent_type,
                 request_budget=self._budget.remaining(run.run_id),
+                surface_method=surface.method,
                 browser_xss_enabled=self._config.browser_xss_validation,
             )
             result = self._tasks.execute(task)

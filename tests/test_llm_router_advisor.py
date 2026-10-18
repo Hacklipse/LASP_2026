@@ -235,7 +235,7 @@ class ValidSuggestionTests(unittest.TestCase):
 
         self.assertEqual(suggestions[0].agent_type, "browser_xss_analyzer")
 
-    def test_generic_post_is_not_offered_for_path_traversal(self) -> None:
+    def test_generic_post_offers_sqli_but_not_path_traversal(self) -> None:
         llm = _FakeLlmClient({"suggestions": []})
         post = _surface(
             url="http://localhost/api/Feedbacks",
@@ -244,7 +244,8 @@ class ValidSuggestionTests(unittest.TestCase):
         )
 
         self.assertEqual(_advise(llm, surfaces=(post,)), ())
-        self.assertEqual(llm.requests, [])
+        self.assertEqual(len(llm.requests), 1)
+        self.assertIn("allowed_types=[SQLi]", llm.requests[0].messages[0].content)
 
 
 class AgenticHypothesisTests(unittest.TestCase):
@@ -669,8 +670,11 @@ class AgenticHypothesisTests(unittest.TestCase):
             _run(), (post,), (_bounded_post_evidence(),), frozenset()
         )
 
-        self.assertEqual(suggestions, ())
-        self.assertEqual(llm.requests, [])
+        self.assertEqual(
+            [(item.vulnerability_type, item.capability_id) for item in suggestions],
+            [("SQLi", "sqli.http.form")],
+        )
+        self.assertEqual(len(llm.requests), 1)
         bounded = next(
             item for item in advisor.last_trace.analyzer_coverage
             if item.capability_id == "path_traversal.bounded_render_form"

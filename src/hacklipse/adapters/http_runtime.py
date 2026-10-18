@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import http.cookiejar
 import http.cookies
+import re
 import socket
 import time
 import urllib.error
@@ -133,11 +134,15 @@ class HttpExecutionRuntime:
         max_body_bytes: int = _DEFAULT_MAX_BODY_BYTES,
         user_agent: str = _DEFAULT_USER_AGENT,
         credential_resolver: CredentialResolver | None = None,
+        redirect_origin_aliases: tuple[str, ...] = (),
     ) -> None:
         self._timeout = timeout_seconds
         self._max_body = max_body_bytes
         self._user_agent = user_agent
         self._credentials = credential_resolver
+        self._redirect_origin_aliases = frozenset(
+            alias.strip().casefold() for alias in redirect_origin_aliases if alias.strip()
+        )
         # CookieJar와 opener는 Run별로 격리한다. 다른 Run의 세션이 섞이면 인증 경계와
         # 검증 provenance가 동시에 깨진다.
         self._sessions: dict[
@@ -186,7 +191,11 @@ class HttpExecutionRuntime:
                 "Accept-Encoding": "identity",
             }
         )
-        body = request.body.encode("utf-8") if request.body is not None else None
+        if request.form_parameters:
+            headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+            body = urllib.parse.urlencode(request.form_parameters).encode("utf-8")
+        else:
+            body = request.body.encode("utf-8") if request.body is not None else None
         http_request = urllib.request.Request(
             requested_url,
             data=body,
@@ -323,13 +332,45 @@ class HttpExecutionRuntime:
 
         # 텍스트만 디코딩한다. 바이너리는 강제 문자열화하지 않고 크기·해시만 남긴다.
         if method != "HEAD" and _is_textual(content_type):
-            observation["body"] = raw.decode(_charset(content_type), errors="replace")
+            body_text = raw.decode(_charset(content_type), errors="replace")
+            if self._redirect_origin_aliases:
+                request_origin = urllib.parse.urlsplit(requested_url)
+                local_origin = f"{request_origin.scheme}://{request_origin.netloc}"
+                for alias in self._redirect_origin_aliases:
+                    body_text = re.sub(
+                        rf"https?:\\/\\/{re.escape(alias)}(?=[\\/\"'`]|$)",
+                        local_origin,
+                        body_text,
+                        flags=re.IGNORECASE,
+                    )
+                    body_text = re.sub(
+                        rf"https?://{re.escape(alias)}(?=[/\"'`]|$)",
+                        local_origin,
+                        body_text,
+                        flags=re.IGNORECASE,
+                    )
+            observation["body"] = body_text
         else:
             observation["body"] = None
 
         if redirect:
             # 어디로 보내려 했는지 남긴다 — Scope 우회 시도 분석의 근거.
-            observation["location"] = response.headers.get("Location")
+            location = response.headers.get("Location")
+            if isinstance(location, str):
+                resolved = urllib.parse.urljoin(requested_url, location)
+                parsed_location = urllib.parse.urlsplit(resolved)
+                if parsed_location.netloc.casefold() in self._redirect_origin_aliases:
+                    requested_origin = urllib.parse.urlsplit(requested_url)
+                    location = urllib.parse.urlunsplit(
+                        (
+                            requested_origin.scheme,
+                            requested_origin.netloc,
+                            parsed_location.path,
+                            parsed_location.query,
+                            parsed_location.fragment,
+                        )
+                    )
+            observation["location"] = location
 
         return ExecutionResult(
             execution_id=request.execution_id,

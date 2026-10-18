@@ -11,6 +11,7 @@ XSS와 SQLi는 신호가 다르지만 절차는 같다 — 기준선 요청 하�
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
@@ -60,7 +61,7 @@ def resolve_analysis_task(
     vulnerability_type: str,
     candidate_store: CandidateStore,
     surface_store: SurfaceStore,
-    required_tool: str = ANALYSIS_TOOL,
+    required_tool: str | None = ANALYSIS_TOOL,
     allow_parameterless_get: bool = False,
     allowed_methods: tuple[str, ...] = ("GET",),
 ) -> tuple[Candidate, Surface, tuple[str, ...]]:
@@ -72,9 +73,6 @@ def resolve_analysis_task(
 
     if task.candidate_id is None or task.surface_id is None or task.target_url is None:
         raise AgentContractError("analysis task is missing candidate or surface context")
-    if required_tool not in task.allowed_tools:
-        raise AgentContractError("analysis execution tool is not allowed by the task")
-
     candidate = candidate_store.get(task.run_id, task.candidate_id)
     if candidate.vulnerability_type != vulnerability_type:
         raise AgentContractError(
@@ -84,6 +82,11 @@ def resolve_analysis_task(
         raise AgentContractError("candidate and task reference different surfaces")
 
     surface = surface_store.get(task.run_id, task.surface_id)
+    selected_tool = required_tool or (
+        "http_post" if surface.method.upper() == "POST" else ANALYSIS_TOOL
+    )
+    if selected_tool not in task.allowed_tools:
+        raise AgentContractError("analysis execution tool is not allowed by the task")
     if surface.url != task.target_url:
         raise AgentContractError("analysis task target does not match its surface")
     if surface.method.upper() not in allowed_methods or (
@@ -165,47 +168,150 @@ def build_probe_requests(
     if any(parameter not in all_parameters for parameter in selected_parameters):
         raise AgentContractError("probe parameter must belong to the request surface")
 
+    observed_values = dict(surface.observed_query)
+
+    def baseline(name: str) -> str:
+        return observed_values.get(name, control_value)
+
+    # Most probes are expressed as ``control + suffix``.  Apply that suffix to
+    # an actually observed value when one exists, preserving routing fields,
+    # nonces, numeric identifiers, and other request preconditions.
+    probe_suffix = (
+        probe_value[len(control_value) :]
+        if probe_value.startswith(control_value)
+        else None
+    )
+
+    def mutated(name: str) -> str:
+        if probe_suffix is not None:
+            return baseline(name) + probe_suffix
+        return probe_value
+
+    def control_parameters() -> tuple[tuple[str, str], ...]:
+        return tuple((name, baseline(name)) for name in all_parameters)
+
     requests = [
         _request(
             surface.surface_id,
-            tuple((name, control_value) for name in all_parameters),
+            surface.method,
+            control_parameters(),
             HttpRequestKind.CONTROL,
             reason=f"control request for {purpose}",
-            suggested_tool=suggested_tool,
+            suggested_tool=(
+                "http_post" if surface.method.upper() == "POST" else suggested_tool
+            ),
         )
     ]
     for parameter in selected_parameters:
         requests.append(
             _request(
                 surface.surface_id,
+                surface.method,
                 tuple(
-                    (name, probe_value if name == parameter else control_value)
+                    (
+                        name,
+                        mutated(name)
+                        if name == parameter
+                        else baseline(name),
+                    )
                     for name in all_parameters
                 ),
                 HttpRequestKind.PROBE,
                 reason=f"probe for parameter {parameter} on {purpose}",
-                suggested_tool=suggested_tool,
+                suggested_tool=(
+                    "http_post" if surface.method.upper() == "POST" else suggested_tool
+                ),
             )
         )
     return tuple(requests)
 
 
+def build_sqli_boolean_requests(
+    surface: Surface,
+    parameters: Sequence[str],
+    *,
+    probe_parameters: Sequence[str],
+    purpose: str,
+) -> tuple[EvidenceRequest, ...]:
+    """Build bounded true/false SQL predicates while preserving request prerequisites.
+
+    Only one field changes in each request.  Observed action, nonce, submit, and
+    companion values stay intact.  The payload grammar is enforced again by
+    ``HttpRequestSpec`` and excludes comments, stacked queries, extraction, and
+    delay functions.
+    """
+
+    all_parameters = tuple(dict.fromkeys(parameters))
+    selected = tuple(dict.fromkeys(probe_parameters))
+    if not selected or any(name not in all_parameters for name in selected):
+        raise AgentContractError("SQLi boolean probes require offered parameters")
+    observed = dict(surface.observed_query)
+
+    def baseline(name: str) -> str:
+        # Empty form controls usually mean "no filter" and often skip the server
+        # branch entirely.  A benign non-empty scalar reaches the same branch while
+        # observed non-empty routing, nonce, and identifier values stay unchanged.
+        return observed.get(name) or "1"
+
+    requests: list[EvidenceRequest] = []
+    for parameter in selected:
+        base = baseline(parameter)
+        numeric = re.fullmatch(r"[+-]?\d+(?:\.\d+)?", base) is not None
+        suffixes = (
+            (" AND 1=1", " AND 1=2")
+            if numeric
+            else ("' AND '1'='1", "' AND '1'='2")
+        )
+        for suffix, kind, label in (
+            (suffixes[0], HttpRequestKind.SQLI_BOOLEAN_TRUE, "true"),
+            (suffixes[1], HttpRequestKind.SQLI_BOOLEAN_FALSE, "false"),
+        ):
+            requests.append(
+                _request(
+                    surface.surface_id,
+                    surface.method,
+                    tuple(
+                        (
+                            name,
+                            baseline(name) + suffix
+                            if name == parameter
+                            else baseline(name),
+                        )
+                        for name in all_parameters
+                    ),
+                    kind,
+                    reason=f"{label} predicate for parameter {parameter} on {purpose}",
+                    suggested_tool=(
+                        "http_post" if surface.method.upper() == "POST" else ANALYSIS_TOOL
+                    ),
+                )
+            )
+    return tuple(requests)
+
+
 def _request(
     surface_id: str,
-    query_parameters: tuple[tuple[str, str], ...],
+    method: str,
+    parameters: tuple[tuple[str, str], ...],
     request_kind: HttpRequestKind,
     *,
     reason: str,
     suggested_tool: str,
 ) -> EvidenceRequest:
+    normalized_method = method.upper()
+    if normalized_method not in {"GET", "POST"}:
+        raise AgentContractError("probe request supports GET or POST surfaces only")
+    query_parameters = parameters if normalized_method == "GET" else ()
+    form_parameters = parameters if normalized_method == "POST" else ()
     return EvidenceRequest(
         evidence_type="http_response",
         surface_id=surface_id,
         reason=reason,
         suggested_tool=suggested_tool,
         http_request=HttpRequestSpec(
-            method="GET",
+            method=normalized_method,
             query_parameters=query_parameters,
+            form_parameters=form_parameters,
             request_kind=request_kind,
         ),
     )

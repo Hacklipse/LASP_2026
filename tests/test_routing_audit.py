@@ -193,7 +193,7 @@ class RoutingAuditTests(unittest.TestCase):
         log = _Log()
         llm = _Llm(
             _item(vulnerability_type="RCE", reason="private-rejected-text"),
-            _item(surface_id="post", vulnerability_type="SQLi"),
+            _item(surface_id="missing", vulnerability_type="SQLi"),
         )
         post = replace(_SURFACE, surface_id="post", method="POST", parameters=("blob",))
         standard_router(mode="hybrid", llm_client=llm, audit_log=log).route(_RUN, (_SURFACE, post), ())

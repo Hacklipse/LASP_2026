@@ -93,16 +93,19 @@ class SurfaceRoutingTests(unittest.TestCase):
             ["XSS", "SQLi"],
         )
 
-    def test_surface_rules_require_their_supported_method_and_parameters(self) -> None:
+    def test_surface_rules_route_parameterized_post_to_sqli(self) -> None:
         router = RuleBasedVulnerabilityRouter()
 
         post = router.route(_run(), (_surface(method="POST"),), ())
         no_parameters = router.route(_run(), (_surface(parameters=()),), ())
 
-        self.assertEqual(post, ())
+        self.assertEqual(
+            [decision.candidate.vulnerability_type for decision in post],
+            ["SQLi"],
+        )
         self.assertEqual(no_parameters, ())
 
-    def test_username_post_surface_routes_only_to_ssti(self) -> None:
+    def test_username_post_surface_routes_to_sqli_and_ssti(self) -> None:
         router = RuleBasedVulnerabilityRouter()
 
         decisions = router.route(
@@ -113,9 +116,9 @@ class SurfaceRoutingTests(unittest.TestCase):
 
         self.assertEqual(
             [decision.candidate.vulnerability_type for decision in decisions],
-            ["SSTI"],
+            ["SQLi", "SSTI"],
         )
-        self.assertEqual(decisions[0].candidate.assigned_agent, "ssti_analyzer")
+        self.assertEqual(decisions[1].candidate.assigned_agent, "ssti_analyzer")
 
     def test_surface_rule_skips_state_changing_get_form(self) -> None:
         router = RuleBasedVulnerabilityRouter()
@@ -150,7 +153,10 @@ class SurfaceRoutingTests(unittest.TestCase):
             (evidence,),
         )
 
-        self.assertEqual(decisions, ())
+        self.assertEqual(
+            [decision.candidate.vulnerability_type for decision in decisions],
+            ["SQLi"],
+        )
 
     def test_restricted_file_bypass_is_disabled_by_default_but_remains_opt_in(self) -> None:
         surface = Surface(
@@ -520,7 +526,10 @@ class AdvisorRoutingTests(unittest.TestCase):
             (),
         )
 
-        self.assertEqual(decisions, ())
+        self.assertEqual(
+            [decision.candidate.vulnerability_type for decision in decisions],
+            ["SQLi"],
+        )
         self.assertEqual(router.last_advisor_outcomes, ((0, "incompatible_surface"),))
 
     def test_http_agent_is_not_given_a_client_route_surface(self) -> None:

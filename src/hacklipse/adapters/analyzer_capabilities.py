@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 from hacklipse.domain import Evidence, Surface
 from hacklipse.ports import AnalyzerCapability, ObservationRequirement
 
-from .request_safety import has_state_changing_parameters, object_identifier_parameters
+from .request_safety import object_identifier_parameters
 
 
 DEFAULT_ANALYZER_CAPABILITIES = (
@@ -47,6 +47,21 @@ DEFAULT_ANALYZER_CAPABILITIES = (
             "server_error_delta",
         ),
         strategy_ids=("compare_query_mutations",),
+        default_priority=0.30,
+    ),
+    AnalyzerCapability(
+        capability_id="sqli.http.form",
+        agent_type="sqli_analyzer",
+        vulnerability_type="SQLi",
+        methods=("POST",),
+        surface_kind="server",
+        exploration_parameter_source="surface",
+        supported_evidence_types=(
+            "control_response",
+            "mutated_input_response",
+            "server_error_delta",
+        ),
+        strategy_ids=("compare_form_mutations",),
         default_priority=0.30,
     ),
     AnalyzerCapability(
@@ -185,8 +200,6 @@ def capability_missing_requirements(
     is_client = bool(urlsplit(surface.url).fragment)
     if is_client != (capability.surface_kind == "client"):
         missing.append("surface_kind")
-    if has_state_changing_parameters(surface.parameters):
-        missing.append("state_changing_input")
     if capability.requires_parameters and not surface.parameters:
         missing.append("input_parameter")
     if capability.parameter_hints:

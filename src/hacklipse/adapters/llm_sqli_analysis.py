@@ -24,6 +24,7 @@ from hacklipse.ports.llm import LlmMessage, LlmRequest
 
 from .probing import (
     build_probe_requests,
+    build_sqli_boolean_requests,
     has_observation_record,
     matching_evidence,
     probe_marker,
@@ -36,7 +37,7 @@ from .knowledge_prompt import (
     safe_selection_reason,
 )
 from .llm_parameter_names import alias_parameter_names
-from .sqli_analysis import sql_error_signal
+from .sqli_analysis import sql_boolean_signal, sql_error_signal
 
 LLM_SQLI_ANALYZER = "llm_sqli_analyzer"
 _PLAN_OBSERVATION = "sqli_probe_plan"
@@ -87,6 +88,8 @@ class LlmSqliAnalyzer:
             vulnerability_type="SQLi",
             candidate_store=self._candidates,
             surface_store=self._surfaces,
+            required_tool=None,
+            allowed_methods=("GET", "POST"),
         )
         evidence = tuple(self._evidence.get_many(task.run_id, task.evidence_ids))
 
@@ -140,12 +143,14 @@ class LlmSqliAnalyzer:
             raise AgentContractError("llm sqli analyzer control evidence was not collected")
 
         reason = str(plan["reason"])
+        found_error_signal = False
         for parameter, probe in zip(selected, collected[1:]):
             if probe is None:
                 raise AgentContractError("llm sqli analyzer probe evidence was not collected")
             signal = sql_error_signal(control, probe)
             if signal is None:
                 continue
+            found_error_signal = True
             if has_observation_record(
                 evidence,
                 LLM_SQLI_ANALYZER,
@@ -168,6 +173,79 @@ class LlmSqliAnalyzer:
                         "parameter": parameter,
                         "control_evidence_id": control.evidence_id,
                         "probe_evidence_id": probe.evidence_id,
+                        "plan_evidence_id": plan_id,
+                        "selection_source": "llm",
+                        "selection_reason": reason,
+                        **signal,
+                    },
+                )
+            )
+            new_evidence_ids.append(observation_id)
+
+        if found_error_signal:
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.COMPLETED,
+                new_evidence_ids=tuple(new_evidence_ids),
+                candidate_ids=(candidate.candidate_id,),
+            )
+
+        boolean_requests = build_sqli_boolean_requests(
+            surface,
+            parameters,
+            probe_parameters=selected,
+            purpose=f"SQLi candidate {candidate.candidate_id}",
+        )
+        boolean_evidence = tuple(
+            matching_evidence(evidence, surface.url, request)
+            for request in boolean_requests
+        )
+        missing_boolean = tuple(
+            request
+            for request, item in zip(boolean_requests, boolean_evidence)
+            if item is None
+        )
+        if missing_boolean:
+            if task.request_budget < len(missing_boolean):
+                raise BudgetExceeded(
+                    "llm sqli analyzer lacks budget for boolean differential requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing_boolean,
+                new_evidence_ids=tuple(new_evidence_ids),
+                candidate_ids=(candidate.candidate_id,),
+            )
+
+        for index, parameter in enumerate(selected):
+            true_response = boolean_evidence[index * 2]
+            false_response = boolean_evidence[index * 2 + 1]
+            if true_response is None or false_response is None:
+                raise AgentContractError("SQLi boolean evidence was not collected")
+            signal = sql_boolean_signal(true_response, false_response)
+            if signal is None or has_observation_record(
+                evidence,
+                LLM_SQLI_ANALYZER,
+                "sqli_differential",
+                parameter,
+                true_response.evidence_id,
+                false_response.evidence_id,
+            ):
+                continue
+            observation_id = f"evi-{self._id_factory()}"
+            self._evidence.append(
+                Evidence(
+                    evidence_id=observation_id,
+                    run_id=task.run_id,
+                    surface_id=surface.surface_id,
+                    created_by=LLM_SQLI_ANALYZER,
+                    evidence_type="observation",
+                    observation={
+                        "type": "sqli_differential",
+                        "parameter": parameter,
+                        "control_evidence_id": true_response.evidence_id,
+                        "probe_evidence_id": false_response.evidence_id,
                         "plan_evidence_id": plan_id,
                         "selection_source": "llm",
                         "selection_reason": reason,

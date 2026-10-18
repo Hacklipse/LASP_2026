@@ -97,6 +97,8 @@ class HttpRequestKind(str, Enum):
 
     CONTROL = "control"
     PROBE = "probe"
+    SQLI_BOOLEAN_TRUE = "sqli_boolean_true"
+    SQLI_BOOLEAN_FALSE = "sqli_boolean_false"
     PATH_TRAVERSAL_PROBE = "path_traversal_probe"
     ACCESS_CONTROL_PROBE = "access_control_probe"
     SSTI_PROBE = "ssti_probe"
@@ -454,6 +456,9 @@ class HttpRequestSpec:
 
     method: str = "GET"
     query_parameters: tuple[tuple[str, str], ...] = ()
+    # application/x-www-form-urlencoded body fields. Keeping these structured
+    # lets the domain apply the same probe-value contract used for query input.
+    form_parameters: tuple[tuple[str, str], ...] = ()
     headers: tuple[tuple[str, str], ...] = ()
     body: str | None = None
     request_kind: HttpRequestKind = HttpRequestKind.CONTROL
@@ -474,8 +479,12 @@ class HttpRequestSpec:
             raise DomainInvariantError("HTTP request kind must be control or probe")
         if self.body is not None and not isinstance(self.body, str):
             raise DomainInvariantError("HTTP request body must be text")
+        if self.body is not None and self.form_parameters:
+            raise DomainInvariantError(
+                "HTTP request cannot carry raw body and structured form parameters"
+            )
 
-        for name, value in self.query_parameters:
+        for name, value in (*self.query_parameters, *self.form_parameters):
             if not isinstance(name, str) or not isinstance(value, str):
                 raise DomainInvariantError("HTTP query parameters must be string pairs")
             # 탐침 요청만 값 형태를 강제한다. CONTROL 요청은 대상이 원래 갖고 있던
@@ -495,6 +504,34 @@ class HttpRequestSpec:
                 raise DomainInvariantError(
                     "path traversal probe may only use markers and the fixed safe path"
                 )
+        if self.request_kind in {
+            HttpRequestKind.SQLI_BOOLEAN_TRUE,
+            HttpRequestKind.SQLI_BOOLEAN_FALSE,
+        }:
+            expected_suffix = (
+                " AND 1=1"
+                if self.request_kind is HttpRequestKind.SQLI_BOOLEAN_TRUE
+                else " AND 1=2"
+            )
+            string_suffix = (
+                "' AND '1'='1"
+                if self.request_kind is HttpRequestKind.SQLI_BOOLEAN_TRUE
+                else "' AND '1'='2"
+            )
+            mutations = [
+                value
+                for _, value in (*self.query_parameters, *self.form_parameters)
+                if value.endswith(expected_suffix) or value.endswith(string_suffix)
+            ]
+            if len(mutations) != 1:
+                raise DomainInvariantError(
+                    "SQLi boolean probe must mutate exactly one structured parameter"
+                )
+            if any(
+                token in mutations[0].casefold()
+                for token in (";", "--", "/*", "union", "select", "sleep", "benchmark")
+            ):
+                raise DomainInvariantError("SQLi boolean probe contains a forbidden token")
         if self.path_suffix is not None:
             if self.request_kind is not HttpRequestKind.PATH_TRAVERSAL_PROBE:
                 raise DomainInvariantError(
@@ -614,6 +651,7 @@ class EvidenceRequest:
         canonical = json.dumps(
             {
                 "body_present": request.body is not None,
+                "form_names": [name for name, _ in request.form_parameters],
                 "approval_present": self.approval_ref is not None,
                 "evidence_type": self.evidence_type,
                 "header_names": [name.casefold() for name, _ in request.headers],
@@ -1097,6 +1135,7 @@ class ExecutionRequest:
     purpose: str
     method: str = "GET"
     query_parameters: tuple[tuple[str, str], ...] = ()
+    form_parameters: tuple[tuple[str, str], ...] = ()
     headers: tuple[tuple[str, str], ...] = ()
     body: str | None = None
     request_kind: HttpRequestKind = HttpRequestKind.CONTROL
@@ -1116,6 +1155,7 @@ class ExecutionRequest:
         HttpRequestSpec(
             method=self.method,
             query_parameters=self.query_parameters,
+            form_parameters=self.form_parameters,
             headers=self.headers,
             body=self.body,
             request_kind=self.request_kind,

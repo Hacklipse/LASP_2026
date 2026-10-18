@@ -60,6 +60,7 @@ class TaskFactory:
         *,
         target_url: str,
         request_budget: int,
+        surface_method: str = "GET",
         knowledge_hints: tuple[KnowledgeHint, ...] = (),
     ) -> TaskEnvelope:
         """Candidate의 실제 Surface URL과 Evidence 참조를 Analysis Task에 담는다."""
@@ -74,6 +75,10 @@ class TaskFactory:
             allowed_tools = (_ACCESS_CONTROL_TOOL,)
         elif candidate.vulnerability_type == "SSTI":
             allowed_tools = (_SSTI_TOOL,)
+        elif candidate.vulnerability_type == "SQLi":
+            allowed_tools = (
+                "http_post" if surface_method.upper() == "POST" else "http_get",
+            )
         else:
             allowed_tools = ("http_get",)
         return self._base(
@@ -99,6 +104,7 @@ class TaskFactory:
         validation_id: str,
         agent_type: str,
         request_budget: int,
+        surface_method: str = "GET",
         browser_xss_enabled: bool = False,
     ) -> TaskEnvelope:
         """Candidate/Evidence 참조만 전달하는 Validation Task를 생성한다."""
@@ -111,6 +117,10 @@ class TaskFactory:
             allowed_tools = (_ACCESS_CONTROL_TOOL,)
         elif candidate.vulnerability_type == "SSTI":
             allowed_tools = (_SSTI_TOOL,)
+        elif candidate.vulnerability_type == "SQLi":
+            allowed_tools = (
+                "http_post" if surface_method.upper() == "POST" else "http_get",
+            )
         else:
             allowed_tools = ("http_get",)
         return self._base(
