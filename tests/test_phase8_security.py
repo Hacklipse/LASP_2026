@@ -204,8 +204,19 @@ class Phase8AuthenticatedWorkflowTests(unittest.TestCase):
         run = app.orchestrator.start(self._request())
 
         self.assertIs(run.phase, RunPhase.DONE)
-        self.assertEqual(_DvwaLikeHandler.login_posts, 1)
-        # 인증 검증 + Recon + control + probe + Validation이 같은 세션을 쓴다.
+        # 로그인은 세션마다 한 번이고 요청마다가 아니다. Analysis 세션 하나와
+        # Validation 세션 각각이 자기 로그인을 갖는다 — 런타임 세션 키에 validation_id가
+        # 들어가 독립 재현이 Analysis의 Cookie를 물려받지 않으므로, 그 세션에서도
+        # form login이 수행되지 않으면 재현 요청이 미인증으로 나간다.
+        validation_ids = {
+            item.validation_id
+            for item in app.stores.evidence.list_by_run(run.run_id)
+            if item.validation_id is not None
+        }
+        self.assertEqual(
+            _DvwaLikeHandler.login_posts, 1 + len(validation_ids)
+        )
+        # 인증 검증 + Recon + control + probe + Validation이 모두 인증된 세션을 쓴다.
         self.assertGreaterEqual(_DvwaLikeHandler.authenticated_gets, 5)
         self.assertEqual(
             app.stores.tasks.list_by_run(run.run_id)[0].envelope.agent_type,
@@ -262,7 +273,9 @@ class Phase8AuthenticatedWorkflowTests(unittest.TestCase):
         run = app.orchestrator.start(self._request(host="localhost"))
 
         self.assertIs(run.phase, RunPhase.DONE)
-        self.assertEqual(_DvwaLikeHandler.login_posts, 1)
+        # 이 검사의 요점은 Domain=localhost Cookie가 재사용되는지다. 로그인 횟수는
+        # 세션 수에 따르므로(Analysis 하나 + Validation 각각) 하한만 확인한다.
+        self.assertGreaterEqual(_DvwaLikeHandler.login_posts, 1)
         self.assertGreaterEqual(_DvwaLikeHandler.authenticated_gets, 5)
 
     def test_login_redirect_is_rejected_when_protected_page_redirects(self) -> None:

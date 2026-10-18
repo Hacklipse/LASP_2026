@@ -1000,6 +1000,29 @@ class Orchestrator:
                 finding_ids.append(finding_id)
         return current.with_updates(finding_ids=tuple(dict.fromkeys(finding_ids)))
 
+    def _authenticate_validation_session(self, run: Run, validation_id: str) -> Run:
+        """Validation 전용 세션에 역할별 로그인을 세운다.
+
+        자격증명이 없는 Run에서는 아무것도 하지 않는다. 한 주체만 인증되면 owner
+        control이 로그인 페이지를 받아 교차 주체 판정이 성립하지 않으므로, 등록된
+        참조 전부에 대해 실행한다.
+        """
+
+        current = run
+        for credential_ref in _run_credentials(run):
+            task = self._task_factory.authentication(
+                current,
+                agent_type=self._config.authentication_agent_type,
+                request_budget=self._budget.remaining(run.run_id),
+                credential_ref=credential_ref,
+                validation_id=validation_id,
+            )
+            result = self._tasks.execute(task)
+            self._require_completed(result, "authentication")
+            current = self._merge_agent_result(current, result)
+            self._runs.save(current)
+        return current
+
     def _validate_candidate(
         self, run: Run, candidate: Candidate
     ) -> tuple[Run, str | None]:
@@ -1008,6 +1031,12 @@ class Orchestrator:
         current = run
         validation = None
         validation_id = f"validation-{self._id_factory()}"
+        # 독립 재현은 세션을 일부러 분리한다(런타임 세션 키에 validation_id가 들어간다).
+        # 그 새 세션에는 정적 Cookie만 심기므로, form login을 쓰는 대상은 재현 요청이
+        # 미인증으로 나가 로그인 페이지를 받고 "노출 없음"으로 읽힌다. 분리는 유지하되
+        # 그 세션에 대해 중앙 인증 Worker를 다시 실행한다 — 로그인이 정책·예산·증적
+        # 경계를 그대로 지나가도록 런타임이 아니라 여기서 한다.
+        current = self._authenticate_validation_session(current, validation_id)
         surface = self._surfaces.get(run.run_id, candidate.surface_id)
         self._emit(
             run,

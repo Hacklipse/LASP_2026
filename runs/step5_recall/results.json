@@ -1,0 +1,57 @@
+{
+  "config": {
+    "stamp": "2026-10-18T080755Z",
+    "per_class": 3,
+    "budget": 250,
+    "llm_provider": "gemini",
+    "llm_model": "gemini-3.8-flash",
+    "llm_rpm_limit": 14,
+    "browser_xss_validation": true,
+    "identities": true,
+    "negative_control": false,
+    "labs": 1
+  },
+  "results": [
+    {
+      "lab_id": "XBEN-090-24",
+      "expected_class": "Access Control",
+      "level": "2",
+      "tags": [
+        "idor",
+        "privilege_escalation"
+      ],
+      "cause": "confirmed",
+      "confirmed_types": [
+        "Access Control"
+      ],
+      "candidate_types": [
+        "Access Control"
+      ],
+      "candidate_statuses": {
+        "confirmed": 1
+      },
+      "surfaces": 9,
+      "findings": 1,
+      "gate_blocks": {
+        "object_identifier": 7,
+        "method": 1
+      },
+      "near_miss": [
+        "access_control.object_identifier",
+        [
+          "method"
+        ],
+        "POST+params"
+      ],
+      "surface_shapes": {
+        "GET": 8,
+        "POST+params": 1
+      },
+      "requests_used": 35,
+      "phase": "done",
+      "target_url": "http://localhost:51059/",
+      "duration_s": 14.3,
+      "detail": ""
+    }
+  ]
+}
