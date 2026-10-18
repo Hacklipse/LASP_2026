@@ -367,7 +367,9 @@ def _gate_diagnosis(expected: str, surfaces, evidence) -> dict:
     }
 
 
-def build_identities(target: str, verbose: bool = False):
+def build_identities(
+    target: str, verbose: bool = False, negative_control: bool = False
+):
     """Access Control 측정의 전제조건인 두 주체를 세운다.
 
     access_control.object_identifier는 같은 좌표를 서로 다른 주체로 읽어 응답이
@@ -441,11 +443,17 @@ def build_identities(target: str, verbose: bool = False):
     )
     # 계정명이 아니라 각 주체가 소유한 객체의 숫자 ID를 넘긴다. 분석기는 두 ID를
     # 서로 바꿔 보내 응답이 갈리는지 보므로, 숫자가 아니면 계약 위반으로 멈춘다.
+    owner_object = provisioned.owner_object
+    if negative_control:
+        # 음성 대조: "다른 주체의 객체" 자리에 actor 자신의 객체를 넣는다. 같은 코드
+        # 경로를 그대로 타지만 접근 통제가 깨진 것이 없으므로, 여기서 확정이 나오면
+        # 정의상 오탐이다. 재현율만 보고 오라클을 넓히면 이 축을 놓친다.
+        owner_object = provisioned.actor_object
     return (
         resolver,
         (("actor", _ACTOR_REF), ("owner", _OWNER_REF)),
         provisioned.actor_object,
-        provisioned.owner_object,
+        owner_object,
         seeds,
     )
 
@@ -457,6 +465,7 @@ def run_lasp(
     expected: str = "",
     browser: bool = True,
     identities: bool = False,
+    negative_control: bool = False,
 ) -> tuple[dict, str]:
     """1회 Run. llm_client가 None이면 결정론적 대조군. (지표, 오류) 반환.
 
@@ -476,7 +485,7 @@ def run_lasp(
             actor_id,
             owner_id,
             seed_urls,
-        ) = build_identities(target)
+        ) = build_identities(target, negative_control=negative_control)
 
     http_runtime = HttpExecutionRuntime(credential_resolver=resolver)
     runtime = PlaywrightBrowserRuntime(http_runtime=http_runtime) if browser else http_runtime
@@ -575,6 +584,7 @@ def measure(
     llm_client=None,
     browser: bool = True,
     identities: bool = False,
+    negative_control: bool = False,
 ) -> LabResult:
     started = time.monotonic()
     result = LabResult(
@@ -591,7 +601,9 @@ def measure(
         return result
 
     result.target_url = url
-    metrics, error = run_lasp(url, budget, llm_client, expected, browser, identities)
+    metrics, error = run_lasp(
+        url, budget, llm_client, expected, browser, identities, negative_control
+    )
     if error:
         result.cause = CAUSE_RUN_ERROR
         result.detail = error
@@ -612,6 +624,52 @@ def measure(
         _compose_down(lab)
     result.duration_s = round(time.monotonic() - started, 1)
     return result
+
+
+def report_false_positives(results: list[LabResult], negative_control: bool) -> None:
+    """확정이 틀릴 수 있는 두 축을 나눠 보고한다.
+
+    재현율만 보면 오라클을 넓히는 변경이 늘 개선처럼 보인다. 확정 판정을 손대기
+    전에는 이 축이 있어야 한다.
+    """
+
+    print("\n" + "=" * 86)
+    print("오탐 축")
+    print("=" * 86)
+
+    if negative_control:
+        confirmed = [item for item in results if item.confirmed_types]
+        print("\n음성 대조 — 구성상 취약하지 않은 좌표. 확정은 전부 오탐이다")
+        if not confirmed:
+            print(f"  확정 0건 / {len(results)}랩  ✅ 오탐 없음")
+        else:
+            print(f"  ⚠ 확정 {len(confirmed)}건 — 오탐")
+            for item in confirmed:
+                print(f"    {item.lab_id}  확정={item.confirmed_types}")
+        return
+
+    # 태그 밖 확정은 오탐과 같지 않다. XBEN-053은 ssti로만 태그됐지만 입력을 그대로
+    # 반사하므로 XSS도 실재한다. 태그는 그 랩이 무엇을 시험하려는지일 뿐 그 앱에 있는
+    # 취약점의 전체 목록이 아니다. 그래서 세어 보여주되 오탐이라고 부르지 않는다.
+    untagged = [
+        (item, sorted(set(item.confirmed_types) - set(_tagged_classes(item))))
+        for item in results
+        if item.confirmed_types
+    ]
+    untagged = [(item, extra) for item, extra in untagged if extra]
+    print("\n태그 밖 확정 — 오탐이 아니라 '태그가 말하지 않은 확정'이다")
+    if not untagged:
+        print("  없음")
+    else:
+        for item, extra in untagged:
+            print(f"  {item.lab_id}  태그={','.join(item.tags)}  확정추가={extra}")
+    print("\n  음성 대조로 오탐을 재려면 --negative-control로 한 번 더 돌려라.")
+
+
+def _tagged_classes(item: LabResult) -> tuple[str, ...]:
+    from xben_inventory import TAG_TO_CLASS
+
+    return tuple(dict.fromkeys(TAG_TO_CLASS[tag] for tag in item.tags if tag in TAG_TO_CLASS))
 
 
 def report(results: list[LabResult]) -> None:
@@ -720,6 +778,11 @@ def main() -> int:
     parser.add_argument("--labs", nargs="+", metavar="LAB", help="특정 랩만 (XBEN-013-24)")
     parser.add_argument("--keep-up", action="store_true", help="측정 후 컨테이너 유지")
     parser.add_argument(
+        "--negative-control",
+        action="store_true",
+        help="구성상 취약하지 않은 좌표로 측정한다. 확정이 나오면 그게 오탐이다",
+    )
+    parser.add_argument(
         "--no-identities",
         action="store_true",
         help="Access Control 랩에서 actor/owner 계정 생성을 건너뛴다",
@@ -798,6 +861,7 @@ def main() -> int:
         "llm_rpm_limit": rpm,
         "browser_xss_validation": not args.no_browser,
         "identities": not args.no_identities,
+        "negative_control": args.negative_control,
         "labs": len(targets),
     }
     print(f"XBEN 베이스라인  랩 {len(targets)}개 / 클래스당 {args.per_class} / 예산 {args.budget}")
@@ -822,6 +886,7 @@ def main() -> int:
             # Access Control은 두 주체가 없으면 후보조차 서지 않는다. 다른 클래스에는
             # 계정이 필요 없고 가입 요청만 늘어나므로 해당 클래스에서만 세운다.
             expected == "Access Control" and not args.no_identities,
+            args.negative_control,
         )
         results.append(result)
         print(
@@ -840,6 +905,7 @@ def main() -> int:
         )
 
     report(results)
+    report_false_positives(results, args.negative_control)
     print(f"\n구성  {config['llm_provider']} / {config['llm_model'] or '대조군'}")
     print(f"결과 저장  {out_path}")
     return 0
