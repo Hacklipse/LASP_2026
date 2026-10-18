@@ -12,6 +12,7 @@ from hacklipse.adapters.path_traversal_analysis import (
     PATH_TRAVERSAL_FORM_PROBE_PATH,
     PATH_TRAVERSAL_FORM_PROOF_MARKERS,
     PATH_TRAVERSAL_POST_APPROVAL_REF,
+    PATH_TRAVERSAL_FILTER_BYPASS_PROBE_PATH,
     PATH_TRAVERSAL_PROBE_PATH,
     PATH_TRAVERSAL_PROOF_MARKERS,
     PATH_TRAVERSAL_TOOL,
@@ -234,14 +235,21 @@ class HeuristicPathTraversalAnalyzerTests(unittest.TestCase):
         self.assertIs(requested.status, AgentResultStatus.NEEDS_EVIDENCE)
         _collect(requested, app, task)
 
-        self.assertEqual(len(runtime.requests), 2)
+        # control 하나와, 같은 증명 파일을 가리키는 두 고정 표기. 두 번째는 한 번만
+        # 훑는 제거 필터가 걸린 대상에서 평문 표기가 통째로 지워지는 경우를 위한 것이다.
+        self.assertEqual(len(runtime.requests), 3)
         self.assertEqual(
             [request.request_kind for request in runtime.requests],
-            [HttpRequestKind.CONTROL, HttpRequestKind.PATH_TRAVERSAL_PROBE],
+            [
+                HttpRequestKind.CONTROL,
+                HttpRequestKind.PATH_TRAVERSAL_PROBE,
+                HttpRequestKind.PATH_TRAVERSAL_PROBE,
+            ],
         )
+        # 값은 중앙에서 고정된 집합이어야 한다 — Agent가 경로를 만들지 않는다.
         self.assertEqual(
-            dict(runtime.requests[1].query_parameters)["page"],
-            PATH_TRAVERSAL_PROBE_PATH,
+            [dict(request.query_parameters)["page"] for request in runtime.requests[1:]],
+            [PATH_TRAVERSAL_PROBE_PATH, PATH_TRAVERSAL_FILTER_BYPASS_PROBE_PATH],
         )
         self.assertTrue(
             all(request.tool == PATH_TRAVERSAL_TOOL for request in runtime.requests)

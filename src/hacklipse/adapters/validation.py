@@ -37,6 +37,7 @@ from .path_traversal_analysis import (
     is_restricted_file_surface,
     path_parameter_candidates,
     path_traversal_bypass_signal,
+    PATH_TRAVERSAL_PROBE_PAYLOADS,
     path_traversal_signal,
 )
 from .access_control_analysis import (
@@ -1532,8 +1533,16 @@ class ValidationAgent:
             )
 
         control = reproduced[0]
-        for parameter, probe in zip(signaled_parameters, reproduced[1:]):
-            if not path_traversal_signal(control, probe):
+        # 한 파라미터에 고정 표기 여러 개를 보내므로 묶음으로 짝짓는다. 인덱스를 1:1로
+        # 가정하면 어떤 표기의 성공이 다른 파라미터에 귀속된다.
+        width = len(PATH_TRAVERSAL_PROBE_PAYLOADS)
+        rest = reproduced[1:]
+        for index, parameter in enumerate(signaled_parameters):
+            group = rest[index * width : (index + 1) * width]
+            probe = next(
+                (item for item in group if path_traversal_signal(control, item)), None
+            )
+            if probe is None:
                 continue
             proof_evidence = (control, probe)
             proof = ValidationProof(

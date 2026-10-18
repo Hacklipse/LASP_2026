@@ -167,6 +167,16 @@ _JS_DATA_VALUE = re.compile(
 # 결정적 Recon 단계에서 실제 요청 없이도 판단할 수 있는 유일한 신호: 파라미터 "이름"이
 # 파일·경로·URL을 가리키는 것처럼 보이는가. Router.DEFAULT_RULES의 "url_or_file_parameter"
 # 규칙과 맞아야 ROUTE 단계가 Candidate를 만들 수 있다.
+# 값이 파일로 보이는지 판정할 때 쓰는 종류 목록. 파라미터 이름과 달리 이것은 파일
+# 형식에 대한 것이어서 대상이 바뀌어도 유효하다.
+_FILE_VALUE_EXTENSIONS = frozenset(
+    {
+        "php", "phtml", "html", "htm", "asp", "aspx", "jsp", "cgi", "pl",
+        "js", "css", "txt", "md", "json", "xml", "yml", "yaml", "csv",
+        "log", "ini", "conf", "cfg", "env", "bak", "tpl", "twig",
+        "pdf", "png", "jpg", "jpeg", "gif", "svg", "zip", "tar", "gz",
+    }
+)
 _FILE_OR_URL_PARAM_HINTS = (
     "file",
     "page",
@@ -615,6 +625,27 @@ def _openapi_item_links(
             if found and found[-1].startswith(base + template.split("{", 1)[0]):
                 break
     return tuple(found[:2])
+def _looks_like_file_value(value: str) -> bool:
+    """관측된 **값**이 파일명이나 경로처럼 보이는지 판정한다.
+
+    이름만 보면 좌표를 놓친다. XBEN-061은 ``post.php?id=`` 하나로 파일을 고르는데
+    (``"posts/" . $id``), ``id``는 어느 대상에서도 파일 힌트가 아니고 넣어서도 안 된다.
+    반면 그 좌표의 관측값은 ``EternalBlue.php``처럼 분명한 파일명이다.
+
+    확장자는 열어 두지 않고 문서·스크립트 종류로 제한한다. 알파벳 확장자를 모두 받으면
+    ``example.com``이 파일로 읽히고, 숫자를 받으면 ``3.14``가 걸린다. 종류 목록은 파일
+    형식에 대한 것이므로 대상이 달라도 그대로 쓰인다.
+    """
+
+    candidate = value.strip()
+    if not candidate or len(candidate) > 128:
+        return False
+    if "@" in candidate or "://" in candidate:
+        return False
+    if "/" in candidate or "\\" in candidate:
+        return True
+    _stem, _, extension = candidate.rpartition(".")
+    return bool(_stem) and extension.lower() in _FILE_VALUE_EXTENSIONS
 
 
 def _client_routes(body: str) -> dict[str, tuple[str, ...]]:
@@ -937,7 +968,7 @@ class ReconAgent:
             record_credential_route(surface_id)
             evidence_ids.extend(
                 self._flag_suspect_parameters(
-                    task.run_id, surface_id, names, clean_url, method
+                    task.run_id, surface_id, names, clean_url, method, observed
                 )
             )
             if _looks_like_restricted_file(clean_url):
@@ -2217,17 +2248,37 @@ class ReconAgent:
         return evidence_id
 
     def _flag_suspect_parameters(
-        self, run_id: str, surface_id: str, params: tuple[str, ...],
-        url: str, method: str,
+        self,
+        run_id: str,
+        surface_id: str,
+        params: tuple[str, ...],
+        url: str,
+        method: str,
+        observed: tuple[tuple[str, str], ...] = (),
     ) -> list[str]:
-        """Record named file inputs and weaker filename inputs on file-serving GETs."""
+        """파일·URL로 보이는 파라미터만 Observation으로 남긴다.
 
+        세 가지 근거를 쓴다. 이름이 파일 힌트인 경우, 파일을 내보내는 GET 경로에서
+        filename류 이름이 나온 경우, 그리고 이름은 힌트가 아니지만 **관측된 값**이
+        파일명이나 경로인 경우다. 마지막 근거가 없으면 ``post.php?id=EternalBlue.php``
+        처럼 이름만으로는 알 수 없는 좌표를 놓친다.
+        """
+
+        values: dict[str, list[str]] = {}
+        for name, value in observed:
+            values.setdefault(name, []).append(value)
         evidence_ids: list[str] = []
         for name in params:
             if _looks_like_file_or_url_parameter(name):
                 observation_type = "url_or_file_parameter"
+                basis = "name"
             elif method.upper() == "GET" and _looks_like_file_serving_parameter(url, name):
                 observation_type = "file_serving_parameter"
+                basis = "file_serving_route"
+            elif any(_looks_like_file_value(value) for value in values.get(name, ())):
+                # 이름으로는 알 수 없고 관측된 값이 파일명인 좌표.
+                observation_type = "url_or_file_parameter"
+                basis = "observed_value"
             else:
                 continue
             evidence_id = f"evi-{self._id_factory()}"
@@ -2238,7 +2289,11 @@ class ReconAgent:
                     surface_id=surface_id,
                     created_by="recon",
                     evidence_type="observation",
-                    observation={"type": observation_type, "parameter": name},
+                    observation={
+                        "type": observation_type,
+                        "parameter": name,
+                        "basis": basis,
+                    },
                 )
             )
             evidence_ids.append(evidence_id)

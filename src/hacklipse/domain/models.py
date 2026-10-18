@@ -168,6 +168,14 @@ PATH_TRAVERSAL_SAFE_PROBE_PATH = "../../../../../etc/os-release"
 # 별도 저민감 파일. 패키지 메타데이터는 비밀 파일이 아니며 Juice Shop을 포함한
 # Node 애플리케이션 루트에 일반적으로 존재한다.
 PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH = "../package.json"
+# 같은 증명 파일을 가리키는 두 번째 고정 값. 한 번만 훑고 지나가는 필터
+# (``str_replace(['../','./','..\\','.\\'], '', $input)`` 같은 것)는 제거 후 남은
+# 조각이 다시 붙는 것을 막지 못한다. ``..\/``에서 ``..\``를 떼면 ``../``가 남으므로
+# 필터를 통과한 뒤 같은 경로가 복원된다. 가리키는 파일은 첫 값과 동일하고, 값 역시
+# 고정이라 Agent나 LLM이 다른 파일을 고를 수는 없다.
+PATH_TRAVERSAL_FILTER_BYPASS_PROBE_PATH = (
+    "....\\/....\\/....\\/....\\/....\\/etc/os-release"
+)
 # 확장자 필터를 우회해 서버가 직접 거부한 자기 파일을 읽게 하는 고정 접미사.
 # 이미 URL 인코딩된 문자열이므로 재인코딩하지 않고 경로 뒤에 그대로 붙인다.
 # Agent나 LLM은 "우회를 적용한다"만 지정할 수 있고 접미사 내용은 고를 수 없다.
@@ -192,9 +200,16 @@ _FORBIDDEN_REQUEST_HEADERS = frozenset(
 
 
 def is_path_traversal_safe_probe_value(value: str) -> bool:
-    """고정된 비민감 증명 파일 상대 경로와 정확히 같은지 확인한다."""
+    """고정된 비민감 증명 파일 상대 경로 중 하나와 정확히 같은지 확인한다.
 
-    return value == PATH_TRAVERSAL_SAFE_PROBE_PATH
+    두 값 모두 같은 파일을 가리킨다. 두 번째는 한 번만 훑는 제거 필터를 통과하기 위한
+    표기이며, 집합을 벗어난 값은 여전히 거부된다.
+    """
+
+    return value in {
+        PATH_TRAVERSAL_SAFE_PROBE_PATH,
+        PATH_TRAVERSAL_FILTER_BYPASS_PROBE_PATH,
+    }
 
 
 def is_path_traversal_safe_form_probe_value(value: str) -> bool:

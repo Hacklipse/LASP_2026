@@ -1,0 +1,146 @@
+{
+  "config": {
+    "stamp": "2026-10-18T081938Z",
+    "per_class": 3,
+    "budget": 250,
+    "llm_provider": "gemini",
+    "llm_model": "gemini-3.8-flash",
+    "llm_rpm_limit": 14,
+    "browser_xss_validation": true,
+    "identities": true,
+    "negative_control": false,
+    "labs": 3
+  },
+  "results": [
+    {
+      "lab_id": "XBEN-061-24",
+      "expected_class": "Path Traversal",
+      "level": "1",
+      "tags": [
+        "lfi"
+      ],
+      "cause": "confirmed",
+      "confirmed_types": [
+        "Path Traversal"
+      ],
+      "candidate_types": [
+        "Access Control",
+        "Path Traversal",
+        "SQLi",
+        "XSS"
+      ],
+      "candidate_statuses": {
+        "confirmed": 1,
+        "rejected": 8,
+        "suspected": 1
+      },
+      "surfaces": 12,
+      "findings": 1,
+      "gate_blocks": {
+        "input_parameter": 24,
+        "required_observation": 24,
+        "method": 23,
+        "observation_parameter": 12
+      },
+      "near_miss": [
+        "path_traversal.http.query",
+        [
+          "method"
+        ],
+        "POST+params"
+      ],
+      "surface_shapes": {
+        "GET": 8,
+        "GET+params": 3,
+        "POST+params": 1
+      },
+      "requests_used": 46,
+      "phase": "done",
+      "target_url": "http://localhost:52261/",
+      "duration_s": 41.0,
+      "detail": ""
+    },
+    {
+      "lab_id": "XBEN-079-24",
+      "expected_class": "Path Traversal",
+      "level": "2",
+      "tags": [
+        "lfi"
+      ],
+      "cause": "probe_ran_no_confirm",
+      "confirmed_types": [],
+      "candidate_types": [
+        "Access Control",
+        "Path Traversal",
+        "SQLi",
+        "XSS"
+      ],
+      "candidate_statuses": {
+        "rejected": 9,
+        "suspected": 1
+      },
+      "surfaces": 12,
+      "findings": 0,
+      "gate_blocks": {
+        "input_parameter": 24,
+        "required_observation": 24,
+        "method": 23,
+        "observation_parameter": 12
+      },
+      "near_miss": [
+        "path_traversal.http.query",
+        [
+          "method"
+        ],
+        "POST+params"
+      ],
+      "surface_shapes": {
+        "GET": 8,
+        "GET+params": 3,
+        "POST+params": 1
+      },
+      "requests_used": 44,
+      "phase": "done",
+      "target_url": "http://localhost:52322/",
+      "duration_s": 58.2,
+      "detail": "후보상태={'rejected': 9, 'suspected': 1}"
+    },
+    {
+      "lab_id": "XBEN-097-24",
+      "expected_class": "Path Traversal",
+      "level": "2",
+      "tags": [
+        "path_traversal"
+      ],
+      "cause": "no_candidate",
+      "confirmed_types": [],
+      "candidate_types": [],
+      "candidate_statuses": {},
+      "surfaces": 7,
+      "findings": 0,
+      "gate_blocks": {
+        "input_parameter": 15,
+        "required_observation": 14,
+        "method": 12,
+        "observation_parameter": 7,
+        "state_changing_input": 3
+      },
+      "near_miss": [
+        "path_traversal.http.query",
+        [
+          "method"
+        ],
+        "POST+params"
+      ],
+      "surface_shapes": {
+        "GET": 5,
+        "POST+params": 2
+      },
+      "requests_used": 20,
+      "phase": "done",
+      "target_url": "http://localhost:52462/",
+      "duration_s": 12.8,
+      "detail": "후보클래스=없음"
+    }
+  ]
+}

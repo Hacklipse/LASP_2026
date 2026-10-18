@@ -75,6 +75,8 @@ _PROOF_TYPE_BY_VULNERABILITY = {
     "SSTI": ValidationProofType.SSTI_EXECUTION,
 }
 
+# form login 한 번이 쓰는 요청 수 상한(CSRF 선행·전송·보호자원 확인).
+_AUTHENTICATION_REQUEST_COST = 3
 VALIDATION_ROUNDS_EXHAUSTED_REASON = "validation rounds exhausted"
 
 
@@ -1009,7 +1011,18 @@ class Orchestrator:
         """
 
         current = run
-        for credential_ref in _run_credentials(run):
+        references = tuple(_run_credentials(run))
+        if not references:
+            return current
+        # 로그인 하나가 CSRF 선행·전송·확인으로 최대 세 요청을 쓴다. 후보당 검증 예비는
+        # 그보다 작게 잡혀 있으므로, 예산이 모자라면 재인증을 시도하지 않고 넘어간다.
+        # 시도해서 BudgetExceeded로 끊기면 그 요청이 실패로 기록되고 남은 예산까지
+        # 흔들린다. 건너뛰면 재현이 미인증으로 돌아 "확정되지 않음"으로 남는다 — 그것이
+        # 예산이 부족했다는 사실에 대한 정직한 결과다.
+        needed = _AUTHENTICATION_REQUEST_COST * len(references)
+        if self._budget.remaining(run.run_id) < needed:
+            return current
+        for credential_ref in references:
             task = self._task_factory.authentication(
                 current,
                 agent_type=self._config.authentication_agent_type,

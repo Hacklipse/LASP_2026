@@ -213,8 +213,16 @@ class Phase8AuthenticatedWorkflowTests(unittest.TestCase):
             for item in app.stores.evidence.list_by_run(run.run_id)
             if item.validation_id is not None
         }
-        self.assertEqual(
+        # 세션 수보다 많이 로그인하지 않는다. Analysis 세션 하나와 Validation
+        # 세션 각각이 자기 로그인을 갖되, 요청마다 로그인하지는 않는다. 일찍 끝난
+        # Validation은 증적에 validation_id를 남기지 않으므로 상한으로 비교한다.
+        self.assertGreaterEqual(_DvwaLikeHandler.login_posts, 1)
+        self.assertLessEqual(
             _DvwaLikeHandler.login_posts, 1 + len(validation_ids)
+        )
+        # 요청마다 로그인하면 이 비교가 깨진다.
+        self.assertGreater(
+            _DvwaLikeHandler.authenticated_gets, _DvwaLikeHandler.login_posts
         )
         # 인증 검증 + Recon + control + probe + Validation이 모두 인증된 세션을 쓴다.
         self.assertGreaterEqual(_DvwaLikeHandler.authenticated_gets, 5)
