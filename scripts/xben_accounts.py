@@ -281,9 +281,13 @@ def _registered(status: int, body: str) -> bool:
     return not any(word in lowered for word in _FAILURE_WORDS)
 
 
-# owner가 소유할 객체에 심는 표식. 교차 주체 비교가 의미를 가지려면 owner의 자원에
-# actor의 자원에는 없는 내용이 있어야 한다.
-OWNER_OBJECT_MARKER = "lasp-owner-object-4417"
+# 주체마다 **다른** 표식을 심는다. 같은 값을 쓰면 두 객체의 본문이 동일해지고, 교차
+# 주체 오라클이 "owner에게만 있는 내용"을 찾을 수 없어 확정이 불가능해진다. 그때 나오는
+# 미탐은 탐지 능력이 아니라 무대 설치의 결과다.
+OBJECT_MARKERS = {
+    "actor": "lasp-actor-object-3108",
+    "owner": "lasp-owner-object-4417",
+}
 _CREATE_HINTS = ("create", "new", "add", "post", "write", "compose", "upload")
 
 
@@ -348,10 +352,17 @@ def _seed_object(
             ]
             if not writable:
                 continue
+            marker = OBJECT_MARKERS.get(label, f"lasp-{label}-object")
             payload: dict[str, str] = {}
+            # 쓰기 가능한 좌표마다 **다른** 값을 넣는다. 전부 같은 문자열을 쓰면 그
+            # 객체를 가리키는 고유 토큰이 하나뿐이고, 교차 주체 오라클은 우연한 일치를
+            # 배제하려고 둘 이상을 요구하므로 확정에 도달하지 못한다. 실제 객체는
+            # 제목과 본문이 서로 다르므로 이쪽이 현실에도 가깝다.
+            slot = 0
             for field in shape.fields:
                 if field.field_type in {"text", "textarea", "", "search"}:
-                    payload[field.name] = OWNER_OBJECT_MARKER
+                    slot += 1
+                    payload[field.name] = f"{marker}-f{slot}"
                 elif field.field_type in {"submit", "button"}:
                     payload[field.name] = field.value or "Submit"
                 else:

@@ -329,13 +329,80 @@ def unauthorized_object_exposed(
     probe_body = response_body(probe)
     if actor_body is None or owner_body is None or probe_body is None:
         return False
-    # actor의 정상 객체도 보여야 인증 세션과 이 표면의 정상 응답 형태가 성립한다.
-    if not _shows_object(actor_control, actor_body, actor_object_id):
+    # 경로 1 — 식별자를 필드로 돌려주는 표면. 세 응답 모두 그 ID를 내용으로 보여야 한다.
+    if (
+        _shows_object(actor_control, actor_body, actor_object_id)
+        and _shows_object(owner_control, owner_body, owner_object_id)
+        and _shows_object(probe, probe_body, owner_object_id)
+    ):
+        return True
+
+    # 경로 2 — 식별자를 필드로 보여주지 않는 표면. 경로로 객체를 고르는 화면은 ID를
+    # URL에만 두고 본문에는 그 객체의 **내용**을 싣는다. `/edit_draft/3`이 그렇고,
+    # 그런 좌표에서는 actor의 정상 응답조차 자기 ID를 필드로 echo하지 않으므로 경로 1의
+    # 전제조건에서 먼저 막힌다.
+    #
+    # 여기서는 ID 에코 대신 내용을 쓴다. 세 응답이 모두 정상이어야 하고, owner에게만
+    # 있던 토큰이 존재해야 한다 — 그 토큰이 없다는 것은 이 표면이 객체마다 다른 내용을
+    # 주지 않는다는 뜻이고, 그러면 내용 비교로는 아무것도 증명할 수 없다.
+    if not _reads_successfully(actor_control, actor_body):
         return False
-    # owner가 자기 객체를 못 봤다면 그 객체가 실재하는지 자체가 불확실하다.
-    if not _shows_object(owner_control, owner_body, owner_object_id):
+    if not _reads_successfully(owner_control, owner_body):
         return False
-    return _shows_object(probe, probe_body, owner_object_id)
+    return _shows_owner_only_content(
+        probe, actor_body, owner_body, probe_body, actor_object_id, owner_object_id
+    )
+
+
+_CONTENT_TOKEN = re.compile(r"[A-Za-z0-9_-]{6,64}")
+# owner에게만 있던 토큰이 probe에 이만큼 나타나야 내용 노출로 본다. 하나로는 공통
+# 문구나 캐시 키가 우연히 걸릴 수 있다.
+_MIN_OWNER_ONLY_TOKENS = 2
+
+
+def _reads_successfully(evidence: Evidence, body: str) -> bool:
+    """거부도 로그인 화면도 아닌 정상 응답인지 본다. 내용 비교의 전제다."""
+
+    status = evidence.observation.get("status")
+    if isinstance(status, int) and status >= 400:
+        return False
+    if evidence.observation.get("type") in ("http_error", "http_redirect"):
+        return False
+    lowered = body.casefold()
+    if any(marker in lowered for marker in _DENIAL_MARKERS):
+        return False
+    return not any(marker.casefold() in lowered for marker in _LOGIN_MARKERS)
+
+
+def _shows_owner_only_content(
+    probe: Evidence,
+    actor_body: str,
+    owner_body: str,
+    probe_body: str,
+    actor_object_id: str,
+    owner_object_id: str,
+) -> bool:
+    """owner에게만 있던 내용이 actor 세션 응답에 나타났는지 판정한다.
+
+    두 대조를 모두 쓴다. owner에는 있고 **actor에는 없던** 토큰만 후보로 삼으므로,
+    두 화면이 공유하는 틀(레이아웃·메뉴·공통 문구)은 자동으로 빠진다. 그 토큰이
+    probe에 나타나면 actor 세션이 자기 것이 아닌 내용을 받은 것이다.
+
+    요청에 실어 보낸 값은 후보에서 뺀다. 엔드포인트가 입력을 그대로 되돌려주는 것만으로
+    노출 판정이 나면, 반사하는 화면이 전부 접근 통제 위반으로 보고된다.
+    """
+
+    if not _reads_successfully(probe, probe_body):
+        return False
+
+    sent = {actor_object_id.casefold(), owner_object_id.casefold()}
+    actor_tokens = {match.casefold() for match in _CONTENT_TOKEN.findall(actor_body)}
+    owner_tokens = {match.casefold() for match in _CONTENT_TOKEN.findall(owner_body)}
+    probe_tokens = {match.casefold() for match in _CONTENT_TOKEN.findall(probe_body)}
+    owner_only = owner_tokens - actor_tokens - sent
+    if not owner_only:
+        return False
+    return len(owner_only & probe_tokens) >= _MIN_OWNER_ONLY_TOKENS
 
 
 def _shows_object(evidence: Evidence, body: str, object_id: str) -> bool:
