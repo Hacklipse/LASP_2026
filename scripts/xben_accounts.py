@@ -106,6 +106,8 @@ class Provisioned:
     # 로그인 후 실제로 도착한 주소. 세션이 섰는지 확인할 좌표로 쓴다.
     actor_landing: str
     owner_landing: str
+    # owner가 소유하게 만든 객체의 좌표. 없으면 비교할 대상이 없다는 뜻이다.
+    owner_object: str | None
 
 
 class _FormParser(HTMLParser):
@@ -278,6 +280,85 @@ def _registered(status: int, body: str) -> bool:
     return not any(word in lowered for word in _FAILURE_WORDS)
 
 
+# owner가 소유할 객체에 심는 표식. 교차 주체 비교가 의미를 가지려면 owner의 자원에
+# actor의 자원에는 없는 내용이 있어야 한다.
+OWNER_OBJECT_MARKER = "lasp-owner-object-4417"
+_CREATE_HINTS = ("create", "new", "add", "post", "write", "compose", "upload")
+
+
+def _seed_owner_object(
+    opener: urllib.request.OpenerDirector,
+    landing: str,
+    verbose: bool = False,
+) -> str | None:
+    """owner 세션으로 객체 하나를 만든다. 만든 좌표(또는 착지 주소)를 돌려준다.
+
+    계정만 있으면 "접근 통제가 깨졌나"를 물을 대상이 없다. XBEN-090에서 두 계정을
+    만들고도 /edit_draft/<id>가 표면에 올라오지 않은 이유가 이것이다 — 아무도 draft를
+    만들지 않았으므로 편집 링크가 생길 수 없었다. 계정과 같은 성격의 전제조건이고,
+    취약점이 아니라 무대 설치다.
+    """
+
+    status, body, _final = _send(opener, landing)
+    if status == 0 or not body:
+        return None
+
+    # 생성 폼으로 가는 링크를 착지 페이지에서 찾는다. 경로 이름을 추측하지 않는다.
+    candidates: list[str] = []
+    for href in re.findall(r"""href\s*=\s*['"]([^'"]{1,200})['"]""", body):
+        if any(hint in href.casefold() for hint in _CREATE_HINTS):
+            candidates.append(urllib.parse.urljoin(landing, href))
+    # 착지 페이지 자체에 생성 폼이 있을 수도 있다.
+    candidates.append(landing)
+
+    for page_url in dict.fromkeys(candidates):
+        status, page_body, _final = _send(opener, page_url)
+        if status == 0 or not page_body:
+            continue
+        parser = _FormParser()
+        parser.feed(page_body)
+        parser.close()
+        for action, fields in parser.forms:
+            shape = FormShape(
+                urllib.parse.urljoin(page_url, action or page_url), tuple(fields)
+            )
+            # 로그인·검색 폼을 집지 않는다. 비밀번호 입력이 있으면 인증 폼이고,
+            # 채울 텍스트 좌표가 없으면 만들 내용이 없다.
+            if shape.password_field is not None:
+                continue
+            writable = [
+                field
+                for field in shape.fields
+                if field.field_type in {"text", "textarea", "", "search"}
+            ]
+            if not writable:
+                continue
+            payload: dict[str, str] = {}
+            for field in shape.fields:
+                if field.field_type in {"text", "textarea", "", "search"}:
+                    payload[field.name] = OWNER_OBJECT_MARKER
+                elif field.field_type in {"submit", "button"}:
+                    payload[field.name] = field.value or "Submit"
+                else:
+                    payload[field.name] = field.value
+            status, _body, final = _send(opener, shape.action, payload)
+            if verbose:
+                print(f"  객체 생성 {shape.action}: status={status}")
+            if status in {200, 201, 301, 302, 303}:
+                # 실제로 owner 자원에 나타났는지 확인한다. 폼이 받아들인 것처럼
+                # 보이면서 아무것도 만들지 않는 경우가 있다.
+                _s, check, _f = _send(opener, landing)
+                if OWNER_OBJECT_MARKER in check:
+                    if verbose:
+                        print("  객체 확인: owner 자원에 표식이 나타남")
+                    return final
+                if verbose:
+                    print("  객체 확인: 표식이 보이지 않음 — 다음 폼 시도")
+    if verbose:
+        print("  객체 생성 폼을 찾지 못했다")
+    return None
+
+
 def _logged_in(status: int, body: str) -> bool:
     """로그인이 성립했는지 판정한다.
 
@@ -346,13 +427,16 @@ def provision(base_url: str, *, verbose: bool = False) -> Provisioned | None:
             print("  로그인 폼의 좌표를 읽지 못했다")
         return None
     landing: dict[str, str] = {}
+    sessions: dict[str, urllib.request.OpenerDirector] = {}
     for account in (ACTOR_USERNAME, OWNER_USERNAME):
         payload = _payload_for(login_shape, account, ACCOUNT_PASSWORD)
         payload[username_field] = account
         payload[password_field] = ACCOUNT_PASSWORD
         # 주체마다 새 세션을 쓴다. 같은 쿠키 저장소를 공유하면 뒤에 로그인한 주체가
         # 앞 주체의 세션을 덮어 두 번째 검증이 항상 통과한다.
-        status, body, final_url = _send(_session(), login_shape.action, payload)
+        opener = _session()
+        sessions[account] = opener
+        status, body, final_url = _send(opener, login_shape.action, payload)
         landing[account] = final_url
         if not _logged_in(status, body):
             if verbose:
@@ -368,6 +452,11 @@ def provision(base_url: str, *, verbose: bool = False) -> Provisioned | None:
         login_shape=login_shape,
         actor_landing=landing.get(ACTOR_USERNAME, base_url),
         owner_landing=landing.get(OWNER_USERNAME, base_url),
+        owner_object=_seed_owner_object(
+            sessions[OWNER_USERNAME],
+            landing.get(OWNER_USERNAME, base_url),
+            verbose=verbose,
+        ),
     )
 
 
@@ -381,6 +470,7 @@ def main(argv: list[str]) -> int:
         return 1
     print(f"\nactor={result.actor.username} owner={result.owner.username}")
     print(f"login_url={result.login_url}")
+    print(f"owner_object={result.owner_object}")
     print(f"username_field={result.login_shape.username_field}")
     print(f"password_field={result.login_shape.password_field}")
     print(f"csrf_field={result.login_shape.csrf_field}")
