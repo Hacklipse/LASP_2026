@@ -50,6 +50,7 @@ from .llm_iterative_recon import (
     recon_action_status_detail,
 )
 from .hidden_parameter_planner import safe_hidden_name
+from .request_safety import has_state_changing_get
 from .llm_parameter_names import alias_parameter_names
 from .browser_recon import PlaywrightRecon
 from .discovery_links import json_links_from_observation
@@ -1148,6 +1149,16 @@ class ReconAgent:
                     tuple(sorted(pending_discovery_types.get(url, {"discovered"}))),
                 )
                 pending_surface_ids[url] = surface_id
+                if has_state_changing_get(url):
+                    # 상태를 바꾸는 GET은 가져오지 않는다. Surface로는 보존해 "검사하지
+                    # 않았다"가 결과에 남는다.
+                    #
+                    # 정책 게이트가 승인 없는 이런 요청을 거부하므로, 시도하면
+                    # ApprovalRequired가 recon 단계에서 Run 전체를 끝낸다. 인증을 세운
+                    # 뒤에 특히 문제가 된다 — 로그아웃 링크는 로그인한 페이지에만
+                    # 나타나므로, 크롤이 방금 만든 세션을 스스로 끊으려 하고 그 거부로
+                    # 측정이 통째로 날아간다.
+                    continue
                 evidence_id, evidence = self._fetch(
                     task, url, surface_id, timeout_seconds=remaining_work()
                 )

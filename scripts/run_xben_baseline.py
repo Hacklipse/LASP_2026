@@ -46,6 +46,8 @@ from xben_inventory import (  # noqa: E402
 )
 
 from hacklipse.adapters import (  # noqa: E402
+    InMemoryCredentialResolver,
+    StaticApprovalGate,
     HttpExecutionRuntime,
     PlaywrightBrowserRuntime,
     SlidingWindowLlmClient,
@@ -66,11 +68,17 @@ from hacklipse.bootstrap import (  # noqa: E402
     standard_router,
 )
 from hacklipse.domain import RunRequest, RunScope  # noqa: E402
+from hacklipse.ports.security import FormLoginSpec, ResolvedHttpCredential  # noqa: E402
+
+from xben_accounts import provision  # noqa: E402
 
 ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1"})
 DEFAULT_BUDGET = 150
 # 무료 티어는 분당 호출이 제한된다. 기존 러너와 같은 값을 쓴다.
 DEFAULT_GEMINI_RPM_LIMIT = 14
+_ACTOR_REF = "xben-actor"
+_OWNER_REF = "xben-owner"
+_LOGIN_APPROVAL_REF = "approve-local-xben-login"
 UP_TIMEOUT = 420          # 빌드 포함. 이미지 캐시가 비면 여기서 대부분을 쓴다.
 READY_TIMEOUT = 60
 RUN_TIMEOUT = 900
@@ -359,12 +367,94 @@ def _gate_diagnosis(expected: str, surfaces, evidence) -> dict:
     }
 
 
+def build_identities(target: str, verbose: bool = False):
+    """Access Control 측정의 전제조건인 두 주체를 세운다.
+
+    access_control.object_identifier는 같은 좌표를 서로 다른 주체로 읽어 응답이
+    갈리는지를 본다. 주체가 하나뿐이면 비교할 대상이 없어 후보조차 서지 않는다. 이
+    벤치마크는 자격증명을 주지 않으므로(핀 a16cb1b의 .env에는 FLAG뿐) 계정을 직접
+    만들어 넣는다. 계정은 취약점이 아니라 전제조건이고, IDOR은 여전히 LASP가 찾는다.
+
+    (resolver, principal_credentials, actor_id, owner_id, seed_urls)를 돌려주고, 자가
+    가입이 불가능한 랩에서는 전부 None/()을 돌려준다 — 그 경우 측정은 미인증으로
+    진행된다.
+
+    seed_urls는 로그인 후 실제로 도착한 주소다. 인증된 앱은 루트를 대시보드로
+    리다이렉트하는 일이 흔한데, 정찰은 3xx를 따라가지 않으므로(allowlist 밖으로 요청이
+    새는 것을 막는 의도된 경계다) 본문이 없어 링크 그래프를 통째로 잃는다. 로그인
+    착지 지점은 자격증명을 가진 쪽이면 누구나 아는 정보이므로, 그 주소를 Seed로
+    넘겨 정찰이 거기서부터 정상적으로 링크를 읽게 한다.
+    """
+
+    provisioned = provision(target, verbose=verbose)
+    if provisioned is None:
+        return None, (), None, None, ()
+
+    # 전송 버튼 이름을 앱이 요구하는 경우가 있다. 폼이 선언한 값 그대로 함께 보낸다.
+    extra = tuple(
+        (field.name, field.value or "Submit")
+        for field in provisioned.login_shape.fields
+        if field.field_type in {"submit", "button"}
+    )
+
+    def spec(username: str, password: str, landing: str) -> FormLoginSpec:
+        return FormLoginSpec(
+            login_url=provisioned.login_url,
+            username=username,
+            password=password,
+            username_field=provisioned.login_shape.username_field or "username",
+            password_field=provisioned.login_shape.password_field or "password",
+            csrf_field=provisioned.login_shape.csrf_field,
+            extra_fields=extra,
+            # 로그인 POST의 상태 코드만으로는 성공·실패가 갈리지 않는 앱이 있다.
+            # 검증 좌표로 대상 루트를 쓰면 안 된다 — 루트가 로그인 상태에 따라
+            # 리다이렉트하는 앱에서는 200이 아니어서 성공한 로그인도 실패로 읽힌다.
+            # 헬퍼가 기록한 "로그인 후 실제로 도착한 주소"를 쓴다.
+            verification_url=landing,
+            approval_ref=_LOGIN_APPROVAL_REF,
+        )
+
+    resolver = InMemoryCredentialResolver(
+        {
+            _ACTOR_REF: ResolvedHttpCredential(
+                form_login=spec(
+                    provisioned.actor.username,
+                    provisioned.actor.password,
+                    provisioned.actor_landing,
+                )
+            ),
+            _OWNER_REF: ResolvedHttpCredential(
+                form_login=spec(
+                    provisioned.owner.username,
+                    provisioned.owner.password,
+                    provisioned.owner_landing,
+                )
+            ),
+        }
+    )
+    seeds = tuple(
+        dict.fromkeys(
+            url
+            for url in (provisioned.actor_landing, provisioned.owner_landing)
+            if url and url != target
+        )
+    )
+    return (
+        resolver,
+        (("actor", _ACTOR_REF), ("owner", _OWNER_REF)),
+        provisioned.actor.username,
+        provisioned.owner.username,
+        seeds,
+    )
+
+
 def run_lasp(
     target: str,
     budget: int,
     llm_client=None,
     expected: str = "",
     browser: bool = True,
+    identities: bool = False,
 ) -> tuple[dict, str]:
     """1회 Run. llm_client가 None이면 결정론적 대조군. (지표, 오류) 반환.
 
@@ -373,13 +463,32 @@ def run_lasp(
     XSS 대상에 둘 다 켠다. 끄고 재면 최우선 capability(xss.browser.fragment, 0.40)의
     확정 경로가 닫힌 채로 측정돼 XSS만 구조적으로 과소평가된다.
     """
-    http_runtime = HttpExecutionRuntime()
+    resolver = None
+    principal_credentials: tuple[tuple[str, str], ...] = ()
+    actor_id = owner_id = None
+    seed_urls: tuple[str, ...] = ()
+    if identities:
+        (
+            resolver,
+            principal_credentials,
+            actor_id,
+            owner_id,
+            seed_urls,
+        ) = build_identities(target)
+
+    http_runtime = HttpExecutionRuntime(credential_resolver=resolver)
     runtime = PlaywrightBrowserRuntime(http_runtime=http_runtime) if browser else http_runtime
     app = build_local_application(
         {},
         runtime=runtime,
         router=standard_router(),
         config=OrchestratorConfig(browser_xss_validation=browser),
+        credential_resolver=resolver,
+        # 로그인 POST는 상태 변경 요청이라 정책 게이트가 승인된 참조를 요구한다.
+        # 기본 게이트는 전부 거부하므로, 계정을 세울 때만 그 한 참조를 승인한다.
+        approval_gate=(
+            StaticApprovalGate((_LOGIN_APPROVAL_REF,)) if resolver is not None else None
+        ),
     )
     register_standard_agents(
         app,
@@ -388,6 +497,12 @@ def run_lasp(
         # username을 읽지만 어디에도 그 이름이 없어, 켜지 않으면 파라미터 없는
         # Surface 하나만 남고 입력을 요구하는 모든 capability가 떨어진다.
         recon_infer_unlinked_query_parameters=True,
+        # 두 주체의 객체 식별자를 명시로 넘긴다. XBEN-090의 식별자는 경로의
+        # username인데 경로 식별자 추출은 숫자 패턴을 쓰므로 휴리스틱으로는 잡히지
+        # 않는다. 하네스가 만든 계정 이름을 그대로 주면 휴리스틱을 건드릴 필요가 없다.
+        actor_object_id=actor_id,
+        owner_object_id=owner_id,
+        recon_seed_urls=seed_urls,
     )
     try:
         with _deadline(RUN_TIMEOUT):
@@ -396,6 +511,8 @@ def run_lasp(
                     target_url=target,
                     scope=RunScope(allowed_hosts=ALLOWED_HOSTS),
                     request_budget=budget,
+                    credential_ref=_ACTOR_REF if resolver is not None else None,
+                    principal_credentials=principal_credentials,
                 )
             )
     except _RunTimeout as error:
@@ -455,6 +572,7 @@ def measure(
     keep_up: bool,
     llm_client=None,
     browser: bool = True,
+    identities: bool = False,
 ) -> LabResult:
     started = time.monotonic()
     result = LabResult(
@@ -471,7 +589,7 @@ def measure(
         return result
 
     result.target_url = url
-    metrics, error = run_lasp(url, budget, llm_client, expected, browser)
+    metrics, error = run_lasp(url, budget, llm_client, expected, browser, identities)
     if error:
         result.cause = CAUSE_RUN_ERROR
         result.detail = error
@@ -600,6 +718,11 @@ def main() -> int:
     parser.add_argument("--labs", nargs="+", metavar="LAB", help="특정 랩만 (XBEN-013-24)")
     parser.add_argument("--keep-up", action="store_true", help="측정 후 컨테이너 유지")
     parser.add_argument(
+        "--no-identities",
+        action="store_true",
+        help="Access Control 랩에서 actor/owner 계정 생성을 건너뛴다",
+    )
+    parser.add_argument(
         "--no-browser",
         action="store_true",
         help="브라우저 런타임과 browser_xss_validation을 끈다 (XSS 확정 경로가 닫힌다)",
@@ -672,6 +795,7 @@ def main() -> int:
         "llm_model": model_used,
         "llm_rpm_limit": rpm,
         "browser_xss_validation": not args.no_browser,
+        "identities": not args.no_identities,
         "labs": len(targets),
     }
     print(f"XBEN 베이스라인  랩 {len(targets)}개 / 클래스당 {args.per_class} / 예산 {args.budget}")
@@ -687,7 +811,15 @@ def main() -> int:
     for index, (lab, expected) in enumerate(targets, start=1):
         print(f"[{index}/{len(targets)}] {lab.lab_id}  기대={expected}  L{lab.level}", flush=True)
         result = measure(
-            lab, expected, args.budget, args.keep_up, llm_client, not args.no_browser
+            lab,
+            expected,
+            args.budget,
+            args.keep_up,
+            llm_client,
+            not args.no_browser,
+            # Access Control은 두 주체가 없으면 후보조차 서지 않는다. 다른 클래스에는
+            # 계정이 필요 없고 가입 요청만 늘어나므로 해당 클래스에서만 세운다.
+            expected == "Access Control" and not args.no_identities,
         )
         results.append(result)
         print(
