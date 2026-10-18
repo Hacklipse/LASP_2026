@@ -200,6 +200,7 @@ def append_run_result(args, app, run) -> None:
     candidates = app.stores.candidates.list_by_run(run.run_id)
     surfaces = app.stores.surfaces.list_by_run(run.run_id)
     run_evidence = app.stores.evidence.list_by_run(run.run_id)
+    evidence_by_id = {item.evidence_id: item for item in run_evidence}
     task_store = getattr(app.stores, "tasks", None)
     task_records = task_store.list_by_run(run.run_id) if task_store is not None else ()
     analysis_states: dict[str, set[str]] = {}
@@ -234,7 +235,8 @@ def append_run_result(args, app, run) -> None:
         "candidate_surface_count": len(candidate_surface_ids),
         "post_surface_count": len(post_surfaces),
         "unrouted_post_surface_count": sum(
-            surface.surface_id not in candidate_surface_ids for surface in post_surfaces
+            surface.surface_id not in candidate_surface_ids
+            for surface in post_surfaces
         ),
         "candidate_count": len(candidates),
         "task_history_available": task_store is not None,
@@ -262,6 +264,31 @@ def append_run_result(args, app, run) -> None:
         surface.surface_id: surface_key(surface)
         for surface in surfaces
     }
+    graphql_candidates = {
+        candidate.surface_id: candidate.candidate_id
+        for candidate in candidates if candidate.vulnerability_type == "SQLi"
+    }
+    graphql_query_checks = [
+        {
+            "surface_key": keys[item.surface_id],
+            "candidate_id": graphql_candidates.get(item.surface_id),
+            "field": item.observation["graphql_field"],
+            "argument": item.observation["graphql_argument"],
+            "outcome": item.observation["outcome"],
+        }
+        for item in run_evidence
+        if item.created_by == "heuristic_sqli_analyzer"
+        and item.observation.get("type") == "graphql_query_probe_result"
+        and item.surface_id in keys
+        and isinstance(item.observation.get("graphql_field"), str)
+        and isinstance(item.observation.get("graphql_argument"), str)
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", item.observation["graphql_field"])
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", item.observation["graphql_argument"])
+        and item.observation.get("outcome") in {
+            "authentication_required", "sql_error_signal",
+            "incomparable_response", "no_sql_error_signal",
+        }
+    ][:128]
     JsonlRoutingAuditLog(args.routing_log).append({
         "schema_version": 4, "event": "run_result", "run_id": run.run_id,
         "report_facts_hash": _report_facts_hash(app, run, _FACTS_HASH_LINE),
@@ -300,6 +327,7 @@ def append_run_result(args, app, run) -> None:
         "phase": run.phase.value,
         "candidate_status_counts": dict(Counter(c.status.value for c in candidates)),
         "stage_funnel": stage_funnel,
+        "graphql_query_checks": graphql_query_checks,
         "validation_review": review,
         "report_narrative": report_narrative,
         "finding_count": len(app.stores.findings.list_by_run(run.run_id)),
@@ -309,6 +337,38 @@ def append_run_result(args, app, run) -> None:
             "candidate_id": c.candidate_id, "surface_key": keys.get(c.surface_id),
             "vulnerability_type": c.vulnerability_type, "agent_type": c.assigned_agent,
             "status": c.status.value, "evidence_count": len(c.evidence_ids),
+            "validation_reason_code": (
+                c.validation_reason_code.value if c.validation_reason_code else None
+            ),
+            "evidence_response_statuses": [
+                evidence_by_id[evidence_id].observation.get("status")
+                for evidence_id in c.evidence_ids[:16]
+                if evidence_id in evidence_by_id
+                and evidence_by_id[evidence_id].evidence_type == "http_response"
+            ],
+            "evidence_observation_types": sorted({
+                kind for evidence_id in c.evidence_ids[:16]
+                if evidence_id in evidence_by_id
+                if isinstance((kind := evidence_by_id[evidence_id].observation.get("type")), str)
+                and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", kind)
+                and evidence_by_id[evidence_id].evidence_type == "observation"
+            }),
+            "browser_probe_signals": [
+                {
+                    "request_kind": observation.get("request_kind"),
+                    "evidence_type": evidence_by_id[evidence_id].evidence_type,
+                    "dom_reflected": observation.get("dom_reflected"),
+                    "script_executed": observation.get("script_executed"),
+                    "foreign_origin_message": observation.get("foreign_origin_message"),
+                    "blocked_request_count": observation.get("blocked_request_count"),
+                    "subrequest_count": observation.get("subrequest_count"),
+                    "error_kind": observation.get("error_kind"),
+                }
+                for evidence_id in c.evidence_ids[:16]
+                if evidence_id in evidence_by_id
+                if (observation := evidence_by_id[evidence_id].observation).get("type")
+                in {"browser_execution", "browser_error"}
+            ],
             "analysis_task_states": sorted(analysis_states.get(c.candidate_id, ())),
             "validation_task_states": sorted(validation_states.get(c.candidate_id, ())),
             "exploration_parameters": list(c.exploration_parameters),

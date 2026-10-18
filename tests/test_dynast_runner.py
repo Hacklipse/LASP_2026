@@ -129,6 +129,42 @@ class DynastRunnerTests(unittest.TestCase):
             ]), 2)
         build.assert_not_called()
 
+    def test_dual_session_requires_matching_ids_and_binds_principals(self):
+        with patch.object(shared, "build_local_application") as build, contextlib.redirect_stdout(io.StringIO()):
+            status = dynast.main([
+                "dynast", "http://localhost:13322/", "--session-cookie-stdin",
+                "--owner-session-cookie-stdin", "--access-actor-object-id", "1",
+            ])
+        self.assertEqual(status, 2)
+        build.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(dynast, "DEFAULT_ARTIFACT_DIRECTORY", Path(directory)))
+            stack.enter_context(patch("builtins.input", return_value="y"))
+            stack.enter_context(patch.object(
+                shared.sys, "stdin", io.StringIO("uid=actor-private\nuid=owner-private\n")
+            ))
+            register = stack.enter_context(patch.object(
+                shared, "register_standard_agents", wraps=shared.register_standard_agents,
+            ))
+            start = stack.enter_context(patch.object(Orchestrator, "start", side_effect=_Stop))
+            output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            with self.assertRaises(_Stop):
+                dynast.main([
+                    "dynast", "http://localhost:13322/", "--session-cookie-stdin",
+                    "--owner-session-cookie-stdin", "--access-actor-object-id", "11",
+                    "--access-owner-object-id", "22",
+                ])
+            request = start.call_args.args[0]
+            self.assertEqual(request.principal_credentials, (
+                ("actor", shared._AUTO_SESSION_CREDENTIAL_REF),
+                ("owner", shared._AUTO_OWNER_CREDENTIAL_REF),
+            ))
+            self.assertEqual(register.call_args.kwargs["actor_object_id"], "11")
+            self.assertEqual(register.call_args.kwargs["owner_object_id"], "22")
+            self.assertNotIn("actor-private", output.getvalue())
+            self.assertNotIn("owner-private", output.getvalue())
+
     def test_explicit_browser_executable_reaches_common_browser_recon(self):
         with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
             executable = Path(directory) / "chromium"
@@ -168,13 +204,13 @@ class DynastRunnerTests(unittest.TestCase):
             result = next(x for x in records if x["event"] == "run_result")
             self.assertEqual(result["phase"], "done")
             self.assertEqual(result["code_version"], "fixture")
-            self.assertEqual(result["requests_used"], 2)
+            self.assertEqual(result["requests_used"], 5)
             self.assertFalse(result["browser_recon_enabled"])
             self.assertEqual(result["stage_funnel"]["candidate_count"], 0)
             self.assertEqual(result["stage_funnel"]["discovered_surface_count"], 1)
-            self.assertEqual(result["recon_frontier"][0]["attempted_url_count"], 2)
+            self.assertEqual(result["recon_frontier"][0]["attempted_url_count"], 5)
             self.assertEqual(result["recon_frontier"][0]["unvisited_count"], 0)
-            self.assertEqual(len(runtime.calls), 2)
+            self.assertEqual(len(runtime.calls), 5)
             self.assertEqual(runtime.closed, [result["run_id"]])
             self.assertIn("DynAST-Bench 자동 탐색 실행 결과", output.getvalue())
             self.assertIn("[실행하지 못한 Analyzer 계약]", output.getvalue())

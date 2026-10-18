@@ -122,7 +122,9 @@ class RuntimeEvidenceCollector:
             path_suffix=http_request.path_suffix,
             validation_id=validation_id,
             timeout_seconds=min(timeout_seconds, run.timeout_seconds),
-            credential_ref=_credential_for(run, spec.principal_role, credential_ref),
+            credential_ref=_credential_for(
+                run, spec.principal_role, credential_ref, anonymous=spec.anonymous
+            ),
             # 개별 Agent가 더 좁은 승인 참조를 지정했다면 그것을 우선한다. CLI에서
             # 사용자가 Run 전체의 상태 변경 가능 요청을 명시적으로 승인한 경우에만
             # 기본 참조를 보충하며, 실제 허용 여부는 중앙 ApprovalGate가 재검증한다.
@@ -251,6 +253,7 @@ def _credential_for(
     run: Run,
     role: AccessPrincipalRole | None,
     requested: str | None = None,
+    *, anonymous: bool = False,
 ) -> str | None:
     """Agent가 지정한 역할을 Run에 등록된 자격증명으로만 해석한다.
 
@@ -261,8 +264,15 @@ def _credential_for(
     `requested`는 중앙 인증 Worker처럼 어떤 주체의 세션을 세울지 Orchestrator가 이미
     정해 둔 경우에만 쓴다. 그 경우에도 Run에 등록된 참조가 아니면 거부하므로, 임의
     자격증명을 끌어다 쓰는 경로는 되지 않는다.
+
+    ``anonymous``는 인증된 Run에서도 공개 접근을 별도로 확인하기 위한 명시적
+    선택이다. 등록된 세션을 기본값으로 되살리지 않는다.
     """
 
+    if anonymous:
+        if role is not None:
+            raise PolicyViolation("anonymous request cannot select a principal role")
+        return None
     if role is not None:
         registered = dict(run.principal_credentials)
         credential_ref = registered.get(role.value)

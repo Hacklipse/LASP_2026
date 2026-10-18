@@ -12,6 +12,7 @@ from hacklipse.adapters import (
     RuleBasedVulnerabilityRouter,
     SurfaceRoutingRule,
 )
+from hacklipse.adapters.xss_analysis import secondary_dom_attribute_sinks
 from hacklipse.application.errors import AgentContractError
 from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.bootstrap import build_local_application
@@ -128,6 +129,15 @@ def _collect_requested(agent_result, app, task: TaskEnvelope) -> TaskEnvelope:
 
 
 class HeuristicXssAnalyzerTests(unittest.TestCase):
+    def test_secondary_attribute_sink_requires_a_direct_html_assignment(self) -> None:
+        self.assertEqual(secondary_dom_attribute_sinks(
+            'out.innerHTML = DOMPurify.sanitize(raw); '
+            'tip.innerHTML = el.getAttribute("data-note");'
+        ), ("data-note",))
+        self.assertEqual(secondary_dom_attribute_sinks(
+            'tip.textContent = el.getAttribute("data-note");'
+        ), ())
+
     def test_reflected_marker_creates_observation(self) -> None:
         agent, app, runtime, task = _task(parameters=("name",))
 

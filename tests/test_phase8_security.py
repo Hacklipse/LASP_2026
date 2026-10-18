@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import time
@@ -500,6 +501,29 @@ class SanitizerStructurePreservationTests(unittest.TestCase):
         self.assertIn('name="password"', sanitized)
         self.assertIn('value="<redacted>"', sanitized)
         self.assertNotIn("<p>password</p>", sanitized)
+
+    def test_short_cookie_value_does_not_corrupt_json_object_ids(self) -> None:
+        original = json.dumps({
+            "results": [{"id": 1, "title": "release 1"}],
+            "access_token": "private-auth-value",
+            "nested": {"password": "private-password-value"},
+        })
+        sanitized = SensitiveDataSanitizer._sanitize_text(
+            original, ("1", "private-auth-value", "private-password-value")
+        )
+        parsed = json.loads(sanitized)
+        self.assertEqual(parsed["results"][0]["id"], 1)
+        self.assertEqual(parsed["access_token"], "<redacted>")
+        self.assertEqual(parsed["nested"]["password"], "<redacted>")
+        self.assertNotIn("private-auth-value", sanitized)
+        self.assertNotIn("private-password-value", sanitized)
+
+    def test_short_cookie_value_does_not_corrupt_html_probe_marker(self) -> None:
+        html = "<div id='q'>hacklipse7331</div><p>uid=3</p>"
+        sanitized = SensitiveDataSanitizer._sanitize_text(html, ("3",))
+        self.assertIn("hacklipse7331", sanitized)
+        self.assertIn("uid=<redacted>", sanitized)
+        self.assertNotIn("uid=3", sanitized)
 
     def test_csrf_path_does_not_redact_unrelated_query_value(self) -> None:
         url = "http://local.test/vulnerabilities/csrf/?q=hacklipse-control"

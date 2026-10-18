@@ -8,6 +8,7 @@ passed to the scanner. No git or software-install commands are used.
 from __future__ import annotations
 
 import argparse
+import ast
 import http.client
 import json
 import os
@@ -37,7 +38,20 @@ def _json_command(command: list[str], *, cwd: Path, env: dict[str, str]) -> dict
         command, cwd=cwd, env=env, capture_output=True, text=True, check=False,
     )
     if completed.returncode != 0:
-        raise RuntimeError(f"{command[1]} failed with exit code {completed.returncode}")
+        diagnostic = (completed.stderr + "\n" + completed.stdout).casefold()[:8192]
+        if any(word in diagnostic for word in ("timed out", "timeout", "deadline exceeded")):
+            reason = "timeout"
+        elif any(word in diagnostic for word in ("no such image", "image not found", "pull access denied")):
+            reason = "image_unavailable"
+        elif any(word in diagnostic for word in ("out of memory", "oom", "killed")):
+            reason = "resource_exhausted"
+        elif "port is already allocated" in diagnostic or "address already in use" in diagnostic:
+            reason = "port_conflict"
+        else:
+            reason = "unspecified"
+        raise RuntimeError(
+            f"{command[1]} failed: {reason} (exit code {completed.returncode})"
+        )
     try:
         result = json.loads(completed.stdout)
     except json.JSONDecodeError as error:
@@ -56,6 +70,46 @@ def _local_target(value: object) -> str:
             or parsed.username or parsed.password or parsed.query or parsed.fragment):
         raise ValueError("benchmark target must be a local HTTP URL without credentials or query")
     return value
+
+
+def _verify_running_stack(
+    executable: str, bench_root: Path, env: dict[str, str],
+    app: str, variant: str, target: str,
+) -> None:
+    """Ensure reset's claimed twin is the healthy stack bound to its target.
+
+    A reset result alone is insufficient: an old opposite-variant container can
+    retain the port. Persist only a categorical failure, never CLI output.
+    """
+
+    status = _json_command(
+        [executable, "status", app, "--json"], cwd=bench_root, env=env,
+    )
+    stacks = status.get("stacks")
+    if not isinstance(stacks, list):
+        raise ValueError("variant_mismatch")
+    active = [
+        item for item in stacks
+        if isinstance(item, dict) and item.get("app") == app
+        and type(item.get("containers_running")) is int
+        and item["containers_running"] > 0
+    ]
+    target_key = target.rstrip("/")
+    matching = [
+        item for item in active
+        if item.get("variant") == variant
+        and item.get("healthy") is True
+        and isinstance(item.get("target"), str)
+        and item["target"].rstrip("/") == target_key
+        and item.get("containers_running") == item.get("containers_total")
+    ]
+    if len(matching) != 1 or any(
+        item is not matching[0]
+        and isinstance(item.get("target"), str)
+        and item["target"].rstrip("/") == target_key
+        for item in active
+    ):
+        raise ValueError("variant_mismatch")
 
 
 def _scanner_env() -> dict[str, str]:
@@ -112,6 +166,286 @@ def _nextjs_seeded_session(bench_root: Path, variant: str, target: str) -> str:
     return "; ".join(f"{name}={cookies[name]}" for name in ("sid", "token"))
 
 
+def _graphql_seeded_authorization(
+    bench_root: Path, variant: str, target: str,
+) -> str:
+    """Use a non-admin local fixture account; retain its bearer only in memory."""
+
+    source = (
+        bench_root / "vulnerable-apps" / "graphql" / variant / "src" / "main.ts"
+    ).read_text(encoding="utf-8")
+    account = None
+    for row in re.finditer(r"\[\s*acme\s*,([^\]\n]+)\]", source):
+        if re.search(r",\s*false\s*,", row.group(1)) is None:
+            continue
+        literals = [value for _, value in re.findall(
+            r"(['\"])([^'\"\n]+)\1", row.group(1)
+        )]
+        if len(literals) >= 2:
+            account = (literals[0], literals[1])
+            break
+    if account is None:
+        raise RuntimeError("local GraphQL test account is unavailable")
+    parsed = urlsplit(target)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}:
+        raise RuntimeError("test login requires a local HTTP target")
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+    try:
+        connection.request(
+            "POST", "/graphql",
+            body=json.dumps({
+                "query": "mutation Login($email: String!, $password: String!) { "
+                         "login(email: $email, password: $password) { token } }",
+                "variables": {"email": account[0], "password": account[1]},
+            }),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        body = response.read(16384)
+        if response.status != 200:
+            raise RuntimeError("local GraphQL test login was rejected")
+        token = json.loads(body).get("data", {}).get("login", {}).get("token")
+    finally:
+        connection.close()
+    if not isinstance(token, str) or re.fullmatch(r"[A-Za-z0-9._~-]{1,8000}", token) is None:
+        raise RuntimeError("local GraphQL test login did not establish a bearer session")
+    return "Bearer " + token
+
+
+def _llmchat_seeded_session(bench_root: Path, variant: str, target: str) -> str:
+    """Use a literal non-admin fixture login without importing challenge code."""
+
+    source = (
+        bench_root / "vulnerable-apps" / "llmchat" / variant / "app.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    account = None
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+        if not any(isinstance(target, ast.Name) and target.id == "USERS" for target in targets):
+            continue
+        if not isinstance(node.value, ast.Dict):
+            break
+        for value in node.value.values:
+            try:
+                item = ast.literal_eval(value)
+            except (ValueError, TypeError):
+                continue
+            if (
+                isinstance(item, dict) and item.get("role") == "user"
+                and item.get("isAdmin") is False
+                and isinstance(item.get("email"), str)
+                and isinstance(item.get("password"), str)
+            ):
+                account = (item["email"], item["password"])
+                break
+        break
+    if account is None:
+        raise RuntimeError("local LLM chat test account is unavailable")
+    parsed = urlsplit(target)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}:
+        raise RuntimeError("test login requires a local HTTP target")
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+    try:
+        connection.request(
+            "POST", "/api/auth/login",
+            body=json.dumps({"email": account[0], "password": account[1]}),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        headers = response.getheaders()
+        response.read(1024)
+        if response.status != 200:
+            raise RuntimeError("local LLM chat test login was rejected")
+    finally:
+        connection.close()
+    for key, value in headers:
+        if key.casefold() != "set-cookie":
+            continue
+        pair = value.split(";", 1)[0]
+        if pair.startswith("session=") and len(pair) > len("session="):
+            return pair
+    raise RuntimeError("local LLM chat login did not establish a session")
+
+
+def _swagger_test_accounts(
+    bench_root: Path, variant: str, *, app: str = "swagger"
+) -> tuple[tuple[str, str], ...]:
+    """Read only non-admin fixture logins, without importing challenge code."""
+
+    if app not in {"swagger", "fastapi"}:
+        raise ValueError("unsupported local Python test fixture")
+    seed = bench_root / "vulnerable-apps" / app / variant / "app" / "seed.py"
+    tree = ast.parse(seed.read_text(encoding="utf-8"))
+    accounts: list[tuple[str, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id != "User":
+            continue
+        fields = {item.arg: item.value for item in node.keywords if item.arg}
+        email = fields.get("email")
+        password_hash = fields.get("password_hash")
+        role = fields.get("role")
+        is_admin = fields.get("is_admin")
+        if (
+            isinstance(email, ast.Constant) and isinstance(email.value, str)
+            and isinstance(password_hash, ast.Call)
+            and isinstance(password_hash.func, ast.Name)
+            and password_hash.func.id == "md5_password"
+            and len(password_hash.args) == 1
+            and isinstance(password_hash.args[0], ast.Constant)
+            and isinstance(password_hash.args[0].value, str)
+            and isinstance(role, ast.Constant) and role.value == "user"
+            and isinstance(is_admin, ast.Constant) and is_admin.value is False
+        ):
+            accounts.append((email.value, password_hash.args[0].value))
+    if not accounts:
+        raise RuntimeError("local Swagger test account is unavailable")
+    return tuple(accounts)
+
+
+def _swagger_login(target: str, account: tuple[str, str]) -> tuple[str, int | None]:
+    parsed = urlsplit(target)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}:
+        raise RuntimeError("test login requires a local HTTP target")
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+    try:
+        connection.request(
+            "POST", "/api/auth/login",
+            body=json.dumps({"email": account[0], "password": account[1]}),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        headers = response.getheaders()
+        body = response.read(1024)
+        if response.status != 200:
+            raise RuntimeError("local Swagger test login was rejected")
+    finally:
+        connection.close()
+    cookies = [
+        value.split(";", 1)[0]
+        for name, value in headers
+        if name.casefold() == "set-cookie" and value.startswith("uid=")
+    ]
+    if len(cookies) != 1 or not cookies[0].split("=", 1)[1]:
+        raise RuntimeError("local Swagger login did not establish a session")
+    try:
+        principal_id = json.loads(body).get("id")
+    except (ValueError, AttributeError):
+        principal_id = None
+    return cookies[0], principal_id if type(principal_id) is int else None
+
+
+def _swagger_seeded_session(bench_root: Path, variant: str, target: str) -> str:
+    """Log in one non-admin local fixture user; retain no credential in output."""
+
+    return _swagger_login(target, _swagger_test_accounts(bench_root, variant)[0])[0]
+
+
+def _fastapi_seeded_session(bench_root: Path, variant: str, target: str) -> str:
+    """Use the same local uid-cookie login contract for a FastAPI test user."""
+
+    return _swagger_login(
+        target, _swagger_test_accounts(bench_root, variant, app="fastapi")[0]
+    )[0]
+
+
+def _gin_seeded_session(bench_root: Path, variant: str, target: str) -> str:
+    """Log in a non-admin local Go fixture user without persisting credentials."""
+
+    source = (bench_root / "vulnerable-apps" / "gin" / variant / "main.go").read_text(
+        encoding="utf-8"
+    )
+    accounts = re.findall(
+        r'insertUser\("([^"\n]+)",\s*"([^"\n]+)",\s*"user",\s*false,', source
+    )
+    if not accounts:
+        raise RuntimeError("local Gin test account is unavailable")
+    parsed = urlsplit(target)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}:
+        raise RuntimeError("test login requires a local HTTP target")
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+    try:
+        connection.request(
+            "POST", "/api/auth/login",
+            body=json.dumps({"email": accounts[0][0], "password": accounts[0][1]}),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        headers = response.getheaders()
+        response.read(1024)
+        if response.status != 200:
+            raise RuntimeError("local Gin test login was rejected")
+    finally:
+        connection.close()
+    cookies = [
+        value.split(";", 1)[0] for name, value in headers
+        if name.casefold() == "set-cookie" and value.startswith("session=")
+    ]
+    if len(cookies) != 1 or not cookies[0].split("=", 1)[1]:
+        raise RuntimeError("local Gin login did not establish a session")
+    return cookies[0]
+
+
+def _swagger_access_sessions(
+    bench_root: Path, variant: str, target: str
+) -> tuple[str, str, str, str]:
+    """Prepare two local principals and their own observed object IDs."""
+
+    accounts = _swagger_test_accounts(bench_root, variant)
+    if len(accounts) < 2:
+        raise RuntimeError("two local Swagger test accounts are unavailable")
+    parsed = urlsplit(target)
+    sessions: list[tuple[str, str, str]] = []
+    for account in accounts[:2]:
+        cookie, principal_id = _swagger_login(target, account)
+        if principal_id is None:
+            raise RuntimeError("local Swagger login did not identify the principal")
+        def get_document(path: str) -> dict:
+            connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+            try:
+                connection.request("GET", path, headers={"Cookie": cookie})
+                response = connection.getresponse()
+                body = response.read(256 * 1024)
+                if response.status != 200:
+                    raise RuntimeError("local Swagger principal cannot inspect test objects")
+            finally:
+                connection.close()
+            try:
+                document = json.loads(body)
+            except ValueError as error:
+                raise RuntimeError("local Swagger test object response is invalid") from error
+            if not isinstance(document, dict):
+                raise RuntimeError("local Swagger test object response is invalid")
+            return document
+
+        own_user = get_document(f"/api/v1/users/{principal_id}")
+        own_org = own_user.get("orgSlug")
+        if not isinstance(own_org, str) or not own_org:
+            raise RuntimeError("local Swagger principal organization is unavailable")
+        rows = get_document("/api/v1/posts").get("results")
+        if not isinstance(rows, list):
+            raise RuntimeError("local Swagger object list is invalid")
+        owned_id = None
+        for row in rows[:16]:
+            object_id = row.get("id") if isinstance(row, dict) else None
+            if type(object_id) is not int or object_id < 1:
+                continue
+            detail = get_document(f"/api/v1/posts/{object_id}")
+            if detail.get("orgSlug") == own_org:
+                owned_id = str(object_id)
+                break
+        if owned_id is None:
+            raise RuntimeError("local Swagger principal has no accessible own-organization object")
+        sessions.append((cookie, owned_id, own_org))
+    if sessions[0][1] == sessions[1][1] or sessions[0][2] == sessions[1][2]:
+        raise RuntimeError("local Swagger test principals do not have distinct organizations and objects")
+    return sessions[0][0], sessions[1][0], sessions[0][1], sessions[1][1]
+
+
 def _run_summary(log_path: Path) -> dict:
     records = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
     results = [item for item in records if item.get("event") == "run_result"]
@@ -127,6 +461,55 @@ def _run_summary(log_path: Path) -> dict:
             "stage_funnel", "budget_allocation_mode", "budget_validation_reserve",
         )
     }
+
+
+def _stage_chain(log_path: Path) -> list[dict]:
+    """Join sanitized Router inputs and final candidate states by Surface ID."""
+
+    records = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+    routing = [item for item in records if item.get("event") == "routing_decision"
+               and item.get("status") == "completed"]
+    results = [item for item in records if item.get("event") == "run_result"]
+    if not routing or len(results) != 1:
+        return []
+    result = results[0]
+    candidates = {
+        item["candidate_id"]: item for item in result.get("candidates", [])
+        if isinstance(item, dict) and isinstance(item.get("candidate_id"), str)
+    }
+    by_surface: dict[str, dict] = {}
+    for decision in routing:
+        manifest = decision.get("routing_input_manifest") or {}
+        reviews = {
+            item["surface_id"]: item for item in decision.get("surface_reviews", [])
+            if isinstance(item, dict) and isinstance(item.get("surface_id"), str)
+        }
+        for surface in manifest.get("surfaces", []):
+            if not isinstance(surface, dict) or not isinstance(surface.get("surface_id"), str):
+                continue
+            review = reviews.get(surface["surface_id"], {})
+            candidate_ids = review.get("candidate_ids") or []
+            by_surface[surface["surface_id"]] = {
+                "surface_key": surface.get("surface_key"),
+                "method": surface.get("method"),
+                "path_hint": surface.get("path"),
+                "discovered_parameter_names": surface.get("parameter_names", []),
+                "observation_types": surface.get("observation_types", []),
+                "route_reason": review.get("unrouted_reason"),
+                "capability_gaps": review.get("capability_gaps", {}),
+                "candidates": [{
+                    "vulnerability_type": candidates[candidate_id].get("vulnerability_type"),
+                    "status": candidates[candidate_id].get("status"),
+                    "validation_reason_code": candidates[candidate_id].get(
+                        "validation_reason_code"
+                    ),
+                    "analysis_task_states": candidates[candidate_id].get("analysis_task_states", []),
+                    "validation_task_states": candidates[candidate_id].get("validation_task_states", []),
+                } for candidate_id in candidate_ids if candidate_id in candidates],
+            }
+    return sorted(by_surface.values(), key=lambda item: (
+        str(item["method"]), str(item["path_hint"]), str(item["surface_key"])
+    ))
 
 
 def _funnel_rates(funnel: object) -> dict[str, float | None]:
@@ -204,6 +587,18 @@ def main(argv: list[str] | None = None) -> int:
                         help="allow state-changing probes only on the reset local DynAST target")
     parser.add_argument("--nextjs-test-session", action="store_true",
                         help="log in a seeded local NextJS test user in memory for each reset twin")
+    parser.add_argument("--swagger-test-session", action="store_true",
+                        help="log in a seeded local Swagger test user in memory for each reset twin")
+    parser.add_argument("--fastapi-test-session", action="store_true",
+                        help="log in a seeded local FastAPI test user in memory for each reset twin")
+    parser.add_argument("--gin-test-session", action="store_true",
+                        help="log in a seeded local Gin test user in memory for each reset twin")
+    parser.add_argument("--graphql-test-session", action="store_true",
+                        help="log in a seeded local GraphQL test user in memory for each reset twin")
+    parser.add_argument("--llmchat-test-session", action="store_true",
+                        help="log in a seeded local LLM chat test user in memory for each reset twin")
+    parser.add_argument("--swagger-access-test-sessions", action="store_true",
+                        help="prepare two seeded local Swagger users and observed own object IDs")
     args = parser.parse_args(argv)
     if re.fullmatch(r"[a-z][a-z0-9-]{0,63}", args.app) is None:
         parser.error("app must be a short lowercase DynAST app name")
@@ -211,6 +606,36 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("code version must be a short label")
     if args.nextjs_test_session and (args.app != "nextjs" or not args.approve_state_changing):
         parser.error("--nextjs-test-session requires nextjs and --approve-state-changing")
+    if args.swagger_test_session and (args.app != "swagger" or not args.approve_state_changing):
+        parser.error("--swagger-test-session requires swagger and --approve-state-changing")
+    if args.fastapi_test_session and (args.app != "fastapi" or not args.approve_state_changing):
+        parser.error("--fastapi-test-session requires fastapi and --approve-state-changing")
+    if args.gin_test_session and (args.app != "gin" or not args.approve_state_changing):
+        parser.error("--gin-test-session requires gin and --approve-state-changing")
+    if args.graphql_test_session and (args.app != "graphql" or not args.approve_state_changing):
+        parser.error("--graphql-test-session requires graphql and --approve-state-changing")
+    if args.llmchat_test_session and (args.app != "llmchat" or not args.approve_state_changing):
+        parser.error("--llmchat-test-session requires llmchat and --approve-state-changing")
+    if args.swagger_access_test_sessions and (
+        args.app != "swagger" or not args.approve_state_changing or args.swagger_test_session
+    ):
+        parser.error("--swagger-access-test-sessions requires swagger and approval, without --swagger-test-session")
+    authenticated_test_session = (
+        args.nextjs_test_session or args.swagger_test_session
+        or args.swagger_access_test_sessions or args.fastapi_test_session
+        or args.gin_test_session or args.graphql_test_session
+        or args.llmchat_test_session
+    )
+    test_session_mode = (
+        "swagger_two_principals" if args.swagger_access_test_sessions else
+        "swagger_single" if args.swagger_test_session else
+        "nextjs_single" if args.nextjs_test_session else
+        "fastapi_single" if args.fastapi_test_session else
+        "gin_single" if args.gin_test_session else
+        "graphql_single" if args.graphql_test_session else
+        "llmchat_single" if args.llmchat_test_session else
+        "anonymous"
+    )
     executable = shutil.which(args.dynast_cli)
     if executable is None:
         parser.error("DynAST CLI is unavailable; provide an existing --dynast-cli path")
@@ -246,13 +671,63 @@ def main(argv: list[str] | None = None) -> int:
                     cwd=bench_root, env=benchmark_env,
                 )
                 target = _local_target(reset.get("target"))
-                session_cookie = (
-                    _nextjs_seeded_session(bench_root, variant, target)
-                    if args.nextjs_test_session else None
+                _verify_running_stack(
+                    executable, bench_root, benchmark_env,
+                    args.app, variant, target,
                 )
+                session_authorization = None
+                if args.nextjs_test_session:
+                    session_cookie = _nextjs_seeded_session(bench_root, variant, target)
+                elif args.swagger_test_session:
+                    session_cookie = _swagger_seeded_session(bench_root, variant, target)
+                elif args.fastapi_test_session:
+                    session_cookie = _fastapi_seeded_session(bench_root, variant, target)
+                elif args.gin_test_session:
+                    session_cookie = _gin_seeded_session(bench_root, variant, target)
+                elif args.graphql_test_session:
+                    session_authorization = _graphql_seeded_authorization(
+                        bench_root, variant, target
+                    )
+                    session_cookie = None
+                elif args.llmchat_test_session:
+                    session_cookie = _llmchat_seeded_session(bench_root, variant, target)
+                elif args.swagger_access_test_sessions:
+                    session_cookie, owner_cookie, actor_id, owner_id = _swagger_access_sessions(
+                        bench_root, variant, target
+                    )
+                else:
+                    session_cookie = None
+            except (OSError, SyntaxError):
+                reset_error = "local_test_fixture_unavailable"
             except (RuntimeError, ValueError) as error:
-                print(f"reset 실패: {error}")
-                return 1
+                # The CLI and fixture may include private response text. Persist
+                # only a bounded diagnostic category, including for partial pairs.
+                detail = str(error)
+                category = (
+                    detail.split("failed: ", 1)[1].split(" ", 1)[0]
+                    if detail.startswith("reset failed: ")
+                    else "variant_mismatch" if detail == "variant_mismatch"
+                    else "reset_failed"
+                )
+                reset_error = (
+                    category if category in {
+                        "timeout", "image_unavailable", "resource_exhausted",
+                        "port_conflict", "unspecified", "variant_mismatch",
+                    } else "reset_failed"
+                )
+            else:
+                reset_error = None
+            if reset_error is not None:
+                leg = {
+                    "iteration": iteration, "variant": variant,
+                    "test_session_mode": test_session_mode,
+                    "error": f"reset_{reset_error}",
+                }
+                pair[variant] = leg
+                results.append(leg)
+                failed = abort = True
+                print(f"[{iteration}/{args.iterations}] {variant} reset 실패: {leg['error']}", flush=True)
+                break
 
             stem = output_dir / f"{iteration:02d}-{variant}"
             report_path = stem.with_suffix(".md")
@@ -265,10 +740,18 @@ def main(argv: list[str] | None = None) -> int:
                 "--budget-allocation", args.budget_allocation,
                 "--report-out", str(report_path), "--routing-log", str(log_path),
             ]
-            if session_cookie is None:
+            if session_authorization is not None:
+                command.append("--session-authorization-stdin")
+            elif session_cookie is None:
                 command.append("--anonymous")
             else:
                 command.append("--session-cookie-stdin")
+            if args.swagger_access_test_sessions:
+                command.extend((
+                    "--owner-session-cookie-stdin",
+                    "--access-actor-object-id", actor_id,
+                    "--access-owner-object-id", owner_id,
+                ))
             if args.no_browser_recon:
                 command.append("--no-browser-recon")
             if args.approve_state_changing:
@@ -278,11 +761,17 @@ def main(argv: list[str] | None = None) -> int:
             scan_started = time.monotonic()
             scan = subprocess.run(
                 command, cwd=PROJECT_ROOT, env=scanner_env,
-                input="y\n" + (session_cookie + "\n" if session_cookie else ""),
+                input=(
+                    "y\n" + (session_cookie + "\n" if session_cookie else "")
+                    + (session_authorization + "\n" if session_authorization else "")
+                    + (owner_cookie + "\n" if args.swagger_access_test_sessions else "")
+                ),
                 text=True, capture_output=True, check=False,
             )
             leg = {
                 "iteration": iteration, "variant": variant,
+                "test_session_mode": test_session_mode,
+                "test_principal_count": 2 if args.swagger_access_test_sessions else int(authenticated_test_session),
                 "scanner_exit": scan.returncode,
                 "scan_elapsed_seconds": round(time.monotonic() - scan_started, 3),
             }
@@ -295,7 +784,7 @@ def main(argv: list[str] | None = None) -> int:
                     leg.get("phase") != "done"
                     or leg.get("code_version") != args.code_version
                     or leg.get("request_budget") != args.request_budget
-                    or leg.get("authenticated") is not args.nextjs_test_session
+                    or leg.get("authenticated") is not authenticated_test_session
                     or leg.get("state_changing_approved") is not args.approve_state_changing
                     or leg.get("budget_allocation_mode") != args.budget_allocation
                     or leg.get("browser_recon_enabled") is not (not args.no_browser_recon)
@@ -360,6 +849,12 @@ def main(argv: list[str] | None = None) -> int:
                     ("safe-coverage", safe_coverage), ("diagnosis", diagnosis),
                 ):
                     _write_json(output_dir / f"{iteration:02d}-{name}.json", document)
+                for variant in ("vuln", "safe"):
+                    _write_json(
+                        output_dir / f"{iteration:02d}-{variant}-stage-chain.json",
+                        {"schema": "hacklipse.surface-stage-chain/v1",
+                         "surfaces": _stage_chain(output_dir / f"{iteration:02d}-{variant}.jsonl")},
+                    )
                 score_briefs.append(brief)
                 _print_score_brief(f"[{iteration}/{args.iterations}] 채점", brief)
             except (RuntimeError, OSError, ValueError) as error:
@@ -379,7 +874,8 @@ def main(argv: list[str] | None = None) -> int:
         "target_mode": "solo" if args.solo else "compose",
         "target_images_reused": args.no_build,
         "state_changing_approved": args.approve_state_changing,
-        "authenticated_test_session": args.nextjs_test_session,
+        "authenticated_test_session": authenticated_test_session,
+        "test_session_mode": test_session_mode,
         "browser_executable_configured": args.browser_executable is not None,
         "iterations": args.iterations, "legs": results,
         "scored_iterations": len(score_briefs), "score_totals": score_totals,

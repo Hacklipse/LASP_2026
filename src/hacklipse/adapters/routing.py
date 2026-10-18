@@ -22,10 +22,16 @@ from .request_safety import (
     object_identifier_parameters,
 )
 from .open_redirect_analysis import REDIRECT_PARAMETER_HINTS
-from .cors_analysis import CORS_OBSERVATION
+from .cors_analysis import CORS_OBSERVATION, CORS_SEARCH_INPUT_NAMES
+from .graphql_introspection import INTROSPECTION_TYPE, INTROSPECTION_RECON_OBSERVATION
+from .graphql_suggestions import SUGGESTION_TYPE, SUGGESTION_PLAN
 from .source_map_exposure import SOURCE_MAP_REFERENCE, SOURCE_MAP_TYPE
+from .error_disclosure import (
+    ERROR_DISCLOSURE_TYPE, ERROR_ROUTE_OBSERVATION, ERROR_GRAPHQL_OBSERVATION,
+)
+from .sensitive_exposure import CONFIG_ROUTE_OBSERVATION
+from .public_login_credentials import PUBLIC_LOGIN_OBSERVATION, PUBLIC_LOGIN_TYPE
 
-_SEARCH_INPUT_NAMES = frozenset({"q", "query", "search", "term", "keyword"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +85,7 @@ class SurfaceRoutingRule:
         """Spend a tight probe budget on general search inputs before opaque fields."""
 
         if self.vulnerability_type in {"XSS", "SQLi"} and any(
-            name.casefold() in _SEARCH_INPUT_NAMES for name in surface.parameters
+            name.casefold() in CORS_SEARCH_INPUT_NAMES for name in surface.parameters
         ):
             return min(1.0, self.priority + 0.12)
         return self.priority
@@ -122,15 +128,41 @@ class IdentifierSurfaceRoutingRule:
 
 # 첫 버전은 설명 가능하고 재현하기 쉬운 명시적 규칙으로 라우팅한다.
 DEFAULT_RULES = (
+    RoutingRule(
+        "postmessage_html_plan", "XSS", "postmessage_xss_analyzer",
+        # A fresh browser navigation is needed for the benign probe and both
+        # validation requests. Run cheaper observed-input candidates first.
+        0.24, methods=("GET",),
+    ),
+    RoutingRule(
+        CONFIG_ROUTE_OBSERVATION, "Sensitive Data Exposure",
+        "sensitive_exposure_analyzer", 0.38, methods=("GET",),
+    ),
+    RoutingRule(
+        ERROR_ROUTE_OBSERVATION, ERROR_DISCLOSURE_TYPE,
+        "error_disclosure_analyzer", 0.41, methods=("GET",),
+    ),
+    RoutingRule(
+        ERROR_GRAPHQL_OBSERVATION, ERROR_DISCLOSURE_TYPE,
+        "error_disclosure_analyzer", 0.41, methods=("GET",),
+    ),
+    RoutingRule(SUGGESTION_PLAN, SUGGESTION_TYPE,
+                "graphql_suggestion_analyzer", 0.42, methods=("GET",)),
+    RoutingRule(INTROSPECTION_RECON_OBSERVATION, INTROSPECTION_TYPE,
+                "graphql_introspection_analyzer", 0.44, methods=("GET",)),
     RoutingRule(CORS_OBSERVATION, "CORS", "cors_analyzer", 0.75),
+    RoutingRule("graphql_schema_operation", "CORS", "cors_analyzer", 0.43, methods=("GET",)),
     RoutingRule("open_redirect", "Open Redirect", "open_redirect_analyzer", 0.75),
     RoutingRule("sensitive_json_exposure", "Sensitive Data Exposure", "sensitive_exposure_analyzer", 0.75),
+    RoutingRule(PUBLIC_LOGIN_OBSERVATION, PUBLIC_LOGIN_TYPE,
+                "public_login_credentials_analyzer", 0.55, methods=("GET",)),
     RoutingRule("reflection", "XSS", "xss_analyzer", 0.8),
     RoutingRule(
         "browser_hash_reflection", "XSS", "browser_xss_analyzer",
         0.52, methods=("GET",),
     ),
     RoutingRule("sql_error", "SQLi", "sqli_analyzer", 0.8),
+    RoutingRule("graphql_read_query_plan", "SQLi", "sqli_analyzer", 0.30, methods=("GET",)),
     RoutingRule("object_id_auth", "Access Control", "access_control_analyzer", 0.8),
     RoutingRule(
         "url_or_file_parameter",
@@ -165,6 +197,7 @@ OPTIONAL_SOURCE_MAP_RULES = (
                 "source_map_exposure_analyzer", 0.22, methods=("GET",)),
 )
 
+
 # `/ftp/*.bak%2500.md` 같은 제한 확장자 필터 우회 구현은 이후 별도 취약점 유형으로
 # 재분류할 수 있도록 보존한다. 기본 Router에는 넣지 않아 일반/all 실행에서 Candidate와
 # 반복 Analysis·Validation 요청을 만들지 않는다. 필요한 실험에서만 rules에 명시적으로
@@ -186,7 +219,7 @@ DEFAULT_SURFACE_RULES = (
     # Sample public, read-only search surfaces instead of probing every GET.
     DiscoveredSurfaceRoutingRule(
         "CORS", "cors_analyzer",
-        parameter_hints=tuple(sorted(_SEARCH_INPUT_NAMES)), priority=0.43,
+        parameter_hints=tuple(sorted(CORS_SEARCH_INPUT_NAMES)), priority=0.43,
         max_candidates_per_origin=1,
     ),
     SurfaceRoutingRule(

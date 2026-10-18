@@ -340,6 +340,105 @@ class ValidationAgentTests(unittest.TestCase):
         self.assertIs(result.validation.verdict, ValidationVerdict.REJECTED)
         self.assertIsNone(result.validation.proof)
 
+    def test_xss_secondary_attribute_probe_needs_independent_execution(self) -> None:
+        for executes in (True, False):
+            with self.subTest(executes=executes):
+                agent, candidates, evidence, _ = _make_agent()
+                candidates.add(_make_candidate(
+                    "XSS", evidence_ids=("evi-reflection", "evi-attribute")
+                ))
+                evidence.append(_reflection_observation())
+                evidence.append(Evidence(
+                    evidence_id="evi-attribute", run_id=_RUN_ID,
+                    surface_id=_SURFACE_ID,
+                    created_by="heuristic_xss_analyzer",
+                    evidence_type="observation",
+                    observation={"type": "dom_secondary_attribute_sink",
+                                 "attribute": "data-note"},
+                ))
+
+                def task(ids, budget=5):
+                    return TaskEnvelope(
+                        task_id="task-validate", run_id=_RUN_ID,
+                        agent_type="validation", surface_id=_SURFACE_ID,
+                        candidate_id=_CANDIDATE_ID, evidence_ids=tuple(ids),
+                        allowed_tools=("http_get", "browser_xss"),
+                        request_budget=budget, validation_id=_VALIDATION_ID,
+                    )
+
+                ids = ["evi-reflection", "evi-attribute"]
+                first = agent.handle(task(ids))
+                self.assertEqual(len(first.evidence_requests), 3)
+                for evidence_id, request in zip(
+                    ("evi-control", "evi-direct"), first.evidence_requests[:2]
+                ):
+                    evidence.append(_browser_collected_for_request(
+                        evidence_id, request, executed=False, marker=None
+                    ))
+                    ids.append(evidence_id)
+                secondary_request = first.evidence_requests[2]
+                assert secondary_request.http_request is not None
+                marker = dict(secondary_request.http_request.query_parameters)["q"]
+                self.assertIn("attr_data-note_", marker)
+                evidence.append(_browser_collected_for_request(
+                    "evi-secondary", secondary_request,
+                    executed=executes, marker=marker if executes else None,
+                ))
+                ids.append("evi-secondary")
+                third = agent.handle(task(ids, budget=2))
+                assert third.validation is not None
+                self.assertIs(
+                    third.validation.verdict,
+                    ValidationVerdict.CONFIRMED if executes else ValidationVerdict.REJECTED,
+                )
+                if executes:
+                    assert third.validation.proof is not None
+                    self.assertEqual(
+                        third.validation.proof.evidence_ids,
+                        ("evi-control", "evi-secondary"),
+                    )
+
+    def test_xss_direct_proof_is_not_starved_by_secondary_probe_budget(self) -> None:
+        agent, candidates, evidence, _ = _make_agent()
+        candidates.add(_make_candidate(
+            "XSS", evidence_ids=("evi-reflection", "evi-attribute")
+        ))
+        evidence.append(_reflection_observation())
+        evidence.append(Evidence(
+            evidence_id="evi-attribute", run_id=_RUN_ID,
+            surface_id=_SURFACE_ID, created_by="heuristic_xss_analyzer",
+            evidence_type="observation",
+            observation={"type": "dom_secondary_attribute_sink",
+                         "attribute": "data-note"},
+        ))
+        task = TaskEnvelope(
+            task_id="task-validate", run_id=_RUN_ID, agent_type="validation",
+            surface_id=_SURFACE_ID, candidate_id=_CANDIDATE_ID,
+            evidence_ids=("evi-reflection", "evi-attribute"),
+            allowed_tools=("http_get", "browser_xss"),
+            request_budget=2, validation_id=_VALIDATION_ID,
+        )
+        first = agent.handle(task)
+        self.assertEqual(len(first.evidence_requests), 2)
+        control_request, direct_request = first.evidence_requests
+        assert direct_request.http_request is not None
+        marker = dict(direct_request.http_request.query_parameters)["q"]
+        evidence.append(_browser_collected_for_request(
+            "evi-control", control_request, executed=False, marker=None
+        ))
+        evidence.append(_browser_collected_for_request(
+            "evi-direct", direct_request, executed=True, marker=marker
+        ))
+        second = agent.handle(TaskEnvelope(
+            task_id="task-validate-2", run_id=_RUN_ID, agent_type="validation",
+            surface_id=_SURFACE_ID, candidate_id=_CANDIDATE_ID,
+            evidence_ids=(*task.evidence_ids, "evi-control", "evi-direct"),
+            allowed_tools=task.allowed_tools,
+            request_budget=0, validation_id=_VALIDATION_ID,
+        ))
+        assert second.validation is not None
+        self.assertIs(second.validation.verdict, ValidationVerdict.CONFIRMED)
+
     def test_requests_independent_reproduction_when_none_collected_yet(self) -> None:
         agent, candidates, evidence, _ = _make_agent()
         candidates.add(_make_candidate(evidence_ids=("evi-seed", "evi-analysis-http")))

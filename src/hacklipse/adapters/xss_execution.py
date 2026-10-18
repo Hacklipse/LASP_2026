@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from html import escape
+import json
 import re
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from hacklipse.domain import ExecutionRequest, HttpRequestKind
+from .probing import probe_marker
 
 BROWSER_XSS_TOOL = "browser_xss"
 XSS_EXECUTION_MARKER_PREFIX = "hacklipsexecution"
@@ -17,7 +20,51 @@ RAW_HASH_CANARY = "hacklipsehashcontrol"
 RAW_HASH_PARAMETER = "fragment"
 _WINDOW_SLOT = "__hacklipse_xss_probe__"
 _MARKER = re.compile(rf"^{XSS_EXECUTION_MARKER_PREFIX}[A-Za-z0-9_-]+$")
+_ATTRIBUTE_MARKER = re.compile(
+    rf"^{XSS_EXECUTION_MARKER_PREFIX}attr_(data-[A-Za-z][A-Za-z0-9-]{{0,30}})_[A-Za-z0-9z]+$"
+)
+_ATTRIBUTE_NAME = re.compile(r"^data-[a-z][a-z0-9-]{0,30}$")
 _REFLECTION_MARKER = re.compile(rf"^{XSS_REFLECTION_MARKER_PREFIX}[A-Za-z0-9_-]+$")
+_MESSAGE_TYPE = re.compile(r"^[a-z][a-z0-9_-]{0,19}(?::[a-z][a-z0-9_-]{0,19}){0,2}$")
+_MESSAGE_FIELDS = frozenset({"html", "markup", "content"})
+_POSTMESSAGE_KINDS = frozenset({
+    HttpRequestKind.POSTMESSAGE_CONTROL,
+    HttpRequestKind.POSTMESSAGE_REFLECTION,
+    HttpRequestKind.POSTMESSAGE_EXECUTION,
+})
+
+
+def postmessage_payload(request: ExecutionRequest) -> tuple[str, str, str] | None:
+    """Decode a tightly bounded message plan. Browser runtime owns the markup."""
+
+    if request.request_kind not in _POSTMESSAGE_KINDS:
+        raise ValueError("request is not a postMessage browser probe")
+    if request.query_parameters or request.headers:
+        raise ValueError("postMessage browser probe cannot change URL or headers")
+    if request.request_kind is HttpRequestKind.POSTMESSAGE_CONTROL:
+        if request.body is not None:
+            raise ValueError("postMessage control must not send a message")
+        return None
+    if request.body is None or len(request.body) > 240:
+        raise ValueError("postMessage probe requires a bounded plan")
+    try:
+        plan = json.loads(request.body)
+    except (ValueError, TypeError) as error:
+        raise ValueError("postMessage plan is not valid JSON") from error
+    if not isinstance(plan, dict) or set(plan) != {"type", "field", "marker"}:
+        raise ValueError("postMessage plan has invalid fields")
+    event_type, field, marker = (plan[key] for key in ("type", "field", "marker"))
+    if not isinstance(event_type, str) or _MESSAGE_TYPE.fullmatch(event_type) is None:
+        raise ValueError("postMessage type is not a bounded event name")
+    if not isinstance(field, str) or field not in _MESSAGE_FIELDS:
+        raise ValueError("postMessage field is not an approved HTML field")
+    expected = (
+        _REFLECTION_MARKER if request.request_kind is HttpRequestKind.POSTMESSAGE_REFLECTION
+        else _MARKER
+    )
+    if not isinstance(marker, str) or expected.fullmatch(marker) is None:
+        raise ValueError("postMessage marker does not match its request kind")
+    return event_type, field, marker
 
 
 def validate_browser_xss_request(request: ExecutionRequest) -> None:
@@ -25,8 +72,13 @@ def validate_browser_xss_request(request: ExecutionRequest) -> None:
 
     if request.tool != BROWSER_XSS_TOOL:
         raise ValueError("request is not assigned to the browser XSS tool")
-    if request.method.upper() != "GET" or request.body is not None or request.headers:
+    if request.method.upper() != "GET" or request.headers:
         raise ValueError("browser XSS execution supports headerless GET requests only")
+    if request.request_kind in _POSTMESSAGE_KINDS:
+        postmessage_payload(request)
+        return
+    if request.body is not None:
+        raise ValueError("ordinary browser XSS execution cannot send a request body")
     if urlsplit(request.target_url).fragment == RAW_HASH_CANARY and (
         len(request.query_parameters) != 1
         or request.query_parameters[0][0] != RAW_HASH_PARAMETER
@@ -57,6 +109,9 @@ def browser_navigation_url(request: ExecutionRequest) -> tuple[str, str | None]:
     """
 
     validate_browser_xss_request(request)
+    if request.request_kind in _POSTMESSAGE_KINDS:
+        plan = postmessage_payload(request)
+        return _browser_url(request, {}), plan[2] if plan else None
     if request.request_kind is HttpRequestKind.CONTROL:
         return _browser_url(request, {}), None
 
@@ -73,8 +128,19 @@ def reflection_marker(request: ExecutionRequest) -> str | None:
     """반사 탐침이 실은 marker. 실행 탐침과 control 에서는 None 이다."""
 
     validate_browser_xss_request(request)
+    if request.request_kind is HttpRequestKind.POSTMESSAGE_REFLECTION:
+        plan = postmessage_payload(request)
+        return plan[2] if plan else None
     reflections = _reflection_markers(request)
     return reflections[0] if reflections else None
+
+
+def attribute_execution_marker(raw: str, attribute: str) -> str:
+    """Bind a fixed double-parsing probe to a validated observed attribute."""
+
+    if _ATTRIBUTE_NAME.fullmatch(attribute) is None:
+        raise ValueError("secondary XSS attribute must be a bounded data-* name")
+    return probe_marker(raw, prefix=f"{XSS_EXECUTION_MARKER_PREFIX}attr_{attribute}_")
 
 
 def _execution_payload(marker: str) -> str:
@@ -85,7 +151,17 @@ def _execution_payload(marker: str) -> str:
     있고 marker 만 바뀌므로 Agent 나 LLM 이 임의 코드를 주입할 수 없다.
     """
 
-    return f"<img src=x onerror=\"window.{_WINDOW_SLOT}='{marker}'\">"
+    # The marker is restricted to safe identifier characters. A template
+    # literal avoids the apostrophe that can break a surrounding SQL string
+    # before an otherwise exploitable reflected HTML response is rendered.
+    script = f"<img src=x onerror=\"window.{_WINDOW_SLOT}=`{marker}`\">"
+    attribute = _ATTRIBUTE_MARKER.fullmatch(marker)
+    if attribute is not None:
+        # A sanitizer may preserve a data-* value that the application later
+        # assigns to innerHTML. Encode the inner markup once so it can only
+        # execute if the observed second parsing sink actually exists.
+        return f'<span {attribute.group(1)}="{escape(script, quote=True)}">tip</span>'
+    return script
 
 
 def _browser_url(request: ExecutionRequest, replacements: dict[str, str]) -> str:

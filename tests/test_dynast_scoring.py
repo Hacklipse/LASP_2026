@@ -100,6 +100,74 @@ class DynastScoringTests(unittest.TestCase):
             "method": "POST", "path": "/api/{value}/{value}", "params": ["email"],
         }])
 
+    def test_embedded_basic_header_uses_observed_document_entry(self):
+        self.stores.surfaces.add(Surface(
+            surface_id="document", run_id="run-1",
+            url="http://localhost:13322/connected/apps", method="GET",
+            discovery_types=("browser_navigation",),
+        ))
+        self.stores.surfaces.add(Surface(
+            surface_id="script", run_id="run-1",
+            url="http://localhost:13322/static/app-123.js", method="GET",
+            discovery_types=("browser_javascript_response",),
+        ))
+        self.stores.evidence.append(Evidence(
+            evidence_id="reference", run_id="run-1", surface_id="script",
+            created_by="browser_recon", evidence_type="observation",
+            observation={"type": "client_script_reference",
+                         "document_surface_id": "document"},
+        ))
+        self.stores.evidence.append(Evidence(
+            evidence_id="signal", run_id="run-1", surface_id="script",
+            created_by="sensitive_exposure_analyzer", evidence_type="observation",
+            observation={"type": "sensitive_json_exposure",
+                         "field_paths": ["fetch.authorization"]},
+        ))
+        self.stores.findings.add(Finding(
+            finding_id="finding-basic", run_id="run-1", candidate_id="candidate-basic",
+            validation_id="validation-basic", vulnerability_type="Sensitive Data Exposure",
+            surface_id="script", evidence_ids=("signal",),
+            proof_type=ValidationProofType.SENSITIVE_DATA_EXPOSURE,
+            reproduction_count=1, severity="high",
+        ))
+        findings, _ = build_dynast_documents(
+            self.app, self.run, app_name="sample", variant="vuln",
+        )
+        self.assertEqual(findings["findings"][0]["cwe"], "CWE-522")
+        self.assertEqual(findings["findings"][0]["location"]["http"], {
+            "method": "GET", "path": "/connected/apps",
+        })
+
+    def test_exports_only_operations_backed_by_successful_schema_response(self):
+        self.stores.surfaces.add(Surface(
+            surface_id="graphql", run_id="run-1",
+            url="http://localhost:13322/graphql", method="GET",
+            discovery_types=("graphql_introspection",),
+        ))
+        self.stores.evidence.append(Evidence(
+            evidence_id="schema", run_id="run-1", surface_id=None,
+            created_by="execution_runtime:http_get", evidence_type="http_response",
+            observation={"status": 200, "content_type": "application/json"},
+        ))
+        for evidence_id, source_id, operation in (
+            ("observed", "schema", "posts"),
+            ("unbacked", "missing", "secretField"),
+        ):
+            self.stores.evidence.append(Evidence(
+                evidence_id=evidence_id, run_id="run-1", surface_id="graphql",
+                created_by="recon", evidence_type="observation",
+                observation={
+                    "type": "graphql_schema_operation", "graphql_kind": "query",
+                    "operation": operation, "schema_evidence_id": source_id,
+                },
+            ))
+        _, endpoints = build_dynast_documents(
+            self.app, self.run, app_name="graphql", variant="vuln",
+        )
+        self.assertIn({"kind": "graphql", "graphql_kind": "query", "op": "posts"},
+                      endpoints["endpoints"])
+        self.assertFalse(any(item.get("op") == "secretField" for item in endpoints["endpoints"]))
+
 
 if __name__ == "__main__":
     unittest.main()

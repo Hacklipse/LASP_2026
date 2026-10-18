@@ -242,6 +242,7 @@ class ReviewingValidationAgent:
 def build_llm_reviewing_validation_agent(
     *, llm_client: LlmClient, candidate_store: CandidateStore,
     evidence_store: EvidenceStore, surface_store: SurfaceStore,
+    collector=None,
     timeout_seconds: float = 60.0,
 ) -> ReviewingValidationAgent:
     """Opt-in assembly point; common bootstrap can register this Agent unchanged."""
@@ -253,6 +254,7 @@ def build_llm_reviewing_validation_agent(
             candidate_store=candidate_store,
             evidence_store=evidence_store,
             surface_store=surface_store,
+            collector=collector,
         ),
         reviewer=LlmValidationReviewer(llm_client=llm_client),
         candidate_store=candidate_store,

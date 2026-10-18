@@ -66,7 +66,7 @@ class BrowserXssAnalyzer:
             required_tool=BROWSER_XSS_TOOL,
         )
         marker = probe_marker(
-            f"{task.task_id}{candidate.candidate_id}",
+            f"{task.run_id}{candidate.candidate_id}",
             prefix=XSS_REFLECTION_MARKER_PREFIX,
         )
         requests = build_reflection_requests(

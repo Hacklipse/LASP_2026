@@ -13,6 +13,7 @@ from hacklipse.adapters.browser_runtime import (
 from hacklipse.adapters.policy import AllowlistPolicyGate
 from hacklipse.adapters.xss_execution import (
     BROWSER_XSS_TOOL,
+    attribute_execution_marker,
     browser_navigation_url,
 )
 from hacklipse.domain import (
@@ -176,8 +177,21 @@ class BrowserProbeContractTests(unittest.TestCase):
         parameters = dict(parse_qsl(urlsplit(url).query, keep_blank_values=True))
         self.assertEqual(
             parameters["name"],
-            f'<img src=x onerror="window.__hacklipse_xss_probe__=\'{_MARKER}\'">',
+            f'<img src=x onerror="window.__hacklipse_xss_probe__=`{_MARKER}`">',
         )
+        self.assertNotIn("'", parameters["name"])
+
+    def test_secondary_attribute_probe_uses_encoded_fixed_script(self) -> None:
+        marker = attribute_execution_marker("validation-1", "data-note")
+        url, expected = browser_navigation_url(_request(value=marker))
+        payload = dict(parse_qsl(urlsplit(url).query, keep_blank_values=True))["name"]
+
+        self.assertEqual(expected, marker)
+        self.assertIn('data-note="&lt;img ', payload)
+        self.assertIn("onerror=&quot;window.__hacklipse_xss_probe__", payload)
+        self.assertNotIn("<img", payload)
+        with self.assertRaises(ValueError):
+            attribute_execution_marker("validation-1", "onerror")
 
     def test_control_request_never_receives_an_execution_script(self) -> None:
         request = _request(kind=HttpRequestKind.CONTROL, value="hacklipse-control")

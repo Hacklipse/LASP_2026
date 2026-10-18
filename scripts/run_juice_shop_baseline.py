@@ -110,6 +110,7 @@ from run_dvwa_baseline import (  # noqa: E402
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1"})
 _CREDENTIAL_REF = "interactive-local-juice-shop"
 _AUTO_SESSION_CREDENTIAL_REF = "interactive-local-juice-shop-auto-session"
+_AUTO_OWNER_CREDENTIAL_REF = "local-auto-owner-session"
 _ACTOR_CREDENTIAL_REF = "interactive-local-juice-shop-actor"
 _OWNER_CREDENTIAL_REF = "interactive-local-juice-shop-owner"
 _RECON_CREDENTIAL_REF = "temporary-local-juice-shop-recon"
@@ -131,6 +132,7 @@ _OBJECT_ID = re.compile(r"^[0-9]{1,10}$")
 _KNOWLEDGE_DIRECTORY = Path("knowledge")
 _MAX_SESSION_COOKIE_LENGTH = 16_384
 _MAX_SESSION_COOKIE_COUNT = 64
+_MAX_SESSION_AUTHORIZATION_LENGTH = 8192
 
 
 def _parse_session_cookie(value: str) -> ResolvedHttpCredential:
@@ -191,6 +193,20 @@ def _read_session_cookie_stdin() -> ResolvedHttpCredential:
     if not value:
         raise ValueError("stdin에 로그인 세션 Cookie가 없습니다")
     return _parse_session_cookie(value)
+
+
+def _read_session_authorization_stdin() -> ResolvedHttpCredential:
+    """Read a bearer credential for the target origin without recording it."""
+
+    value = sys.stdin.readline(_MAX_SESSION_AUTHORIZATION_LENGTH + 2).strip()
+    if value.casefold().startswith("authorization:"):
+        value = value.split(":", 1)[1].strip()
+    if (
+        len(value) > _MAX_SESSION_AUTHORIZATION_LENGTH
+        or re.fullmatch(r"Bearer [A-Za-z0-9._~-]{1,8000}", value) is None
+    ):
+        raise ValueError("세션 Authorization은 Bearer 토큰 형식이어야 합니다")
+    return ResolvedHttpCredential(authorization=value)
 
 
 def _recon_planner_summary(evidence) -> str | None:
@@ -1181,6 +1197,8 @@ def main(
                 session_credential = None
             elif getattr(args, "session_cookie_stdin", False):
                 session_credential = _read_session_cookie_stdin()
+            elif getattr(args, "session_authorization_stdin", False):
+                session_credential = _read_session_authorization_stdin()
             else:
                 session_credential = _prompt_optional_session_cookie()
         except ValueError as error:
@@ -1189,7 +1207,20 @@ def main(
         if session_credential is not None:
             credentials[_AUTO_SESSION_CREDENTIAL_REF] = session_credential
             run_credential_ref = _AUTO_SESSION_CREDENTIAL_REF
-            print("로그인 세션을 이 Run에 적용합니다. Cookie 원문은 저장하지 않습니다.")
+            print("로그인 세션을 이 Run에 적용합니다. 인증정보 원문은 저장하지 않습니다.")
+            if getattr(args, "owner_session_cookie_stdin", False):
+                try:
+                    owner_credential = _read_session_cookie_stdin()
+                except ValueError as error:
+                    print(f"취소: 두 번째 세션이 유효하지 않습니다: {error}")
+                    return 2
+                credentials[_AUTO_OWNER_CREDENTIAL_REF] = owner_credential
+                principal_credentials = (
+                    ("actor", _AUTO_SESSION_CREDENTIAL_REF),
+                    ("owner", _AUTO_OWNER_CREDENTIAL_REF),
+                )
+                actor_object_id = args.access_actor_object_id
+                owner_object_id = args.access_owner_object_id
         else:
             print("로그인 세션 없이 익명 탐색을 진행합니다.")
     if access_control:

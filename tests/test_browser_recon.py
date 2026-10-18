@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import unittest
@@ -10,7 +11,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
 from hacklipse.adapters.browser_recon import (
-    PlaywrightRecon, _CollectorTransport, _page_family, _page_visit_cap,
+    PlaywrightRecon, _CollectorTransport, _adaptive_page_visit_cap,
+    _page_family, _page_visit_cap,
     _promote_unvisited_family, request_structure,
 )
 from hacklipse.adapters.browser_runtime import PlaywrightBrowserRuntime
@@ -59,6 +61,13 @@ class BrowserRequestBoundaryTests(unittest.TestCase):
         self.assertEqual(_page_visit_cap(6, 100), 12)
         self.assertEqual(_page_visit_cap(2, 100), 2)
 
+    def test_observed_low_page_cost_extends_only_new_route_families(self):
+        self.assertEqual(_adaptive_page_visit_cap(6, 8, 8, 30, 48, True), 9)
+        self.assertEqual(_adaptive_page_visit_cap(6, 8, 8, 30, 34, True), 8)
+        self.assertEqual(_adaptive_page_visit_cap(6, 8, 8, 30, 48, False), 8)
+        self.assertEqual(_adaptive_page_visit_cap(2, 2, 2, 1, 48, True), 2)
+        self.assertEqual(_adaptive_page_visit_cap(6, 12, 12, 10, 48, True), 12)
+
     def test_json_navigation_response_feeds_browser_frontier_without_extra_request(self):
         app, task = _fixture()
 
@@ -85,12 +94,59 @@ class BrowserRequestBoundaryTests(unittest.TestCase):
         self.assertEqual(transport.sent, 1)
         self.assertEqual(route.outcome[0], "fulfill")
 
+    def test_script_request_records_only_same_origin_document_provenance(self):
+        app, task = _fixture()
+
+        class Collector:
+            def collect_with_result(self, *args, **kwargs):
+                return "evi-script", ExecutionResult(
+                    execution_id="script", evidence_type="http_response",
+                    observation={
+                        "status": 200, "content_type": "application/javascript",
+                        "headers": [["content-type", "application/javascript"]],
+                        "body": "void 0",
+                    },
+                )
+
+        def remember(url, method, names, *args):
+            return "script" if url.endswith("app.js") else "document"
+
+        transport = _CollectorTransport(
+            collector=Collector(), task=task,
+            scope=app.stores.runs.get(task.run_id).scope,
+            remember=remember, limit=3, deadline=time.monotonic() + 3,
+        )
+        for referer in (
+            "http://127.0.0.1/page?view=private",
+            "http://127.0.0.1/page?view=private",
+            "https://example.invalid/page",
+        ):
+            route = _Route(
+                "http://127.0.0.1/app.js", resource_type="script",
+                headers={"referer": referer},
+            )
+            transport.handle(route)
+            self.assertEqual(route.outcome[0], "fulfill")
+        self.assertEqual(
+            [detail for _, detail in transport.observations],
+            [{"type": "client_script_reference", "document_surface_id": "document"}],
+        )
+        self.assertNotIn("private", str(transport.observations))
+
     def test_page_family_prioritizes_new_routes_without_dropping_object_links(self):
         base = "http://127.0.0.1:8080"
         first = base + "/posts/1"
         second = base + "/posts/2"
         search = base + "/search?q=first"
         self.assertEqual(_page_family(first), _page_family(second))
+        self.assertEqual(
+            _page_family(base + "/posts/cmvcnc9nw000nmh1kt1nlensz"),
+            _page_family(base + "/posts/cmvcnc9no000jmh1kunnk5huv"),
+        )
+        self.assertNotEqual(
+            _page_family(base + "/posts/quarterly-report-2026"),
+            _page_family(base + "/posts/annual-report-2026"),
+        )
         self.assertEqual(_page_family(search), _page_family(base + "/search?q=second"))
         pending = [second, search]
         _promote_unvisited_family(pending, {_page_family(first)})
@@ -160,6 +216,11 @@ class _App(BaseHTTPRequestHandler):
               <button role="tab" onclick="document.querySelector('nav').insertAdjacentHTML('beforeend','<a href=/tabbed>Tab page</a>');let x=new XMLHttpRequest();x.open('GET','/api/tab?view=detail');x.send()">Details</button>
               <script src="/runtime.js"></script><script src="/vendor.js"></script><script src="/framework.js"></script>
               <script src="/app/layout.js"></script></body></html>'''
+        elif self.path == "/seed-index":
+            body = '<html><body><a href="/seed-schema.json">API description</a></body></html>'
+        elif self.path == "/seed-schema.json":
+            media = "application/json"
+            body = '{"openapi":"3.0.0","paths":{"/hash":{"get":{}}}}'
         elif self.path == "/app/layout.js":
             media = "application/javascript"
             body = 'fetch(["","api","nav"].join("/")).then(r=>r.json()).then(d=>{document.querySelector("nav").innerHTML=d.map(x=>`<a href="${x}">${x}</a>`).join("")});' + f'fetch("{self.other_origin}/outside").catch(()=>{{}});' + 'setTimeout(()=>document.body.insertAdjacentHTML("beforeend", "<a href=/late>Late link</a>"),50);'
@@ -178,6 +239,11 @@ class _App(BaseHTTPRequestHandler):
             body = '''<html><body><div id="out"></div><script>
               function render(){document.getElementById('out').innerHTML=decodeURIComponent(location.hash.slice(1))}
               addEventListener('hashchange',render);render();</script></body></html>'''
+        elif self.path == "/hash-delayed":
+            body = '''<html><body><div id="out"></div><script>
+              function render(){document.getElementById('out').innerHTML=decodeURIComponent(location.hash.slice(1))}
+              addEventListener('hashchange',()=>setTimeout(render,1000));render();
+              </script></body></html>'''
         elif self.path == "/hash-safe":
             body = '''<html><body><div id="out"></div><script>
               function render(){document.getElementById('out').textContent=decodeURIComponent(location.hash.slice(1))}
@@ -200,7 +266,10 @@ class LiveBrowserReconTests(unittest.TestCase):
         from playwright.sync_api import sync_playwright, Error
         with sync_playwright() as p:
             try:
-                browser = p.chromium.launch()
+                executable = os.environ.get("HACKLIPSE_TEST_CHROMIUM")
+                browser = p.chromium.launch(**(
+                    {"executable_path": executable} if executable else {}
+                ))
                 browser.close()
             except Error as error:
                 raise unittest.SkipTest("Chromium not installed") from error
@@ -247,6 +316,7 @@ class LiveBrowserReconTests(unittest.TestCase):
             iterative_planner=planner,
             browser_recon=PlaywrightRecon(
                 collector=app.collector, run_store=app.stores.runs, max_pages=2,
+                executable_path=os.environ.get("HACKLIPSE_TEST_CHROMIUM"),
             ),
         )
         agent.handle(task)
@@ -272,6 +342,7 @@ class LiveBrowserReconTests(unittest.TestCase):
         task = replace(task, target_url=base + "/")
         browser = PlaywrightRecon(
             collector=app.collector, run_store=app.stores.runs, max_pages=2,
+            executable_path=os.environ.get("HACKLIPSE_TEST_CHROMIUM"),
         )
         result = browser.discover(
             task, remember=lambda *args: "surface-observed",
@@ -292,7 +363,10 @@ class LiveBrowserReconTests(unittest.TestCase):
         task = replace(task, target_url=base + "/")
         agent = ReconAgent(collector=app.collector, evidence_store=app.stores.evidence,
                            surface_store=app.stores.surfaces, max_pages=10,
-                           browser_recon=PlaywrightRecon(collector=app.collector, run_store=app.stores.runs, max_pages=6))
+                           browser_recon=PlaywrightRecon(
+                               collector=app.collector, run_store=app.stores.runs, max_pages=6,
+                               executable_path=os.environ.get("HACKLIPSE_TEST_CHROMIUM"),
+                           ))
         result = agent.handle(task)
         surfaces = app.stores.surfaces.list_by_run(task.run_id)
         urls = {s.url for s in surfaces}
@@ -324,7 +398,8 @@ class LiveBrowserReconTests(unittest.TestCase):
             collector=app.collector, evidence_store=app.stores.evidence,
             surface_store=app.stores.surfaces, max_pages=1,
             browser_recon=PlaywrightRecon(
-                collector=app.collector, run_store=app.stores.runs, max_pages=1
+                collector=app.collector, run_store=app.stores.runs, max_pages=1,
+                executable_path=os.environ.get("HACKLIPSE_TEST_CHROMIUM"),
             ),
         )
         agent.handle(task)
@@ -342,6 +417,45 @@ class LiveBrowserReconTests(unittest.TestCase):
         ))
         self.assertFalse(any(method != "GET" for method, _ in _App.requests))
 
+    def test_unlinked_html_discovered_from_schema_is_rendered(self):
+        base = f"http://127.0.0.1:{self.server.server_port}"
+        app, task = _fixture(budget=40)
+        from dataclasses import replace
+        task = replace(task, target_url=base + "/seed-index")
+        agent = ReconAgent(
+            collector=app.collector, evidence_store=app.stores.evidence,
+            surface_store=app.stores.surfaces, max_pages=5,
+            browser_recon=PlaywrightRecon(
+                collector=app.collector, run_store=app.stores.runs, max_pages=3,
+                executable_path=os.environ.get("HACKLIPSE_TEST_CHROMIUM"),
+            ),
+        )
+        agent.handle(task)
+        self.assertIn(("GET", "/hash"), _App.requests)
+        self.assertTrue(any(
+            surface.url == base + "/hash#" + RAW_HASH_CANARY
+            for surface in app.stores.surfaces.list_by_run(task.run_id)
+        ))
+
+    def test_async_hash_render_is_observed_within_browser_deadline(self):
+        base = f"http://127.0.0.1:{self.server.server_port}"
+        app, task = _fixture(budget=20)
+        from dataclasses import replace
+        task = replace(task, target_url=base + "/hash-delayed")
+        agent = ReconAgent(
+            collector=app.collector, evidence_store=app.stores.evidence,
+            surface_store=app.stores.surfaces, max_pages=1,
+            browser_recon=PlaywrightRecon(
+                collector=app.collector, run_store=app.stores.runs, max_pages=1,
+                executable_path=os.environ.get("HACKLIPSE_TEST_CHROMIUM"),
+            ),
+        )
+        agent.handle(task)
+        self.assertTrue(any(
+            item.url == base + "/hash-delayed#" + RAW_HASH_CANARY
+            for item in app.stores.surfaces.list_by_run(task.run_id)
+        ))
+
     def test_safe_hash_renderer_does_not_execute_validation_payload(self):
         base = f"http://127.0.0.1:{self.server.server_port}"
         marker = XSS_EXECUTION_MARKER_PREFIX + "safecontrol"
@@ -356,7 +470,8 @@ class LiveBrowserReconTests(unittest.TestCase):
         )
         navigation_url, expected = browser_navigation_url(request)
         result = PlaywrightBrowserRuntime._run_playwright(
-            request, navigation_url, expected, ()
+            request, navigation_url, expected, (),
+            executable_path=os.environ.get("HACKLIPSE_TEST_CHROMIUM"),
         )
         self.assertEqual(result.evidence_type, "browser_execution")
         self.assertFalse(result.observation["script_executed"])
@@ -370,7 +485,10 @@ class LiveBrowserReconTests(unittest.TestCase):
                 _App.requests = []
                 app, task = _fixture(
                     budget=budget,
-                    runtime=PlaywrightBrowserRuntime(http_runtime=HttpExecutionRuntime()),
+                    runtime=PlaywrightBrowserRuntime(
+                        http_runtime=HttpExecutionRuntime(),
+                        executable_path=os.environ.get("HACKLIPSE_TEST_CHROMIUM"),
+                    ),
                 )
                 _, result = app.collector.collect_with_result(
                     task.run_id, base + "/hash#" + RAW_HASH_CANARY,

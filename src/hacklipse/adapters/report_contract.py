@@ -37,11 +37,19 @@ PROOF_DESCRIPTIONS = MappingProxyType({
     ValidationProofType.SSTI_EXECUTION:
         "고정 산술 control/probe 비교에서 서버 측 평가 확인",
     ValidationProofType.SENSITIVE_DATA_EXPOSURE:
-        "독립 공개 HTML 재요청에서 자격증명 형태 JSON 필드 확인",
+        "독립 클라이언트 콘텐츠 재요청에서 자격증명 노출 확인",
+    ValidationProofType.WORKING_PUBLIC_CREDENTIAL:
+        "독립 공개 스크립트 재요청과 승인된 로그인 재현으로 유효한 자격증명 확인",
+    ValidationProofType.GRAPHQL_INTROSPECTION_EXPOSURE:
+        "독립 무인증 읽기 전용 요청에서 GraphQL 스키마 조회 가능 확인",
+    ValidationProofType.GRAPHQL_FIELD_SUGGESTION_EXPOSURE:
+        "독립 무인증 읽기 전용 요청에서 GraphQL 필드 이름 제안 확인",
     ValidationProofType.SOURCE_MAP_EXPOSURE:
         "독립 GET 재요청에서 공개 source map의 원본 소스 확인",
+    ValidationProofType.ERROR_DETAIL_EXPOSURE:
+        "독립 GET 재요청에서 오류 응답의 내부 스택 프레임 확인",
     ValidationProofType.OPEN_REDIRECT:
-        "독립 control/probe 비교에서 외부 origin 리다이렉트 확인",
+        "독립 control/probe 비교에서 외부 origin 이동 대상 확인",
 })
 PROOF_UNAVAILABLE = "검증 상세를 사용할 수 없음"
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")

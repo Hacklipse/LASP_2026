@@ -13,6 +13,7 @@ import unittest
 from dataclasses import replace
 
 from hacklipse.adapters import HeuristicSqliAnalyzer
+from hacklipse.adapters.validation import ValidationAgent
 from hacklipse.adapters.sqli_analysis import HEURISTIC_SQLI_ANALYZER
 from hacklipse.application.errors import AgentContractError
 from hacklipse.ports.errors import BudgetExceeded
@@ -20,6 +21,7 @@ from hacklipse.bootstrap import build_local_application
 from hacklipse.domain import (
     AgentResultStatus,
     Candidate,
+    Evidence,
     DomainInvariantError,
     ExecutionRequest,
     ExecutionResult,
@@ -29,6 +31,8 @@ from hacklipse.domain import (
     RunScope,
     Surface,
     TaskEnvelope,
+    ValidationProofType,
+    ValidationVerdict,
 )
 
 _RUN_ID = "run-sqli"
@@ -286,6 +290,89 @@ class HeuristicSqliAnalyzerTests(unittest.TestCase):
         self.assertIs(result.status, AgentResultStatus.NEEDS_EVIDENCE)
         self.assertEqual(runtime.requests, [], "Agent는 직접 요청하지 않는다")
         self.assertTrue(result.evidence_requests)
+
+
+class GraphqlSqliPipelineTests(unittest.TestCase):
+    def test_schema_derived_read_query_requires_independent_error_reproduction(self):
+        runtime = _SqlRuntime(mode="error_message")
+        app = build_local_application({}, runtime=runtime)
+        app.stores.runs.add(Run(
+            run_id=_RUN_ID, target_url="http://local.test/",
+            scope=RunScope(allowed_hosts=frozenset({"local.test"})),
+            policy_profile="safe", request_budget=20,
+        ))
+        app.stores.surfaces.add(Surface(
+            surface_id=_SURFACE_ID, run_id=_RUN_ID,
+            url="http://local.test/graphql", method="GET",
+            discovery_types=("graphql_introspection",),
+        ))
+        app.stores.evidence.append(Evidence(
+            evidence_id="evi-plan", run_id=_RUN_ID, surface_id=_SURFACE_ID,
+            created_by="recon", evidence_type="observation",
+            observation={"type": "graphql_read_query_plan", "plans": [
+                {"field": "search", "argument": "term", "select_typename": True},
+            ]},
+        ))
+        app.stores.candidates.add(Candidate(
+            candidate_id=_CANDIDATE_ID, run_id=_RUN_ID,
+            surface_id=_SURFACE_ID, vulnerability_type="SQLi",
+            hypothesis="schema-derived read query", assigned_agent="sqli_analyzer",
+            evidence_ids=("evi-plan",),
+        ))
+        app.budget_manager.open_run(_RUN_ID, 20)
+        analyzer = HeuristicSqliAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
+        task = TaskEnvelope(
+            task_id="task-graphql-analysis", run_id=_RUN_ID,
+            agent_type="sqli_analyzer", target_url="http://local.test/graphql",
+            surface_id=_SURFACE_ID, candidate_id=_CANDIDATE_ID,
+            evidence_ids=("evi-plan",), allowed_tools=("http_get",),
+            request_budget=20,
+        )
+        first = analyzer.handle(task)
+        self.assertIs(first.status, AgentResultStatus.NEEDS_EVIDENCE)
+        self.assertEqual(len(first.evidence_requests), 2)
+        self.assertEqual([item.http_request.request_kind for item in first.evidence_requests], [
+            HttpRequestKind.GRAPHQL_QUERY_CONTROL, HttpRequestKind.GRAPHQL_QUERY_PROBE,
+        ])
+        task = _collect(first, app, task)
+        analyzed = analyzer.handle(task)
+        self.assertEqual(len(analyzed.new_evidence_ids), 2)
+        observations = app.stores.evidence.get_many(_RUN_ID, analyzed.new_evidence_ids)
+        self.assertEqual(
+            {item.observation.get("type") for item in observations},
+            {"graphql_query_probe_result", "sql_error"},
+        )
+
+        validator = ValidationAgent(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        )
+        validation_task = TaskEnvelope(
+            task_id="task-graphql-validation", run_id=_RUN_ID,
+            agent_type="validation_agent", surface_id=_SURFACE_ID,
+            candidate_id=_CANDIDATE_ID, validation_id="validation-graphql",
+            evidence_ids=(*task.evidence_ids, *analyzed.new_evidence_ids),
+            allowed_tools=("http_get",), request_budget=20,
+        )
+        pending = validator.handle(validation_task)
+        self.assertIs(pending.status, AgentResultStatus.NEEDS_EVIDENCE)
+        self.assertEqual(len(pending.evidence_requests), 2)
+        self.assertEqual(runtime.requests[-1].request_kind, HttpRequestKind.GRAPHQL_QUERY_PROBE)
+        ids = tuple(app.collector.collect(
+            _RUN_ID, "http://local.test/graphql", request,
+            task_id=validation_task.task_id, validation_id=validation_task.validation_id,
+        ) for request in pending.evidence_requests)
+        decided = validator.handle(replace(
+            validation_task, evidence_ids=(*validation_task.evidence_ids, *ids)
+        ))
+        self.assertIs(decided.validation.verdict, ValidationVerdict.CONFIRMED)
+        self.assertIs(decided.validation.proof.proof_type, ValidationProofType.SQLI_EFFECT)
+        self.assertEqual(len(runtime.requests), 4)
 
 
 if __name__ == "__main__":

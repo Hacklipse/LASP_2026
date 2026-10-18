@@ -143,10 +143,10 @@ class LlmBrowserXssAnalyzer:
                 candidate_ids=(candidate.candidate_id,),
             )
 
-        # marker 는 휴리스틱 판과 같은 규칙으로 만든다. task 와 candidate 로부터
-        # 결정적이므로 NEEDS_EVIDENCE 라운드를 넘어가도 같은 값이 복원된다.
+        # Task ID는 Evidence 수집 뒤 재호출할 때 달라진다. Run/Candidate ID로
+        # marker를 고정해야 수집된 Evidence를 다음 라운드에서 다시 찾는다.
         marker = probe_marker(
-            f"{task.task_id}{candidate.candidate_id}",
+            f"{task.run_id}{candidate.candidate_id}",
             prefix=XSS_REFLECTION_MARKER_PREFIX,
         )
         requests = build_reflection_requests(

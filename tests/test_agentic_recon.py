@@ -301,7 +301,8 @@ class AgenticReconIntegrationTests(unittest.TestCase):
         class BrowserFrontier:
             selected = None
 
-            def discover(self, task, *, remember, request_budget, timeout_seconds, select_next):
+            def discover(self, task, *, remember, request_budget, timeout_seconds,
+                         document_seed_urls=(), select_next):
                 options = tuple(
                     (task.target_url + path, remember(
                         task.target_url + path, "GET", (), (), ("browser_dom",)

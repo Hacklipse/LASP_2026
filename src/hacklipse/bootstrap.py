@@ -42,14 +42,19 @@ from hacklipse.adapters import (
 from hacklipse.adapters.llm_router_advisor import LlmRouterAdvisor
 from hacklipse.adapters.browser_recon import PlaywrightRecon
 from hacklipse.adapters.browser_runtime import PlaywrightBrowserRuntime
+from hacklipse.adapters.postmessage_xss_analysis import PostMessageXssAnalyzer
 from hacklipse.adapters.analyzer_capabilities import (
     DEFAULT_ANALYZER_CAPABILITIES, OPTIONAL_SOURCE_MAP_CAPABILITIES,
 )
 from hacklipse.adapters.routing import OPTIONAL_SOURCE_MAP_RULES
 from hacklipse.adapters.sensitive_exposure import SensitiveExposureAnalyzer
+from hacklipse.adapters.public_login_credentials import PublicLoginCredentialsAnalyzer
+from hacklipse.adapters.graphql_introspection import GraphqlIntrospectionAnalyzer
+from hacklipse.adapters.graphql_suggestions import GraphqlSuggestionAnalyzer
 from hacklipse.adapters.open_redirect_analysis import OpenRedirectAnalyzer
 from hacklipse.adapters.cors_analysis import CorsAnalyzer
 from hacklipse.adapters.source_map_exposure import SourceMapExposureAnalyzer
+from hacklipse.adapters.error_disclosure import ErrorDisclosureAnalyzer
 from hacklipse.adapters.agentic_probe import AgenticHttpProbeAgent
 from hacklipse.adapters.analysis_llm_fallback import (
     BoundedAnalysisLlmClient,
@@ -360,13 +365,18 @@ def build_local_application(
 # 실제로 구현된 Analysis Agent. Router가 이 목록 밖 Candidate를 만들면 Dispatcher가
 # AgentUnavailable로 Run 전체를 실패시키므로, 배선과 라우팅 규칙이 같은 목록을 봐야 한다.
 IMPLEMENTED_ANALYZERS = (
+    "error_disclosure_analyzer",
+    "graphql_suggestion_analyzer",
+    "graphql_introspection_analyzer",
     "source_map_exposure_analyzer",
     "cors_analyzer",
     "open_redirect_analyzer",
     "sensitive_exposure_analyzer",
+    "public_login_credentials_analyzer",
     "access_control_analyzer",
     "xss_analyzer",
     "browser_xss_analyzer",
+    "postmessage_xss_analyzer",
     "sqli_analyzer",
     "path_traversal_analyzer",
     "ssti_analyzer",
@@ -778,6 +788,43 @@ def register_standard_agents(
         allowed_tools=("http_get",),
     )
     app.dispatcher.register(
+        "public_login_credentials_analyzer",
+        PublicLoginCredentialsAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+            collector=app.collector,
+        ),
+        allowed_tools=("http_get", "http_post"),
+    )
+    app.dispatcher.register(
+        "graphql_introspection_analyzer",
+        GraphqlIntrospectionAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        ),
+        allowed_tools=("http_get",),
+    )
+    app.dispatcher.register(
+        "graphql_suggestion_analyzer",
+        GraphqlSuggestionAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        ),
+        allowed_tools=("http_get",),
+    )
+    app.dispatcher.register(
+        "error_disclosure_analyzer",
+        ErrorDisclosureAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        ),
+        allowed_tools=("http_get",),
+    )
+    app.dispatcher.register(
         "source_map_exposure_analyzer",
         SourceMapExposureAnalyzer(
             candidate_store=app.stores.candidates,
@@ -812,6 +859,15 @@ def register_standard_agents(
         allowed_tools=("browser_xss",),
     )
     app.dispatcher.register(
+        "postmessage_xss_analyzer",
+        PostMessageXssAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+        ),
+        allowed_tools=("browser_xss",),
+    )
+    app.dispatcher.register(
         "sqli_analyzer",
         sqli_analyzer,
         allowed_tools=("http_get",),
@@ -838,6 +894,7 @@ def register_standard_agents(
         candidate_store=app.stores.candidates,
         evidence_store=app.stores.evidence,
         surface_store=app.stores.surfaces,
+        collector=app.collector,
     )
     if validation_review:
         validation_agent = build_llm_reviewing_validation_agent(
@@ -845,12 +902,14 @@ def register_standard_agents(
             candidate_store=app.stores.candidates,
             evidence_store=app.stores.evidence,
             surface_store=app.stores.surfaces,
+            collector=app.collector,
         )
     app.dispatcher.register(
         "validation",
         validation_agent,
         allowed_tools=(
             "http_get",
+            "http_post",
             "browser_xss",
             "path_traversal_probe",
             "access_control_probe",

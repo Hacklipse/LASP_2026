@@ -36,6 +36,9 @@ from .probing import (
     resolve_analysis_task,
     response_body,
 )
+from .graphql_discovery import (
+    graphql_auth_blocked_response, graphql_query_plans, graphql_query_requests,
+)
 
 SQLI_ANALYSIS_TOOL = ANALYSIS_TOOL
 HEURISTIC_SQLI_ANALYZER = "heuristic_sqli_analyzer"
@@ -86,7 +89,19 @@ class HeuristicSqliAnalyzer:
             vulnerability_type="SQLi",
             candidate_store=self._candidates,
             surface_store=self._surfaces,
+            allow_parameterless_get=True,
         )
+        evidence = tuple(self._evidence.get_many(task.run_id, task.evidence_ids))
+        graphql_plans = tuple(
+            plan
+            for item in evidence
+            if item.surface_id == surface.surface_id
+            for plan in graphql_query_plans(item)
+        )
+        if graphql_plans and "graphql_introspection" in surface.discovery_types:
+            return self._handle_graphql(task, candidate, surface, evidence, graphql_plans)
+        if not parameters:
+            raise AgentContractError("SQLi analysis needs a parameterized read surface")
         # control과 probe가 따옴표 하나만 다르도록 같은 marker를 기준값으로 쓴다.
         marker = probe_marker(_stable_seed(task, candidate.candidate_id))
         requests = build_probe_requests(
@@ -96,7 +111,6 @@ class HeuristicSqliAnalyzer:
             probe_value=marker + _SYNTAX_BREAKER,
             purpose=f"SQLi candidate {candidate.candidate_id}",
         )
-        evidence = tuple(self._evidence.get_many(task.run_id, task.evidence_ids))
         collected = tuple(
             matching_evidence(evidence, surface.url, request) for request in requests
         )
@@ -159,6 +173,99 @@ class HeuristicSqliAnalyzer:
         return AgentResult(
             task_id=task.task_id,
             status=AgentResultStatus.COMPLETED,
+            new_evidence_ids=tuple(new_evidence_ids),
+            candidate_ids=(candidate.candidate_id,),
+        )
+
+    def _handle_graphql(
+        self, task: TaskEnvelope, candidate, surface, evidence, plans,
+    ) -> AgentResult:
+        """Probe only schema-derived read queries via the domain's bounded kind."""
+
+        marker = probe_marker(_stable_seed(task, candidate.candidate_id))
+        requests = tuple(
+            request
+            for plan in plans
+            for request in graphql_query_requests(
+                surface.surface_id, plan, marker,
+                f"GraphQL SQLi candidate {candidate.candidate_id}",
+            )
+        )
+        collected = tuple(
+            matching_evidence(evidence, surface.url, request) for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "GraphQL SQLi analysis lacks budget for comparable query pairs",
+                    required_requests=len(missing),
+                )
+            return AgentResult(
+                task_id=task.task_id, status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+                candidate_ids=(candidate.candidate_id,),
+            )
+        new_evidence_ids: list[str] = []
+        for index, plan in enumerate(plans):
+            control, probe = collected[2 * index:2 * index + 2]
+            if control is None or probe is None:
+                raise AgentContractError("GraphQL SQLi response pair is missing")
+            signal = sql_error_signal(control, probe)
+            parameter = f"{plan.field}.{plan.argument}"
+            outcome = (
+                "authentication_required"
+                if graphql_auth_blocked_response(control)
+                or graphql_auth_blocked_response(probe)
+                else "sql_error_signal" if signal is not None
+                else "incomparable_response" if any(
+                    item.observation.get("type") in {"http_error", "http_redirect"}
+                    for item in (control, probe)
+                ) else "no_sql_error_signal"
+            )
+            if not has_observation_record(
+                evidence, HEURISTIC_SQLI_ANALYZER, "graphql_query_probe_result",
+                parameter, control.evidence_id, probe.evidence_id,
+            ):
+                trace_id = f"evi-{self._id_factory()}"
+                self._evidence.append(Evidence(
+                    evidence_id=trace_id, run_id=task.run_id,
+                    surface_id=surface.surface_id, created_by=HEURISTIC_SQLI_ANALYZER,
+                    evidence_type="observation",
+                    observation={
+                        "type": "graphql_query_probe_result",
+                        "parameter": parameter,
+                        "graphql_field": plan.field,
+                        "graphql_argument": plan.argument,
+                        "outcome": outcome,
+                        "control_evidence_id": control.evidence_id,
+                        "probe_evidence_id": probe.evidence_id,
+                    },
+                ))
+                new_evidence_ids.append(trace_id)
+            if signal is None or has_observation_record(
+                evidence, HEURISTIC_SQLI_ANALYZER, "sql_error", parameter,
+                control.evidence_id, probe.evidence_id,
+            ):
+                continue
+            observation_id = f"evi-{self._id_factory()}"
+            self._evidence.append(Evidence(
+                evidence_id=observation_id, run_id=task.run_id,
+                surface_id=surface.surface_id, created_by=HEURISTIC_SQLI_ANALYZER,
+                evidence_type="observation",
+                observation={
+                    "type": "sql_error", "parameter": parameter,
+                    "graphql_field": plan.field, "graphql_argument": plan.argument,
+                    "control_evidence_id": control.evidence_id,
+                    "probe_evidence_id": probe.evidence_id,
+                    **signal,
+                },
+            ))
+            new_evidence_ids.append(observation_id)
+        return AgentResult(
+            task_id=task.task_id, status=AgentResultStatus.COMPLETED,
             new_evidence_ids=tuple(new_evidence_ids),
             candidate_ids=(candidate.candidate_id,),
         )

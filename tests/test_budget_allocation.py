@@ -17,6 +17,7 @@ from hacklipse.domain import (
     AgentResultStatus,
     Candidate,
     CandidateStatus,
+    Evidence,
     EvidenceRequest,
     ExecutionResult,
     HttpRequestSpec,
@@ -86,7 +87,67 @@ class _Agent:
         )
 
 
-def _app(*, stores=None, budget=None, advisor=None, analysis=None, validation=None):
+class _PlannedValidationAgent:
+    """Declare the entire request batch before the collector sends any part."""
+
+    def __init__(self, app, counts: dict[str, int], calls: list):
+        self._app = app
+        self._counts = counts
+        self._calls = calls
+
+    def handle(self, task):
+        self._calls.append(("validation", task.candidate_id))
+        existing = [item for item in self._app.stores.evidence.list_by_run(task.run_id)
+                    if item.validation_id == task.validation_id
+                    and item.surface_id == task.surface_id
+                    and item.evidence_type == "http_response"]
+        missing_count = self._counts.get(task.candidate_id, 0) - len(existing)
+        if missing_count > 0:
+            return AgentResult(
+                task_id=task.task_id, status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=tuple(EvidenceRequest(
+                    evidence_type="http_response", surface_id=task.surface_id,
+                    reason=f"planned proof request {index}", suggested_tool="http_get",
+                    http_request=HttpRequestSpec(method="GET"),
+                ) for index in range(missing_count)),
+            )
+        return AgentResult(
+            task_id=task.task_id, status=AgentResultStatus.COMPLETED,
+            validation=ValidationResult(
+                validation_id=task.validation_id or "", run_id=task.run_id,
+                candidate_id=task.candidate_id or "", verdict=ValidationVerdict.REJECTED,
+                evidence_ids=(), reason="planned proof rejected",
+            ),
+        )
+
+
+class _PlannedAnalysisAgent:
+    def __init__(self, app, counts: dict[str, int], calls: list):
+        self._app = app
+        self._counts = counts
+        self._calls = calls
+
+    def handle(self, task):
+        self._calls.append(("analysis", task.candidate_id))
+        existing = [item for item in self._app.stores.evidence.get_many(
+            task.run_id, task.evidence_ids
+        ) if item.surface_id == task.surface_id
+            and item.evidence_type == "http_response"]
+        missing_count = self._counts.get(task.candidate_id, 0) - len(existing)
+        if missing_count > 0:
+            return AgentResult(
+                task_id=task.task_id, status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=tuple(EvidenceRequest(
+                    evidence_type="http_response", surface_id=task.surface_id,
+                    reason=f"planned analysis request {index}", suggested_tool="http_get",
+                    http_request=HttpRequestSpec(method="GET"),
+                ) for index in range(missing_count)),
+            )
+        return AgentResult(task_id=task.task_id, status=AgentResultStatus.COMPLETED)
+
+
+def _app(*, stores=None, budget=None, advisor=None, analysis=None, validation=None,
+         planned_analysis=None, planned_validation=None):
     runtime = _Runtime()
     app = build_local_application(
         {},
@@ -99,12 +160,16 @@ def _app(*, stores=None, budget=None, advisor=None, analysis=None, validation=No
     calls: list[tuple[str, str]] = []
     app.dispatcher.register(
         "test_analyzer",
-        _Agent(app, stage="analysis", request_counts=analysis or {}, calls=calls),
+        (_PlannedAnalysisAgent(app, planned_analysis, calls)
+         if planned_analysis is not None else
+         _Agent(app, stage="analysis", request_counts=analysis or {}, calls=calls)),
         allowed_tools=("http_get",),
     )
     app.dispatcher.register(
         "validation",
-        _Agent(app, stage="validation", request_counts=validation or {}, calls=calls),
+        (_PlannedValidationAgent(app, planned_validation, calls)
+         if planned_validation is not None else
+         _Agent(app, stage="validation", request_counts=validation or {}, calls=calls)),
         allowed_tools=("http_get",),
     )
     return app, runtime, calls
@@ -178,6 +243,70 @@ class _Llm:
 
 
 class BudgetAllocationTests(unittest.TestCase):
+    def test_unallocated_analysis_preserves_observed_browser_validation_cost(self):
+        app, _, _ = _app()
+        run = _seed(app, budget=40)
+        first = app.stores.candidates.get(run.run_id, "candidate-a")
+        app.stores.evidence.append(Evidence(
+            evidence_id="browser-probe", run_id=run.run_id,
+            surface_id=first.surface_id, created_by="execution_runtime:browser_xss",
+            evidence_type="browser_execution", observation={
+                "type": "browser_execution", "dom_reflected": True,
+                "subrequest_count": 9,
+            },
+        ))
+        app.stores.candidates.save(
+            first.add_evidence(("browser-probe",)).set_status(CandidateStatus.ANALYZED)
+        )
+        self.assertEqual(app.orchestrator._analysis_floor(run, "candidate-b"), 20)
+
+    def test_deferred_analysis_reuses_only_a_wholly_affordable_batch(self):
+        for budget, expected_calls, first_status in (
+            (7, 5, CandidateStatus.REJECTED),
+            (5, 1, CandidateStatus.SKIPPED_BUDGET),
+        ):
+            with self.subTest(budget=budget):
+                app, runtime, calls = _app(planned_analysis={
+                    "candidate-a": 4, "candidate-b": 1,
+                })
+                run = _seed(
+                    app, budget=budget,
+                    planned_order=("candidate-a", "candidate-b"), reserve=1,
+                )
+                completed = app.orchestrator.resume(run.run_id)
+                self.assertIs(completed.phase, RunPhase.DONE)
+                self.assertEqual(runtime.calls, expected_calls)
+                self.assertIs(
+                    app.stores.candidates.get(run.run_id, "candidate-a").status,
+                    first_status,
+                )
+                self.assertIs(
+                    app.stores.candidates.get(run.run_id, "candidate-b").status,
+                    CandidateStatus.REJECTED,
+                )
+
+    def test_deferred_validation_reuses_only_a_fully_affordable_batch(self):
+        for budget, expected_calls, first_status in (
+            (5, 5, CandidateStatus.REJECTED),
+            (4, 1, CandidateStatus.SKIPPED_BUDGET),
+        ):
+            with self.subTest(budget=budget):
+                app, runtime, calls = _app(planned_validation={
+                    "candidate-a": 4, "candidate-b": 1,
+                })
+                run = _seed(app, budget=budget)
+                completed = app.orchestrator.resume(run.run_id)
+                self.assertIs(completed.phase, RunPhase.DONE)
+                self.assertEqual(runtime.calls, expected_calls)
+                self.assertIs(app.stores.candidates.get(run.run_id, "candidate-a").status,
+                              first_status)
+                self.assertIs(app.stores.candidates.get(run.run_id, "candidate-b").status,
+                              CandidateStatus.REJECTED)
+                validation_calls = [candidate_id for stage, candidate_id in calls
+                                    if stage == "validation"]
+                self.assertEqual(validation_calls, ["candidate-a", "candidate-b", "candidate-b"]
+                                 + (["candidate-a", "candidate-a"] if budget == 5 else []))
+
     def test_hybrid_allocation_loads_llm_independently_of_other_modes(self):
         from scripts.routing_options import needs_llm
 

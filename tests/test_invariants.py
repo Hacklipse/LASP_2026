@@ -9,6 +9,7 @@ from hacklipse.application import RunStateMachine
 from hacklipse.bootstrap import build_local_application
 from hacklipse.domain import (
     Candidate,
+    CandidateStatus,
     DomainInvariantError,
     Evidence,
     ExecutionRequest,
@@ -134,6 +135,23 @@ class ArchitectureInvariantTests(unittest.TestCase):
                 reason="no proof",
                 reason_code="free form reason",  # type: ignore[arg-type]
             )
+
+    def test_candidate_keeps_only_structured_validation_reason(self) -> None:
+        candidate = Candidate(
+            candidate_id="candidate-1", run_id="run-1", surface_id="surface-1",
+            vulnerability_type="XSS", hypothesis="reflection", assigned_agent="xss_analyzer",
+            evidence_ids=(),
+        )
+        rejected = candidate.set_status(
+            CandidateStatus.REJECTED,
+            validation_reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+        )
+        self.assertEqual(rejected.validation_reason_code,
+                         ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED)
+        self.assertIsNone(rejected.set_status(CandidateStatus.ANALYZED).validation_reason_code)
+        with self.assertRaises(DomainInvariantError):
+            candidate.set_status(CandidateStatus.REJECTED,
+                                 validation_reason_code="arbitrary response text")
 
     def test_confirmed_finding_preserves_structured_proof_facts(self) -> None:
         candidate = Candidate(

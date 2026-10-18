@@ -288,9 +288,11 @@ def _dom_fixture(*, reflected: bool = True):
     return app, analyzer
 
 
-def _xss_task(evidence_ids: tuple[str, ...] = ()) -> TaskEnvelope:
+def _xss_task(
+    evidence_ids: tuple[str, ...] = (), *, task_id: str = "task-xss",
+) -> TaskEnvelope:
     return TaskEnvelope(
-        task_id="task-xss",
+        task_id=task_id,
         run_id=_RUN_ID,
         agent_type=BROWSER_XSS_ANALYZER,
         target_url=f"http://{_HOST}/#/search",
@@ -318,7 +320,8 @@ class BrowserXssAnalysisTests(unittest.TestCase):
             )
             for request in first.evidence_requests
         )
-        result = analyzer.handle(_xss_task(collected))
+        # Orchestrator creates a new Task ID after collecting Evidence.
+        result = analyzer.handle(_xss_task(collected, task_id="task-xss-retry"))
 
         self.assertIs(result.status, AgentResultStatus.COMPLETED)
         observations = [

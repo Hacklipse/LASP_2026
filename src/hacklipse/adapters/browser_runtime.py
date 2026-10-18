@@ -9,7 +9,7 @@ from typing import Protocol
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from hacklipse.application import RuntimeEvidenceCollector
-from hacklipse.domain import ExecutionRequest, ExecutionResult, RunScope, TaskEnvelope
+from hacklipse.domain import ExecutionRequest, ExecutionResult, HttpRequestKind, RunScope, TaskEnvelope
 from hacklipse.ports.errors import ExternalExecutionDisabled
 
 from .http_runtime import HttpExecutionRuntime
@@ -18,13 +18,20 @@ from .xss_execution import (
     browser_navigation_url,
     dom_reflection_script,
     execution_marker_script,
+    postmessage_payload,
     reflection_marker,
+    _execution_payload,
 )
 
 # SPA 는 DOM 을 클라이언트에서 그린다. domcontentloaded 직후에는 라우트가 아직
 # 렌더되지 않아 반사도 실행도 관측되지 않는다. socket.io 를 쓰는 대상이라 networkidle
 # 을 기다릴 수 없으므로, 고정 sleep 대신 기대한 marker 조건을 제한 시간 동안 polling한다.
 _PROBE_WAIT_TIMEOUT_MS = 5000
+_POSTMESSAGE_KINDS = frozenset({
+    HttpRequestKind.POSTMESSAGE_CONTROL,
+    HttpRequestKind.POSTMESSAGE_REFLECTION,
+    HttpRequestKind.POSTMESSAGE_EXECUTION,
+})
 
 
 class BrowserProbeRunner(Protocol):
@@ -131,7 +138,9 @@ class PlaywrightBrowserRuntime:
                                 for name, value in cookies
                             ]
                         )
-                    page = context.new_page()
+                    postmessage = request.request_kind in _POSTMESSAGE_KINDS
+                    attacker = context.new_page() if postmessage else None
+                    page = None if postmessage else context.new_page()
                     allowed_origin = _origin_key(navigation_url)
 
                     def enforce_scope(route) -> None:
@@ -163,20 +172,52 @@ class PlaywrightBrowserRuntime:
                             evidence_type="browser_xss_subrequest",
                             reason="load browser XSS page dependency",
                         )
-                        page.route("**/*", transport.handle)
+                        if postmessage:
+                            context.route("**/*", transport.handle)
+                        else:
+                            page.route("**/*", transport.handle)
                     else:
-                        page.route("**/*", enforce_scope)
+                        if postmessage:
+                            context.route("**/*", enforce_scope)
+                        else:
+                            page.route("**/*", enforce_scope)
+                    if postmessage:
+                        # The fixed data page has a null origin. Its popup remains
+                        # reachable through WindowProxy after it navigates to the
+                        # target, so every message truly crosses origins.
+                        attacker.goto("data:text/html,<button id=launch>Open</button>")
+                        attacker.evaluate(
+                            "() => document.getElementById('launch').onclick = "
+                            "() => { window.__hacklipseTarget = window.open('about:blank'); }"
+                        )
+                        with attacker.expect_popup() as opened:
+                            attacker.click("#launch")
+                        page = opened.value
                     response = page.goto(
                         navigation_url,
                         wait_until="domcontentloaded",
                         timeout=max(1, int(request.timeout_seconds * 1000)),
                     )
-                    _wait_for_probe_signal(
-                        page,
-                        request,
-                        expected_marker,
-                        timeout_error=PlaywrightTimeoutError,
-                    )
+                    if postmessage:
+                        plan = postmessage_payload(request)
+                        if plan is not None:
+                            event_type, field, marker = plan
+                            payload = (
+                                f'<span data-hacklipse-postmessage="{marker}"></span>'
+                                if request.request_kind is HttpRequestKind.POSTMESSAGE_REFLECTION
+                                else _execution_payload(marker)
+                            )
+                            _send_foreign_message_until_signal(
+                                attacker, page, request, event_type, field, payload,
+                                expected_marker,
+                            )
+                    else:
+                        _wait_for_probe_signal(
+                            page,
+                            request,
+                            expected_marker,
+                            timeout_error=PlaywrightTimeoutError,
+                        )
                     observed = page.evaluate(execution_marker_script())
                     executed = bool(
                         expected_marker is not None and observed == expected_marker
@@ -210,11 +251,44 @@ class PlaywrightBrowserRuntime:
                 # marker 원문은 무해한 canary이며 proof가 어떤 실행을 관측했는지 묶는다.
                 "execution_marker": expected_marker if executed else None,
                 "reflection_marker": expected_marker if reflected else None,
+                "foreign_origin_message": postmessage,
                 "blocked_request_count": blocked_requests + (transport.blocked if transport else 0),
                 "subrequest_count": transport.sent if transport else None,
                 "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
             },
         )
+
+
+def _send_foreign_message_until_signal(
+    attacker, page, request: ExecutionRequest,
+    event_type: str, field: str, payload: str, marker: str | None,
+) -> None:
+    """Retry only while client-side listeners hydrate; no extra HTTP mutation."""
+
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    if attacker.evaluate("() => location.origin") != "null":
+        raise ExternalExecutionDisabled("postMessage sender is not a foreign origin")
+    deadline = time.monotonic() + min(
+        _PROBE_WAIT_TIMEOUT_MS / 1000, request.timeout_seconds,
+    )
+    signal = (
+        dom_reflection_script(marker)
+        if request.request_kind is HttpRequestKind.POSTMESSAGE_REFLECTION
+        else execution_marker_script()
+    )
+    while time.monotonic() < deadline:
+        attacker.evaluate(
+            "({type, field, value}) => "
+            "window.__hacklipseTarget.postMessage({type, [field]: value}, '*')",
+            {"type": event_type, "field": field, "value": payload},
+        )
+        try:
+            page.wait_for_function(signal, timeout=250)
+            return
+        except PlaywrightTimeoutError:
+            # A missing signal is a negative observation, not a browser error.
+            pass
 
 
 def _wait_for_probe_signal(

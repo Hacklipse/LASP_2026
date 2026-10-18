@@ -26,6 +26,17 @@ _DESTRUCTIVE = re.compile(r"delete|remove|logout|log out|sign out|save|submit|co
 _HEADERS = frozenset({"accept", "content-type", "rsc", "next-router-state-tree", "next-router-prefetch", "next-url", "x-requested-with"})
 _MAX_OBSERVATIONS = 200
 _PAGE_ID = re.compile(r"(?:[0-9]{1,12}|[0-9a-fA-F]{16,}|[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})\Z")
+_OPAQUE_PAGE_ID = re.compile(r"[A-Za-z0-9_-]{20,64}\Z")
+
+
+def _object_id_segment(value: str) -> bool:
+    """Recognize opaque generated IDs without grouping ordinary word slugs."""
+
+    return bool(_PAGE_ID.fullmatch(value) or (
+        _OPAQUE_PAGE_ID.fullmatch(value)
+        and any(char.isalpha() for char in value)
+        and sum(char.isdigit() for char in value) >= 3
+    ))
 
 
 def _page_family(url: str) -> tuple[str, str, str, tuple[str, ...], str]:
@@ -35,7 +46,7 @@ def _page_family(url: str) -> tuple[str, str, str, tuple[str, ...], str]:
     segments = parsed.path.split("/")
     for index in range(1, len(segments)):
         previous = segments[index - 1].casefold()
-        if previous.endswith("s") and _PAGE_ID.fullmatch(segments[index]):
+        if previous.endswith("s") and _object_id_segment(segments[index]):
             segments[index] = "{id}"
     fragment = parsed.fragment.split("?", 1)[0]
     names = tuple(sorted({name for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}))
@@ -78,6 +89,28 @@ def _page_visit_cap(base_pages: int, request_budget: int) -> int:
         return base_pages
     extra = max(0, (request_budget - base_pages * 6) // 6)
     return base_pages + min(base_pages, extra)
+
+
+def _adaptive_page_visit_cap(
+    base_pages: int, current_cap: int, visits: int,
+    requests_used: int, request_budget: int, has_new_family: bool,
+) -> int:
+    """Use observed request cost to visit one more distinct page family.
+
+    The provisional six-request estimate can be too high for small SPAs.
+    Keep an explicit small cap intact and leave one unit of headroom for the
+    next page's resources. The transport still enforces the hard HTTP limit.
+    """
+
+    if (
+        base_pages < 6 or not has_new_family or visits < current_cap
+        or current_cap >= 2 * base_pages or visits < 1
+    ):
+        return current_cap
+    observed_cost = max(2, (requests_used + visits - 1) // visits)
+    if request_budget - requests_used < observed_cost + 1:
+        return current_cap
+    return current_cap + 1
 
 
 def _names(values) -> tuple[str, ...]:
@@ -147,6 +180,7 @@ class _CollectorTransport:
         self.observations: list[tuple[str | None, dict]] = []
         self.cache: dict[str, dict] = {}
         self.json_links: list[str] = []
+        self.script_references: set[tuple[str, str]] = set()
 
     def in_scope(self, url: str) -> bool:
         try:
@@ -236,6 +270,26 @@ class _CollectorTransport:
         if type(status) is not int or response.get("truncated"):
             route.abort("failed")
             return
+        if (
+            req.resource_type == "script" and method == "GET"
+            and 200 <= status < 300
+            and len(self.observations) < _MAX_OBSERVATIONS
+        ):
+            # Browser requests can load a route's JS before a DOM snapshot is
+            # taken. Keep the document relationship from the browser-generated
+            # Referer without storing its value or any request credentials.
+            referrer = headers.get("referer", "").split("#", 1)[0]
+            if referrer and self.in_scope(referrer) and _origin_key(referrer) == _origin_key(req.url):
+                script_id = self.remember(req.url, "GET", (), (), ("browser_script_reference",))
+                document_id = self.remember(referrer, "GET", _names(k for k, _ in _query(referrer)),
+                                            _query(referrer), ("browser_document_reference",))
+                reference = (script_id, document_id)
+                if reference not in self.script_references:
+                    self.script_references.add(reference)
+                    self.observations.append((script_id, {
+                        "type": "client_script_reference",
+                        "document_surface_id": document_id,
+                    }))
         fulfilled_headers = {}
         for name, value in response.get("headers", []):
             if name.lower() not in {"content-length", "content-encoding", "transfer-encoding", "connection"}:
@@ -247,6 +301,7 @@ class _CollectorTransport:
 # DOM만 읽으며 입력 값은 반환하지 않는다. 메뉴/탭 조작 뒤에도 같은 snapshot을 사용한다.
 _SNAPSHOT = """() => ({
  links: [...document.querySelectorAll('a[href],area[href]')].slice(0,200).map(e=>e.href),
+ scripts: [...document.querySelectorAll('script[src]')].slice(0,32).map(e=>e.src),
  forms: [...document.forms].slice(0,12).map(f=>({url:f.action, method:(f.method||'get').toUpperCase(),
    names:[...f.elements].map(e=>e.name).filter(Boolean), content_type:f.enctype})),
  actions: [...document.querySelectorAll('button,[role=tab],[role=button],summary,[aria-expanded]')]
@@ -271,6 +326,7 @@ class PlaywrightRecon:
 
     def discover(self, task: TaskEnvelope, *, remember: Callable,
                  request_budget: int, timeout_seconds: float,
+                 document_seed_urls: tuple[str, ...] = (),
                  select_next: Callable[[tuple[tuple[str, str], ...], int, float], str | None] | None = None) -> BrowserReconResult:
         deadline = time.monotonic() + min(timeout_seconds, 45.0)
         transport = _CollectorTransport(
@@ -320,6 +376,19 @@ class PlaywrightRecon:
                         context.add_cookies([{"name": k, "value": v, "url": _origin(task.target_url)} for k, v in cookies])
                     page = context.new_page()
                     pending = [task.target_url]
+                    for seed_url in document_seed_urls[:4]:
+                        location = urlsplit(seed_url)
+                        if (
+                            seed_url == task.target_url
+                            or location.query or location.fragment
+                            or not transport.in_scope(seed_url)
+                            or seed_url in pending
+                        ):
+                            continue
+                        pending_surface_ids[seed_url] = remember(
+                            seed_url, "GET", (), (), ("observed_html_document",),
+                        )
+                        pending.append(seed_url)
                     visited: set[str] = set()
                     seen_actions: set[tuple] = set()
                     seen_forms: set[tuple] = set()
@@ -335,8 +404,29 @@ class PlaywrightRecon:
                     def snapshot():
                         nonlocal json_link_cursor
                         data = page.evaluate(_SNAPSHOT)
+                        document_surface_id = None
                         if transport.in_scope(page.url):
-                            remember(page.url, "GET", _names(k for k, _ in _query(page.url)), _query(page.url), ("browser_navigation",))
+                            document_surface_id = remember(
+                                page.url, "GET", _names(k for k, _ in _query(page.url)),
+                                _query(page.url), ("browser_navigation",),
+                            )
+                        if document_surface_id is not None:
+                            for script_url in data["scripts"]:
+                                if not transport.in_scope(script_url):
+                                    continue
+                                script_surface_id = remember(
+                                    script_url, "GET", (), (), ("browser_script_reference",),
+                                )
+                                reference = (script_surface_id, document_surface_id)
+                                if (
+                                    reference not in transport.script_references
+                                    and len(transport.observations) < _MAX_OBSERVATIONS
+                                ):
+                                    transport.script_references.add(reference)
+                                    transport.observations.append((script_surface_id, {
+                                        "type": "client_script_reference",
+                                        "document_surface_id": document_surface_id,
+                                    }))
                         for url in data["links"]:
                             if transport.in_scope(url):
                                 pending_surface_ids[url] = remember(
@@ -374,7 +464,19 @@ class PlaywrightRecon:
                                     }))
                         return data
 
-                    while pending and visits < visit_cap and transport.attempts < request_budget and time.monotonic() < deadline:
+                    while pending and transport.attempts < request_budget and time.monotonic() < deadline:
+                        if visits >= visit_cap:
+                            visit_cap = _adaptive_page_visit_cap(
+                                self._max_pages, visit_cap, visits,
+                                transport.attempts, request_budget,
+                                any(
+                                    url not in visited
+                                    and _page_family(url) not in visited_families
+                                    for url in pending
+                                ),
+                            )
+                            if visits >= visit_cap:
+                                break
                         if visits >= self._max_pages and not any(
                             _page_family(url) not in visited_families for url in pending
                         ):
@@ -414,6 +516,7 @@ class PlaywrightRecon:
                                 data = snapshot()
                                 if actions < self._max_actions:
                                     filters = page.locator('input[type=search],input[role=searchbox],input[placeholder*="search" i],input[placeholder*="검색"],select')
+                                    filter_changed = False
                                     for i in range(min(filters.count(), 4)):
                                         if actions >= self._max_actions or time.monotonic() >= deadline:
                                             break
@@ -427,11 +530,14 @@ class PlaywrightRecon:
                                             if choices.count() > 1:
                                                 control.select_option(index=1, timeout=500)
                                                 actions += 1
+                                                filter_changed = True
                                         elif control.is_editable() and not control.input_value():
                                             control.fill("hacklipse-control", timeout=500)
                                             actions += 1
-                                    settle()
-                                    data = snapshot()
+                                            filter_changed = True
+                                    if filter_changed:
+                                        settle()
+                                        data = snapshot()
                                 # React 등은 name 없는 입력을 상태로 보유한다. submit handler가
                                 # 만든 fetch/XHR를 관측하고 변경 요청은 transport에서 중단한다.
                                 form_key = (page.url, tuple((f["url"], tuple(f["names"])) for f in data["forms"]))
@@ -491,7 +597,12 @@ class PlaywrightRecon:
                                     page.wait_for_function(
                                         "marker => !!document.body && document.body.innerHTML.includes(marker)",
                                         arg=RAW_HASH_CANARY,
-                                        timeout=min(750, max(1, int((deadline-time.monotonic())*1000))),
+                                        # Client routers may render after the
+                                        # hashchange event and an async fetch.
+                                        # A short wait silently loses the
+                                        # reflection even when the page is
+                                        # visited within the page limit.
+                                        timeout=min(1500, max(1, int((deadline-time.monotonic())*1000))),
                                     )
                                 except Error:
                                     pass
@@ -524,7 +635,13 @@ class PlaywrightRecon:
             stop_reason = "request_budget"
         elif pending and visits >= self._max_pages:
             status = "bounded"
-            stop_reason = "page_limit" if visits >= visit_cap else "route_family_limit"
+            has_new_family = any(
+                _page_family(url) not in visited_families for url in pending
+            )
+            stop_reason = (
+                "page_limit" if has_new_family and visits >= visit_cap
+                else "route_family_limit"
+            )
         elif actions >= self._max_actions:
             status = "bounded"
             stop_reason = "action_limit"

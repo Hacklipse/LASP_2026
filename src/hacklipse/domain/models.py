@@ -68,6 +68,7 @@ class ValidationReasonCode(str, Enum):
 
     UNSPECIFIED = "unspecified"
     ANALYSIS_SIGNAL_MISSING = "analysis_signal_missing"
+    AUTHENTICATION_REQUIRED = "authentication_required"
     POST_REQUEST_TEMPLATE_MISSING = "post_request_template_missing"
     CONTROL_SIGNAL_PRESENT = "control_signal_present"
     PROBE_SIGNAL_NOT_REPRODUCED = "probe_signal_not_reproduced"
@@ -91,7 +92,11 @@ class ValidationProofType(str, Enum):
     PATH_TRAVERSAL_FILE_READ = "path_traversal_file_read"
     SSTI_EXECUTION = "ssti_execution"
     SENSITIVE_DATA_EXPOSURE = "sensitive_data_exposure"
+    WORKING_PUBLIC_CREDENTIAL = "working_public_credential"
+    GRAPHQL_INTROSPECTION_EXPOSURE = "graphql_introspection_exposure"
+    GRAPHQL_FIELD_SUGGESTION_EXPOSURE = "graphql_field_suggestion_exposure"
     SOURCE_MAP_EXPOSURE = "source_map_exposure"
+    ERROR_DETAIL_EXPOSURE = "error_detail_exposure"
     OPEN_REDIRECT = "open_redirect"
     CORS_ORIGIN_REFLECTION = "cors_origin_reflection"
 
@@ -101,6 +106,11 @@ class HttpRequestKind(str, Enum):
 
     CONTROL = "control"
     PROBE = "probe"
+    POSTMESSAGE_CONTROL = "postmessage_control"
+    POSTMESSAGE_REFLECTION = "postmessage_reflection"
+    POSTMESSAGE_EXECUTION = "postmessage_execution"
+    GRAPHQL_QUERY_CONTROL = "graphql_query_control"
+    GRAPHQL_QUERY_PROBE = "graphql_query_probe"
     OPEN_REDIRECT_PROBE = "open_redirect_probe"
     CORS_PROBE = "cors_probe"
     PATH_TRAVERSAL_PROBE = "path_traversal_probe"
@@ -143,6 +153,11 @@ _HTTP_METHOD = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 # 새 탐침 기법이 다른 문자를 필요로 하면 여기를 늘리는 것이 명시적 결정이 된다.
 PROBE_METACHARACTERS = "'\"<>"
 _PROBE_VALUE = re.compile(r"^[A-Za-z0-9_-]+['\"<>]{0,4}$")
+_GRAPHQL_READ_DOCUMENT = re.compile(
+    r'query \{ [A-Za-z_][A-Za-z0-9_]{0,79}'
+    r'\([A-Za-z_][A-Za-z0-9_]{0,79}: "(hacklipse[A-Za-z0-9]{1,180})(\'?)"\)'
+    r'(?: \{ __typename \})? \}\Z'
+)
 # Path Traversal 자동 검증이 읽을 수 있는 유일한 값이다. 컨테이너에 기본 존재하는
 # 비민감 OS 식별 파일을 정확한 상대 경로 하나로 고정해 LLM이나 Agent가 다른 파일
 # (예: /etc/passwd)을 선택하지 못하게 한다.
@@ -464,7 +479,7 @@ class HttpRequestSpec:
     method: str = "GET"
     query_parameters: tuple[tuple[str, str], ...] = ()
     headers: tuple[tuple[str, str], ...] = ()
-    body: str | None = None
+    body: str | None = field(default=None, repr=False)
     request_kind: HttpRequestKind = HttpRequestKind.CONTROL
     # ACCESS_CONTROL_PROBE에서 값이 바뀌는 유일한 파라미터. 나머지 query는 Recon이 관측한
     # 원본을 그대로 보존해야 하므로 어느 것이 식별자인지 명시적으로 지정한다.
@@ -512,6 +527,26 @@ class HttpRequestSpec:
                 raise DomainInvariantError(
                     "path traversal probe may only use markers and the fixed safe path"
                 )
+        if self.request_kind in {
+            HttpRequestKind.GRAPHQL_QUERY_CONTROL,
+            HttpRequestKind.GRAPHQL_QUERY_PROBE,
+        }:
+            document = (
+                self.query_parameters[0][1]
+                if len(self.query_parameters) == 1 and self.query_parameters[0][0] == "query"
+                else None
+            )
+            match = _GRAPHQL_READ_DOCUMENT.fullmatch(document or "")
+            if (
+                self.method.upper() != "GET" or self.headers or self.body is not None
+                or match is None
+                or bool(match.group(2)) != (
+                    self.request_kind is HttpRequestKind.GRAPHQL_QUERY_PROBE
+                )
+            ):
+                raise DomainInvariantError(
+                    "GraphQL query probe must be a bounded read-only GET with one marker"
+                )
         if self.path_suffix is not None:
             if self.request_kind is not HttpRequestKind.PATH_TRAVERSAL_PROBE:
                 raise DomainInvariantError(
@@ -531,7 +566,21 @@ class HttpRequestSpec:
             raise DomainInvariantError("open redirect probe must be a bounded GET request")
         if self.request_kind is HttpRequestKind.CORS_PROBE and (
             self.method.upper() != "GET" or self.body is not None
-            or self.query_parameters
+            or (
+                self.query_parameters
+                and (
+                    len(self.query_parameters) != 1
+                    or not (
+                        self.query_parameters == (("query", "query { __typename }"),)
+                        or (
+                            self.query_parameters[0][0].casefold() in {
+                                "q", "query", "search", "term", "keyword"
+                            }
+                            and self.query_parameters[0][1] == "hacklipse-control"
+                        )
+                    )
+                )
+            )
             or len(self.headers) != 1
             or self.headers[0] not in {
                 ("Origin", "https://probe-a.invalid"),
@@ -539,7 +588,6 @@ class HttpRequestSpec:
             }
         ):
             raise DomainInvariantError("CORS probe must use one fixed nonresident Origin")
-
         for name, value in self.headers:
             if not isinstance(name, str) or not isinstance(value, str):
                 raise DomainInvariantError("HTTP headers must be string pairs")
@@ -618,6 +666,9 @@ class EvidenceRequest:
     # Agent는 어떤 자격증명을 쓸지 고를 수 없고 역할만 지정한다. 역할 → credential_ref
     # 해석은 중앙 Collector가 Run에 등록된 매핑으로만 수행한다.
     principal_role: AccessPrincipalRole | None = None
+    # A read-only exposure check may explicitly require an unauthenticated
+    # request even when the Run also has an authorized test session.
+    anonymous: bool = False
     # 상태 변경 요청의 승인 참조는 비밀이 아니라 사용자가 부여한 권한의 식별자다.
     # 실제 허용 여부는 Agent가 아니라 중앙 ApprovalGate가 판단한다.
     approval_ref: str | None = None
@@ -627,6 +678,8 @@ class EvidenceRequest:
             self.principal_role, AccessPrincipalRole
         ):
             raise DomainInvariantError("principal role must be a structured role")
+        if type(self.anonymous) is not bool or (self.anonymous and self.principal_role is not None):
+            raise DomainInvariantError("anonymous request cannot select a principal role")
         if self.approval_ref is not None and not self.approval_ref.strip():
             raise DomainInvariantError("evidence request approval reference cannot be blank")
 
@@ -655,6 +708,7 @@ class EvidenceRequest:
                 "principal_role": (
                     self.principal_role.value if self.principal_role is not None else None
                 ),
+                "anonymous": self.anonymous,
                 "query_names": [name for name, _ in request.query_parameters],
                 "request_kind": request.request_kind.value,
                 "identifier_location": (
@@ -852,6 +906,9 @@ class Candidate:
     # 이 Candidate만 실패했을 때의 사유. 다른 Candidate는 계속 진행하므로 실패를
     # Run 전체가 아니라 Candidate에 남겨야 무엇이 검사되지 않았는지 알 수 있다.
     last_error: str | None = None
+    # Validation 판정의 구조화된 분기 코드. 자유형 응답 문자열이나 증적 원문은
+    # Candidate와 비교 산출물에 저장하지 않는다.
+    validation_reason_code: ValidationReasonCode | None = None
     # 예산 때문에 건너뛴 Candidate가 어느 단계에서 멈췄는지. 재개할 때 이 값으로
     # 분석부터 다시 할지 검증만 다시 할지 정한다. 이것이 없으면 검증 직전에 멈춘
     # Candidate를 재개 시 처음부터 다시 분석하게 된다.
@@ -910,6 +967,14 @@ class Candidate:
                 raise DomainInvariantError(
                     f"unknown candidate status: {value!r}"
                 ) from error
+        if self.validation_reason_code is not None:
+            try:
+                object.__setattr__(
+                    self, "validation_reason_code",
+                    ValidationReasonCode(self.validation_reason_code),
+                )
+            except ValueError as error:
+                raise DomainInvariantError("unknown candidate validation reason code") from error
 
     def add_evidence(self, evidence_ids: tuple[str, ...]) -> Candidate:
         """기존 순서를 유지하면서 중복 없이 Evidence 참조를 합친다."""
@@ -918,7 +983,8 @@ class Candidate:
         return replace(self, evidence_ids=merged)
 
     def set_status(
-        self, status: CandidateStatus, *, reason: str | None = None
+        self, status: CandidateStatus, *, reason: str | None = None,
+        validation_reason_code: ValidationReasonCode | None = None,
     ) -> Candidate:
         """분석·검증 진행 상태가 변경된 Candidate 복사본을 만든다.
 
@@ -927,7 +993,10 @@ class Candidate:
         검증을 완료하지 못한 상태는 일반화된 사유를 명시적으로 보존할 수 있다.
         """
 
-        return replace(self, status=status, last_error=reason, resume_status=None)
+        return replace(
+            self, status=status, last_error=reason, resume_status=None,
+            validation_reason_code=validation_reason_code,
+        )
 
     def fail(self, reason: str) -> Candidate:
         """이 Candidate만 실패로 표시한다.
@@ -936,7 +1005,10 @@ class Candidate:
         남긴다. 사유가 없으면 실패한 Candidate가 안전한 Candidate처럼 보인다.
         """
 
-        return replace(self, status=CandidateStatus.FAILED, last_error=reason)
+        return replace(
+            self, status=CandidateStatus.FAILED, last_error=reason,
+            validation_reason_code=None,
+        )
 
     def skip_for_budget(self, reason: str) -> Candidate:
         """예산이 모자라 시도조차 하지 못한 Candidate로 표시한다.
@@ -957,6 +1029,7 @@ class Candidate:
             status=CandidateStatus.SKIPPED_BUDGET,
             last_error=reason,
             resume_status=origin,
+            validation_reason_code=None,
         )
 
 
@@ -975,6 +1048,10 @@ class ValidationProof:
     proof_type: ValidationProofType
     evidence_ids: tuple[str, ...]
     summary: str
+    # A multi-step proof may use an observed second Surface (for example a
+    # public script and the login endpoint that consumes its literal account).
+    # The Orchestrator still checks Run ownership, origin, and session provenance.
+    related_surface_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.proof_type, ValidationProofType):
@@ -983,6 +1060,8 @@ class ValidationProof:
             raise DomainInvariantError("validation proof must reference evidence")
         if not self.summary.strip():
             raise DomainInvariantError("validation proof must explain the reproduced effect")
+        if any(not value for value in self.related_surface_ids) or len(set(self.related_surface_ids)) != len(self.related_surface_ids):
+            raise DomainInvariantError("related proof surfaces must be distinct IDs")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1131,7 +1210,7 @@ class ExecutionRequest:
     method: str = "GET"
     query_parameters: tuple[tuple[str, str], ...] = ()
     headers: tuple[tuple[str, str], ...] = ()
-    body: str | None = None
+    body: str | None = field(default=None, repr=False)
     request_kind: HttpRequestKind = HttpRequestKind.CONTROL
     identifier_parameter: str | None = None
     identifier_location: AccessIdentifierLocation | None = None

@@ -11,6 +11,16 @@ from hacklipse.domain import Evidence, Run, Surface
 from hacklipse.ports import AnalyzerCapability, ObservationRequirement
 
 from .request_safety import has_state_changing_parameters, object_identifier_parameters
+from .cors_analysis import CORS_SEARCH_INPUT_NAMES
+from .graphql_introspection import INTROSPECTION_TYPE, INTROSPECTION_RECON_OBSERVATION
+from .graphql_suggestions import SUGGESTION_TYPE, SUGGESTION_PLAN
+from .error_disclosure import (
+    ERROR_DISCLOSURE_TYPE, ERROR_ROUTE_OBSERVATION, ERROR_GRAPHQL_OBSERVATION,
+)
+from .sensitive_exposure import CONFIG_ROUTE_OBSERVATION
+from .public_login_credentials import PUBLIC_LOGIN_OBSERVATION, PUBLIC_LOGIN_TYPE
+from .open_redirect_analysis import REDIRECT_PARAMETER_HINTS
+from .postmessage_plan import POSTMESSAGE_ANALYZER, POSTMESSAGE_CAPABILITY, POSTMESSAGE_PLAN
 
 
 OPTIONAL_SOURCE_MAP_CAPABILITIES = (
@@ -29,9 +39,84 @@ OPTIONAL_SOURCE_MAP_CAPABILITIES = (
 
 DEFAULT_ANALYZER_CAPABILITIES = (
     AnalyzerCapability(
+        capability_id=POSTMESSAGE_CAPABILITY,
+        agent_type=POSTMESSAGE_ANALYZER,
+        vulnerability_type="XSS",
+        methods=("GET",), surface_kind="server", requires_parameters=False,
+        observation_requirements=(ObservationRequirement(POSTMESSAGE_PLAN),),
+        exploration_parameter_source="none",
+        supported_evidence_types=("browser_execution",),
+        strategy_ids=("independent_foreign_origin_message_execution",),
+        default_priority=0.47,
+    ),
+    AnalyzerCapability(
+        capability_id="credentials.public_login_pair",
+        agent_type="public_login_credentials_analyzer",
+        vulnerability_type=PUBLIC_LOGIN_TYPE,
+        methods=("GET",), surface_kind="server", requires_parameters=False,
+        observation_requirements=(ObservationRequirement(PUBLIC_LOGIN_OBSERVATION),),
+        exploration_parameter_source="none",
+        supported_evidence_types=("http_response",),
+        strategy_ids=("approved_observed_login_replay",), default_priority=0.55,
+    ),
+    AnalyzerCapability(
+        capability_id="sensitive_data.observed_config_route",
+        agent_type="sensitive_exposure_analyzer",
+        vulnerability_type="Sensitive Data Exposure",
+        methods=("GET",), surface_kind="server", requires_parameters=False,
+        observation_requirements=(ObservationRequirement(CONFIG_ROUTE_OBSERVATION),),
+        exploration_parameter_source="none",
+        supported_evidence_types=("http_response",),
+        strategy_ids=("independent_config_credential_fetch",), default_priority=0.38,
+    ),
+    AnalyzerCapability(
+        capability_id="error_details.diagnostic_get",
+        agent_type="error_disclosure_analyzer",
+        vulnerability_type=ERROR_DISCLOSURE_TYPE,
+        methods=("GET",), surface_kind="server", requires_parameters=False,
+        observation_requirements=(ObservationRequirement(ERROR_ROUTE_OBSERVATION),),
+        exploration_parameter_source="none",
+        supported_evidence_types=("http_response",),
+        strategy_ids=("independent_error_stack_fetch",), default_priority=0.41,
+    ),
+    AnalyzerCapability(
+        capability_id="error_details.graphql_syntax",
+        agent_type="error_disclosure_analyzer",
+        vulnerability_type=ERROR_DISCLOSURE_TYPE,
+        methods=("GET",), surface_kind="server", requires_parameters=False,
+        observation_requirements=(ObservationRequirement(ERROR_GRAPHQL_OBSERVATION),),
+        exploration_parameter_source="none",
+        supported_evidence_types=("http_response",),
+        strategy_ids=("independent_anonymous_parser_errors",), default_priority=0.41,
+    ),
+    AnalyzerCapability(
+        capability_id="graphql.field_suggestion", agent_type="graphql_suggestion_analyzer",
+        vulnerability_type=SUGGESTION_TYPE, methods=("GET",),
+        surface_kind="server", requires_parameters=False,
+        observation_requirements=(ObservationRequirement(SUGGESTION_PLAN),),
+        exploration_parameter_source="none", supported_evidence_types=("http_response",),
+        strategy_ids=("independent_anonymous_field_typo",), default_priority=0.42,
+    ),
+    AnalyzerCapability(
+        capability_id="graphql.schema_read", agent_type="graphql_introspection_analyzer",
+        vulnerability_type=INTROSPECTION_TYPE, methods=("GET",),
+        surface_kind="server", requires_parameters=False,
+        observation_requirements=(ObservationRequirement(INTROSPECTION_RECON_OBSERVATION),),
+        exploration_parameter_source="none", supported_evidence_types=("http_response",),
+        strategy_ids=("independent_read_only_schema_fetch",), default_priority=0.44,
+    ),
+    AnalyzerCapability(
         capability_id="cors.http.search_sample", agent_type="cors_analyzer",
         vulnerability_type="CORS", methods=("GET",), surface_kind="server",
-        parameter_hints=("q", "query", "search", "term", "keyword"),
+        parameter_hints=tuple(sorted(CORS_SEARCH_INPUT_NAMES)),
+        exploration_parameter_source="none", supported_evidence_types=("http_response",),
+        strategy_ids=("compare_fixed_origin_headers",), default_priority=0.43,
+    ),
+    AnalyzerCapability(
+        capability_id="cors.graphql.operation", agent_type="cors_analyzer",
+        vulnerability_type="CORS", methods=("GET",), surface_kind="server",
+        requires_parameters=False,
+        observation_requirements=(ObservationRequirement("graphql_schema_operation"),),
         exploration_parameter_source="none", supported_evidence_types=("http_response",),
         strategy_ids=("compare_fixed_origin_headers",), default_priority=0.43,
     ),
@@ -40,7 +125,7 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         agent_type="open_redirect_analyzer",
         vulnerability_type="Open Redirect",
         methods=("GET",), surface_kind="server",
-        parameter_hints=("next", "return", "return_url", "redirect", "redirect_uri", "destination", "dest"),
+        parameter_hints=REDIRECT_PARAMETER_HINTS,
         exploration_parameter_source="surface",
         supported_evidence_types=("http_redirect",),
         strategy_ids=("compare_redirect_locations",), default_priority=0.50,
@@ -91,6 +176,15 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         ),
         strategy_ids=("compare_query_mutations",),
         default_priority=0.30,
+    ),
+    AnalyzerCapability(
+        capability_id="sqli.graphql.read_query",
+        agent_type="sqli_analyzer", vulnerability_type="SQLi",
+        methods=("GET",), surface_kind="server", requires_parameters=False,
+        observation_requirements=(ObservationRequirement("graphql_read_query_plan"),),
+        exploration_parameter_source="none",
+        supported_evidence_types=("control_response", "mutated_input_response"),
+        strategy_ids=("compare_graphql_query_argument",), default_priority=0.30,
     ),
     AnalyzerCapability(
         capability_id="path_traversal.http.query",

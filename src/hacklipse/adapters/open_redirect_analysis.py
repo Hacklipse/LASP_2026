@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from html.parser import HTMLParser
 from uuid import uuid4
 
 from hacklipse.domain import (
@@ -16,7 +17,10 @@ from .probing import matching_evidence, probe_marker, resolve_analysis_task
 
 REDIRECT_TYPE = "Open Redirect"
 REDIRECT_OBSERVATION = "open_redirect"
-REDIRECT_PARAMETER_HINTS = ("next", "return", "return_url", "redirect", "redirect_uri", "destination", "dest")
+REDIRECT_PARAMETER_HINTS = (
+    "next", "return", "return_url", "redirect", "redirect_uri",
+    "destination", "dest", "url",
+)
 _PROBE_ORIGIN = "http://127.0.0.1:9"
 
 
@@ -32,12 +36,43 @@ def redirect_probe_url(marker: str) -> str:
 
 
 def redirected_to_probe(evidence: Evidence | None, expected_url: str) -> bool:
-    return bool(
-        evidence is not None
-        and evidence.evidence_type == "http_redirect"
-        and evidence.observation.get("status") in {301, 302, 303, 307, 308}
-        and evidence.observation.get("location") == expected_url
-    )
+    if evidence is None:
+        return False
+    observation = evidence.observation
+    if (
+        evidence.evidence_type == "http_redirect"
+        and observation.get("status") in {301, 302, 303, 307, 308}
+        and observation.get("location") == expected_url
+    ):
+        return True
+    # A user-controlled link can navigate away without a 3xx response. A
+    # reflected string is insufficient: require a real anchor destination.
+    body = observation.get("body")
+    media = observation.get("content_type")
+    if (
+        evidence.evidence_type != "http_response" or observation.get("status") != 200
+        or not isinstance(media, str) or media.split(";", 1)[0].strip().casefold() != "text/html"
+        or not isinstance(body, str) or len(body) > 128 * 1024
+        or observation.get("truncated")
+    ):
+        return False
+    parser = _AnchorDestination(expected_url)
+    parser.feed(body)
+    return parser.matched
+
+
+class _AnchorDestination(HTMLParser):
+    def __init__(self, expected_url: str):
+        super().__init__()
+        self.expected_url = expected_url
+        self.matched = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.casefold() == "a" and any(
+            name.casefold() == "href" and value == self.expected_url
+            for name, value in attrs
+        ):
+            self.matched = True
 
 
 def build_redirect_requests(

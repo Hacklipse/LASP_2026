@@ -29,6 +29,12 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
                         help="run without prompting for a target session Cookie")
     parser.add_argument("--session-cookie-stdin", action="store_true",
                         help="read a target session Cookie from stdin without terminal prompting")
+    parser.add_argument("--session-authorization-stdin", action="store_true",
+                        help="read a target Bearer authorization from stdin without recording it")
+    parser.add_argument("--owner-session-cookie-stdin", action="store_true",
+                        help="read a second local principal Cookie from stdin for independent access checks")
+    parser.add_argument("--access-actor-object-id")
+    parser.add_argument("--access-owner-object-id")
 
 
 def _validate_args(args: argparse.Namespace) -> str | None:
@@ -38,8 +44,23 @@ def _validate_args(args: argparse.Namespace) -> str | None:
         return "--app은 짧은 소문자 DynAST 앱 이름이어야 합니다."
     if args.app and not args.code_version:
         return "채점 파일에는 비교 가능한 --code-version이 필요합니다."
-    if args.anonymous and args.session_cookie_stdin:
-        return "--anonymous와 --session-cookie-stdin은 함께 사용할 수 없습니다."
+    if sum((args.anonymous, args.session_cookie_stdin, args.session_authorization_stdin)) > 1:
+        return "익명, Cookie, Bearer 세션 모드는 하나만 선택할 수 있습니다."
+    if args.session_authorization_stdin and args.owner_session_cookie_stdin:
+        return "Bearer 세션은 Cookie 기반 두 주체 검사와 함께 사용할 수 없습니다."
+    dual = (
+        args.owner_session_cookie_stdin,
+        args.access_actor_object_id is not None,
+        args.access_owner_object_id is not None,
+    )
+    if any(dual):
+        if not all(dual) or not args.session_cookie_stdin:
+            return "두 주체 검사는 두 Cookie와 actor/owner 객체 ID를 함께 요구합니다."
+        if not all(
+            re.fullmatch(r"[1-9][0-9]{0,9}", value)
+            for value in (args.access_actor_object_id, args.access_owner_object_id)
+        ) or args.access_actor_object_id == args.access_owner_object_id:
+            return "두 주체의 객체 ID는 서로 다른 양의 숫자여야 합니다."
     return None
 
 

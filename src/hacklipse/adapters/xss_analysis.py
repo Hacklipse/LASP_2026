@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from uuid import uuid4
 
@@ -29,6 +30,25 @@ XSS_ANALYSIS_TOOL = ANALYSIS_TOOL
 _REFLECTION_MARKER = "hacklipse7331"
 
 HEURISTIC_XSS_ANALYZER = "heuristic_xss_analyzer"
+_SECONDARY_ATTRIBUTE_SINK = re.compile(
+    r"\.innerHTML\s*=\s*[A-Za-z_$][\w$]*\.getAttribute\(\s*"
+    r"['\"](data-[A-Za-z][A-Za-z0-9-]{0,30})['\"]\s*\)",
+    re.I,
+)
+
+
+def secondary_dom_attribute_sinks(body: str) -> tuple[str, ...]:
+    """Find bounded data attributes copied into a second HTML parsing sink.
+
+    This is only an Analysis hint. A separate browser execution still has to
+    reproduce the effect before Validation can confirm a finding.
+    """
+
+    if len(body) > 2 * 1024 * 1024:
+        return ()
+    return tuple(dict.fromkeys(
+        match.group(1).lower() for match in _SECONDARY_ATTRIBUTE_SINK.finditer(body)
+    ))[:2]
 
 
 class HeuristicXssAnalyzer:
@@ -92,6 +112,26 @@ class HeuristicXssAnalyzer:
             raise AgentContractError("xss baseline control evidence was not collected")
         control_body = response_body(control)
         new_evidence_ids: list[str] = []
+
+        for attribute in secondary_dom_attribute_sinks(control_body):
+            if any(
+                item.created_by == HEURISTIC_XSS_ANALYZER
+                and item.surface_id == surface.surface_id
+                and item.observation.get("type") == "dom_secondary_attribute_sink"
+                and item.observation.get("attribute") == attribute
+                for item in evidence
+            ):
+                continue
+            sink_id = f"evi-{self._id_factory()}"
+            self._evidence.append(Evidence(
+                evidence_id=sink_id, run_id=task.run_id,
+                surface_id=surface.surface_id, created_by=HEURISTIC_XSS_ANALYZER,
+                evidence_type="observation", source_task_id=task.task_id,
+                observation={"type": "dom_secondary_attribute_sink",
+                             "attribute": attribute,
+                             "response_evidence_id": control.evidence_id},
+            ))
+            new_evidence_ids.append(sink_id)
 
         for parameter, probe in zip(parameters, collected[1:]):
             if probe is None:  # missing 분기 이후에는 도달하지 않는 방어선.

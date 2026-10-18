@@ -25,6 +25,7 @@ _JWT = re.compile(
     r"[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])"
 )
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+_BASIC = re.compile(r"(?i)\bBasic\s+[A-Za-z0-9+/=]{8,256}(?![A-Za-z0-9+/=])")
 _EMAIL = re.compile(
     r"(?i)(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])"
 )
@@ -178,6 +179,21 @@ class SensitiveDataSanitizer:
     def sanitize(
         self, request: ExecutionRequest, result: ExecutionResult
     ) -> ExecutionResult:
+        # Derive a bounded signal before any short Cookie value can alter a
+        # credential-shaped field. The raw values stay in this call frame and
+        # are added to the redaction set; only field names enter Evidence.
+        from .sensitive_exposure import (
+            TRUSTED_EXPOSURE_FIELDS, TRUSTED_LOGIN_PAIR_COUNT,
+            client_credential_signals, client_login_pairs,
+        )
+
+        raw_observation = dict(result.observation)
+        # Only this adapter may publish the trusted derived field. A custom
+        # Runtime result cannot assert the signal by supplying the same key.
+        raw_observation.pop(TRUSTED_EXPOSURE_FIELDS, None)
+        raw_observation.pop(TRUSTED_LOGIN_PAIR_COUNT, None)
+        field_paths, exposed_values = client_credential_signals(raw_observation)
+        login_pairs = client_login_pairs(raw_observation)
         secrets: tuple[str, ...] = _request_secret_values(request)
         if request.credential_ref is not None and self._credentials is not None:
             secrets = tuple(
@@ -185,7 +201,15 @@ class SensitiveDataSanitizer:
                     (*secrets, *self._credentials.resolve(request.credential_ref).secret_values())
                 )
             )
-        observation = self._sanitize_mapping(dict(result.observation), secrets)
+        secrets = tuple(dict.fromkeys((
+            *secrets, *exposed_values,
+            *(value for pair in login_pairs for value in pair),
+        )))
+        observation = self._sanitize_mapping(raw_observation, secrets)
+        if field_paths:
+            observation[TRUSTED_EXPOSURE_FIELDS] = list(field_paths)
+        if login_pairs:
+            observation[TRUSTED_LOGIN_PAIR_COUNT] = len(login_pairs)
         artifacts = {
             key: self._sanitize_text(value, secrets)
             for key, value in result.artifact_refs.items()
@@ -246,6 +270,24 @@ class SensitiveDataSanitizer:
         if url_sanitized is not None:
             return url_sanitized
 
+        # Treat a JSON response as structured data before replacing known
+        # credential values. A short numeric Cookie such as uid=1 otherwise
+        # turns an ordinary JSON number ("id":1) into invalid syntax
+        # ("id":<redacted>), hiding links and response fields from Recon.
+        # Sensitive string fields are still redacted; ordinary JSON numbers
+        # remain numbers even when their spelling matches a Cookie value.
+        if value.lstrip().startswith(("{", "[")):
+            try:
+                document = json.loads(value)
+            except ValueError:
+                pass
+            else:
+                if isinstance(document, (dict, list)):
+                    return json.dumps(
+                        _sanitize_json_value(document, secrets),
+                        ensure_ascii=False, separators=(",", ":"),
+                    )
+
         # HTML 태그 안의 name/type 같은 구조는 Recon의 입력이다. 자격증명 값이 흔한
         # 단어(`password`)라는 이유로 전역 replace하면 name="password_new"까지
         # 훼손된다. 민감 input value는 전용 패턴으로 지우고, 알려진 비밀 원문 치환은
@@ -262,6 +304,32 @@ class SensitiveDataSanitizer:
             )
 
         return _sanitize_plain_text(value, secrets)
+
+
+def _sanitize_json_value(value: object, secrets: Sequence[str], depth: int = 0) -> object:
+    """Preserve JSON structure while masking credential-bearing string values."""
+
+    if depth >= 16:
+        return _REDACTED
+    if isinstance(value, dict):
+        sanitized: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                continue
+            normalized = key.casefold().replace("-", "_")
+            if normalized in {
+                "authorization", "cookie", "set_cookie", "password", "passwd",
+                "csrf", "token", "secret", "session", "sessionid",
+            }:
+                sanitized[key] = _REDACTED
+            else:
+                sanitized[key] = _sanitize_json_value(item, secrets, depth + 1)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_json_value(item, secrets, depth + 1) for item in value]
+    if isinstance(value, str):
+        return _sanitize_plain_text(value, secrets)
+    return value
 
 
 def _request_secret_values(request: ExecutionRequest) -> tuple[str, ...]:
@@ -303,6 +371,7 @@ def _is_sensitive_field(name: str) -> bool:
 def _sanitize_plain_text(value: str, secrets: Sequence[str]) -> str:
     sanitized = _replace_known_secrets(value, secrets)
     sanitized = _BEARER.sub("Bearer <redacted>", sanitized)
+    sanitized = _BASIC.sub("Basic <redacted>", sanitized)
     sanitized = _JWT.sub(_REDACTED, sanitized)
     sanitized = _EMAIL.sub("<redacted-email>", sanitized)
     sanitized = _PHONE.sub("<redacted-phone>", sanitized)
@@ -317,7 +386,15 @@ def _replace_known_secrets(value: str, secrets: Sequence[str]) -> str:
 
     sanitized = value
     for secret in sorted((item for item in secrets if item), key=len, reverse=True):
-        pattern = re.compile(re.escape(secret))
+        # A short Cookie value such as uid=3 must not erase every "3" inside
+        # an unrelated probe marker, identifier, or HTML text. Exact standalone
+        # values (including uid=3) remain masked; structured Cookie/JSON/URL
+        # fields also have their own masking path above.
+        literal = re.escape(secret)
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9_-]){literal}(?![A-Za-z0-9_-])"
+            if len(secret) < 8 else literal
+        )
 
         def replace(match: re.Match[str]) -> str:
             tail = sanitized[match.end() :]

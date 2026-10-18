@@ -24,6 +24,14 @@ class PolicyViolation(ArchitectureError):
 class BudgetExceeded(ArchitectureError):
     """Run이 남은 실행 예산보다 많은 단위를 소비하려 할 때 발생한다."""
 
+    def __init__(self, message: str, *, required_requests: int | None = None) -> None:
+        super().__init__(message)
+        if required_requests is not None and (
+            type(required_requests) is not int or required_requests < 1
+        ):
+            raise ValueError("required_requests must be a positive integer")
+        self.required_requests = required_requests
+
 
 class ExternalExecutionDisabled(ArchitectureError):
     """안전한 기본 Runtime이 외부 실행을 거부했음을 나타낸다."""

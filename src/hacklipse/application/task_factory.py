@@ -22,6 +22,8 @@ _BROWSER_XSS_TOOL = "browser_xss"
 # XSS 는 담당 Agent 가 둘이다. 서버 반사는 http_get, SPA 의 DOM 반사는 브라우저로만
 # 관측된다. 도구는 취약점 유형이 아니라 그 Agent 가 무엇으로 요청하는지에 달려 있다.
 _BROWSER_XSS_ANALYZER = "browser_xss_analyzer"
+_POSTMESSAGE_XSS_ANALYZER = "postmessage_xss_analyzer"
+_PUBLIC_LOGIN_CREDENTIAL_TYPE = "Exposed Working Credentials"
 
 
 class TaskFactory:
@@ -64,7 +66,7 @@ class TaskFactory:
     ) -> TaskEnvelope:
         """Candidate의 실제 Surface URL과 Evidence 참조를 Analysis Task에 담는다."""
 
-        if candidate.assigned_agent == _BROWSER_XSS_ANALYZER:
+        if candidate.assigned_agent in {_BROWSER_XSS_ANALYZER, _POSTMESSAGE_XSS_ANALYZER}:
             allowed_tools = (_BROWSER_XSS_TOOL,)
         elif candidate.vulnerability_type == "Path Traversal":
             allowed_tools = (_PATH_TRAVERSAL_TOOL,)
@@ -74,6 +76,8 @@ class TaskFactory:
             allowed_tools = (_ACCESS_CONTROL_TOOL,)
         elif candidate.vulnerability_type == "SSTI":
             allowed_tools = (_SSTI_TOOL,)
+        elif candidate.vulnerability_type == _PUBLIC_LOGIN_CREDENTIAL_TYPE:
+            allowed_tools = ("http_get", "http_post")
         else:
             allowed_tools = ("http_get",)
         return self._base(
@@ -111,6 +115,8 @@ class TaskFactory:
             allowed_tools = (_ACCESS_CONTROL_TOOL,)
         elif candidate.vulnerability_type == "SSTI":
             allowed_tools = (_SSTI_TOOL,)
+        elif candidate.vulnerability_type == _PUBLIC_LOGIN_CREDENTIAL_TYPE:
+            allowed_tools = ("http_get", "http_post")
         else:
             allowed_tools = ("http_get",)
         return self._base(

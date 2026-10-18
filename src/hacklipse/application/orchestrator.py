@@ -63,7 +63,11 @@ _PROOF_TYPE_BY_VULNERABILITY = {
     "CORS": ValidationProofType.CORS_ORIGIN_REFLECTION,
     "Open Redirect": ValidationProofType.OPEN_REDIRECT,
     "Sensitive Data Exposure": ValidationProofType.SENSITIVE_DATA_EXPOSURE,
+    "Exposed Working Credentials": ValidationProofType.WORKING_PUBLIC_CREDENTIAL,
+    "GraphQL Introspection Exposure": ValidationProofType.GRAPHQL_INTROSPECTION_EXPOSURE,
+    "GraphQL Field Suggestion Exposure": ValidationProofType.GRAPHQL_FIELD_SUGGESTION_EXPOSURE,
     "Source Map Exposure": ValidationProofType.SOURCE_MAP_EXPOSURE,
+    "Error Detail Exposure": ValidationProofType.ERROR_DETAIL_EXPOSURE,
     "XSS": ValidationProofType.XSS_EXECUTION,
     "SQLi": ValidationProofType.SQLI_EFFECT,
     "Access Control": ValidationProofType.UNAUTHORIZED_OBJECT_ACCESS,
@@ -624,8 +628,9 @@ class Orchestrator:
         )
 
     def _analysis_floor(self, run: Run, candidate_id: str) -> int:
+        validation_floor = self._pending_validation_floor(run)
         if not run.budget_candidate_order:
-            return 0
+            return validation_floor
         order = run.budget_candidate_order
         pending = tuple(
             item_id for item_id in order
@@ -639,7 +644,33 @@ class Orchestrator:
         weight = weights[candidate_id]
         total_weight = sum(weights[item] for item in pending)
         share = max(1, (analysis_pool * weight + total_weight - 1) // total_weight)
-        return max((analyzed + 1) * reserve, remaining - share)
+        return max(validation_floor, (analyzed + 1) * reserve, remaining - share)
+
+    def _pending_validation_floor(self, run: Run) -> int:
+        """Keep enough requests for proofs already earned during Analysis.
+
+        Browser probes load page dependencies through the same central budget as
+        top-level requests. Use the observed dependency count to reserve two
+        independent validation navigations. This applies even when optional
+        candidate allocation is off, so a late analysis cannot consume an
+        earlier candidate's proof budget.
+        """
+
+        reserve = 0
+        for candidate_id in run.candidate_ids:
+            candidate = self._candidates.get(run.run_id, candidate_id)
+            if not _pending_in(candidate, CandidateStatus.ANALYZED):
+                continue
+            browser_costs = [
+                min(32, 1 + count)
+                for evidence in self._evidence.get_many(run.run_id, candidate.evidence_ids)
+                if evidence.observation.get("type") == "browser_execution"
+                and evidence.observation.get("dom_reflected") is True
+                if type(count := evidence.observation.get("subrequest_count")) is int
+                and count >= 0
+            ]
+            reserve += 2 * max(browser_costs) if browser_costs else 2
+        return reserve
 
     def _validation_floor(
         self, run: Run, candidate_id: str, remaining_ids: Sequence[str]
@@ -697,6 +728,7 @@ class Orchestrator:
 
         current = run
         order = run.budget_candidate_order or run.candidate_ids
+        deferred_costs: dict[str, int] = {}
         for candidate_id in order:
             candidate = self._candidates.get(run.run_id, candidate_id)
             # 이미 처리된 Candidate는 재개 시 중복 분석하지 않는다.
@@ -717,9 +749,43 @@ class Orchestrator:
             try:
                 with self._budget_scope(run.run_id, floor):
                     current = self._analyze_candidate(current, candidate)
+            except BudgetExceeded as error:
+                if error.required_requests is not None:
+                    deferred_costs[candidate_id] = error.required_requests
+                current = self._skip_candidate_for_budget(current, candidate_id)
             except Exception as error:
                 current = self._fail_candidate(current, candidate_id, error)
             current = self._clear_active_budget_candidate(current)
+        # Redistribute unused analysis shares after every candidate had a
+        # first turn. Preserve one validation unit per already analyzed
+        # candidate. Only a declared request batch is retried, so a partially
+        # spent probe cannot consume the last validation units.
+        if run.budget_candidate_order:
+            for candidate_id in order:
+                required = deferred_costs.get(candidate_id)
+                candidate = self._candidates.get(run.run_id, candidate_id)
+                if required is None or not (
+                    candidate.status is CandidateStatus.SKIPPED_BUDGET
+                    and candidate.resume_status is CandidateStatus.ROUTED
+                ):
+                    continue
+                floor = (
+                    self._pending_validation_count(current, run.candidate_ids)
+                    * run.budget_validation_reserve
+                )
+                if self._global_remaining(run.run_id) - floor < required:
+                    continue
+                current, floor = self._activate_budget_candidate(
+                    current, candidate_id, "analyze", floor
+                )
+                try:
+                    with self._budget_scope(run.run_id, floor):
+                        current = self._analyze_candidate(current, candidate)
+                except BudgetExceeded:
+                    current = self._skip_candidate_for_budget(current, candidate_id)
+                except Exception as error:
+                    current = self._fail_candidate(current, candidate_id, error)
+                current = self._clear_active_budget_candidate(current)
         return current
 
     def _analyze_candidate(self, run: Run, candidate: Candidate) -> Run:
@@ -770,6 +836,12 @@ class Orchestrator:
                 )
             if evidence_round >= self._config.max_evidence_rounds:
                 raise AgentContractError("analysis evidence rounds exhausted")
+
+            if len(result.evidence_requests) > self._budget.remaining(run.run_id):
+                raise BudgetExceeded(
+                    "analysis evidence batch exceeds the available request budget",
+                    required_requests=len(result.evidence_requests),
+                )
 
             # Agent는 실행하지 않고 요청만 반환한다. 실제 실행은 중앙 수집 Task가 맡는다.
             for request in result.evidence_requests:
@@ -851,6 +923,7 @@ class Orchestrator:
         # 부분 재개를 고려해 저장소에 이미 존재하는 Finding부터 복원한다.
         finding_ids = [item.finding_id for item in self._findings.list_by_run(run.run_id)]
         order = run.budget_candidate_order or run.candidate_ids
+        deferred_costs: dict[str, int] = {}
         for position, candidate_id in enumerate(order):
             candidate = self._candidates.get(run.run_id, candidate_id)
             if not _pending_in(candidate, CandidateStatus.ANALYZED):
@@ -865,6 +938,39 @@ class Orchestrator:
                 current = self._skip_candidate_for_budget(current, candidate_id)
                 current = self._clear_active_budget_candidate(current)
                 continue
+            try:
+                with self._budget_scope(run.run_id, floor):
+                    current, finding_id = self._validate_candidate(current, candidate)
+            except BudgetExceeded as error:
+                if error.required_requests is not None:
+                    deferred_costs[candidate_id] = error.required_requests
+                current = self._skip_candidate_for_budget(current, candidate_id)
+                current = self._clear_active_budget_candidate(current)
+                continue
+            except Exception as error:
+                current = self._fail_candidate(current, candidate_id, error)
+                current = self._clear_active_budget_candidate(current)
+                continue
+            current = self._clear_active_budget_candidate(current)
+            if finding_id is not None:
+                finding_ids.append(finding_id)
+        # A fair share can leave budget unused when later proofs are cheap.
+        # Retry only a validation that published its outstanding request cost,
+        # and only if the global remainder can pay the whole batch. This avoids
+        # spending a few requests on a proof that still cannot complete.
+        for candidate_id in order:
+            required = deferred_costs.get(candidate_id)
+            if required is None or self._global_remaining(run.run_id) < required:
+                continue
+            candidate = self._candidates.get(run.run_id, candidate_id)
+            if not (
+                candidate.status is CandidateStatus.SKIPPED_BUDGET
+                and candidate.resume_status is CandidateStatus.ANALYZED
+            ):
+                continue
+            current, floor = self._activate_budget_candidate(
+                current, candidate_id, "validate", 0
+            )
             try:
                 with self._budget_scope(run.run_id, floor):
                     current, finding_id = self._validate_candidate(current, candidate)
@@ -938,6 +1044,12 @@ class Orchestrator:
             if evidence_round >= self._config.max_evidence_rounds:
                 break
 
+            if len(result.evidence_requests) > self._budget.remaining(run.run_id):
+                raise BudgetExceeded(
+                    "validation evidence batch exceeds the available request budget",
+                    required_requests=len(result.evidence_requests),
+                )
+
             # Validator는 요청만 제안한다. 실제 실행과 provenance 부여는 중앙에서 한다.
             for request in result.evidence_requests:
                 if request.surface_id != candidate.surface_id:
@@ -993,7 +1105,10 @@ class Orchestrator:
         # Validator의 reason은 외부 응답을 포함할 수 있어 그대로 저장하지 않는다.
         # BLOCKED는 판정은 났지만 검증을 완료하지 못했다는 사실만 일반화해 남긴다.
         reason = "validation blocked" if status is CandidateStatus.BLOCKED else None
-        candidate = candidate.set_status(status, reason=reason)
+        candidate = candidate.set_status(
+            status, reason=reason,
+            validation_reason_code=validation.reason_code,
+        )
         self._candidates.save(candidate)
         self._emit(
             current,
@@ -1196,9 +1311,22 @@ class Orchestrator:
                     "validation evidence is missing its collection task provenance"
                 )
             if item.surface_id != candidate.surface_id:
-                raise AgentContractError(
-                    "validation result references evidence from another surface"
-                )
+                related = validation.proof.related_surface_ids if validation.proof is not None else ()
+                if validation.verdict is not ValidationVerdict.CONFIRMED or item.surface_id not in related:
+                    raise AgentContractError(
+                        "validation result references evidence from another surface"
+                    )
+                other_surface = self._surfaces.get(run.run_id, item.surface_id)
+                primary_surface = self._surfaces.get(run.run_id, candidate.surface_id)
+                from urllib.parse import urlsplit
+                if (
+                    urlsplit(other_surface.url).scheme.casefold(),
+                    urlsplit(other_surface.url).netloc.casefold(),
+                ) != (
+                    urlsplit(primary_surface.url).scheme.casefold(),
+                    urlsplit(primary_surface.url).netloc.casefold(),
+                ):
+                    raise AgentContractError("related proof surface is outside the candidate origin")
 
         if validation.verdict is ValidationVerdict.CONFIRMED:
             expected_proof = _PROOF_TYPE_BY_VULNERABILITY.get(

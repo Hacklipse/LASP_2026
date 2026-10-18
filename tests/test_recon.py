@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from hacklipse.adapters import HttpExecutionRuntime
 from hacklipse.adapters.browser_recon import BrowserReconResult
 from hacklipse.adapters.memory import InMemoryEvidenceStore, InMemorySurfaceStore
-from hacklipse.adapters.recon import ReconAgent, _json_links_from_response
+from hacklipse.adapters.recon import ReconAgent, _json_links_from_response, _parse_page
 from hacklipse.adapters.routing import RuleBasedVulnerabilityRouter
 from hacklipse.application.errors import AgentContractError, WorkflowExecutionError
 from hacklipse.bootstrap import build_local_application
@@ -109,6 +109,55 @@ def _task(
 
 
 class ReconAgentTests(unittest.TestCase):
+    def test_html_preloaded_script_chunks_enter_existing_script_frontier(self) -> None:
+        _, _, sources, _ = _parse_page(
+            '<script src="/app.js"></script>'
+            '<link rel="modulepreload" href="/route.mjs">'
+            '<link rel="preload" as="script" href="/lazy.js">'
+            '<link rel="preload" as="style" href="/styles.css">'
+            '<link rel="stylesheet" href="/other.js">'
+            '<link rel="modulepreload" href="/route.mjs">',
+            "http://localhost/",
+        )
+        self.assertEqual(sources, [
+            "http://localhost/app.js", "http://localhost/route.mjs",
+            "http://localhost/lazy.js",
+        ])
+
+    def test_browser_only_search_page_can_confirm_query_surface(self) -> None:
+        base = "http://localhost"
+        marker = "hacklipse-search-control"
+        evidence_store = InMemoryEvidenceStore()
+        surface_store = InMemorySurfaceStore()
+        collector = _RoutingCollector(evidence_store, {
+            base + "/": "<html></html>",
+            base + "/search?q=" + marker: "<html>Results for: " + marker + "</html>",
+        })
+
+        class BrowserSearch:
+            def discover(self, task, **kwargs):
+                evidence_store.append(Evidence(
+                    evidence_id="browser-search-response", run_id=task.run_id,
+                    surface_id=None, created_by="execution_runtime:http_get",
+                    evidence_type="http_response", observation={
+                        "requested_url": base + "/search", "status": 200,
+                        "content_type": "text/html", "body": "<html>Results for: </html>",
+                    },
+                ))
+                return BrowserReconResult(("browser-search-response",), ())
+
+        agent = ReconAgent(
+            collector=collector, evidence_store=evidence_store,
+            surface_store=surface_store, browser_recon=BrowserSearch(),
+            max_pages=8,
+        )
+        agent.handle(replace(_task("browser-search", base + "/"), request_budget=30))
+        self.assertIn(base + "/search?q=" + marker, collector.calls)
+        self.assertTrue(any(
+            surface.url == base + "/search" and surface.parameters == ("q",)
+            for surface in surface_store.list_by_run("browser-search")
+        ))
+
     def test_reuses_browser_fetched_javascript_without_another_request(self) -> None:
         evidence_store = InMemoryEvidenceStore()
         surface_store = InMemorySurfaceStore()
@@ -149,9 +198,12 @@ class ReconAgentTests(unittest.TestCase):
         agent.handle(task)
 
         self.assertEqual(
-            [url for _, url in collector.calls],
-            ["http://localhost/", "http://localhost/openapi.json"],
+            [url for _, url in collector.calls[:4]],
+            ["http://localhost/", "http://localhost/openapi.json",
+             "http://localhost/swagger.json", "http://localhost/swagger/v1/swagger.json"],
         )
+        self.assertEqual(len(collector.calls), 5)
+        self.assertTrue(collector.calls[4][1].startswith("http://localhost/graphql?query="))
         surfaces = surface_store.list_by_run(task.run_id)
         self.assertTrue(any(
             surface.url == "http://localhost/api/search"
@@ -487,6 +539,136 @@ def _crawling_agent(bodies: dict[str, str], **kwargs):
 
 
 class ReconCrawlTests(unittest.TestCase):
+    def test_search_query_surface_requires_observed_echo(self) -> None:
+        base = "http://localhost"
+        marker = "hacklipse-search-control"
+        agent, collector, surfaces = _crawling_agent({
+            base + "/": '<a href="/search">Search</a><a href="/lookup">Lookup</a>',
+            base + "/search": "<html>Results for: </html>",
+            base + "/search?q=" + marker: "<html>Results for: " + marker + "</html>",
+            base + "/lookup": "<html>Lookup</html>",
+            base + "/lookup?q=" + marker: "<html>Lookup</html>",
+        }, max_pages=8)
+        agent.handle(replace(_task("search-echo", base + "/"), request_budget=30))
+
+        self.assertIn(base + "/search?q=" + marker, collector.calls)
+        self.assertIn(base + "/lookup?q=" + marker, collector.calls)
+        self.assertTrue(any(
+            surface.url == base + "/search"
+            and surface.parameters == ("q",)
+            and "observed_search_parameter" in surface.discovery_types
+            for surface in surfaces.list_by_run("search-echo")
+        ))
+        self.assertFalse(any(
+            surface.url == base + "/lookup" and surface.parameters
+            for surface in surfaces.list_by_run("search-echo")
+        ))
+
+    def test_sparse_root_records_public_graphql_schema_without_executing_mutations(self) -> None:
+        base = "http://localhost"
+        schema = {"data": {"__schema": {
+            "queryType": {"name": "Query"},
+            "mutationType": {"name": "Mutation"},
+            "types": [
+                {"kind": "OBJECT", "name": "Query", "fields": [{"name": "posts"}]},
+                {"kind": "OBJECT", "name": "Mutation", "fields": [{"name": "login"}]},
+                {"kind": "OBJECT", "name": "User", "fields": [{"name": "displayName"}]},
+            ],
+        }}}
+        agent, collector, surfaces = _crawling_agent(
+            {base + "/": "<html><body>Welcome</body></html>"},
+        )
+        original_collect = collector.collect
+
+        def collect(run_id, target_url, spec, **kwargs):
+            if target_url.startswith(base + "/graphql?query="):
+                collector._bodies[target_url] = json.dumps(schema)
+                collector._content_types[target_url] = "application/json"
+            return original_collect(run_id, target_url, spec, **kwargs)
+
+        collector.collect = collect
+        agent.handle(replace(_task("graphql-schema", base + "/"), request_budget=30))
+        discovered = surfaces.list_by_run("graphql-schema")
+        self.assertTrue(any(
+            item.url == base + "/graphql" and item.discovery_types == ("graphql_introspection",)
+            for item in discovered
+        ))
+        observations = [
+            item.observation for item in collector._evidence.list_by_run("graphql-schema")
+            if item.observation.get("type") == "graphql_schema_operation"
+        ]
+        self.assertEqual(
+            {(item["graphql_kind"], item["operation"]) for item in observations},
+            {("query", "__schema"), ("query", "posts"),
+             ("mutation", "login")},
+        )
+        self.assertEqual(len([url for url in collector.calls if "/graphql?" in url]), 1)
+
+    def test_sparse_root_stops_schema_probe_at_first_valid_description(self) -> None:
+        base = "http://localhost"
+        schema = {"openapi": "3.0.0", "paths": {
+            "/api/search": {"get": {"parameters": [
+                {"name": "q", "in": "query", "schema": {"type": "string"}}
+            ]}},
+        }}
+        agent, collector, surfaces = _crawling_agent(
+            {base + "/": "<html><body>Welcome</body></html>",
+             base + "/swagger.json": json.dumps(schema)},
+            content_types={base + "/swagger.json": "application/json"},
+        )
+        agent.handle(replace(_task("sparse-schema", base + "/"), request_budget=30))
+        self.assertEqual(collector.calls, [
+            base + "/", base + "/openapi.json", base + "/swagger.json",
+        ])
+        self.assertTrue(any(
+            item.url == base + "/api/search" and item.parameters == ("q",)
+            for item in surfaces.list_by_run("sparse-schema")
+        ))
+
+    def test_openapi_get_sampling_follows_response_links_without_mutation(self) -> None:
+        base = "http://localhost"
+        schema = {"openapi": "3.0.0", "paths": {
+            "/api/config": {"get": {}},
+            "/api/info": {"get": {}},
+            "/api/logout": {"get": {}},
+            "/api/items": {"post": {}},
+        }}
+        agent, collector, surfaces = _crawling_agent(
+            {base + "/": "<html><body>Welcome</body></html>",
+             base + "/openapi.json": json.dumps(schema),
+             base + "/api/info": '{"navigation":["/api/linked?term=ok"]}'},
+            content_types={
+                base + "/openapi.json": "application/json",
+                base + "/api/info": "application/json",
+            },
+        )
+        agent.handle(replace(_task("schema-get-sample", base + "/"), request_budget=30))
+        self.assertIn(base + "/api/info", collector.calls)
+        self.assertIn(base + "/api/linked?term=ok", collector.calls)
+        self.assertNotIn(base + "/api/logout", collector.calls)
+        self.assertNotIn(base + "/api/items", collector.calls)
+        self.assertNotIn(base + "/api/config", collector.calls)
+        self.assertTrue(any(
+            item.url == base + "/api/linked" and item.parameters == ("term",)
+            for item in surfaces.list_by_run("schema-get-sample")
+        ))
+
+    def test_template_only_openapi_is_recorded_without_guessing_another_schema_url(self) -> None:
+        base = "http://localhost"
+        schema = {"openapi": "3.0.0", "paths": {
+            "/api/items/{item_id}": {"get": {}},
+        }}
+        agent, collector, surfaces = _crawling_agent(
+            {base + "/": '<a href="/api/schema/">schema</a>',
+             base + "/api/schema/": json.dumps(schema)},
+            content_types={base + "/api/schema/": "application/json"},
+        )
+        agent.handle(replace(_task("template-only", base + "/"), request_budget=20))
+        self.assertEqual(collector.calls, [base + "/", base + "/api/schema/"])
+        self.assertFalse(any(
+            "item_id" in item.url for item in surfaces.list_by_run("template-only")
+        ))
+
     def test_heuristic_frontier_summary_names_unvisited_surfaces_and_stop_reason(self) -> None:
         base = "http://localhost"
         agent, collector, _ = _crawling_agent(
@@ -528,11 +710,23 @@ class ReconCrawlTests(unittest.TestCase):
         }}
         agent, collector, surfaces = _crawling_agent(
             {base + "/": '<a href="/api/schema/">API</a>',
-             base + "/api/schema/": json.dumps(schema)},
-            content_types={base + "/api/schema/": "application/json"},
+             base + "/api/schema/": json.dumps(schema),
+             base + "/api/items": json.dumps({"results": [
+                 {"id": 7, "name": "observed item"},
+                 {"id": "../../outside", "name": "ignored"},
+             ]}),
+             base + "/api/items/7": json.dumps({"id": 7})},
+            content_types={
+                base + "/api/schema/": "application/json",
+                base + "/api/items": "application/json",
+                base + "/api/items/7": "application/json",
+            },
         )
         agent.handle(replace(_task("linked-openapi", base + "/"), request_budget=20))
-        self.assertEqual(collector.calls, [base + "/", base + "/api/schema/"])
+        self.assertEqual(collector.calls, [
+            base + "/", base + "/api/schema/", base + "/api/items",
+            base + "/api/items/7",
+        ])
         self.assertTrue(any(
             item.url == base + "/api/items" and item.parameters == ("filter",)
             for item in surfaces.list_by_run("linked-openapi")
@@ -552,7 +746,12 @@ class ReconCrawlTests(unittest.TestCase):
         self.assertFalse(shape["request_template_available"])
         self.assertNotIn("secret-token-value", str(shape))
         self.assertNotIn("private@example.invalid", str(shape))
-        self.assertEqual(collector.calls, [base + "/", base + "/api/schema/"])
+        self.assertTrue(any(
+            item.url == base + "/api/items/7"
+            and item.path_identifier == "item_id"
+            for item in surfaces.list_by_run("linked-openapi")
+        ))
+        self.assertFalse(any("outside" in item.url for item in surfaces.list_by_run("linked-openapi")))
 
     def test_public_openapi_adds_literal_request_shapes_without_mutations(self) -> None:
         base = "http://localhost"
@@ -783,6 +982,121 @@ class ReconCrawlTests(unittest.TestCase):
         self.assertEqual(found["http://localhost/api/items"], ("term",))
         self.assertNotIn("http://localhost/api/itemId", found)
         self.assertNotIn("http://localhost//evil.example/collect", found)
+
+    def test_discovers_all_fields_in_literal_javascript_query(self) -> None:
+        bundle = (
+            'fetch("/api/items?term=hello&sort=recent&limit=10");'
+            'fetch("//outside.example/items?token=secret");'
+            'fetch("/api/" + itemId + "?unknown=value");'
+        )
+        agent, collector, surfaces = _crawling_agent(
+            {"http://localhost/": _SPA_HTML, "http://localhost/main.js": bundle}
+        )
+        agent.handle(_task("run-literal-query", "http://localhost/"))
+        found = {
+            surface.url: surface.parameters
+            for surface in surfaces.list_by_run("run-literal-query")
+        }
+        self.assertEqual(
+            found["http://localhost/api/items"], ("limit", "sort", "term")
+        )
+        self.assertNotIn("http://localhost/api/itemId", found)
+        self.assertFalse(any("outside.example" in url for url in collector.calls))
+
+    def test_discovers_inline_script_routes_without_parsing_json_data_as_code(self) -> None:
+        html = (
+            '<script type="application/json">{"path":"/api/not-code?secret=x"}</script>'
+            '<script>fetch("/api/inline?term=a&sort=recent");'
+            'location.assign("/account")</script>'
+            '<script src="/main.js"></script>'
+        )
+        agent, collector, surfaces = _crawling_agent(
+            {
+                "http://localhost/": html,
+                "http://localhost/main.js": 'fetch("/api/external?q=")',
+                "http://localhost/account": "<html>account</html>",
+            }, max_pages=4,
+        )
+        agent.handle(replace(
+            _task("run-inline-js", "http://localhost/"), request_budget=20
+        ))
+        found = {
+            surface.url: surface.parameters
+            for surface in surfaces.list_by_run("run-inline-js")
+        }
+        self.assertEqual(found["http://localhost/api/inline"], ("sort", "term"))
+        self.assertEqual(found["http://localhost/api/external"], ("q",))
+        self.assertNotIn("http://localhost/api/not-code", found)
+        self.assertIn("http://localhost/main.js", collector.calls)
+        self.assertIn("http://localhost/account", collector.calls)
+        self.assertNotIn("http://localhost/openapi.json", collector.calls)
+        self.assertLess(
+            collector.calls.index("http://localhost/main.js"),
+            collector.calls.index("http://localhost/account"),
+        )
+
+    def test_inline_scripts_keep_distinct_query_shapes_for_one_route(self) -> None:
+        html = (
+            '<script>fetch("/api/search?q=")</script>'
+            '<script>fetch("/api/search?sort=")</script>'
+        )
+        agent, _, surfaces = _crawling_agent(
+            {"http://localhost/": html}, max_pages=3,
+        )
+        agent.handle(replace(
+            _task("run-inline-shapes", "http://localhost/"), request_budget=20
+        ))
+        shapes = {
+            surface.parameters
+            for surface in surfaces.list_by_run("run-inline-shapes")
+            if surface.url == "http://localhost/api/search"
+        }
+        self.assertEqual(shapes, {("q",), ("sort",)})
+
+    def test_inline_script_cap_preserves_input_bearing_routes(self) -> None:
+        bundle = "".join(f'const p{i}="/asset{i}";' for i in range(110))
+        bundle += 'fetch("/api/search?q=")'
+        agent, _, surfaces = _crawling_agent(
+            {"http://localhost/": f"<script>{bundle}</script>"}, max_pages=2,
+        )
+        agent.handle(replace(
+            _task("run-inline-cap", "http://localhost/"), request_budget=20
+        ))
+        found = {
+            surface.url: surface.parameters
+            for surface in surfaces.list_by_run("run-inline-cap")
+        }
+        self.assertEqual(found["http://localhost/api/search"], ("q",))
+        self.assertNotIn("http://localhost/asset90", found)
+
+    def test_client_script_records_literal_mutation_methods_without_sending_them(self) -> None:
+        bundle = (
+            'fetch("/api/messages?view=short", {method: "POST", '
+            'body: JSON.stringify({message: secretValue})});'
+            'axios.patch("/api/profile/7", {name: "private"});'
+            'fetch("//evil.example/collect", {method: "POST"});'
+            'fetch(dynamicPath, {method: "POST"});'
+        )
+        agent, collector, surfaces = _crawling_agent(
+            {"http://localhost/": _SPA_HTML, "http://localhost/main.js": bundle}
+        )
+        agent.handle(_task("script-methods", "http://localhost/"))
+        found = {(surface.url, surface.method): surface
+                 for surface in surfaces.list_by_run("script-methods")}
+        post = found[("http://localhost/api/messages", "POST")]
+        self.assertEqual(post.parameters, ())
+        self.assertIn("script_request_shape", post.discovery_types)
+        shape = next(
+            item.observation for item in collector._evidence.list_by_run("script-methods")
+            if item.surface_id == post.surface_id
+            and item.observation.get("type") == "script_request_structure"
+        )
+        self.assertEqual(shape["query_parameter_names"], ["view"])
+        self.assertFalse(shape["request_template_available"])
+        self.assertIn(("http://localhost/api/profile/7", "PATCH"), found)
+        self.assertFalse(any("evil.example" in surface.url for surface in found.values()))
+        self.assertFalse(any("dynamicPath" in surface.url for surface in found.values()))
+        self.assertFalse(any(url.endswith("/api/messages") for url in collector.calls))
 
     def test_ignores_numeric_character_counters_but_keeps_real_numeric_routes(self) -> None:
         bundle = (
