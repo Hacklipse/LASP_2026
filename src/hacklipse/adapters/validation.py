@@ -68,7 +68,10 @@ from .ssti_analysis import (
     ssti_query_execution_signal,
 )
 from .xss_execution import (
-    BROWSER_XSS_TOOL, XSS_EXECUTION_MARKER_PREFIX, attribute_execution_marker,
+    BROWSER_XSS_TOOL,
+    XSS_EXECUTION_MARKER_PREFIX,
+    attribute_execution_marker,
+    context_execution_marker,
 )
 from .postmessage_plan import POSTMESSAGE_ANALYZER
 from .postmessage_xss_analysis import message_request
@@ -911,11 +914,25 @@ class ValidationAgent:
             and item.observation.get("type") == "dom_secondary_attribute_sink"
             and isinstance((attribute := item.observation.get("attribute")), str)
         ))[:2]
+        # Analysis가 응답 본문에서 계산한 반사 맥락. HTML text 맥락을 가정한 기본
+        # payload는 JS 문자열 리터럴이나 URI 속성에서는 실행되지 않으므로, 맥락마다
+        # 그 맥락에서만 발화하는 고정 payload를 따로 재현한다.
+        signaled_contexts = tuple(dict.fromkeys(
+            context
+            for item in evidence
+            if item.surface_id == candidate.surface_id
+            and item.observation.get("type") == "reflection"
+            for context in (item.observation.get("payload_contexts") or ())
+            if isinstance(context, str) and context != "html_text"
+        ))[:2]
         secondary_plans = []
-        for attribute in secondary_attributes:
+        for seed, builder in (
+            *((attribute, attribute_execution_marker) for attribute in secondary_attributes),
+            *((context, context_execution_marker) for context in signaled_contexts),
+        ):
             try:
-                secondary_marker = attribute_execution_marker(
-                    f"{task.validation_id}{candidate.candidate_id}", attribute
+                secondary_marker = builder(
+                    f"{task.validation_id}{candidate.candidate_id}", seed
                 )
             except ValueError:
                 continue

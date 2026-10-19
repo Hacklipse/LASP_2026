@@ -401,3 +401,80 @@ def marker_reflected(
         and marker in probe_body
         and (control_body is None or marker not in control_body)
     )
+
+
+# Payload를 고를 수 있는 반사 맥락. LLM이 말하는 coarse context와 달리 이 값은 Python이
+# 응답 본문에서 직접 계산한 사실이다. 어떤 payload를 보낼지가 여기서 갈리므로, 맥락
+# 판정을 LLM에 맡기면 LLM이 사실상 payload를 고르게 된다.
+PAYLOAD_CONTEXTS = (
+    "html_text",
+    "js_string_double",
+    "js_string_single",
+    "uri_attribute",
+    "attribute_double",
+    "attribute_single",
+    "unclassified",
+)
+# 한 응답에서 분류할 반사 자리 수의 상한. 같은 값이 수백 번 되돌아오는 페이지에서
+# 전체를 훑지 않는다.
+_MAX_CONTEXT_SITES = 8
+# javascript: URI가 자동으로 실행되는 속성. href처럼 사용자 조작이 필요한 것은
+# 자동 탐침으로 재현할 수 없으므로 넣지 않는다.
+_URI_ATTRIBUTES = frozenset({"src", "action", "formaction", "data", "poster"})
+_SCRIPT_OPEN = re.compile(r"<script\b[^>]*>", re.I)
+_SCRIPT_CLOSE = re.compile(r"</script\s*>", re.I)
+_ATTRIBUTE_BEFORE = re.compile(r"([A-Za-z_:][\w:.-]{0,40})\s*=\s*(\"|')$")
+_MAX_CONTEXT_BODY = 2 * 1024 * 1024
+
+
+def payload_contexts(body: str | None, marker: str) -> tuple[str, ...]:
+    """marker가 떨어진 구문 맥락들을 결정적으로 분류한다.
+
+    HTML text 맥락만 가정한 `<img onerror=...>` 한 형태로는 JS 문자열 리터럴이나
+    URI 속성에 떨어진 반사를 실행으로 재현할 수 없다. 맥락을 알면 그 맥락에 맞는
+    고정 payload 하나만 보낼 수 있다 — 형태는 코드에 박혀 있고 marker만 바뀐다.
+
+    한 값이 여러 곳에 반사되면 맥락도 여러 개다. 중복을 제거해 등장 순서대로
+    돌려주고, 분류하지 못한 자리는 payload를 고를 근거가 없으므로 버린다.
+    """
+
+    if not body or len(body) > _MAX_CONTEXT_BODY:
+        return ()
+    found: list[str] = []
+    for match in list(re.finditer(re.escape(marker), body))[:_MAX_CONTEXT_SITES]:
+        context = _payload_context_at(body, marker, match.start())
+        if context != "unclassified" and context not in found:
+            found.append(context)
+    return tuple(found)
+
+
+def _payload_context_at(body: str, marker: str, index: int) -> str:
+    before = body[:index]
+
+    opened = None
+    for match in _SCRIPT_OPEN.finditer(before):
+        opened = match
+    if opened is not None and not _SCRIPT_CLOSE.search(before, opened.end()):
+        # <script> 안이다. 여는 따옴표가 marker 앞에 있고 닫는 짝이 뒤에 있어야
+        # 문자열 리터럴 안이라고 말할 수 있다.
+        script = before[opened.end():]
+        rest = body[index + len(marker):]
+        end = _SCRIPT_CLOSE.search(rest)
+        after = rest[: end.start()] if end else rest
+        for quote, context in (('"', "js_string_double"), ("'", "js_string_single")):
+            if script.count(quote) % 2 == 1 and quote in after:
+                return context
+        return "unclassified"
+
+    tag_open = before.rfind("<")
+    if tag_open == -1 or tag_open < before.rfind(">"):
+        return "html_text"
+    attribute = _ATTRIBUTE_BEFORE.search(before[tag_open:])
+    if attribute is None:
+        return "unclassified"
+    name, quote = attribute.group(1).casefold(), attribute.group(2)
+    if quote not in body[index + len(marker):]:
+        return "unclassified"
+    if name in _URI_ATTRIBUTES and body[index:].startswith(marker):
+        return "uri_attribute"
+    return "attribute_double" if quote == '"' else "attribute_single"
