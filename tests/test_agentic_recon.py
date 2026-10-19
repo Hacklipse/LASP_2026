@@ -689,6 +689,38 @@ class AgenticReconIntegrationTests(unittest.TestCase):
         self.assertEqual(api.parameter_names, ("q",))
         self.assertEqual(api.discovery_types, ("script_literal",))
 
+    def test_source_map_reference_does_not_abort_agentic_recon(self) -> None:
+        bodies = {
+            "http://localhost/": '<script src="/main.js"></script>',
+            "http://localhost/main.js": (
+                'const endpoint = "/api/search?q=";\n'
+                '//# sourceMappingURL=main.js.map'
+            ),
+            "http://localhost/api/search": "[]",
+        }
+        evidence_store = InMemoryEvidenceStore()
+        surface_store = InMemorySurfaceStore()
+        collector = _Collector(evidence_store, bodies)
+        planner = _SelectPathPlanner("/api/search")
+        ids = iter(range(1000))
+        agent = ReconAgent(
+            collector=collector,
+            evidence_store=evidence_store,
+            surface_store=surface_store,
+            iterative_planner=planner,
+            max_pages=5,
+            id_factory=lambda: str(next(ids)),
+        )
+
+        agent.handle(replace(_TASK, request_budget=10))
+
+        self.assertIn("http://localhost/api/search", collector.calls)
+        self.assertTrue(any(
+            "source_map_reference" in surface.discovery_types
+            for surface in surface_store.list_by_run(_TASK.run_id)
+        ))
+        self.assertTrue(planner.calls)
+
     def test_recon_agent_independently_blocks_a_foreign_surface_id(self) -> None:
         bodies = {
             "http://localhost/": '<a href="/a">a</a>',
