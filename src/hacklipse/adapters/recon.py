@@ -2823,8 +2823,12 @@ def _parse_page(
         names = tuple(
             dict.fromkeys(
                 field["name"]
+                # 이름 있는 <button>도 폼 필드다. 브라우저는 누른 버튼의 name=value를
+                # 함께 보내고, 그 값이 있어야 비로소 실행되는 분기가 흔하다 —
+                # XBEN-071의 send.php는 isset($_POST['submit'])로 전체를 감싸므로
+                # 버튼을 빼면 주입 지점에 닿는 요청을 만들 수 없다.
                 for field in form.find_all(
-                    ["input", "select", "textarea"], attrs={"name": True}
+                    ["input", "select", "textarea", "button"], attrs={"name": True}
                 )
                 if field["name"]
             )

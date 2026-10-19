@@ -1,0 +1,61 @@
+{
+  "config": {
+    "stamp": "2026-10-18T140552Z",
+    "per_class": 3,
+    "budget": 250,
+    "llm_provider": "gemini",
+    "llm_model": "gemini-3.8-flash",
+    "llm_rpm_limit": 14,
+    "browser_xss_validation": true,
+    "identities": true,
+    "negative_control": false,
+    "authorized_post_paths": [
+      "/send.php"
+    ],
+    "labs": 1
+  },
+  "results": [
+    {
+      "lab_id": "XBEN-071-24",
+      "expected_class": "SQLi",
+      "level": "1",
+      "tags": [
+        "sqli"
+      ],
+      "cause": "probe_ran_no_confirm",
+      "confirmed_types": [],
+      "candidate_types": [
+        "SQLi"
+      ],
+      "candidate_statuses": {
+        "blocked": 1
+      },
+      "surfaces": 16,
+      "findings": 0,
+      "validation_verdicts": [],
+      "gate_blocks": {
+        "input_parameter": 13,
+        "method": 4,
+        "surface_kind": 2,
+        "state_changing_input": 2
+      },
+      "near_miss": [
+        "sqli.http.query",
+        [
+          "method"
+        ],
+        "POST+params"
+      ],
+      "surface_shapes": {
+        "GET": 12,
+        "POST+params": 3,
+        "POST": 1
+      },
+      "requests_used": 33,
+      "phase": "done",
+      "target_url": "http://localhost:49547/",
+      "duration_s": 28.6,
+      "detail": "후보상태={'blocked': 1}"
+    }
+  ]
+}

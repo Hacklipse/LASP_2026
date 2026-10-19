@@ -115,6 +115,7 @@ class LabResult:
     candidate_statuses: dict[str, int] = field(default_factory=dict)
     surfaces: int = 0
     findings: int = 0
+    validation_verdicts: list[str] = field(default_factory=list)
     gate_blocks: dict[str, int] = field(default_factory=dict)
     near_miss: list = field(default_factory=list)
     surface_shapes: dict[str, int] = field(default_factory=dict)
@@ -515,6 +516,23 @@ def run_lasp(
         owner_object_id=owner_id,
         recon_seed_urls=seed_urls,
     )
+    # 검증 이유 코드는 AgentResult로만 돌아오고 저장되지 않는다. 미탐을 읽으려면 그
+    # 코드가 필요하므로(blocked·rejected가 각각 다른 원인을 가린다) 디스패치를 감싸
+    # 수집한다 — 프로덕션 코드는 건드리지 않는다.
+    verdicts: list[str] = []
+    dispatch = app.dispatcher.dispatch
+
+    def recording_dispatch(envelope):
+        result = dispatch(envelope)
+        validation = getattr(result, "validation", None)
+        if validation is not None:
+            verdict = getattr(validation.verdict, "value", str(validation.verdict))
+            code = getattr(validation.reason_code, "value", str(validation.reason_code))
+            verdicts.append(f"{verdict}:{code}")
+        return result
+
+    app.dispatcher.dispatch = recording_dispatch
+
     try:
         with _deadline(RUN_TIMEOUT):
             run = app.orchestrator.start(
@@ -548,6 +566,7 @@ def run_lasp(
                 getattr(c.status, "value", str(c.status)) for c in candidates
             )
         ),
+        "validation_verdicts": verdicts,
         "confirmed_types": sorted(
             {
                 f.vulnerability_type
@@ -618,6 +637,7 @@ def measure(
         result.gate_blocks = metrics.get("gate_blocks", {})
         result.near_miss = metrics.get("near_miss", [])
         result.surface_shapes = metrics.get("surface_shapes", {})
+        result.validation_verdicts = metrics.get("validation_verdicts", [])
         result.cause, result.detail = classify(expected, metrics)
 
     if not keep_up:
