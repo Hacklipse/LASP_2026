@@ -73,6 +73,7 @@ _PROOF_TYPE_BY_VULNERABILITY = {
     "Access Control": ValidationProofType.UNAUTHORIZED_OBJECT_ACCESS,
     "Path Traversal": ValidationProofType.PATH_TRAVERSAL_FILE_READ,
     "SSTI": ValidationProofType.SSTI_EXECUTION,
+    "File Upload": ValidationProofType.FILE_UPLOAD_RETRIEVAL,
 }
 
 # form login 한 번이 쓰는 요청 수 상한(CSRF 선행·전송·보호자원 확인).

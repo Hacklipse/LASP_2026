@@ -20,7 +20,10 @@ from hacklipse.adapters.security import SensitiveDataSanitizer, StaticApprovalGa
 from hacklipse.adapters.http_runtime import HttpExecutionRuntime
 from hacklipse.application import OrchestratorConfig
 from hacklipse.bootstrap import build_local_application, register_standard_agents, standard_router
-from hacklipse.domain import CandidateStatus, ExecutionRequest, ExecutionResult, HttpRequestSpec, RunPhase, RunRequest, RunScope
+from hacklipse.domain import (
+    CandidateStatus, ExecutionRequest, ExecutionResult, HttpRequestSpec, RunPhase, RunRequest,
+    RunScope, ValidationProofType,
+)
 from hacklipse.domain.errors import DomainInvariantError
 
 
@@ -88,6 +91,12 @@ class _UploadRuntime:
                     assert self.token
                     self.token = ""
                 stored_name = filename
+                suffix = filename[len(marker):]
+                if (self.mode == "normalize_repeat" and suffix
+                        and any(name.endswith(suffix) for name in self.files)):
+                    # 같은 확장자를 두 번째로 올리는 쪽이 독립 재현이다. 서버가 그때
+                    # 확장자를 깎으면 "임의 타입이 보관된다"가 재현되지 않는다.
+                    stored_name = "normalized" + str(len(self.uploads)) + ".bin"
                 if self.mode in {"rename", "rename_safe"}:
                     stored_name = "renamed" + str(len(self.uploads)) + (".bin" if self.mode == "rename_safe" else filename[len(marker):])
                 self.files["/files/" + stored_name] = payload
@@ -132,7 +141,7 @@ def _scan(mode="accept", approved=True, budget=500, allocation=False):
 
 
 class FileUploadAnalysisTests(unittest.TestCase):
-    def test_pipeline_records_every_extension_and_independent_suspicion(self):
+    def test_pipeline_records_every_extension_and_confirms_retrieved_storage(self):
         app, runtime, run = _scan()
         self.assertEqual(run.phase, RunPhase.DONE)
         results = [item for item in app.stores.evidence.list_by_run(run.run_id)
@@ -145,8 +154,11 @@ class FileUploadAnalysisTests(unittest.TestCase):
         self.assertEqual(len(set(runtime.uploads)), len(runtime.uploads))
         candidates = app.stores.candidates.list_by_run(run.run_id)
         self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0].status, CandidateStatus.SUSPECTED)
-        self.assertFalse(app.stores.findings.list_by_run(run.run_id))
+        self.assertEqual(candidates[0].status, CandidateStatus.CONFIRMED)
+        findings = app.stores.findings.list_by_run(run.run_id)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].vulnerability_type, "File Upload")
+        self.assertEqual(findings[0].proof_type, ValidationProofType.FILE_UPLOAD_RETRIEVAL)
         reports = app.stores.reports.list_by_run(run.run_id)
         self.assertIn("파일 업로드 확장자 검사", reports[0].content)
         self.assertIn(".phtml", reports[0].content)
@@ -212,10 +224,12 @@ class FileUploadAnalysisTests(unittest.TestCase):
                 rows = {(row["extension"], row["profile"]): row for row in result["results"]}
                 self.assertEqual(rows[(".png", "png_image")]["outcome"], "accepted")
                 self.assertEqual(rows[(".png", "text_octet")]["outcome"], "rejected")
-                self.assertFalse(app.stores.findings.list_by_run(run.run_id))
+                # 내용만 검사하고 확장자는 통과시키는 서버다. 보관된 확장자가 위험하면
+                # 내용 검사를 통과했다는 사실이 면죄가 되지 않는다.
+                self.assertTrue(app.stores.findings.list_by_run(run.run_id))
 
     def test_renamed_files_are_verified_without_claiming_safe_suffixes_are_risky(self):
-        for mode, expected in (("rename", CandidateStatus.SUSPECTED), ("rename_safe", CandidateStatus.BLOCKED)):
+        for mode, expected in (("rename", CandidateStatus.CONFIRMED), ("rename_safe", CandidateStatus.BLOCKED)):
             with self.subTest(mode=mode):
                 app, _, run = _scan(mode)
                 self.assertEqual(run.phase, RunPhase.DONE)
@@ -223,6 +237,13 @@ class FileUploadAnalysisTests(unittest.TestCase):
                             if item.observation.get("type") == UPLOAD_RESULT)
                 self.assertTrue(all(row["outcome"] == "accepted" and row["renamed"] for row in rows))
                 self.assertEqual(app.stores.candidates.list_by_run(run.run_id)[0].status, expected)
+
+    def test_a_normalized_reproduction_stops_short_of_confirmation(self):
+        app, _, run = _scan("normalize_repeat")
+        self.assertEqual(run.phase, RunPhase.DONE)
+        candidate = app.stores.candidates.list_by_run(run.run_id)[0]
+        self.assertEqual(candidate.status, CandidateStatus.SUSPECTED)
+        self.assertFalse(app.stores.findings.list_by_run(run.run_id))
 
     def test_rotating_csrf_and_form_defaults_are_fresh_and_redacted(self):
         app, runtime, run = _scan("csrf")
@@ -333,7 +354,7 @@ class FileUploadAnalysisTests(unittest.TestCase):
                 self.assertEqual(run.phase, RunPhase.DONE)
                 candidates = app.stores.candidates.list_by_run(run.run_id)
                 self.assertEqual(len(candidates), 2)
-                self.assertTrue(all(candidate.status == CandidateStatus.SUSPECTED for candidate in candidates))
+                self.assertTrue(all(candidate.status == CandidateStatus.CONFIRMED for candidate in candidates))
                 self.assertLessEqual(len(runtime.requests), 297)
 
     def test_allowlist_and_case_sensitive_blocklist_outcomes(self):

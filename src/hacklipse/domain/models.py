@@ -99,6 +99,7 @@ class ValidationProofType(str, Enum):
     ERROR_DETAIL_EXPOSURE = "error_detail_exposure"
     OPEN_REDIRECT = "open_redirect"
     CORS_ORIGIN_REFLECTION = "cors_origin_reflection"
+    FILE_UPLOAD_RETRIEVAL = "file_upload_retrieval"
 
 
 class HttpRequestKind(str, Enum):

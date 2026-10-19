@@ -48,6 +48,7 @@ _EXPECTED_PROOF = {
     "Access Control": ValidationProofType.UNAUTHORIZED_OBJECT_ACCESS,
     "Path Traversal": ValidationProofType.PATH_TRAVERSAL_FILE_READ,
     "SSTI": ValidationProofType.SSTI_EXECUTION,
+    "File Upload": ValidationProofType.FILE_UPLOAD_RETRIEVAL,
 }
 
 

@@ -282,13 +282,44 @@ class ValidationAgent:
             self._collector, task, surface, analysis["parameter"],
             form_page=form_page, probes=((accepted[0]["extension"], accepted[0].get("profile", "text_octet")),),
         )
-        verified = any(row["outcome"] == "accepted" and row.get("stored_extension", "").casefold()
-                       in {extension.casefold() for extension in UPLOAD_RISK_EXTENSIONS} for row in reproduced)
-        if verified:
+        # outcome="accepted"는 업로드 응답만으로 서지 않는다. 저장된 파일을 되읽어
+        # 바이트가 일치했을 때만 붙는다. 여기에 확장자 보존까지 겹치면 "서버가 임의
+        # 타입 파일을 그 타입 그대로 보관하고 되돌려준다"는 재현된 사실이므로 CONFIRMED로
+        # 본다. 스크립트 실행은 별개이고 주장하지 않는다.
+        risky = {extension.casefold() for extension in UPLOAD_RISK_EXTENSIONS}
+        stored = next((row for row in reproduced
+                       if row["outcome"] == "accepted"
+                       and row.get("stored_extension", "").casefold() in risky), None)
+        if stored is not None:
+            proof_evidence = self._evidence.get_many(
+                task.run_id, tuple(stored.get("evidence_ids") or ids),
+            )
+            if proof_evidence:
+                served = stored.get("served_content_type") or "an unclassified type"
+                return self._validation_result(
+                    task, verdict=ValidationVerdict.CONFIRMED, evidence=proof_evidence,
+                    reason=(
+                        f"independent upload stored an inert {stored['stored_extension']} file "
+                        f"with its extension intact and served it back byte-identical as {served}"
+                    ),
+                    reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+                    proof=ValidationProof(
+                        proof_type=ValidationProofType.FILE_UPLOAD_RETRIEVAL,
+                        evidence_ids=tuple(item.evidence_id for item in proof_evidence),
+                        summary=(
+                            f"independent session uploaded an inert file to {analysis['parameter']} "
+                            f"and retrieved it byte-identical at a stored {stored['stored_extension']} "
+                            f"path served as {served}; the server keeps an arbitrary file type, "
+                            "which is not by itself proof of script execution"
+                        ),
+                    ),
+                )
+        # 되읽기는 됐지만 서버가 확장자를 정규화했다면 임의 타입 보관이 아니다.
+        if any(row["outcome"] == "accepted" for row in reproduced):
             return self._validation_result(
                 task, verdict=ValidationVerdict.SUSPECTED,
                 evidence=self._evidence.get_many(task.run_id, ids),
-                reason="inert risky-extension upload independently accepted; this proves neither execution nor a server allowlist violation",
+                reason="inert upload independently stored, but the server normalized the extension it is served under",
                 reason_code=ValidationReasonCode.GENERIC_NO_PROOF,
             )
         return self._validation_result(
