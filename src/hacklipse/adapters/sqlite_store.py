@@ -30,6 +30,7 @@ from hacklipse.domain import (
     RunExecutionProfile,
     RunPhase,
     RunScope,
+    PathAssignment,
     Surface,
     TaskEnvelope,
     TaskRecord,
@@ -285,6 +286,12 @@ def _decode_surface(data: str) -> Surface:
     )
     value["parameters"] = tuple(value["parameters"])
     value["discovery_types"] = tuple(value.get("discovery_types", ()))
+    assignment = value.get("path_assignment")
+    # 재개한 Run도 같은 좌표를 그대로 써야 한다. dict로 복원하면 Surface 불변식이
+    # 범위와 URL의 일치를 다시 확인하므로, 저장본이 어긋나면 조용히 통과하지 않는다.
+    value["path_assignment"] = (
+        PathAssignment(**assignment) if assignment is not None else None
+    )
     return Surface(**value)
 
 

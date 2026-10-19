@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
+from collections.abc import Callable
 from typing import Mapping
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
@@ -182,6 +183,10 @@ PATH_TRAVERSAL_BYPASS_SUFFIX = "%2500.md"
 # Access Control 탐침이 식별자 파라미터에 실을 수 있는 값. 숫자만 허용해 LLM이나 Agent가
 # 경로·따옴표·와일드카드를 객체 ID 자리에 넣지 못하게 한다.
 _OBJECT_IDENTIFIER = re.compile(r"^[0-9]{1,10}$")
+# 경로에 `이름=값` 형태로 실린 입력의 이름. query 파라미터명과 같은 수준으로 보수적인
+# 식별자만 인정한다. base64 꼬리(`/aGVsbG8=`)처럼 `=`가 들어간 경로를 입력 좌표로
+# 오인하면 관측하지 않은 자리에 탐침을 보내게 된다.
+_PATH_ASSIGNMENT_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,31}")
 _FORBIDDEN_REQUEST_HEADERS = frozenset(
     {
         "accept-encoding",
@@ -220,6 +225,21 @@ def is_path_traversal_bypass_suffix(value: str) -> bool:
     """도메인이 고정한 확장자 필터 우회 접미사와 정확히 같은지 확인한다."""
 
     return value == PATH_TRAVERSAL_BYPASS_SUFFIX
+
+
+# 경로에 실린 입력의 값을 교체할 수 있는 탐침 종류와, 그 종류가 실을 수 있는 유일한 값.
+#
+# 왜 종류별로 값을 묶는가 — 두 탐침은 서로 다른 것을 증명한다. 상대 탈출은 "디렉터리
+# 밖으로 나갈 수 있는가"를, 절대 경로는 "경로를 그대로 여는가"를 본다. ``..``를 거르는
+# 필터가 절대 경로는 막지 못하는 경우가 흔해 같은 자리에서 결과가 갈린다.
+#
+# 왜 하나로 합치지 않는가 — 값 집합을 종류와 분리해 "둘 중 아무거나"로 두면, 이 필드가
+# 곧 "경로 아무 자리에 허용 목록 중 아무 값이나" 넣는 통로가 된다. 종류마다 값이 하나로
+# 고정돼야 Agent도 LLM도 무엇이 전송될지 고를 수 없다.
+_PATH_ASSIGNMENT_PROBE_VALUES: dict[HttpRequestKind, Callable[[str], bool]] = {
+    HttpRequestKind.PATH_TRAVERSAL_PROBE: is_path_traversal_safe_probe_value,
+    HttpRequestKind.ARBITRARY_FILE_READ_PROBE: is_arbitrary_file_read_safe_probe_value,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -508,6 +528,13 @@ class HttpRequestSpec:
     # 경로 끝에 그대로 붙는 도메인 고정 접미사. 값 형태를 도메인이 강제하므로
     # Agent가 임의 경로나 임의 인코딩을 여기로 실을 수 없다.
     path_suffix: str | None = None
+    # 경로에 실린 `이름=값` 입력에서 값 부분만 교체하는 좌표. 범위는 Recon이 관측한
+    # 것을 그대로 받고, 실을 수 있는 값은 도메인이 고정한 증명 경로 하나뿐이다.
+    # 범용 경로 치환 API가 되지 않도록 아래 _validate_path_assignment가 강제한다.
+    path_assignment_name: str | None = None
+    path_assignment_value_start: int | None = None
+    path_assignment_value_end: int | None = None
+    path_assignment_value: str | None = None
 
     def __post_init__(self) -> None:
         if not self.method or _HTTP_METHOD.fullmatch(self.method) is None:
@@ -606,6 +633,7 @@ class HttpRequestSpec:
                 raise DomainInvariantError(
                     f"path suffix must be the fixed bypass suffix: {self.path_suffix!r}"
                 )
+        self._validate_path_assignment()
         if self.request_kind is HttpRequestKind.ACCESS_CONTROL_PROBE:
             self._validate_access_control_probe()
         if self.request_kind is HttpRequestKind.OPEN_REDIRECT_PROBE and (
@@ -648,6 +676,63 @@ class HttpRequestSpec:
                 raise DomainInvariantError(f"HTTP header is controlled by the runtime: {name}")
             if "\r" in value or "\n" in value:
                 raise DomainInvariantError("HTTP header value cannot contain line breaks")
+
+    def _validate_path_assignment(self) -> None:
+        """경로 내장 입력의 값 교체를 고정된 증명 경로 하나로 제한한다.
+
+        네 필드는 함께 있어야 한다. 하나라도 빠지면 "어디를 바꾸는지"가 불완전해지고,
+        실행기가 남은 정보로 자리를 추측하게 된다.
+
+        실을 수 있는 값은 Path Traversal이 쓰는 고정 증명 경로뿐이다. 임의 문자열을
+        허용하면 이 필드가 곧 "경로 아무 데나 아무거나 넣는" 통로가 된다. control은
+        값을 바꾸지 않고 관측된 URL을 그대로 쓰므로 이 좌표를 싣지 않는다.
+        """
+
+        span = (
+            self.path_assignment_name,
+            self.path_assignment_value_start,
+            self.path_assignment_value_end,
+            self.path_assignment_value,
+        )
+        if all(value is None for value in span):
+            return
+        if any(value is None for value in span):
+            raise DomainInvariantError(
+                "path assignment name, span, and value must be provided together"
+            )
+        assert self.path_assignment_name is not None
+        assert self.path_assignment_value_start is not None
+        assert self.path_assignment_value_end is not None
+        assert self.path_assignment_value is not None
+        accepts_value = _PATH_ASSIGNMENT_PROBE_VALUES.get(self.request_kind)
+        if accepts_value is None:
+            raise DomainInvariantError(
+                "path assignment replacement belongs to a safe-file probe kind only"
+            )
+        if _PATH_ASSIGNMENT_NAME.fullmatch(self.path_assignment_name) is None:
+            raise DomainInvariantError("path assignment name is invalid")
+        if (
+            type(self.path_assignment_value_start) is not int
+            or type(self.path_assignment_value_end) is not int
+            or not 0 <= self.path_assignment_value_start < self.path_assignment_value_end
+        ):
+            raise DomainInvariantError("path assignment span must be a non-empty range")
+        if not accepts_value(self.path_assignment_value):
+            raise DomainInvariantError(
+                "path assignment probe may only use the fixed safe path of its kind: "
+                f"{self.path_assignment_value!r}"
+            )
+        # 같은 경로를 두 규칙이 동시에 고쳐 쓰면 결과 경로를 어느 쪽도 책임지지 못한다.
+        if self.path_suffix is not None or self.query_parameters or self.form_parameters:
+            raise DomainInvariantError(
+                "path assignment probe cannot also change the suffix or structured parameters"
+            )
+        if self.identifier_location is not None or self.path_identifier_index is not None:
+            raise DomainInvariantError(
+                "path assignment probe cannot also move a path object identifier"
+            )
+        if self.body is not None or self.headers or self.method.upper() != "GET":
+            raise DomainInvariantError("path assignment probe must be a bare GET request")
 
     def _validate_access_control_probe(self) -> None:
         """객체 권한 탐침이 식별자 값 하나만 바꾸도록 강제한다.
@@ -769,6 +854,15 @@ class EvidenceRequest:
                 ),
                 "path_identifier_index": request.path_identifier_index,
                 "path_identifier_present": request.path_identifier_value is not None,
+                # 좌표의 이름과 범위는 비밀이 아니라 "어느 자리를 바꾸는 요청인가"다.
+                # 값은 넣지 않는다 — 같은 좌표의 control과 probe는 kind와 purpose로
+                # 이미 구분되고, 값까지 해시하면 관측값이 추측 대상이 된다.
+                "path_assignment_name": request.path_assignment_name,
+                "path_assignment_span": (
+                    [request.path_assignment_value_start, request.path_assignment_value_end]
+                    if request.path_assignment_name is not None
+                    else None
+                ),
                 "surface_id": self.surface_id,
                 "target": [
                     parsed.scheme.casefold(),
@@ -865,6 +959,55 @@ class Evidence:
 
 
 @dataclass(frozen=True, slots=True)
+class PathAssignment:
+    """경로 자체에 ``이름=값``으로 실린 입력 좌표.
+
+    ``/file=web_assets/app.js``처럼 query가 아니라 경로가 입력을 나르는 표면이 있다.
+    이런 자리를 query parameter로 기록하면 Analyzer가 ``?file=``을 덧붙인, 대상이
+    가진 적 없는 URL을 만든다. 그래서 위치를 별도 좌표로 보존한다.
+
+    ``value_start``/``value_end``는 ``urlsplit(url).path``(퍼센트 인코딩이 풀리지 않은
+    원본)의 slice 범위다. 실행기는 이 범위만 교체하므로 경로의 나머지 바이트는 관측된
+    그대로 남고, 임의 경로를 만들어낼 수 없다.
+
+    ``source``는 이 좌표를 관측한 구조적 출처다. "URL에 그런 문자열이 있었다"는 사실만
+    뜻하며, 서버가 실제로 이를 입력으로 처리한다는 증거가 아니다. 그 판정은 control과
+    probe를 비교한 Analysis·Validation만 내린다.
+    """
+
+    name: str
+    value_start: int
+    value_end: int
+    observed_value: str
+    source: str
+
+    def __post_init__(self) -> None:
+        if _PATH_ASSIGNMENT_NAME.fullmatch(self.name) is None:
+            raise DomainInvariantError(f"path assignment name is invalid: {self.name!r}")
+        if not isinstance(self.source, str) or not self.source:
+            raise DomainInvariantError("path assignment must record its observed source")
+        if type(self.value_start) is not int or type(self.value_end) is not int:
+            raise DomainInvariantError("path assignment span must be integer offsets")
+        if not 0 <= self.value_start < self.value_end:
+            raise DomainInvariantError("path assignment span must be a non-empty range")
+        if not isinstance(self.observed_value, str) or not self.observed_value:
+            raise DomainInvariantError("path assignment must record a non-empty value")
+        if len(self.observed_value) != self.value_end - self.value_start:
+            raise DomainInvariantError(
+                "path assignment span length must match its observed value"
+            )
+
+    def matches(self, url: str) -> bool:
+        """이 좌표가 주어진 URL의 경로에서 실제로 그 값을 가리키는지 확인한다."""
+
+        path = urlsplit(url).path
+        return (
+            self.value_end <= len(path)
+            and path[self.value_start : self.value_end] == self.observed_value
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Surface:
     """Recon이 발견한 공격 표면 하나(URL·메서드·파라미터·인증 요건)."""
 
@@ -883,6 +1026,9 @@ class Surface:
     path_identifier: str | None = None
     path_identifier_index: int | None = None
     observed_path_identifier: str | None = None
+    # `/file=web_assets/app.js`처럼 경로가 `이름=값`으로 입력을 나르는 표면의 좌표.
+    # query parameters와 섞지 않는다 — 섞으면 Analyzer가 없던 query를 덧붙인다.
+    path_assignment: PathAssignment | None = None
     # Recon이 이 좌표를 처음 발견한 구조적 출처. 추가 Recon 우선순위에만 사용하며
     # 취약점 여부나 Analyzer 판정 근거로 취급하지 않는다.
     discovery_types: tuple[str, ...] = ()
@@ -899,6 +1045,7 @@ class Surface:
             raise DomainInvariantError(
                 "surface discovery types must be unique non-empty strings"
             )
+        self._validate_path_assignment()
         values = (
             self.path_identifier,
             self.path_identifier_index,
@@ -920,6 +1067,25 @@ class Surface:
         if segments[self.path_identifier_index] != self.observed_path_identifier:
             raise DomainInvariantError(
                 "observed path object id must match the indexed URL segment"
+            )
+
+    def _validate_path_assignment(self) -> None:
+        """기록된 범위가 이 Surface의 URL에서 그 값을 정확히 가리키는지 확인한다.
+
+        범위를 저장해 두고 실행 시점에 다시 찾지 않는 이유는, 재탐색이 곧 "경로 어딘가의
+        비슷한 문자열"을 고르는 추측이 되기 때문이다. URL과 범위가 어긋나면 교체할 자리를
+        모르는 것이므로 실행하지 않고 여기서 막는다.
+        """
+
+        if self.path_assignment is None:
+            return
+        if not self.path_assignment.matches(self.url):
+            raise DomainInvariantError(
+                "path assignment span does not select its observed value in the surface URL"
+            )
+        if self.path_assignment.name in self.parameters:
+            raise DomainInvariantError(
+                "path assignment name must not be recorded as a query parameter"
             )
 
 
@@ -1269,6 +1435,10 @@ class ExecutionRequest:
     path_identifier_index: int | None = None
     path_identifier_value: str | None = None
     path_suffix: str | None = None
+    path_assignment_name: str | None = None
+    path_assignment_value_start: int | None = None
+    path_assignment_value_end: int | None = None
+    path_assignment_value: str | None = None
     validation_id: str | None = None
     timeout_seconds: float = 120.0
     credential_ref: str | None = None
@@ -1289,6 +1459,10 @@ class ExecutionRequest:
             path_identifier_index=self.path_identifier_index,
             path_identifier_value=self.path_identifier_value,
             path_suffix=self.path_suffix,
+            path_assignment_name=self.path_assignment_name,
+            path_assignment_value_start=self.path_assignment_value_start,
+            path_assignment_value_end=self.path_assignment_value_end,
+            path_assignment_value=self.path_assignment_value,
         )
         if self.timeout_seconds <= 0:
             raise DomainInvariantError("execution timeout must be positive")
@@ -1315,12 +1489,36 @@ class ExecutionRequest:
             # 도메인이 고정한 접미사이며 이미 인코딩된 문자열이다. 다시 quote하면
             # `%25`가 `%2525`가 되어 우회가 성립하지 않는다.
             path = f"{path}{self.path_suffix}"
+        if self.path_assignment_name is not None:
+            path = self._replace_path_assignment(path)
         encoded = urlencode(self.query_parameters)
         query = parsed.query
         if encoded:
             query = f"{query}&{encoded}" if query else encoded
         # URL fragment는 HTTP 요청 대상에 포함되지 않는다.
         return urlunsplit((parsed.scheme, parsed.netloc, path, query, ""))
+
+    def _replace_path_assignment(self, path: str) -> str:
+        """경로에 실린 입력에서 기록된 범위만 증명 값으로 바꾼다.
+
+        범위 밖은 관측된 바이트 그대로 남는다. 새 세그먼트를 붙이거나 query를 덧붙이지
+        않으므로, 대상이 실제로 제공한 경로 구조에서 값 하나만 달라진 요청이 된다.
+
+        ``safe="/"``로 인코딩한다. 경로에 실린 파일 입력은 구분자 ``/``를 값 안에 포함하는
+        것이 정상이고, 서버는 그 전체를 하나의 경로로 읽는다. ``/``까지 ``%2F``로 바꾸면
+        정상 요청과 다른 형태가 되어 control 비교가 성립하지 않는다. 나머지 문자는
+        인코딩되므로 값이 경로 밖 요소(query·fragment)로 넘어갈 수 없다.
+        """
+
+        start = self.path_assignment_value_start
+        end = self.path_assignment_value_end
+        assert start is not None and end is not None
+        assert self.path_assignment_value is not None
+        if not 0 <= start < end <= len(path):
+            raise DomainInvariantError(
+                "path assignment span is outside the target URL path"
+            )
+        return path[:start] + quote(self.path_assignment_value, safe="/") + path[end:]
 
 @dataclass(frozen=True, slots=True)
 class ExecutionResult:

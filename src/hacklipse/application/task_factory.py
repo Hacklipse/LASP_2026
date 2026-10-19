@@ -17,6 +17,8 @@ from hacklipse.domain import (
 
 _PATH_TRAVERSAL_TOOL = "path_traversal_probe"
 _ACCESS_CONTROL_TOOL = "access_control_probe"
+_ARBITRARY_FILE_READ_TOOL = "arbitrary_file_read_probe"
+_ARBITRARY_FILE_READ_TYPE = "Arbitrary File Read"
 _SSTI_TOOL = "ssti_probe"
 _BROWSER_XSS_TOOL = "browser_xss"
 # XSS 는 담당 Agent 가 둘이다. 서버 반사는 http_get, SPA 의 DOM 반사는 브라우저로만
@@ -71,6 +73,8 @@ class TaskFactory:
             allowed_tools = (_BROWSER_XSS_TOOL,)
         elif candidate.vulnerability_type == "Path Traversal":
             allowed_tools = (_PATH_TRAVERSAL_TOOL,)
+        elif candidate.vulnerability_type == _ARBITRARY_FILE_READ_TYPE:
+            allowed_tools = (_ARBITRARY_FILE_READ_TOOL,)
         elif candidate.vulnerability_type == "Access Control":
             # 권한 우회 탐침은 전용 도구로만 나간다. 일반 http_get을 허용하면 Agent가
             # 식별자 제약과 헤더 금지 규칙을 우회한 요청을 만들 수 있다.
@@ -117,6 +121,8 @@ class TaskFactory:
             allowed_tools = ("http_get", "browser_xss")
         elif candidate.vulnerability_type == "Path Traversal":
             allowed_tools = (_PATH_TRAVERSAL_TOOL,)
+        elif candidate.vulnerability_type == _ARBITRARY_FILE_READ_TYPE:
+            allowed_tools = (_ARBITRARY_FILE_READ_TOOL,)
         elif candidate.vulnerability_type == "Access Control":
             allowed_tools = (_ACCESS_CONTROL_TOOL,)
         elif candidate.vulnerability_type == "SSTI":

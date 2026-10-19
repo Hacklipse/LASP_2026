@@ -35,6 +35,10 @@ _HTTP_TOOLS = frozenset(
         "http_get",
         "http_post",
         "path_traversal_probe",
+        # 이 도구가 빠져 있던 동안 Arbitrary File Read는 Analyzer와 Validation이
+        # 모두 구현돼 있어도 실제 대상에서 한 건도 실행되지 못했다. 테스트가 Evidence를
+        # 직접 만들어 넣는 대역을 써서 드러나지 않았다.
+        "arbitrary_file_read_probe",
         "access_control_probe",
         "ssti_probe",
     }

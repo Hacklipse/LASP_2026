@@ -121,6 +121,10 @@ class RuntimeEvidenceCollector:
             path_identifier_index=http_request.path_identifier_index,
             path_identifier_value=http_request.path_identifier_value,
             path_suffix=http_request.path_suffix,
+            path_assignment_name=http_request.path_assignment_name,
+            path_assignment_value_start=http_request.path_assignment_value_start,
+            path_assignment_value_end=http_request.path_assignment_value_end,
+            path_assignment_value=http_request.path_assignment_value,
             validation_id=validation_id,
             timeout_seconds=min(timeout_seconds, run.timeout_seconds),
             credential_ref=_credential_for(

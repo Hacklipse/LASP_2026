@@ -40,6 +40,10 @@ from .probing import (
     response_body,
 )
 from .request_safety import has_state_changing_parameters
+from .path_traversal_analysis import (
+    has_file_like_path_assignment,
+    prefers_path_assignment,
+)
 
 ARBITRARY_FILE_READ_TOOL = "arbitrary_file_read_probe"
 HEURISTIC_ARBITRARY_FILE_READ_ANALYZER = "heuristic_arbitrary_file_read_analyzer"
@@ -49,6 +53,9 @@ ARBITRARY_FILE_READ_PROOF_FILE = "/etc/os-release"
 # 고정 증명 파일에만 나타나는 표식. Path Traversal 과 같은 파일을 읽으므로 같은 표식을
 # 쓴다. 둘 중 하나만 성립하는 경우를 구분하는 것은 표식이 아니라 보낸 값이다.
 ARBITRARY_FILE_READ_PROOF_MARKERS = ("PRETTY_NAME=", "VERSION_ID=")
+# 경로에 실린 입력 자리를 절대 경로로 탐침하는 capability. Path Traversal 쪽과 좌표는
+# 같지만 싣는 값과 증명하는 사실이 다르므로 별도로 둔다.
+ARBITRARY_FILE_READ_PATH_CAPABILITY = "arbitrary_file_read.http.path_assignment"
 # 탐침이 바뀌지 않은 파라미터에 싣는 값. Path Traversal control 과 같은 역할이다.
 CONTROL_VALUE = "hacklipse-control"
 # Recon의 ``url_or_file_parameter`` 관측은 파일 이름과 URL 이름을 한 목록으로 묶는다
@@ -98,12 +105,29 @@ def validate_arbitrary_file_read_request(request: ExecutionRequest) -> None:
         raise ValueError("arbitrary file read probe cannot carry a body or headers")
     if request.path_suffix is not None:
         raise ValueError("arbitrary file read probe cannot alter the path shape")
+    if request.path_assignment_name is not None:
+        # 경로에 실린 입력의 값만 바꾸는 탐침. 도메인이 이미 종류별 고정 값 하나만
+        # 허용했고, 여기서는 이 도구로 들어온 요청에도 같은 계약이 적용됐는지
+        # 독립적으로 다시 확인한다.
+        if request.request_kind is not HttpRequestKind.ARBITRARY_FILE_READ_PROBE:
+            raise ValueError("path assignment replacement requires the probe kind")
+        if not is_arbitrary_file_read_safe_probe_value(
+            request.path_assignment_value or ""
+        ):
+            raise ValueError("path assignment probe may only use the fixed safe path")
+        if request.query_parameters:
+            raise ValueError("path assignment probe cannot add query parameters")
+        return
 
     values = tuple(value for _, value in request.query_parameters)
     if request.request_kind is HttpRequestKind.CONTROL:
         if any(value != CONTROL_VALUE for value in values):
             raise ValueError("arbitrary file read control may only use the fixed marker")
         return
+    if not values:
+        # 경로 좌표 흐름의 control 은 위에서 끝났다. 바꿀 값이 없는 probe 는 성립하지
+        # 않으므로 여기서 막는다.
+        raise ValueError("arbitrary file read probe requires a value to change")
     if request.request_kind is not HttpRequestKind.ARBITRARY_FILE_READ_PROBE:
         raise ValueError("arbitrary file read tool requires control or probe kind")
     proof_values = tuple(
@@ -176,6 +200,54 @@ def build_arbitrary_file_read_requests(
     return tuple(requests)
 
 
+def build_arbitrary_file_read_path_requests(
+    surface: Surface, *, purpose: str
+) -> tuple[EvidenceRequest, ...]:
+    """관측된 URL 그대로의 control 과 값만 절대 경로로 바꾼 probe 를 만든다.
+
+    Path Traversal 쪽과 같은 좌표를 쓰지만 싣는 값이 다르다. ``..``를 거르는 필터가
+    절대 경로는 막지 못하는 경우가 있어, 같은 자리에서 두 결과가 갈린다.
+    """
+
+    assignment = surface.path_assignment
+    if assignment is None:
+        raise AgentContractError(
+            "arbitrary file read path probe requires an observed coordinate"
+        )
+    if surface.method.upper() != "GET":
+        raise AgentContractError("arbitrary file read probe supports GET surfaces")
+    if not assignment.matches(surface.url):
+        raise AgentContractError("path assignment span does not match the surface URL")
+
+    return (
+        EvidenceRequest(
+            evidence_type="http_response",
+            surface_id=surface.surface_id,
+            reason=f"observed path control request for {purpose}",
+            suggested_tool=ARBITRARY_FILE_READ_TOOL,
+            http_request=HttpRequestSpec(
+                method="GET", request_kind=HttpRequestKind.CONTROL
+            ),
+        ),
+        EvidenceRequest(
+            evidence_type="http_response",
+            surface_id=surface.surface_id,
+            reason=(
+                f"absolute path probe for path assignment {assignment.name} on {purpose}"
+            ),
+            suggested_tool=ARBITRARY_FILE_READ_TOOL,
+            http_request=HttpRequestSpec(
+                method="GET",
+                request_kind=HttpRequestKind.ARBITRARY_FILE_READ_PROBE,
+                path_assignment_name=assignment.name,
+                path_assignment_value_start=assignment.value_start,
+                path_assignment_value_end=assignment.value_end,
+                path_assignment_value=ARBITRARY_FILE_READ_PROBE_PATH,
+            ),
+        ),
+    )
+
+
 def arbitrary_file_read_signal(control: Evidence, probe: Evidence) -> bool:
     """probe에만 고정 증명 파일 표식이 나타난 성공적인 읽기인지 확인한다."""
 
@@ -202,6 +274,7 @@ def record_arbitrary_file_read_observations(
     evidence_store: EvidenceStore,
     created_by: str,
     id_factory: Callable[[], str],
+    extra: dict[str, object] | None = None,
 ) -> list[str]:
     """Python이 확인한 고정 파일 읽기만 Observation으로 저장한다."""
 
@@ -221,6 +294,15 @@ def record_arbitrary_file_read_observations(
         ):
             continue
         observation_id = f"evi-{id_factory()}"
+        observation: dict[str, object] = {
+            "type": ARBITRARY_FILE_READ_OBSERVATION,
+            "parameter": parameter,
+            "proof_file": ARBITRARY_FILE_READ_PROOF_FILE,
+            "control_evidence_id": control.evidence_id,
+            "probe_evidence_id": probe.evidence_id,
+        }
+        if extra:
+            observation.update(extra)
         evidence_store.append(
             Evidence(
                 evidence_id=observation_id,
@@ -229,13 +311,7 @@ def record_arbitrary_file_read_observations(
                 created_by=created_by,
                 evidence_type="observation",
                 source_task_id=task.task_id,
-                observation={
-                    "type": ARBITRARY_FILE_READ_OBSERVATION,
-                    "parameter": parameter,
-                    "proof_file": ARBITRARY_FILE_READ_PROOF_FILE,
-                    "control_evidence_id": control.evidence_id,
-                    "probe_evidence_id": probe.evidence_id,
-                },
+                observation=observation,
             )
         )
         new_ids.append(observation_id)
@@ -265,6 +341,8 @@ class HeuristicArbitraryFileReadAnalyzer:
             candidate_store=self._candidates,
             surface_store=self._surfaces,
             required_tool=ARBITRARY_FILE_READ_TOOL,
+            # 경로가 입력을 나르는 표면은 query 파라미터가 없다.
+            allow_parameterless_get=True,
             allowed_methods=("GET",),
         )
         evidence = tuple(self._evidence.get_many(task.run_id, task.evidence_ids))
@@ -281,6 +359,11 @@ class HeuristicArbitraryFileReadAnalyzer:
         ):
             # 상태를 바꾸는 입력과 클라이언트 전용 좌표는 읽기 탐침 대상이 아니다.
             raise AgentContractError("invalid arbitrary file read target surface")
+        if prefers_path_assignment(
+            candidate, surface, evidence, selected,
+            capability_id=ARBITRARY_FILE_READ_PATH_CAPABILITY,
+        ):
+            return self._handle_path_assignment(task, candidate, surface, evidence)
         if not selected:
             return AgentResult(
                 task_id=task.task_id,
@@ -324,6 +407,60 @@ class HeuristicArbitraryFileReadAnalyzer:
             evidence_store=self._evidence,
             created_by=HEURISTIC_ARBITRARY_FILE_READ_ANALYZER,
             id_factory=self._id_factory,
+        )
+        return AgentResult(
+            task_id=task.task_id,
+            status=AgentResultStatus.COMPLETED,
+            new_evidence_ids=tuple(new_ids),
+            candidate_ids=(candidate.candidate_id,),
+        )
+
+    def _handle_path_assignment(
+        self,
+        task: TaskEnvelope,
+        candidate,
+        surface: Surface,
+        evidence: Sequence[Evidence],
+    ) -> AgentResult:
+        """경로에 실린 입력 자리를 고정 절대 경로로 열 수 있는지 비교한다."""
+
+        assignment = surface.path_assignment
+        assert assignment is not None  # prefers_path_assignment 가 이미 확인했다.
+        requests = build_arbitrary_file_read_path_requests(
+            surface,
+            purpose=f"Arbitrary File Read candidate {candidate.candidate_id}",
+        )
+        collected = tuple(
+            matching_evidence(evidence, surface.url, request) for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "arbitrary file read path probe lacks budget for its evidence requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+                candidate_ids=(candidate.candidate_id,),
+            )
+
+        control, probe = collected
+        if control is None or probe is None:  # missing 이후에는 도달하지 않는다.
+            raise AgentContractError("arbitrary file read path evidence was not collected")
+        new_ids = record_arbitrary_file_read_observations(
+            task=task,
+            selected=(assignment.name,),
+            control=control,
+            probes=(probe,),
+            evidence=evidence,
+            evidence_store=self._evidence,
+            created_by=HEURISTIC_ARBITRARY_FILE_READ_ANALYZER,
+            id_factory=self._id_factory,
+            extra={"location": "path_assignment"},
         )
         return AgentResult(
             task_id=task.task_id,

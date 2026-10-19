@@ -72,6 +72,7 @@ _PROOF_TYPE_BY_VULNERABILITY = {
     "SQLi": ValidationProofType.SQLI_EFFECT,
     "Access Control": ValidationProofType.UNAUTHORIZED_OBJECT_ACCESS,
     "Path Traversal": ValidationProofType.PATH_TRAVERSAL_FILE_READ,
+    "Arbitrary File Read": ValidationProofType.ARBITRARY_FILE_READ,
     "SSTI": ValidationProofType.SSTI_EXECUTION,
 }
 
