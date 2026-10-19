@@ -55,9 +55,15 @@ SSTI_QUERY_PROBES = (
     ("erb", "<%=713*17%>"),       # ERB, EJS
 )
 # 쿼리 probe가 보낼 수 있는 값 전체. 안전 검증기가 이 집합 밖의 값을 거부한다.
-SSTI_QUERY_VALUES = frozenset(
-    {SSTI_CONTROL_VALUE, *(expression for _, expression in SSTI_QUERY_PROBES)}
+SSTI_PROBE_EXPRESSIONS = frozenset(
+    expression for _, expression in SSTI_QUERY_PROBES
 )
+SSTI_QUERY_VALUES = frozenset({SSTI_CONTROL_VALUE, *SSTI_PROBE_EXPRESSIONS})
+# POST 폼 경로에서 한 요청이 실을 수 있는 필드 수 상한.
+_MAX_SSTI_FORM_FIELDS = 16
+# 템플릿 식을 여는 두 글자. 탐침이 아닌 필드로 템플릿 문법이 흘러드는 것을 막는다.
+# 한 글자(`#`, `$`)로 막으면 관측된 정상 값까지 거부해 폼이 성립하지 않는다.
+_TEMPLATE_OPENERS = ("{{", "${", "#{", "<%")
 
 
 def validate_ssti_request(request: ExecutionRequest) -> None:
@@ -87,6 +93,44 @@ def validate_ssti_request(request: ExecutionRequest) -> None:
             HttpRequestKind.SSTI_PROBE,
         }:
             raise ValueError("SSTI query probe has an invalid request kind")
+        return
+
+    if request.form_parameters:
+        # 상태 없이 즉시 렌더링하는 POST 폼 경로. /profile 계약과 달리 대상의 저장
+        # 상태를 바꾸지 않으므로 설정·정리 시퀀스가 없고 엔드포인트도 제한하지 않는
+        # 대신, "바꾸는 좌표는 하나, 그 값은 고정 집합" 으로만 좁힌다. 나머지 필드는
+        # 폼이 성립하는 데 필요한 관측된 값이므로 그대로 두되 템플릿 문법은 막는다.
+        if request.method.upper() != "POST":
+            raise ValueError("SSTI form probe must be a POST")
+        if request.body is not None or request.headers:
+            raise ValueError("SSTI form probe must carry no raw body or headers")
+        if request.query_parameters:
+            raise ValueError("SSTI form probe sets no query coordinate")
+        if request.request_kind not in {
+            HttpRequestKind.CONTROL,
+            HttpRequestKind.SSTI_PROBE,
+        }:
+            raise ValueError("SSTI form probe has an invalid request kind")
+        if len(request.form_parameters) > _MAX_SSTI_FORM_FIELDS:
+            raise ValueError("SSTI form probe sends a bounded number of fields")
+        expressions = tuple(
+            value for _, value in request.form_parameters
+            if value in SSTI_PROBE_EXPRESSIONS
+        )
+        if request.request_kind is HttpRequestKind.CONTROL:
+            if expressions:
+                raise ValueError("SSTI form control cannot carry a probe expression")
+        elif len(expressions) != 1:
+            raise ValueError(
+                "SSTI form probe sets exactly one coordinate to a fixed expression"
+            )
+        if any(
+            opener in value
+            for _, value in request.form_parameters
+            if value not in SSTI_QUERY_VALUES
+            for opener in _TEMPLATE_OPENERS
+        ):
+            raise ValueError("SSTI form probe may not carry template syntax in other fields")
         return
 
     if not urlsplit(request.resolved_url).path.rstrip("/").endswith("/profile"):
@@ -246,6 +290,62 @@ def build_ssti_query_requests(
     return tuple(requests)
 
 
+def build_ssti_form_requests(
+    surface: Surface,
+    parameter: str,
+    *,
+    purpose: str,
+) -> tuple[EvidenceRequest, ...]:
+    """상태 없이 즉시 렌더링하는 POST 폼 한 좌표에 control과 방언별 probe를 요청한다.
+
+    /profile 계약의 5요청 시퀀스(설정·조회·설정·조회·정리)를 쓰지 않는다. 그 경로는
+    대상의 저장된 프로필을 바꾸므로 정리가 필요하지만, 여기서 보낸 값은 그 응답에만
+    렌더링되므로 GET 쿼리 경로와 같은 control 1회 + 방언별 probe로 충분하다.
+
+    바꾸는 좌표는 하나다. 나머지 필드는 관측된 값을 그대로 싣는다 — 버튼 이름이나
+    고정 필드가 빠지면 분기 자체에 닿지 못하는 폼이 흔하다.
+    """
+
+    if parameter not in surface.parameters:
+        raise AgentContractError("SSTI parameter must belong to the surface")
+    if surface.method.upper() != "POST":
+        raise AgentContractError("SSTI form probe needs a POST surface")
+    observed = dict(surface.observed_query)
+
+    def send(value: str, kind: HttpRequestKind, label: str) -> EvidenceRequest:
+        return EvidenceRequest(
+            evidence_type="http_response",
+            surface_id=surface.surface_id,
+            reason=f"{label} for {purpose}",
+            suggested_tool=SSTI_TOOL,
+            http_request=HttpRequestSpec(
+                method="POST",
+                form_parameters=tuple(
+                    (
+                        name,
+                        value if name == parameter
+                        else observed.get(name) or SSTI_CONTROL_VALUE,
+                    )
+                    for name in surface.parameters
+                ),
+                request_kind=kind,
+            ),
+        )
+
+    requests = [
+        send(SSTI_CONTROL_VALUE, HttpRequestKind.CONTROL, "send SSTI form control")
+    ]
+    requests.extend(
+        send(
+            expression,
+            HttpRequestKind.SSTI_PROBE,
+            f"send SSTI {dialect} arithmetic probe",
+        )
+        for dialect, expression in SSTI_QUERY_PROBES
+    )
+    return tuple(requests)
+
+
 def ssti_query_execution_signal(
     collected: Sequence[Evidence | None],
 ) -> str | None:
@@ -345,8 +445,9 @@ def record_ssti_query_observation(
     evidence_store: EvidenceStore,
     created_by: str,
     id_factory: Callable[[], str],
+    extra: dict[str, object] | None = None,
 ) -> tuple[str, ...]:
-    """GET 쿼리 경로가 확인한 산술 평가 사실을 공통 Observation으로 저장한다."""
+    """상태를 남기지 않는 경로가 확인한 산술 평가 사실을 공통 Observation으로 저장한다."""
 
     control = collected[0]
     probe_index = next(
@@ -382,6 +483,7 @@ def record_ssti_query_observation(
                 "expected_result": SSTI_EXPECTED_RESULT,
                 "control_evidence_id": control.evidence_id,
                 "probe_evidence_id": probe.evidence_id,
+                **(extra or {}),
             },
         )
     )
@@ -442,6 +544,79 @@ def record_ssti_observation(
     return (evidence_id,)
 
 
+def handle_stateless_ssti_surface(
+    *,
+    task: TaskEnvelope,
+    candidate: Candidate,
+    surface: Surface,
+    selected: Sequence[str],
+    build: Callable[..., tuple[EvidenceRequest, ...]],
+    evidence: Sequence[Evidence],
+    evidence_store: EvidenceStore,
+    created_by: str,
+    id_factory: Callable[[], str],
+    new_evidence_ids: Sequence[str] = (),
+    extra: dict[str, object] | None = None,
+) -> AgentResult:
+    """상태를 남기지 않는 좌표의 공통 분석 흐름.
+
+    heuristic과 LLM 구현이 같은 함수를 쓴다. 두 구현이 각자 이 흐름을 들고 있으면
+    한쪽에만 경로가 생기고 다른 쪽은 조용히 신호를 만들지 못한다 — SSTI에서 이미
+    그렇게 갈라졌다. 요청 모양만 build가, 선택 근거만 extra가 결정한다.
+    """
+
+    if not selected:
+        return AgentResult(
+            task_id=task.task_id,
+            status=AgentResultStatus.COMPLETED,
+            new_evidence_ids=tuple(new_evidence_ids),
+            candidate_ids=(candidate.candidate_id,),
+        )
+    parameter = selected[0]
+    requests = build(
+        surface, parameter, purpose=f"SSTI candidate {candidate.candidate_id}",
+    )
+    collected = tuple(
+        matching_ssti_evidence(evidence, surface.url, request) for request in requests
+    )
+    missing = tuple(
+        request for request, item in zip(requests, collected) if item is None
+    )
+    if missing:
+        if task.request_budget < len(missing):
+            raise BudgetExceeded("SSTI stateless probe lacks budget for its request set")
+        return AgentResult(
+            task_id=task.task_id,
+            status=AgentResultStatus.NEEDS_EVIDENCE,
+            evidence_requests=missing,
+            new_evidence_ids=tuple(new_evidence_ids),
+            candidate_ids=(candidate.candidate_id,),
+        )
+    dialect = ssti_query_execution_signal(collected)
+    recorded = (
+        record_ssti_query_observation(
+            task=task,
+            surface=surface,
+            parameter=parameter,
+            dialect=dialect,
+            collected=collected,
+            evidence=evidence,
+            evidence_store=evidence_store,
+            created_by=created_by,
+            id_factory=id_factory,
+            extra=extra,
+        )
+        if dialect
+        else ()
+    )
+    return AgentResult(
+        task_id=task.task_id,
+        status=AgentResultStatus.COMPLETED,
+        new_evidence_ids=(*new_evidence_ids, *recorded),
+        candidate_ids=(candidate.candidate_id,),
+    )
+
+
 class HeuristicSstiAnalyzer:
     """username Surface에 고정 산술 control/probe를 요청하는 baseline Agent."""
 
@@ -458,6 +633,19 @@ class HeuristicSstiAnalyzer:
         self._evidence = evidence_store
         self._id_factory = id_factory or (lambda: str(uuid4()))
 
+    def _handle_form_surface(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        surface: Surface,
+        selected: Sequence[str],
+    ) -> AgentResult:
+        """상태를 남기지 않는 POST 폼 좌표를 방언별 고정 산술로 확인한다."""
+
+        return self._handle_stateless_surface(
+            task, candidate, surface, selected, build_ssti_form_requests,
+        )
+
     def _handle_query_surface(
         self,
         task: TaskEnvelope,
@@ -467,55 +655,28 @@ class HeuristicSstiAnalyzer:
     ) -> AgentResult:
         """GET 쿼리 좌표를 방언별 고정 산술로 확인한다."""
 
-        if not selected:
-            return AgentResult(
-                task_id=task.task_id,
-                status=AgentResultStatus.COMPLETED,
-                candidate_ids=(candidate.candidate_id,),
-            )
-        parameter = selected[0]
-        requests = build_ssti_query_requests(
-            surface,
-            parameter,
-            purpose=f"SSTI candidate {candidate.candidate_id}",
+        return self._handle_stateless_surface(
+            task, candidate, surface, selected, build_ssti_query_requests,
         )
-        evidence = tuple(self._evidence.get_many(task.run_id, task.evidence_ids))
-        collected = tuple(
-            matching_ssti_evidence(evidence, surface.url, request) for request in requests
-        )
-        missing = tuple(
-            request for request, item in zip(requests, collected) if item is None
-        )
-        if missing:
-            if task.request_budget < len(missing):
-                raise BudgetExceeded("SSTI query probe lacks budget for its request set")
-            return AgentResult(
-                task_id=task.task_id,
-                status=AgentResultStatus.NEEDS_EVIDENCE,
-                evidence_requests=missing,
-                candidate_ids=(candidate.candidate_id,),
-            )
-        dialect = ssti_query_execution_signal(collected)
-        new_ids = (
-            record_ssti_query_observation(
-                task=task,
-                surface=surface,
-                parameter=parameter,
-                dialect=dialect,
-                collected=collected,
-                evidence=evidence,
-                evidence_store=self._evidence,
-                created_by=HEURISTIC_SSTI_ANALYZER,
-                id_factory=self._id_factory,
-            )
-            if dialect
-            else ()
-        )
-        return AgentResult(
-            task_id=task.task_id,
-            status=AgentResultStatus.COMPLETED,
-            new_evidence_ids=new_ids,
-            candidate_ids=(candidate.candidate_id,),
+
+    def _handle_stateless_surface(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        surface: Surface,
+        selected: Sequence[str],
+        build: Callable[..., tuple[EvidenceRequest, ...]],
+    ) -> AgentResult:
+        return handle_stateless_ssti_surface(
+            task=task,
+            candidate=candidate,
+            surface=surface,
+            selected=selected,
+            build=build,
+            evidence=tuple(self._evidence.get_many(task.run_id, task.evidence_ids)),
+            evidence_store=self._evidence,
+            created_by=HEURISTIC_SSTI_ANALYZER,
+            id_factory=self._id_factory,
         )
 
     def handle(self, task: TaskEnvelope) -> AgentResult:
@@ -528,11 +689,9 @@ class HeuristicSstiAnalyzer:
         if surface.method.upper() == "GET":
             return self._handle_query_surface(task, candidate, surface, selected)
         if "username" not in selected:
-            return AgentResult(
-                task_id=task.task_id,
-                status=AgentResultStatus.COMPLETED,
-                candidate_ids=(candidate.candidate_id,),
-            )
+            # username이 아니면 /profile 저장 계약을 쓸 수 없다. 그래도 보낸 값을 그
+            # 응답에 바로 렌더링하는 폼이면 상태를 남기지 않는 경로로 확인할 수 있다.
+            return self._handle_form_surface(task, candidate, surface, selected)
         requests = build_ssti_requests(
             surface,
             "username",

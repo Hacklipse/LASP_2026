@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from hacklipse.application.errors import AgentContractError
 from hacklipse.domain import (
@@ -59,6 +59,7 @@ from .graphql_suggestions import (
     suggestion_request, suggested_field,
 )
 from .ssti_analysis import (
+    build_ssti_form_requests,
     SSTI_OBSERVATION,
     SSTI_TOOL,
     build_ssti_query_requests,
@@ -1727,18 +1728,19 @@ class ValidationAgent:
             proof=proof,
         )
 
-    def _validate_ssti_query(
+    def _validate_ssti_stateless(
         self,
         task: TaskEnvelope,
         surface: Surface,
         signaled_parameters: Sequence[str],
         reproduction: Sequence[Evidence],
+        build: Callable[..., tuple[EvidenceRequest, ...]],
     ) -> AgentResult:
-        """GET 쿼리 좌표의 평가를 Validation 세션에서 독립적으로 다시 확인한다.
+        """상태를 남기지 않는 좌표의 평가를 Validation 세션에서 다시 확인한다.
 
-        POST 경로의 정리(cleanup) 검사를 쓰지 않는다. GET은 상태를 남기지 않으므로
-        복원할 것이 없고, 마지막 요청의 302/303을 요구하면 정상 응답(200)을 실패로
-        읽는다.
+        /profile 경로의 정리(cleanup) 검사를 쓰지 않는다. 이 경로는 상태를 남기지
+        않으므로 복원할 것이 없고, 마지막 요청의 302/303을 요구하면 정상 응답(200)을
+        실패로 읽는다. 요청 모양만 build가 결정한다.
         """
 
         if not signaled_parameters:
@@ -1750,7 +1752,7 @@ class ValidationAgent:
                 reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
             )
         parameter = signaled_parameters[0]
-        requests = build_ssti_query_requests(
+        requests = build(
             surface,
             parameter,
             purpose=f"SSTI validation {task.validation_id}",
@@ -1765,7 +1767,7 @@ class ValidationAgent:
         if missing:
             if task.request_budget < len(missing):
                 raise BudgetExceeded(
-                    "SSTI query validation lacks budget for its independent request set"
+                    "SSTI stateless validation lacks budget for its independent request set"
                 )
             return AgentResult(
                 task_id=task.task_id,
@@ -1830,17 +1832,16 @@ class ValidationAgent:
             )
         )
         if surface.method.upper() == "GET":
-            return self._validate_ssti_query(
-                task, surface, signaled_parameters, reproduction
+            return self._validate_ssti_stateless(
+                task, surface, signaled_parameters, reproduction,
+                build_ssti_query_requests,
             )
 
         if "username" not in signaled_parameters:
-            return self._validation_result(
-                task,
-                verdict=ValidationVerdict.REJECTED,
-                evidence=(),
-                reason="analysis produced no fixed-arithmetic SSTI signal to reproduce",
-                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            # /profile 저장 계약이 아닌 좌표는 응답에만 렌더링되는 폼 경로로 재현한다.
+            return self._validate_ssti_stateless(
+                task, surface, signaled_parameters, reproduction,
+                build_ssti_form_requests,
             )
 
         requests = build_ssti_requests(

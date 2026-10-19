@@ -119,7 +119,7 @@ def _legacy_hypothesis(item: dict) -> dict:
         "Access Control": (
             "access_control.object_identifier", "compare_object_ownership"
         ),
-        "SSTI": ("ssti.form.username", "compare_template_expressions"),
+        "SSTI": ("ssti.http.form", "compare_template_expressions"),
     }[vulnerability_type]
     return {
         "surface_id": item["surface_id"],
@@ -1001,7 +1001,7 @@ class OfferSelectionTests(unittest.TestCase):
             for item in advisor.last_trace.analyzer_coverage
         }
         self.assertEqual(
-            coverage["ssti.form.username"].missing_requirements,
+            coverage["ssti.http.form"].missing_requirements,
             ("method", "input_parameter", "parameter_hint"),
         )
         self.assertEqual(

@@ -14,8 +14,11 @@ from hacklipse.adapters.ssti_analysis import (
     SSTI_CLEANUP_VALUE,
     SSTI_CONTROL_VALUE,
     SSTI_EXPECTED_RESULT,
+    SSTI_QUERY_PROBES,
     SSTI_SAFE_EXPRESSION,
     SSTI_TOOL,
+    build_ssti_form_requests,
+    validate_ssti_request,
 )
 from hacklipse.bootstrap import build_local_application
 from hacklipse.domain import (
@@ -151,6 +154,117 @@ def _collect(result, app, task: TaskEnvelope) -> TaskEnvelope:
         evidence_ids=tuple(evidence_ids),
         request_budget=app.budget_manager.remaining(task.run_id),
     )
+
+
+def _form_request(
+    parameters: tuple[tuple[str, str], ...],
+    kind: HttpRequestKind = HttpRequestKind.SSTI_PROBE,
+    **overrides,
+) -> ExecutionRequest:
+    defaults: dict = {
+        "execution_id": "exe-form",
+        "run_id": _RUN_ID,
+        "task_id": "task-form",
+        "tool": SSTI_TOOL,
+        "target_url": "http://local.test/search",
+        "surface_id": _SURFACE_ID,
+        "purpose": "unit",
+        "method": "POST",
+        "form_parameters": parameters,
+        "request_kind": kind,
+    }
+    defaults.update(overrides)
+    return ExecutionRequest(**defaults)
+
+
+class SstiStatelessFormContractTests(unittest.TestCase):
+    """응답에만 렌더링되는 POST 폼 경로. /profile 저장 계약과 제약이 다르다."""
+
+    def test_builds_one_control_and_one_probe_per_dialect(self) -> None:
+        surface = Surface(
+            surface_id=_SURFACE_ID, run_id=_RUN_ID, url="http://local.test/search",
+            method="POST", parameters=("name", "submit"),
+            observed_query=(("submit", "Search"),),
+        )
+        requests = build_ssti_form_requests(surface, "name", purpose="unit")
+
+        self.assertEqual(len(requests), 1 + len(SSTI_QUERY_PROBES))
+        kinds = [item.http_request.request_kind for item in requests]
+        self.assertEqual(kinds[0], HttpRequestKind.CONTROL)
+        self.assertTrue(all(kind is HttpRequestKind.SSTI_PROBE for kind in kinds[1:]))
+        for item in requests:
+            fields = dict(item.http_request.form_parameters)
+            # 버튼 이름이 빠지면 분기 자체에 닿지 못하는 폼이 흔하다. 관측된 값을 싣는다.
+            self.assertEqual(fields["submit"], "Search")
+            self.assertEqual(item.http_request.method, "POST")
+            self.assertIsNone(item.http_request.body)
+        self.assertEqual(
+            [dict(item.http_request.form_parameters)["name"] for item in requests],
+            [SSTI_CONTROL_VALUE, *(expression for _, expression in SSTI_QUERY_PROBES)],
+        )
+
+    def test_only_a_post_surface_can_use_the_form_path(self) -> None:
+        surface = Surface(
+            surface_id=_SURFACE_ID, run_id=_RUN_ID, url="http://local.test/search",
+            method="GET", parameters=("name",),
+        )
+        with self.assertRaises(Exception):
+            build_ssti_form_requests(surface, "name", purpose="unit")
+
+    def test_accepts_exactly_one_fixed_expression(self) -> None:
+        validate_ssti_request(_form_request(
+            (("name", SSTI_SAFE_EXPRESSION), ("submit", "Search")),
+        ))
+        validate_ssti_request(_form_request(
+            (("name", SSTI_CONTROL_VALUE),), HttpRequestKind.CONTROL,
+        ))
+
+    def test_rejects_a_value_outside_the_fixed_set(self) -> None:
+        for value in ("{{7*7}}", "{{config}}", SSTI_SAFE_EXPRESSION + "x"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    validate_ssti_request(_form_request((("name", value),)))
+
+    def test_rejects_two_changed_coordinates(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_ssti_request(_form_request(
+                (("name", SSTI_SAFE_EXPRESSION), ("note", SSTI_SAFE_EXPRESSION)),
+            ))
+
+    def test_control_cannot_carry_a_probe_expression(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_ssti_request(_form_request(
+                (("name", SSTI_SAFE_EXPRESSION),), HttpRequestKind.CONTROL,
+            ))
+
+    def test_rejects_template_syntax_smuggled_through_another_field(self) -> None:
+        for value in ("{{7*7}}", "${7*7}", "#{7*7}", "<%=7*7%>"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    validate_ssti_request(_form_request(
+                        (("name", SSTI_SAFE_EXPRESSION), ("note", value)),
+                    ))
+
+    def test_rejects_a_raw_body_header_or_query_coordinate(self) -> None:
+        for overrides in (
+            {"body": "name=x"},
+            {"headers": (("X-Test", "1"),)},
+            {"query_parameters": (("name", SSTI_CONTROL_VALUE),)},
+            {"method": "PUT"},
+        ):
+            with self.subTest(overrides=tuple(overrides)):
+                with self.assertRaises(ValueError):
+                    validate_ssti_request(_form_request(
+                        (("name", SSTI_SAFE_EXPRESSION),), **overrides,
+                    ))
+
+    def test_the_form_path_needs_no_profile_endpoint(self) -> None:
+        # /profile 계약은 저장된 프로필을 바꾸므로 엔드포인트를 묶지만, 이 경로는
+        # 보낸 값이 그 응답에만 렌더링되므로 묶을 이유가 없다.
+        validate_ssti_request(_form_request(
+            (("name", SSTI_SAFE_EXPRESSION),),
+            target_url="http://local.test/shop/index.php",
+        ))
 
 
 class SstiSafetyContractTests(unittest.TestCase):

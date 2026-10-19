@@ -12,6 +12,7 @@ from hacklipse.ports import AnalyzerCapability, ObservationRequirement
 
 from .request_safety import has_state_changing_parameters, object_identifier_parameters
 from .cors_analysis import CORS_SEARCH_INPUT_NAMES
+from .ssti_analysis import SSTI_PARAMETER_HINTS
 from .graphql_introspection import INTROSPECTION_TYPE, INTROSPECTION_RECON_OBSERVATION
 from .graphql_suggestions import SUGGESTION_TYPE, SUGGESTION_PLAN
 from .error_disclosure import (
@@ -277,17 +278,23 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         default_priority=0.25,
     ),
     AnalyzerCapability(
-        capability_id="ssti.form.username",
+        capability_id="ssti.http.form",
         agent_type="ssti_analyzer",
         vulnerability_type="SSTI",
         methods=("POST",),
         surface_kind="server",
-        parameter_hints=("username",),
+        # username 하나로 좁히면 템플릿에 렌더링되는 POST 좌표가 name·message·template
+        # 으로 불리는 대상에서는 후보가 서지 않는다. 좁힘 기준은 분석기가 쓰는 집합
+        # 하나여야 한다 — 선언과 분석기가 서로 다른 목록을 들고 있으면 한쪽만 넓혀도
+        # 다른 쪽이 조용히 떨어뜨린다.
+        parameter_hints=tuple(sorted(SSTI_PARAMETER_HINTS)),
         exploration_parameter_source="surface",
         supported_evidence_types=(
             "control_response",
             "template_execution_marker",
         ),
+        # username이면 저장되는 /profile 계약을, 아니면 응답에만 렌더링되는 폼 경로를
+        # 쓴다. 두 경로 모두 고정 산술 control/probe 비교이므로 전략은 하나로 센다.
         strategy_ids=("compare_template_expressions",),
         default_priority=0.20,
     ),

@@ -231,18 +231,19 @@ DEFAULT_SURFACE_RULES = (
     SurfaceRoutingRule(
         "SQLi", "sqli_analyzer", methods=("POST",), priority=0.30
     ),
+    # 템플릿에 렌더링되는 좌표의 이름은 대상마다 name·message·template 등으로 다르다.
+    # 힌트 목록은 분석기가 실제로 고를 때 쓰는 집합과 같은 상수를 참조해 두 곳으로
+    # 갈라지지 않게 한다. POST를 username 하나로 좁혀 두었던 것은 그 경로가 프로필에
+    # **쓰는** 요청뿐이었기 때문인데, 이제 응답에만 렌더링되는 폼은 상태를 남기지 않는
+    # 경로로 확인하므로 그 제약이 필요 없다. 저장되는 /profile 쓰기는 분석기와 안전
+    # 검증기가 여전히 username으로만 허용한다.
     SurfaceRoutingRule(
         "SSTI",
         "ssti_analyzer",
         methods=("POST",),
-        parameter_hints=("username",),
+        parameter_hints=tuple(sorted(SSTI_PARAMETER_HINTS)),
         priority=0.20,
     ),
-    # GET 쿼리로 렌더링되는 좌표. POST 규칙과 나누는 이유는 힌트 폭이 다르기
-    # 때문이다. POST는 프로필 필드에 쓰므로 검증된 username 하나로 좁혀 두지만,
-    # GET은 읽기라서 그 제약이 필요 없고, 템플릿에 들어가는 좌표의 이름은 대상마다
-    # name·message·template 등으로 다르다. 힌트 목록은 분석기가 실제로 고를 때
-    # 쓰는 집합과 같은 상수를 참조해 두 곳으로 갈라지지 않게 한다.
     SurfaceRoutingRule(
         "SSTI",
         "ssti_analyzer",
