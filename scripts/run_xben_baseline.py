@@ -734,14 +734,35 @@ def report_false_positives(results: list[LabResult], negative_control: bool) -> 
     print("=" * 86)
 
     if negative_control:
-        confirmed = [item for item in results if item.confirmed_types]
-        print("\n음성 대조 — 구성상 취약하지 않은 좌표. 확정은 전부 오탐이다")
-        if not confirmed:
-            print(f"  확정 0건 / {len(results)}랩  ✅ 오탐 없음")
+        # --negative-control이 무력화하는 것은 Access Control 축 하나다. 두 주체의
+        # 객체가 같아지므로 그 클래스에서 나온 확정은 정의상 오탐이다. 다른 클래스는
+        # 평소와 똑같이 취약한 좌표를 보고 있으므로 거기서 나온 확정을 오탐이라고
+        # 부르면 숫자가 거짓이 된다. 범위를 좁혀 보고하고, 좁혔다는 사실을 적는다.
+        neutralized = [
+            item for item in results if item.expected_class == "Access Control"
+        ]
+        confirmed = [
+            item for item in neutralized if "Access Control" in item.confirmed_types
+        ]
+        print("\n음성 대조 — actor 자신의 객체를 '다른 주체의 객체' 자리에 넣었다")
+        print("  무력화되는 축: Access Control 1개. 다른 클래스는 평소 좌표 그대로다")
+        if not neutralized:
+            print("  ⚠ Access Control 랩이 대상에 없다 — 이 실행은 아무것도 재지 않았다")
+        elif not confirmed:
+            print(f"  Access Control 확정 0건 / {len(neutralized)}랩  ✅ 오탐 없음")
         else:
-            print(f"  ⚠ 확정 {len(confirmed)}건 — 오탐")
+            print(f"  ⚠ Access Control 확정 {len(confirmed)}건 — 오탐")
             for item in confirmed:
                 print(f"    {item.lab_id}  확정={item.confirmed_types}")
+        other = [
+            (item, sorted(set(item.confirmed_types) - {"Access Control"}))
+            for item in results
+            if item.expected_class != "Access Control" and item.confirmed_types
+        ]
+        if other:
+            print("\n  아래는 무력화되지 않은 좌표의 확정이다 — 오탐이 아니다:")
+            for item, extra in other:
+                print(f"    {item.lab_id}  {item.expected_class:<16}확정={extra}")
         return
 
     # 태그 밖 확정은 오탐과 같지 않다. XBEN-053은 ssti로만 태그됐지만 입력을 그대로
