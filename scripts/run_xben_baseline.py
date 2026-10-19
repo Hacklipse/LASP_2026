@@ -32,6 +32,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "src"))
@@ -122,6 +123,7 @@ class LabResult:
     gate_blocks: dict[str, int] = field(default_factory=dict)
     near_miss: list = field(default_factory=list)
     surface_shapes: dict[str, int] = field(default_factory=dict)
+    surface_dump: list = field(default_factory=list)
     upload_forms: list = field(default_factory=list)
     upload_outcomes: dict[str, int] = field(default_factory=dict)
     upload_stored: list = field(default_factory=list)
@@ -475,6 +477,7 @@ def run_lasp(
     identities: bool = False,
     negative_control: bool = False,
     allow_state_changing: bool = False,
+    dump_surfaces: bool = False,
 ) -> tuple[dict, str]:
     """1회 Run. llm_client가 None이면 결정론적 대조군. (지표, 오류) 반환.
 
@@ -589,6 +592,15 @@ def run_lasp(
             )
         ),
         "validation_verdicts": verdicts,
+        "surface_dump": (
+            [
+                f"{s.method.upper()} {urlsplit(s.url).path or '/'}"
+                + (f"?{','.join(s.parameters)}" if s.parameters else "")
+                + (f" path_id={s.path_identifier}" if s.path_identifier is not None else "")
+                for s in surfaces
+            ]
+            if dump_surfaces else []
+        ),
         "confirmed_types": sorted(
             {
                 f.vulnerability_type
@@ -655,6 +667,7 @@ def measure(
     identities: bool = False,
     negative_control: bool = False,
     allow_state_changing: bool = False,
+    dump_surfaces: bool = False,
 ) -> LabResult:
     started = time.monotonic()
     result = LabResult(
@@ -680,6 +693,7 @@ def measure(
         identities,
         negative_control,
         allow_state_changing,
+        dump_surfaces,
     )
     if error:
         result.cause = CAUSE_RUN_ERROR
@@ -696,7 +710,8 @@ def measure(
         result.near_miss = metrics.get("near_miss", [])
         result.surface_shapes = metrics.get("surface_shapes", {})
         result.validation_verdicts = metrics.get("validation_verdicts", [])
-        for name in ("upload_forms", "upload_outcomes", "upload_stored", "upload_statuses"):
+        for name in ("upload_forms", "upload_outcomes", "upload_stored",
+                     "upload_statuses", "surface_dump"):
             if name in metrics:
                 setattr(result, name, metrics[name])
         result.cause, result.detail = classify(expected, metrics)
@@ -859,6 +874,14 @@ def main() -> int:
     parser.add_argument("--labs", nargs="+", metavar="LAB", help="특정 랩만 (XBEN-013-24)")
     parser.add_argument("--keep-up", action="store_true", help="측정 후 컨테이너 유지")
     parser.add_argument(
+        "--dump-surfaces",
+        action="store_true",
+        help=(
+            "정찰이 찾은 Surface를 경로·메서드·파라미터까지 결과에 남긴다. no_candidate의 "
+            "원인이 '게이트에 막힘'인지 '그 Surface를 아예 못 찾음'인지는 이것 없이 구분되지 않는다"
+        ),
+    )
+    parser.add_argument(
         "--expect",
         metavar="CLASS",
         help=(
@@ -995,6 +1018,7 @@ def main() -> int:
             expected == "Access Control" and not args.no_identities,
             args.negative_control,
             args.approve_state_changing,
+            args.dump_surfaces,
         )
         results.append(result)
         print(
