@@ -107,6 +107,12 @@ class _UploadRuntime:
                     data["echo"] = fields["csrf_token"]
                     data["echo_nonce"] = fields["nonce"]
                 body = json.dumps({"data": {"file": data}})
+                if self.mode == "html_link":
+                    # 고전 PHP 업로드 폼의 응답 모양: 저장 경로를 HTML 링크로만 알린다.
+                    media = "text/html"
+                    body = ("<html><body>File is valid, and was successfully uploaded "
+                            f"<a href='/files/{stored_name}'>here</a>."
+                            "<a href='/logout'>Log out</a></body></html>")
         elif path in self.files:
             payload = self.files[path]
             body = payload.decode() if payload.startswith(b"upload") else None
@@ -244,6 +250,39 @@ class FileUploadAnalysisTests(unittest.TestCase):
         candidate = app.stores.candidates.list_by_run(run.run_id)[0]
         self.assertEqual(candidate.status, CandidateStatus.SUSPECTED)
         self.assertFalse(app.stores.findings.list_by_run(run.run_id))
+
+    def test_an_html_link_response_locates_the_stored_file(self):
+        app, runtime, run = _scan("html_link")
+        self.assertEqual(run.phase, RunPhase.DONE)
+        rows = next(item.observation["results"] for item in app.stores.evidence.list_by_run(run.run_id)
+                    if item.observation.get("type") == UPLOAD_RESULT)
+        self.assertTrue(all(row["outcome"] == "accepted" for row in rows))
+        self.assertEqual(app.stores.candidates.list_by_run(run.run_id)[0].status,
+                         CandidateStatus.CONFIRMED)
+        # 응답에 같이 실린 무관한 링크는 따라가지 않는다. 방금 올린 파일 이름을 담은
+        # 참조만 읽기 때문이다.
+        self.assertFalse(any(urlsplit(request.resolved_url).path == "/logout"
+                             for request in runtime.requests))
+
+    def test_a_storage_directory_name_is_not_a_state_changing_action(self):
+        marker = "upload" + "b" * 32
+        def located(href, extension=".php"):
+            body = f"<html><body>stored <a href='{href}'>here</a></body></html>"
+            return uploaded_file_url(
+                {"type": "http_response", "status": 200, "body": body, "content_type": "text/html"},
+                "http://local.test/index.php", marker + extension,
+            )
+
+        # /upload/<marker>.php 를 받아오는 것은 업로드가 아니라 방금 만들어진 파일 읽기다.
+        for directory in ("upload", "uploads", "media/img"):
+            with self.subTest(directory=directory):
+                self.assertEqual(located(f"{directory}/{marker}.php"),
+                                 f"http://local.test/{directory}/{marker}.php")
+        # 디렉터리 이름이 실제 동작이면 그대로 막힌다.
+        self.assertIsNone(located(f"delete/{marker}.php"))
+        self.assertIsNone(located(f"/logout/{marker}.php"))
+        # 확장자 없는 경로는 정적 파일 읽기로 보지 않는다.
+        self.assertIsNone(located(f"upload/{marker}", extension=""))
 
     def test_rotating_csrf_and_form_defaults_are_fresh_and_redacted(self):
         app, runtime, run = _scan("csrf")

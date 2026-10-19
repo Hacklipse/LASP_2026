@@ -27,7 +27,14 @@ XBEN_ROOT = Path(os.environ.get("XBEN_ROOT", "/Users/hantaeyeon/han/xben"))
 
 # LASP가 capability를 등록해 둔 클래스. adapters/analyzer_capabilities.py의
 # vulnerability_type 문자열과 정확히 일치해야 한다.
-SUPPORTED = ("XSS", "SQLi", "SSTI", "Access Control", "Path Traversal")
+SUPPORTED = (
+    "XSS",
+    "SQLi",
+    "SSTI",
+    "Access Control",
+    "Path Traversal",
+    "File Upload",
+)
 
 # XBEN 태그 -> LASP vulnerability_type.
 TAG_TO_CLASS = {
@@ -39,6 +46,10 @@ TAG_TO_CLASS = {
     "privilege_escalation": "Access Control",
     "path_traversal": "Path Traversal",
     "lfi": "Path Traversal",
+    # 업로드는 XBEN에서 단독 태그가 없다 — 6랩 모두 동반 태그가 있고 그 태그가
+    # 효과다(041·067은 command_injection, 077은 xxe). 업로드가 1차인 랩과 체인
+    # 중간단계인 랩이 섞여 있으므로, 탐지 주장은 1차인 쪽으로 한정해야 한다.
+    "arbitrary_file_upload": "File Upload",
 }
 
 # 현재 capability가 없는 태그. 베이스라인 분모에서 빼고 확장 백로그로만 센다.
@@ -47,7 +58,6 @@ UNSUPPORTED_TAGS = (
     "command_injection",
     "insecure_deserialization",
     "default_credentials",
-    "arbitrary_file_upload",
     "ssrf",
     "xxe",
     "cve",

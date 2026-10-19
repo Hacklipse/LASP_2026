@@ -79,6 +79,9 @@ DEFAULT_GEMINI_RPM_LIMIT = 14
 _ACTOR_REF = "xben-actor"
 _OWNER_REF = "xben-owner"
 _LOGIN_APPROVAL_REF = "approve-local-xben-login"
+# 업로드 탐침은 자체 승인 참조를 싣지 않고 Run 기본 참조에 의존한다. 대상 디스크에
+# 파일을 남기는 상태 변경이므로 운영자가 명시로 켤 때만 준다.
+_STATE_CHANGING_APPROVAL_REF = "approve-local-xben-state-changing"
 UP_TIMEOUT = 420          # 빌드 포함. 이미지 캐시가 비면 여기서 대부분을 쓴다.
 READY_TIMEOUT = 60
 RUN_TIMEOUT = 900
@@ -119,6 +122,10 @@ class LabResult:
     gate_blocks: dict[str, int] = field(default_factory=dict)
     near_miss: list = field(default_factory=list)
     surface_shapes: dict[str, int] = field(default_factory=dict)
+    upload_forms: list = field(default_factory=list)
+    upload_outcomes: dict[str, int] = field(default_factory=dict)
+    upload_stored: list = field(default_factory=list)
+    upload_statuses: dict = field(default_factory=dict)
     requests_used: int = 0
     phase: str = ""
     target_url: str = ""
@@ -467,6 +474,7 @@ def run_lasp(
     browser: bool = True,
     identities: bool = False,
     negative_control: bool = False,
+    allow_state_changing: bool = False,
 ) -> tuple[dict, str]:
     """1회 Run. llm_client가 None이면 결정론적 대조군. (지표, 오류) 반환.
 
@@ -499,7 +507,19 @@ def run_lasp(
         # 로그인 POST는 상태 변경 요청이라 정책 게이트가 승인된 참조를 요구한다.
         # 기본 게이트는 전부 거부하므로, 계정을 세울 때만 그 한 참조를 승인한다.
         approval_gate=(
-            StaticApprovalGate((_LOGIN_APPROVAL_REF,)) if resolver is not None else None
+            StaticApprovalGate(approvals) if (approvals := tuple(
+                ref
+                for ref, enabled in (
+                    (_LOGIN_APPROVAL_REF, resolver is not None),
+                    (_STATE_CHANGING_APPROVAL_REF, allow_state_changing),
+                )
+                if enabled
+            )) else None
+        ),
+        # 자체 참조를 싣지 않는 탐침(업로드)이 이 기본값을 쓴다. 인가하지 않으면
+        # None이고, 그 경우 상태 변경 요청은 정책에서 거부된다.
+        default_approval_ref=(
+            _STATE_CHANGING_APPROVAL_REF if allow_state_changing else None
         ),
     )
     register_standard_agents(
@@ -556,6 +576,8 @@ def run_lasp(
     findings = app.stores.findings.list_by_run(run.run_id)
     return {
         **_gate_diagnosis(expected, surfaces, app.stores.evidence.list_by_run(run.run_id)),
+        **(_upload_diagnosis(app.stores.evidence.list_by_run(run.run_id))
+           if expected == "File Upload" else {}),
         "phase": run.phase.value,
         "surfaces": len(surfaces),
         "findings": len(findings),
@@ -577,6 +599,34 @@ def run_lasp(
             }
         ),
     }, ""
+
+
+def _upload_diagnosis(evidence) -> dict:
+    """업로드 체인이 어디서 끊겼는지 본다.
+
+    폼 관측이 없으면 Recon, 행이 없으면 Analyzer 진입, 행은 있는데 수락이 없으면
+    서버 응답 해석이 문제다. 세 경우를 한 눈에 구분한다.
+    """
+
+    forms = [item.observation for item in evidence
+             if item.observation.get("type") == "file_upload_form"]
+    results = [item.observation for item in evidence
+               if item.observation.get("type") == "file_upload_extension_result"]
+    rows = [row for item in results for row in item.get("results", ())]
+    tested = [row for row in rows if row.get("outcome") != "not_tested"]
+    return {
+        "upload_forms": [form.get("parameter") for form in forms],
+        "upload_outcomes": dict(
+            Counter(f"{row.get('outcome')}:{row.get('reason')}" for row in tested).most_common(6)
+        ),
+        "upload_stored": sorted({
+            f"{row.get('extension')}->{row.get('stored_extension')}"
+            for row in tested if row.get("outcome") == "accepted"
+        })[:8],
+        "upload_statuses": dict(
+            Counter(row.get("status") for row in tested if row.get("status")).most_common(5)
+        ),
+    }
 
 
 def classify(expected: str, metrics: dict) -> tuple[str, str]:
@@ -604,6 +654,7 @@ def measure(
     browser: bool = True,
     identities: bool = False,
     negative_control: bool = False,
+    allow_state_changing: bool = False,
 ) -> LabResult:
     started = time.monotonic()
     result = LabResult(
@@ -621,7 +672,14 @@ def measure(
 
     result.target_url = url
     metrics, error = run_lasp(
-        url, budget, llm_client, expected, browser, identities, negative_control
+        url,
+        budget,
+        llm_client,
+        expected,
+        browser,
+        identities,
+        negative_control,
+        allow_state_changing,
     )
     if error:
         result.cause = CAUSE_RUN_ERROR
@@ -638,6 +696,9 @@ def measure(
         result.near_miss = metrics.get("near_miss", [])
         result.surface_shapes = metrics.get("surface_shapes", {})
         result.validation_verdicts = metrics.get("validation_verdicts", [])
+        for name in ("upload_forms", "upload_outcomes", "upload_stored", "upload_statuses"):
+            if name in metrics:
+                setattr(result, name, metrics[name])
         result.cause, result.detail = classify(expected, metrics)
 
     if not keep_up:
@@ -798,6 +859,14 @@ def main() -> int:
     parser.add_argument("--labs", nargs="+", metavar="LAB", help="특정 랩만 (XBEN-013-24)")
     parser.add_argument("--keep-up", action="store_true", help="측정 후 컨테이너 유지")
     parser.add_argument(
+        "--approve-state-changing",
+        action="store_true",
+        help=(
+            "대상 상태를 바꾸는 탐침을 인가한다. 업로드는 대상 디스크에 파일을 남기므로 "
+            "이것 없이는 후보가 서도 정책에서 거부된다"
+        ),
+    )
+    parser.add_argument(
         "--negative-control",
         action="store_true",
         help="구성상 취약하지 않은 좌표로 측정한다. 확정이 나오면 그게 오탐이다",
@@ -882,6 +951,7 @@ def main() -> int:
         "browser_xss_validation": not args.no_browser,
         "identities": not args.no_identities,
         "negative_control": args.negative_control,
+        "approve_state_changing": args.approve_state_changing,
         "labs": len(targets),
     }
     print(f"XBEN 베이스라인  랩 {len(targets)}개 / 클래스당 {args.per_class} / 예산 {args.budget}")
@@ -907,6 +977,7 @@ def main() -> int:
             # 계정이 필요 없고 가입 요청만 늘어나므로 해당 클래스에서만 세운다.
             expected == "Access Control" and not args.no_identities,
             args.negative_control,
+            args.approve_state_changing,
         )
         results.append(result)
         print(
