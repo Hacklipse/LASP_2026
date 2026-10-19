@@ -4,9 +4,8 @@
 
     Rule    설명 가능한 Observation·Surface 규칙으로 Candidate를 만든다 (routing.py, 결정적)
     Hybrid  규칙이 비워 둔 자리에 한해 조사할 유형을 제안
-    Agentic 현재 Run의 모든 Surface를 Analyzer 실행 계약으로 분류하고, 실행 가능한
-            Surface/유형 조합은 빠짐없이 Analysis로 전달한다. LLM 판단은 감사용 진단
-            신호일 뿐 Candidate를 제거하지 않는다.
+    Agentic 현재 Run의 모든 Surface를 Analyzer 실행 계약으로 분류하고, LLM이
+            1차 분석 가설을 고른다. 미선택 조합도 낮은 우선순위로 보존한다.
 
 LLM은 Candidate를 만들지 않고, 담당 Agent도 고르지 않는다. 고르는 것은 이미 존재하는
 ``surface_id``와 취약점 유형 두 가지뿐이며, ``agent_type`` 해석은 표면 모양(fragment 여부)을
@@ -32,7 +31,7 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -158,25 +157,26 @@ _SYSTEM = (
 )
 
 _AGENTIC_SYSTEM = (
-    "You rank executable analyzer hypotheses for one authorized security assessment "
+    "You select first-pass analyzer hypotheses for one authorized security assessment "
     "from only the structured surfaces and observations offered to you. Do not assume a known "
     "vulnerable endpoint, target-specific payload, expected finding, or ground truth. "
-    "Return exactly one hypothesis for every offered surface_id and capability_id pair; "
-    "never omit a pair. For each hypothesis, copy the offered identifiers and choose "
+    "Return only the strongest hypotheses, up to the first-pass limit in the request. "
+    "Omit weaker pairs; they remain eligible for lower-priority analysis if budget allows. "
+    "For each selected hypothesis, copy the offered identifiers and choose "
     "confidence and execution priority, "
     "zero or more short observation ref values (e.g. o1), not their kind labels, "
     "belonging to that surface in basis_observation_ids, "
     "one hypothesis reason code, generic evidence types needed for Analysis, and one "
-    "analysis_strategy_id offered by that capability. Your confidence and priority rank "
-    "work but never suppress an executable assignment; Analysis performs the security test. "
+    "analysis_strategy_id offered by that capability. Your selection ranks work but "
+    "never establishes a vulnerability; Analysis and Validation perform the security test. "
     "A parameterized server-side route can justify a "
     "testable, low-confidence hypothesis from its path and input names even before an HTTP "
     "response has been observed; review server and client routes independently rather than "
     "stopping after one plausible hypothesis. If a surface has observation_refs=[(none)], "
     "use basis_observation_ids=[]; never borrow a ref from another surface. "
-    "Never invent or omit an endpoint, capability, parameter, observation ref, reason code, "
-    "evidence type, strategy, payload, or credential. Return an empty hypotheses list only "
-    "when no surface/capability pair was offered."
+    "Never invent an endpoint, capability, parameter, observation ref, reason code, "
+    "evidence type, strategy, payload, or credential. An empty hypotheses list means "
+    "no offered pair is a strong first-pass choice."
 )
 
 
@@ -217,14 +217,14 @@ class _OfferedSurface:
 class RouterHypothesis:
     """Agentic LLM이 실행 가능한 capability에 부여한 분석 계획.
 
-    실제 Analysis 전달 여부는 이 값이 아니라 Analyzer capability가 정한다. 모델이 항목을
-    누락하거나 계약을 위반하면 코드가 ``unanswered``를 합성해 감사 가능성을 유지한다.
+    실제 Analysis 전달 여부는 이 값이 아니라 Analyzer capability와 예산이 정한다.
+    미선택은 ``deferred``, 계약 위반은 ``unanswered``로 구분한다.
     """
 
     surface_id: str
     vulnerability_type: str
     agent_type: str
-    status: Literal["planned", "unanswered"]
+    status: Literal["planned", "deferred", "unanswered"]
     reason_code: str
     basis_evidence_ids: tuple[str, ...] = ()
     required_evidence_types: tuple[str, ...] = ()
@@ -270,8 +270,8 @@ class LlmRouterAdvisor:
     """LLM 판단을 검증하고 Analyzer capability를 라우팅 결과로 돌려주는 구현.
 
     Agentic 모드의 confidence/priority는 실행 순서 메타데이터이고, 실행 가능한 모든
-    조합은 ``RouteSuggestion``이 된다. Router 단계에서는 대상 HTTP 요청이나 Analysis
-    Agent를 호출하지 않는다.
+    조합은 ``RouteSuggestion``이 된다. 미선택 조합은 뒤로 미루되 제거하지 않는다.
+    Router 단계에서는 대상 HTTP 요청이나 Analysis Agent를 호출하지 않는다.
     """
 
     def __init__(
@@ -461,7 +461,7 @@ class LlmRouterAdvisor:
         capabilities: tuple[SurfaceCapability, ...],
         analyzer_coverage: tuple[AnalyzerCapabilityCoverage, ...],
     ) -> tuple[RouteSuggestion, ...]:
-        """실행 가능한 모든 조합을 보존하고 LLM 판단은 감사 근거로만 쓴다."""
+        """실행 가능한 모든 조합을 보존하고 LLM 선택을 1차 실행 순서로 쓴다."""
 
         started = time.monotonic()
         capability_suggestions = self._capability_suggestions(offered)
@@ -532,8 +532,8 @@ class LlmRouterAdvisor:
                 self._parse_hypotheses(response.payload, batch)
             )
             hypotheses.extend(batch_hypotheses)
-            # LLM의 confidence/priority는 취약점 진위 판정이 아니다. 실행 가능한 조합은
-            # 하나도 자르지 않고 Analysis가 자체 control/probe로 판정하게 한다.
+            # LLM 미선택은 탈락이 아니다. 예산이 남으면 뒤에서 분석하며 최종 판정은
+            # Analysis/Validation의 control/probe 계약에 맡긴다.
             suggestion_overrides.update(
                 {
                     (item.surface_id, item.capability_id): item
@@ -583,7 +583,8 @@ class LlmRouterAdvisor:
 
         overall_status = "partial" if "partial" in statuses else "ok"
         final_suggestions = self._merge_capability_suggestions(
-            capability_suggestions, suggestion_overrides
+            capability_suggestions, suggestion_overrides,
+            defer_unselected=overall_status == "ok",
         )
         self.last_trace = RouterAdvisorTrace(
             suggestions=final_suggestions,
@@ -641,12 +642,14 @@ class LlmRouterAdvisor:
     def _merge_capability_suggestions(
         capability_suggestions: tuple[RouteSuggestion, ...],
         overrides: dict[tuple[str, str], RouteSuggestion],
+        *, defer_unselected: bool = False,
     ) -> tuple[RouteSuggestion, ...]:
-        """LLM route 근거는 보존하되 defer/reject가 capability를 제거하지 못하게 한다."""
+        """미선택은 뒤로 보내되 LLM 실패 시 결정적 기본 순서를 유지한다."""
 
         return tuple(
             overrides.get(
-                (item.surface_id, item.capability_id), item
+                (item.surface_id, item.capability_id),
+                replace(item, priority_label="low") if defer_unselected else item,
             )
             for item in capability_suggestions
         )
@@ -969,14 +972,16 @@ class LlmRouterAdvisor:
             )
         lines.append("")
         if self._hypothesis_mode:
+            pair_count = sum(len(item.allowed_capability_ids) for item in offered)
             lines.extend(
                 [
+                    f"First-pass limit: {max(1, (pair_count + 1) // 2)} of {pair_count} offered pairs.",
                     "Hypothesis reason codes: "
                     + ", ".join(sorted(CANDIDATE_REASON_CODES)),
                     "Evidence types: "
                     + ", ".join(sorted(CANDIDATE_EVIDENCE_TYPES)),
-                    "Return one hypothesis for every allowed_capabilities entry. "
-                    "Confidence and priority rank Analysis work; they never remove it.",
+                    "Return only the strongest first-pass hypotheses. Omitted pairs "
+                    "remain eligible at low priority if the request budget allows.",
                 ]
             )
         else:
@@ -1101,7 +1106,7 @@ class LlmRouterAdvisor:
         tuple[tuple[int, str], ...],
         str,
     ]:
-        """Capability별 우선순위 계획을 검증한다. 실행 가능 조합은 절대 제거하지 않는다."""
+        """1차 선택을 검증한다. 미선택도 뒤로 미룰 뿐 제거하지 않는다."""
 
         expected: dict[tuple[str, str], tuple[_OfferedSurface, AnalyzerCapability]] = {}
         for surface in offered:
@@ -1210,18 +1215,37 @@ class LlmRouterAdvisor:
                 analysis_strategy_id=strategy_id,
             )
 
+        first_pass_limit = max(1, (len(expected) + 1) // 2)
+        capped: set[tuple[str, str]] = set()
+        if len(valid) > first_pass_limit:
+            ranked = sorted(
+                valid,
+                key=lambda key: (
+                    {"low": 0, "normal": 1, "high": 2}[valid[key].priority],
+                    {"low": 0, "medium": 1, "high": 2}[valid[key].confidence],
+                ),
+                reverse=True,
+            )
+            capped = set(ranked[first_pass_limit:])
+            for key in capped:
+                valid.pop(key)
+                suggestions.pop(key)
+
         assessments: list[RouterHypothesis] = []
         for key, (surface, capability) in expected.items():
             assessment = valid.get(key)
             if assessment is None:
+                deferred = key in capped or not rejected
                 assessment = RouterHypothesis(
                     surface_id=surface.surface_id,
                     vulnerability_type=capability.vulnerability_type,
                     agent_type=capability.agent_type,
-                    status="unanswered",
+                    status="deferred" if deferred else "unanswered",
                     reason_code=(
                         "invalid_hypothesis"
                         if key in invalid_expected
+                        else "first_pass_limit" if key in capped
+                        else "llm_deferred" if deferred
                         else "missing_hypothesis"
                     ),
                     capability_id=capability.capability_id,
@@ -1231,9 +1255,9 @@ class LlmRouterAdvisor:
                 )
             assessments.append(assessment)
 
-        if expected and not valid:
+        if raw and not valid:
             status = "all_rejected"
-        elif rejected or len(valid) != len(expected):
+        elif rejected:
             status = "partial"
         else:
             status = "ok"

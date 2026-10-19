@@ -588,10 +588,13 @@ class DynastEvaluationTests(unittest.TestCase):
                     "browser_recon_enabled": True, "authenticated": False,
                     "state_changing_approved": True,
                     "budget_allocation_mode": "heuristic",
+                    "router_mode": "agentic", "llm_model": "gemini-3.5-flash-lite",
                 }) + "\n")
                 self.assertIn("--anonymous", command)
                 self.assertIn("--approve-state-changing", command)
                 self.assertEqual(command[command.index("--budget-allocation") + 1], "heuristic")
+                self.assertEqual(command[command.index("--router") + 1], "agentic")
+                self.assertEqual(command[command.index("--llm-model") + 1], "gemini-3.5-flash-lite")
                 self.assertEqual(kwargs["input"], "y\n")
                 self.assertIn("--browser-executable", command)
                 self.assertFalse(any(k.startswith("DYNAST_BENCH_") for k in kwargs["env"]))
@@ -630,6 +633,7 @@ class DynastEvaluationTests(unittest.TestCase):
                     "--no-build",
                     "--approve-state-changing",
                     "--budget-allocation", "heuristic",
+                    "--router", "agentic", "--llm-model", "gemini-3.5-flash-lite",
                 ]), 0)
             summary = json.loads((output_dir / "summary.json").read_text())
             self.assertEqual(summary["scored_iterations"], 2)
@@ -640,6 +644,8 @@ class DynastEvaluationTests(unittest.TestCase):
             self.assertIn("2회 합계 (반복 검사 건수): TP 2 | FP 2 | FN 6 | safe Finding 2", output.getvalue())
             self.assertTrue(summary["state_changing_approved"])
             self.assertEqual(summary["budget_allocation_mode"], "heuristic")
+            self.assertEqual(summary["router_mode"], "agentic")
+            self.assertEqual(summary["llm_model"], "gemini-3.5-flash-lite")
             self.assertEqual(summary["target_mode"], "solo")
             self.assertTrue(summary["target_images_reused"])
             diagnosis = json.loads((output_dir / "01-diagnosis.json").read_text())

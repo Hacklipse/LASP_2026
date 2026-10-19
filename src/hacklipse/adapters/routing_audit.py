@@ -138,7 +138,10 @@ class AuditedVulnerabilityRouter:
             original = {item.candidate.candidate_id: item for item in baseline}
             outcomes = dict(routed.last_advisor_outcomes) if routed else {}
             final_by_key = {
-                (item.candidate.surface_id, item.candidate.vulnerability_type): item
+                (
+                    item.candidate.surface_id,
+                    item.candidate.routing_capability_id or item.candidate.vulnerability_type,
+                ): item
                 for item in decisions
             }
             decisions_by_surface: dict[str, list[str]] = {}
@@ -187,7 +190,9 @@ class AuditedVulnerabilityRouter:
             proposals = []
             if routed:
                 for index, item in enumerate(routed.last_advisor_suggestions):
-                    final = final_by_key.get((item.surface_id, item.vulnerability_type))
+                    final = final_by_key.get((
+                        item.surface_id, item.capability_id or item.vulnerability_type,
+                    ))
                     proposals.append({
                         "index": index, "index_scope": "validated_items",
                         "surface_id": item.surface_id,
@@ -306,7 +311,7 @@ class AuditedVulnerabilityRouter:
                                 advisor_trace.hypotheses if advisor_trace else ()
                             )
                         )
-                        for status in ("planned", "unanswered")
+                        for status in ("planned", "deferred", "unanswered")
                     },
                     "hypotheses": [
                         {

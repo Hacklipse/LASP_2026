@@ -6,8 +6,10 @@ import unittest
 
 from hacklipse.adapters.llm_router_advisor import LlmRouterAdvisor
 from hacklipse.adapters.routing import RuleBasedVulnerabilityRouter
-from hacklipse.domain import Run, RunScope, Surface
-from hacklipse.ports import AnalyzerCapability, AnalyzerCapabilityRegistry
+from hacklipse.domain import Evidence, Run, RunScope, Surface
+from hacklipse.ports import (
+    AnalyzerCapability, AnalyzerCapabilityRegistry, ObservationRequirement,
+)
 from hacklipse.ports.llm import LlmResponse
 
 
@@ -131,8 +133,49 @@ class CapabilityDrivenRoutingTests(unittest.TestCase):
             "second_strategy",
         )
         self.assertEqual(
-            {item.status for item in advisor.last_trace.hypotheses}, {"planned"}
+            {item.status for item in advisor.last_trace.hypotheses},
+            {"planned", "deferred"},
         )
+
+    def test_required_observation_reaches_analyzer_when_llm_omits_basis(self) -> None:
+        class _EmptyPlanner:
+            def complete(self, request):
+                return LlmResponse(payload={"hypotheses": []}, model="fixture")
+
+        capability = AnalyzerCapability(
+            capability_id="custom.observed",
+            agent_type="custom_analyzer",
+            vulnerability_type="Custom",
+            requires_parameters=False,
+            observation_requirements=(ObservationRequirement("test_plan", "recon"),),
+        )
+        evidence = tuple(
+            Evidence(
+                evidence_id=evidence_id,
+                run_id=self.run.run_id,
+                surface_id=self.surface.surface_id,
+                created_by="recon",
+                evidence_type="observation",
+                observation={"type": "test_plan", "source": source},
+            )
+            for evidence_id, source in (
+                ("evi-correct", "recon"), ("evi-wrong-source", "other")
+            )
+        )
+        router = RuleBasedVulnerabilityRouter(
+            rules=(), surface_rules=(), capabilities=(capability,),
+            advisor=LlmRouterAdvisor(
+                llm_client=_EmptyPlanner(), capabilities=(capability,),
+                hypothesis_mode=True,
+            ),
+            advisor_mode="primary",
+        )
+
+        decisions = router.route(self.run, (self.surface,), evidence)
+
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].candidate.evidence_ids, ("evi-correct",))
+        self.assertEqual(decisions[0].candidate.routing_priority, "low")
 
 
 if __name__ == "__main__":

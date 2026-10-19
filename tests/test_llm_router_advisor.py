@@ -389,7 +389,7 @@ class AgenticHypothesisTests(unittest.TestCase):
             ((0, "unknown_observation"),),
         )
 
-    def test_empty_hypotheses_are_visible_as_unanswered_and_fallback(self) -> None:
+    def test_empty_hypotheses_defer_every_pair_without_dropping_them(self) -> None:
         llm = _FakeLlmClient({"dispositions": []})
         advisor = LlmRouterAdvisor(
             llm_client=llm,
@@ -401,16 +401,20 @@ class AgenticHypothesisTests(unittest.TestCase):
             len(advisor.advise(_run(), (_surface(),), (), frozenset())),
             3,
         )
-        self.assertEqual(advisor.last_trace.source, "deterministic_fallback")
-        self.assertEqual(advisor.last_trace.status, "all_rejected")
+        self.assertEqual(advisor.last_trace.source, "llm")
+        self.assertEqual(advisor.last_trace.status, "ok")
         self.assertTrue(advisor.last_trace.hypotheses)
         self.assertEqual(
             {item.status for item in advisor.last_trace.hypotheses},
-            {"unanswered"},
+            {"deferred"},
         )
         self.assertEqual(
             {item.reason_code for item in advisor.last_trace.hypotheses},
-            {"missing_hypothesis"},
+            {"llm_deferred"},
+        )
+        self.assertEqual(
+            {item.priority_label for item in advisor.last_trace.suggestions},
+            {"low"},
         )
 
     def test_hypothesis_ranking_preserves_all_capabilities(self) -> None:
@@ -460,14 +464,14 @@ class AgenticHypothesisTests(unittest.TestCase):
                 for item in advisor.last_trace.hypotheses
             ),
             [
-                ("Path Traversal", "planned", "low"),
+                ("Path Traversal", "deferred", "low"),
                 ("SQLi", "planned", "high"),
                 ("XSS", "planned", "medium"),
             ],
         )
         self.assertEqual(advisor.last_trace.offered_pair_count, 3)
 
-    def test_missing_pair_is_unanswered_instead_of_silent_rejection(self) -> None:
+    def test_missing_pair_is_deferred_and_remains_routable(self) -> None:
         llm = _FakeLlmClient({"dispositions": [{
             "surface_id": "surface-import",
             "vulnerability_type": "SQLi",
@@ -483,18 +487,22 @@ class AgenticHypothesisTests(unittest.TestCase):
         suggestions = advisor.advise(_run(), (_surface(),), (), frozenset())
 
         self.assertEqual(len(suggestions), 3)
-        unanswered = [
+        deferred = [
             item for item in advisor.last_trace.hypotheses
-            if item.status == "unanswered"
+            if item.status == "deferred"
         ]
         self.assertEqual(
-            {item.vulnerability_type for item in unanswered},
+            {item.vulnerability_type for item in deferred},
             {"Path Traversal", "XSS"},
         )
         self.assertEqual(
-            {item.reason_code for item in unanswered}, {"missing_hypothesis"}
+            {item.reason_code for item in deferred}, {"llm_deferred"}
         )
-        self.assertEqual(advisor.last_trace.status, "partial")
+        self.assertEqual(advisor.last_trace.status, "ok")
+        self.assertEqual(
+            {item.priority_label for item in suggestions if item.vulnerability_type != "SQLi"},
+            {"low"},
+        )
 
     def test_agentic_batches_cover_every_compatible_surface_without_cap_loss(self) -> None:
         llm = _ExhaustiveLlmClient()
@@ -517,7 +525,8 @@ class AgenticHypothesisTests(unittest.TestCase):
             {f"surface-{index}" for index in range(5)},
         )
         self.assertEqual(
-            {item.status for item in advisor.last_trace.hypotheses}, {"planned"}
+            {item.status for item in advisor.last_trace.hypotheses},
+            {"planned", "deferred"},
         )
         self.assertEqual(advisor.last_trace.status, "ok")
 

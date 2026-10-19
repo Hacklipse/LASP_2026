@@ -327,7 +327,7 @@ class RoutingAuditTests(unittest.TestCase):
         self.assertEqual(record["llm"]["selection_policy"], "analyzer_capability")
         self.assertIs(record["llm"]["hypotheses_advisory_only"], True)
         self.assertEqual(record["llm"]["hypothesis_counts"], {
-            "planned": 3, "unanswered": 0,
+            "planned": 2, "deferred": 1, "unanswered": 0,
         })
         self.assertEqual(
             sorted(
@@ -335,7 +335,7 @@ class RoutingAuditTests(unittest.TestCase):
                 for item in record["llm"]["hypotheses"]
             ),
             [
-                ("Path Traversal", "planned", "low"),
+                ("Path Traversal", "deferred", "low"),
                 ("SQLi", "planned", "high"),
                 ("XSS", "planned", "medium"),
             ],
