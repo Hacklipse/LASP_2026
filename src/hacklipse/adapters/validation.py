@@ -57,6 +57,12 @@ from .graphql_suggestions import (
     SUGGESTION_TYPE, SUGGESTION_OBSERVATION,
     suggestion_request, suggested_field,
 )
+from .arbitrary_file_read import (
+    ARBITRARY_FILE_READ_OBSERVATION,
+    ARBITRARY_FILE_READ_TOOL,
+    arbitrary_file_read_signal,
+    build_arbitrary_file_read_requests,
+)
 from .ssti_analysis import (
     SSTI_OBSERVATION,
     SSTI_TOOL,
@@ -162,6 +168,10 @@ class ValidationAgent:
             candidate.vulnerability_type == "Access Control"
             and ACCESS_CONTROL_TOOL in task.allowed_tools
         )
+        specialized_file_read_validation = (
+            candidate.vulnerability_type == "Arbitrary File Read"
+            and ARBITRARY_FILE_READ_TOOL in task.allowed_tools
+        )
         specialized_ssti_validation = (
             candidate.vulnerability_type == "SSTI" and SSTI_TOOL in task.allowed_tools
         )
@@ -177,6 +187,8 @@ class ValidationAgent:
             required_tool = ACCESS_CONTROL_TOOL
         elif specialized_ssti_validation:
             required_tool = SSTI_TOOL
+        elif specialized_file_read_validation:
+            required_tool = ARBITRARY_FILE_READ_TOOL
         elif specialized_login_validation:
             required_tool = "http_post"
         else:
@@ -220,6 +232,10 @@ class ValidationAgent:
             return self._validate_access_control(task, candidate, evidence)
         if specialized_ssti_validation:
             return self._validate_ssti(task, candidate, evidence, reproduction)
+        if specialized_file_read_validation:
+            return self._validate_arbitrary_file_read(
+                task, candidate, evidence, reproduction
+            )
         if (
             candidate.vulnerability_type == "XSS"
             and BROWSER_XSS_TOOL in task.allowed_tools
@@ -1605,6 +1621,101 @@ class ValidationAgent:
             reason="independent control/probe comparison reproduced the filter bypass read",
             reason_code=ValidationReasonCode.CONFIRMED_PROOF,
             proof=proof,
+        )
+
+    def _validate_arbitrary_file_read(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        evidence,
+        reproduction,
+    ) -> AgentResult:
+        """Analysis가 남긴 신호를 독립 요청으로 다시 만들어야 확정한다."""
+
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        signaled = tuple(
+            dict.fromkeys(
+                parameter
+                for item in evidence
+                if item.surface_id == candidate.surface_id
+                and item.observation.get("type") == ARBITRARY_FILE_READ_OBSERVATION
+                and isinstance((parameter := item.observation.get("parameter")), str)
+                and parameter in surface.parameters
+            )
+        )
+        if not signaled:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no absolute-path read signal to reproduce",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+
+        requests = build_arbitrary_file_read_requests(
+            surface,
+            surface.parameters,
+            signaled,
+            purpose=f"Arbitrary File Read validation {task.validation_id}",
+        )
+        collected = tuple(
+            matching_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "Arbitrary File Read validation lacks budget for independent requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+
+        reproduced = tuple(item for item in collected if item is not None)
+        if any(
+            item.observation.get("type") in {"http_error", "http_redirect"}
+            for item in reproduced
+        ):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=reproduced,
+                reason="independent absolute-path reproduction could not obtain comparable responses",
+                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+            )
+
+        control = reproduced[0]
+        for parameter, probe in zip(signaled, reproduced[1:]):
+            if not arbitrary_file_read_signal(control, probe):
+                continue
+            proof_evidence = (control, probe)
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence=proof_evidence,
+                reason="independent control/probe comparison reproduced the absolute-path read",
+                reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+                proof=ValidationProof(
+                    proof_type=ValidationProofType.ARBITRARY_FILE_READ,
+                    evidence_ids=tuple(item.evidence_id for item in proof_evidence),
+                    summary=(
+                        "independent fixed absolute-path probe reproduced a file read "
+                        f"for parameter {parameter}"
+                    ),
+                ),
+            )
+
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.REJECTED,
+            evidence=reproduced,
+            reason="independent probe did not reproduce the absolute-path read",
+            reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
         )
 
     def _validate_ssti(

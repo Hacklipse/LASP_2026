@@ -180,6 +180,15 @@ DEFAULT_RULES = (
     ),
     RoutingRule("template_error", "SSTI", "ssti_analyzer", 0.7),
     RoutingRule("template_execution", "SSTI", "ssti_analyzer", 0.9),
+    # 파일 파라미터를 가리키는 같은 관측에서 상대 탈출과 함께 올라온다. ``..``를
+    # 거르는 필터가 절대 경로는 막지 못하는 경우가 있어 둘 다 시도할 값이 있다.
+    RoutingRule(
+        "url_or_file_parameter",
+        "Arbitrary File Read",
+        "arbitrary_file_read_analyzer",
+        0.55,
+        methods=("GET",),
+    ),
 )
 
 # Public source maps can be deliberately published for debugging or open

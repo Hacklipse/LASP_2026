@@ -98,6 +98,7 @@ class ValidationProofType(str, Enum):
     SOURCE_MAP_EXPOSURE = "source_map_exposure"
     ERROR_DETAIL_EXPOSURE = "error_detail_exposure"
     OPEN_REDIRECT = "open_redirect"
+    ARBITRARY_FILE_READ = "arbitrary_file_read"
     CORS_ORIGIN_REFLECTION = "cors_origin_reflection"
 
 
@@ -119,6 +120,7 @@ class HttpRequestKind(str, Enum):
     ACCESS_CONTROL_PROBE = "access_control_probe"
     SSTI_PROBE = "ssti_probe"
     SSTI_CLEANUP = "ssti_cleanup"
+    ARBITRARY_FILE_READ_PROBE = "arbitrary_file_read_probe"
 
 
 class AccessPrincipalRole(str, Enum):
@@ -164,6 +166,11 @@ _GRAPHQL_READ_DOCUMENT = re.compile(
 # 비민감 OS 식별 파일을 정확한 상대 경로 하나로 고정해 LLM이나 Agent가 다른 파일
 # (예: /etc/passwd)을 선택하지 못하게 한다.
 PATH_TRAVERSAL_SAFE_PROBE_PATH = "../../../../../etc/os-release"
+# 경로를 그대로 여는 표면에서 쓰는 절대 경로. 같은 비민감 파일을 가리키지만 탈출
+# 시퀀스가 없다. ``..``를 거르는 필터는 절대 경로를 막지 못하는 경우가 흔해, 같은
+# 파라미터에서 상대 탈출과 결과가 갈린다. 여기서도 읽을 파일을 하나로 고정해
+# Agent나 LLM이 /etc/passwd 같은 다른 파일을 고를 수 없게 한다.
+ARBITRARY_FILE_READ_SAFE_PROBE_PATH = "/etc/os-release"
 # 서버 템플릿의 layout/view 경로가 뷰 디렉터리 밖으로 나가는지 확인할 때만 쓰는
 # 별도 저민감 파일. 패키지 메타데이터는 비밀 파일이 아니며 Juice Shop을 포함한
 # Node 애플리케이션 루트에 일반적으로 존재한다.
@@ -195,6 +202,12 @@ def is_path_traversal_safe_probe_value(value: str) -> bool:
     """고정된 비민감 증명 파일 상대 경로와 정확히 같은지 확인한다."""
 
     return value == PATH_TRAVERSAL_SAFE_PROBE_PATH
+
+
+def is_arbitrary_file_read_safe_probe_value(value: str) -> bool:
+    """고정된 비민감 증명 파일 절대 경로와 정확히 같은지 확인한다."""
+
+    return value == ARBITRARY_FILE_READ_SAFE_PROBE_PATH
 
 
 def is_path_traversal_safe_form_probe_value(value: str) -> bool:

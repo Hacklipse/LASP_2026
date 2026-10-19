@@ -18,6 +18,7 @@ from hacklipse.adapters import (
     HeuristicAccessControlAnalyzer,
     HeuristicSqliAnalyzer,
     HeuristicSstiAnalyzer,
+    HeuristicArbitraryFileReadAnalyzer,
     HeuristicPathTraversalAnalyzer,
     HeuristicXssAnalyzer,
     InMemoryBudgetManager,
@@ -380,6 +381,7 @@ IMPLEMENTED_ANALYZERS = (
     "sqli_analyzer",
     "path_traversal_analyzer",
     "ssti_analyzer",
+    "arbitrary_file_read_analyzer",
 )
 
 def standard_router(
@@ -881,6 +883,17 @@ def register_standard_agents(
         "access_control_analyzer",
         access_control_analyzer,
         allowed_tools=("access_control_probe",),
+    )
+    # LLM 변형이 없는 분석기이므로 프로필 분기 밖에서 한 번만 만든다.
+    arbitrary_file_read_analyzer: Agent = HeuristicArbitraryFileReadAnalyzer(
+        candidate_store=app.stores.candidates,
+        surface_store=app.stores.surfaces,
+        evidence_store=app.stores.evidence,
+    )
+    app.dispatcher.register(
+        "arbitrary_file_read_analyzer",
+        arbitrary_file_read_analyzer,
+        allowed_tools=("arbitrary_file_read_probe",),
     )
     app.dispatcher.register(
         "ssti_analyzer",

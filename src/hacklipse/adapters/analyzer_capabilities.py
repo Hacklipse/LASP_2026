@@ -276,6 +276,17 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         strategy_ids=("compare_object_ownership",),
         default_priority=0.35,
     ),
+    AnalyzerCapability(
+        capability_id="arbitrary_file_read.http.query",
+        agent_type="arbitrary_file_read_analyzer",
+        vulnerability_type="Arbitrary File Read",
+        methods=("GET",),
+        surface_kind="server",
+        exploration_parameter_source="surface",
+        supported_evidence_types=("control_response", "file_read_marker"),
+        strategy_ids=("probe_absolute_file_path",),
+        default_priority=0.22,
+    ),
 )
 
 

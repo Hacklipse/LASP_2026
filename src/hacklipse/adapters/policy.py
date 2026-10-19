@@ -18,6 +18,10 @@ from .access_control_analysis import (
     ACCESS_CONTROL_TOOL,
     validate_access_control_request,
 )
+from .arbitrary_file_read import (
+    ARBITRARY_FILE_READ_TOOL,
+    validate_arbitrary_file_read_request,
+)
 from .ssti_analysis import SSTI_TOOL, validate_ssti_request
 from .xss_execution import BROWSER_XSS_TOOL, validate_browser_xss_request
 
@@ -56,6 +60,11 @@ class AllowlistPolicyGate:
         if request.tool == PATH_TRAVERSAL_TOOL:
             try:
                 validate_path_traversal_request(request)
+            except ValueError as error:
+                raise PolicyViolation(str(error)) from error
+        if request.tool == ARBITRARY_FILE_READ_TOOL:
+            try:
+                validate_arbitrary_file_read_request(request)
             except ValueError as error:
                 raise PolicyViolation(str(error)) from error
         if request.tool == SSTI_TOOL:

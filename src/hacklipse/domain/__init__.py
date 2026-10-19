@@ -13,6 +13,7 @@ from .models import (
     Finding,
     PROBE_METACHARACTERS,
     PATH_TRAVERSAL_BYPASS_SUFFIX,
+    ARBITRARY_FILE_READ_SAFE_PROBE_PATH,
     PATH_TRAVERSAL_SAFE_PROBE_PATH,
     PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH,
     AccessPrincipalRole,
@@ -45,6 +46,7 @@ from .models import (
     UncheckedCandidate,
     credential_for_vulnerability,
     is_path_traversal_bypass_suffix,
+    is_arbitrary_file_read_safe_probe_value,
     is_path_traversal_safe_probe_value,
     is_path_traversal_safe_form_probe_value,
 )
@@ -60,6 +62,7 @@ __all__ = [
     "ExecutionResult",
     "Finding",
     "PROBE_METACHARACTERS",
+    "ARBITRARY_FILE_READ_SAFE_PROBE_PATH",
     "PATH_TRAVERSAL_SAFE_PROBE_PATH",
     "PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH",
     "AccessPrincipalRole",
@@ -93,6 +96,7 @@ __all__ = [
     "credential_for_vulnerability",
     "generalize_parameter_names",
     "generalize_surface_path",
+    "is_arbitrary_file_read_safe_probe_value",
     "is_path_traversal_safe_probe_value",
     "is_path_traversal_safe_form_probe_value",
 ]
