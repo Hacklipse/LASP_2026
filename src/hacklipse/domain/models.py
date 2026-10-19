@@ -122,6 +122,7 @@ class HttpRequestKind(str, Enum):
     SSTI_PROBE = "ssti_probe"
     SSTI_CLEANUP = "ssti_cleanup"
     ARBITRARY_FILE_READ_PROBE = "arbitrary_file_read_probe"
+    PATH_TRAVERSAL_ROOT_ESCAPE_PROBE = "path_traversal_root_escape_probe"
 
 
 class AccessPrincipalRole(str, Enum):
@@ -176,6 +177,34 @@ ARBITRARY_FILE_READ_SAFE_PROBE_PATH = "/etc/os-release"
 # 별도 저민감 파일. 패키지 메타데이터는 비밀 파일이 아니며 Juice Shop을 포함한
 # Node 애플리케이션 루트에 일반적으로 존재한다.
 PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH = "../package.json"
+# 선언된 하위 디렉터리 밖으로 나가는지 확인할 때 읽는 고정 파일과, 같은 자리에서
+# "없는 파일"을 받아 보는 고정 이름.
+#
+# 왜 /etc/os-release 로는 부족한가 — 앱이 자기 루트 밖을 전부 거부하면서도 선언한
+# 하위 디렉터리(`web_assets/`) 제한은 강제하지 않는 경우가 있다. 그 경우 OS 파일은
+# 영영 403이고, 실제 취약점인 "디렉터리 탈출"은 증명되지 않는다.
+#
+# 왜 README.md 인가 — 프로젝트 루트의 공개 설명 파일이라 비밀이 아니고, 언어 생태계를
+# 가리지 않고 가장 흔하다. 없으면 증명하지 못한 채로 남기지, 다른 파일을 고르지 않는다.
+PATH_TRAVERSAL_DECLARED_ROOT_PROOF_FILE = "README.md"
+# 존재할 리 없는 이름. 같은 자리에서 "파일 없음" 응답이 어떻게 생겼는지 받아 두면,
+# 200으로 오류 화면을 돌려주는 앱을 증명으로 오인하지 않는다.
+PATH_TRAVERSAL_DECLARED_ROOT_ABSENT_FILE = "hacklipse-absent-proof.md"
+# 탈출 탐침의 형태. 앞의 한 세그먼트는 관측된 값의 첫 디렉터리 이름이고 나머지는 고정이다.
+# 경로가 어휘적으로 정규화되므로 `X/../README.md`는 X가 무엇이든 base의 README.md 하나만
+# 가리킨다 — 즉 앞 세그먼트는 "선언된 디렉터리를 벗어난다"는 형태를 만들 뿐 읽는 파일을
+# 바꾸지 못한다. 그래서 이 탐침이 읽을 수 있는 실재 파일은 끝까지 하나뿐이다.
+_PATH_TRAVERSAL_ROOT_ESCAPE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}/\.\./(?:"
+    + "|".join(
+        re.escape(name)
+        for name in (
+            PATH_TRAVERSAL_DECLARED_ROOT_PROOF_FILE,
+            PATH_TRAVERSAL_DECLARED_ROOT_ABSENT_FILE,
+        )
+    )
+    + r")"
+)
 # 확장자 필터를 우회해 서버가 직접 거부한 자기 파일을 읽게 하는 고정 접미사.
 # 이미 URL 인코딩된 문자열이므로 재인코딩하지 않고 경로 뒤에 그대로 붙인다.
 # Agent나 LLM은 "우회를 적용한다"만 지정할 수 있고 접미사 내용은 고를 수 없다.
@@ -221,6 +250,12 @@ def is_path_traversal_safe_form_probe_value(value: str) -> bool:
     return value == PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH
 
 
+def is_path_traversal_root_escape_value(value: str) -> bool:
+    """선언된 하위 디렉터리를 벗어나는 고정 형태의 탐침 값인지 확인한다."""
+
+    return _PATH_TRAVERSAL_ROOT_ESCAPE.fullmatch(value) is not None
+
+
 def is_path_traversal_bypass_suffix(value: str) -> bool:
     """도메인이 고정한 확장자 필터 우회 접미사와 정확히 같은지 확인한다."""
 
@@ -239,6 +274,7 @@ def is_path_traversal_bypass_suffix(value: str) -> bool:
 _PATH_ASSIGNMENT_PROBE_VALUES: dict[HttpRequestKind, Callable[[str], bool]] = {
     HttpRequestKind.PATH_TRAVERSAL_PROBE: is_path_traversal_safe_probe_value,
     HttpRequestKind.ARBITRARY_FILE_READ_PROBE: is_arbitrary_file_read_safe_probe_value,
+    HttpRequestKind.PATH_TRAVERSAL_ROOT_ESCAPE_PROBE: is_path_traversal_root_escape_value,
 }
 
 

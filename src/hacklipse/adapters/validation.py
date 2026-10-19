@@ -33,6 +33,10 @@ from .path_traversal_analysis import (
     PATH_TRAVERSAL_OBSERVATION,
     PATH_TRAVERSAL_TOOL,
     build_path_assignment_requests,
+    build_root_escape_requests,
+    declared_root_of,
+    path_assignment_probe_plan,
+    root_escape_signal,
     build_path_traversal_bypass_requests,
     build_path_traversal_requests,
     has_file_like_path_assignment,
@@ -1575,9 +1579,14 @@ class ValidationAgent:
                 reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
             )
 
-        requests = build_path_assignment_requests(
-            surface, purpose=f"Path Traversal validation {task.validation_id}"
-        )
+        safe_file, root_escape = path_assignment_probe_plan(candidate, surface)
+        purpose = f"Path Traversal validation {task.validation_id}"
+        # Analysis 와 같은 순서로 재현한다. 강한 증명을 먼저 보고, 신호가 없을 때만
+        # 탈출 탐침으로 넘어가 재현 요청도 같은 수만큼만 쓴다.
+        if safe_file:
+            requests = build_path_assignment_requests(surface, purpose=purpose)
+        else:
+            requests = build_root_escape_requests(surface, purpose=purpose)
         collected = tuple(
             matching_evidence(reproduction, surface.url, request)
             for request in requests
@@ -1596,48 +1605,99 @@ class ValidationAgent:
                 status=AgentResultStatus.NEEDS_EVIDENCE,
                 evidence_requests=missing,
             )
-
-        control, probe = collected
-        if control is None or probe is None:  # missing 이후에는 도달하지 않는다.
+        if any(item is None for item in collected):
             raise AgentContractError("path assignment reproduction was not collected")
+
+        control = collected[0]
+        probe = collected[1] if safe_file else None
+        if safe_file and root_escape and not path_traversal_signal(control, probe):
+            escalated = build_root_escape_requests(surface, purpose=purpose)
+            collected = tuple(
+                matching_evidence(reproduction, surface.url, request)
+                for request in escalated
+            )
+            missing = tuple(
+                request for request, item in zip(escalated, collected) if item is None
+            )
+            if missing:
+                if task.request_budget < len(missing):
+                    raise BudgetExceeded(
+                        "Path Traversal validation lacks budget for independent requests",
+                        required_requests=len(missing),
+                    )
+                return AgentResult(
+                    task_id=task.task_id,
+                    status=AgentResultStatus.NEEDS_EVIDENCE,
+                    evidence_requests=missing,
+                )
+            if any(item is None for item in collected):
+                raise AgentContractError(
+                    "declared root escape reproduction was not collected"
+                )
+            control, probe = collected[0], None
         if any(
             item.observation.get("type") in {"http_error", "http_redirect"}
-            for item in (control, probe)
+            for item in collected
         ):
             # 정상 control 을 못 만들었으면 비교 자체가 성립하지 않는다. 확정도
             # 기각도 아닌 상태로 남기고 이유를 표시한다.
             return self._validation_result(
                 task,
                 verdict=ValidationVerdict.BLOCKED,
-                evidence=(control, probe),
+                evidence=tuple(collected),
                 reason=(
                     "independent safe-file reproduction could not obtain comparable responses"
                 ),
                 reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
             )
-        if not path_traversal_signal(control, probe):
+        if probe is not None and path_traversal_signal(control, probe):
             return self._validation_result(
                 task,
-                verdict=ValidationVerdict.REJECTED,
+                verdict=ValidationVerdict.CONFIRMED,
                 evidence=(control, probe),
-                reason="independent probe did not reproduce the safe-file read",
-                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+                reason=(
+                    "independent control/probe comparison reproduced the safe-file read"
+                ),
+                reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+                proof=ValidationProof(
+                    proof_type=ValidationProofType.PATH_TRAVERSAL_FILE_READ,
+                    evidence_ids=(control.evidence_id, probe.evidence_id),
+                    summary=(
+                        "independent fixed safe-file probe reproduced an out-of-directory "
+                        f"file read through the observed path assignment {assignment.name}"
+                    ),
+                ),
             )
-        proof = ValidationProof(
-            proof_type=ValidationProofType.PATH_TRAVERSAL_FILE_READ,
-            evidence_ids=(control.evidence_id, probe.evidence_id),
-            summary=(
-                "independent fixed safe-file probe reproduced an out-of-directory file "
-                f"read through the observed path assignment {assignment.name}"
-            ),
-        )
+        if (
+            root_escape
+            and probe is None
+            and root_escape_signal(control, collected[-2], collected[-1])
+        ):
+            escape = collected[-1]
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence=(control, collected[-2], escape),
+                reason=(
+                    "independent probe reproduced a read outside the declared directory"
+                ),
+                reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+                proof=ValidationProof(
+                    proof_type=ValidationProofType.PATH_TRAVERSAL_FILE_READ,
+                    evidence_ids=(control.evidence_id, escape.evidence_id),
+                    summary=(
+                        "independent probe read a file outside the declared directory "
+                        f"{declared_root_of(surface.path_assignment)!r} through the "
+                        f"observed path assignment {assignment.name}"
+                    ),
+                ),
+            )
         return self._validation_result(
             task,
-            verdict=ValidationVerdict.CONFIRMED,
-            evidence=(control, probe),
-            reason="independent control/probe comparison reproduced the safe-file read",
-            reason_code=ValidationReasonCode.CONFIRMED_PROOF,
-            proof=proof,
+            verdict=ValidationVerdict.REJECTED,
+            evidence=tuple(collected),
+            reason="independent probe did not reproduce the safe-file read",
+            reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
         )
 
     def _validate_hidden_body_parameter(

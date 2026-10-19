@@ -21,6 +21,10 @@ from hacklipse.adapters.analyzer_capabilities import (
 )
 from hacklipse.adapters.http_runtime import HttpExecutionRuntime
 from hacklipse.adapters.path_traversal_analysis import (
+    PATH_TRAVERSAL_ROOT_ESCAPE_OBSERVATION,
+    ROOT_ESCAPE_ABSENT_FILE,
+    ROOT_ESCAPE_PROOF_FILE,
+    declared_root_of,
     FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION,
     PATH_ASSIGNMENT_CAPABILITY,
     PATH_ASSIGNMENT_OBSERVATION,
@@ -67,6 +71,7 @@ from hacklipse.domain import (
     Surface,
     TaskEnvelope,
     ValidationProofType,
+    is_path_traversal_root_escape_value,
 )
 from hacklipse.ports.errors import ApprovalRequired, PolicyViolation
 
@@ -1219,6 +1224,232 @@ class ArbitraryFileReadWiringTests(unittest.TestCase):
             ),
             ["Arbitrary File Read", "Path Traversal"],
         )
+
+
+class _DeclaredRootRuntime:
+    """`web_assets/` 밖을 열 수 있는지 서버별로 달리 흉내 내는 대역.
+
+    confine=True  : 정규화 후 web_assets 안으로 가두는 올바른 구현
+    confine=False : 앱 루트가 base 인 취약 구현 (CVE-2024-3234 형태)
+    soft_error    : 없는 파일에도 200 으로 오류 화면을 돌려주는 앱
+    """
+
+    README = "# project readme\nnot an asset\n"
+
+    def __init__(self, *, confine: bool, soft_error: bool = False) -> None:
+        self.confine = confine
+        self.soft_error = soft_error
+        self.requests: list[ExecutionRequest] = []
+
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        self.requests.append(request)
+        path = urlsplit(request.resolved_url).path
+        if path in ("/", "/index.html"):
+            return self._ok(request, f'<a href="{_FILE_PATH}">js</a>')
+        value = path[len("/file="):] if path.startswith("/file=") else ""
+        # 어휘 정규화: 실제 서버들이 하는 것과 같다.
+        parts: list[str] = []
+        for part in value.split("/"):
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if parts:
+                    parts.pop()
+                continue
+            parts.append(part)
+        resolved = "/".join(parts)
+        if resolved.startswith("/") or value.startswith("/"):
+            return self._fail(request, 403, "File not allowed")
+        if self.confine and not resolved.startswith("web_assets/"):
+            return self._fail(request, 403, "File not allowed")
+        if resolved == "README.md":
+            return self._ok(request, self.README)
+        if resolved == _OBSERVED_VALUE:
+            return self._ok(request, "console.log('example');")
+        return self._fail(request, 404, "File not found")
+
+    def _ok(self, request, body: str) -> ExecutionResult:
+        return ExecutionResult(
+            execution_id=request.execution_id, evidence_type="http_response",
+            observation={"type": "http_response", "status": 200, "body": body,
+                         "requested_url": request.resolved_url},
+        )
+
+    def _fail(self, request, status: int, detail: str) -> ExecutionResult:
+        # soft_error 앱은 없는 파일에도 200 으로 같은 안내 화면을 돌려준다.
+        code = 200 if self.soft_error else status
+        return ExecutionResult(
+            execution_id=request.execution_id, evidence_type="http_response",
+            observation={"type": "http_response", "status": code,
+                         "body": f'{{"detail":"{detail}"}}',
+                         "requested_url": request.resolved_url},
+        )
+
+
+def _declared_root_run(**options):
+    runtime = _DeclaredRootRuntime(**options)
+    app = build_local_application(
+        {}, runtime=runtime,
+        router=standard_router(vulnerability_types=("Path Traversal",)),
+    )
+    register_standard_agents(app, recon_max_pages=2)
+    run = app.orchestrator.start(
+        RunRequest(
+            target_url=f"{_ORIGIN}/",
+            scope=RunScope(allowed_hosts=frozenset({_HOST})),
+            request_budget=40,
+        )
+    )
+    return app, runtime, run
+
+
+class DeclaredRootEscapeTests(unittest.TestCase):
+    """선언된 하위 디렉터리 밖으로 나가는 읽기를 증명하는 좌표."""
+
+    def test_escape_value_shape_is_fixed(self) -> None:
+        for value in (
+            f"web_assets/../{ROOT_ESCAPE_PROOF_FILE}",
+            f"static/../{ROOT_ESCAPE_ABSENT_FILE}",
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(is_path_traversal_root_escape_value(value))
+        # 한 단계만 올라가고, 읽는 파일은 고정된 둘 중 하나뿐이다.
+        for value in (
+            "web_assets/../../README.md",
+            "web_assets/../config.json",
+            "../README.md",
+            "web_assets/../etc/passwd",
+            "web_assets/../../../etc/os-release",
+            "README.md",
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(is_path_traversal_root_escape_value(value))
+
+    def test_kind_is_bound_to_the_escape_shape(self) -> None:
+        base = {
+            "path_assignment_name": "file",
+            "path_assignment_value_start": _VALUE_START,
+            "path_assignment_value_end": _VALUE_END,
+        }
+        spec = HttpRequestSpec(
+            request_kind=HttpRequestKind.PATH_TRAVERSAL_ROOT_ESCAPE_PROBE,
+            path_assignment_value=f"web_assets/../{ROOT_ESCAPE_PROOF_FILE}", **base,
+        )
+        self.assertTrue(spec.path_assignment_value.endswith(ROOT_ESCAPE_PROOF_FILE))
+        # 다른 종류의 고정 값을 이 종류로 실을 수 없고, 그 반대도 안 된다.
+        for kind, value in (
+            (HttpRequestKind.PATH_TRAVERSAL_ROOT_ESCAPE_PROBE, PATH_TRAVERSAL_PROBE_PATH),
+            (HttpRequestKind.PATH_TRAVERSAL_ROOT_ESCAPE_PROBE, ARBITRARY_FILE_READ_PROBE_PATH),
+            (HttpRequestKind.PATH_TRAVERSAL_PROBE, f"web_assets/../{ROOT_ESCAPE_PROOF_FILE}"),
+        ):
+            with self.subTest(kind=kind, value=value), self.assertRaises(
+                DomainInvariantError
+            ):
+                HttpRequestSpec(request_kind=kind, path_assignment_value=value, **base)
+
+    def test_prefix_cannot_smuggle_a_path(self) -> None:
+        # 앞 세그먼트는 관측된 디렉터리 이름 하나뿐이다. 구분자나 상위 이동을 넣을 수 없다.
+        for prefix in ("a/b", "..", ".", "a/../b", "/abs"):
+            with self.subTest(prefix=prefix):
+                self.assertFalse(
+                    is_path_traversal_root_escape_value(
+                        f"{prefix}/../{ROOT_ESCAPE_PROOF_FILE}"
+                    )
+                )
+
+    def test_declared_root_comes_from_the_observed_value(self) -> None:
+        self.assertEqual(declared_root_of(_assignment()), "web_assets")
+        # 디렉터리가 없는 값에는 벗어날 하위 디렉터리 자체가 없다.
+        flat = PathAssignment(
+            name="file", value_start=6, value_end=6 + len("app.js"),
+            observed_value="app.js", source=PATH_ASSIGNMENT_SOURCE,
+        )
+        self.assertIsNone(declared_root_of(flat))
+
+    def test_vulnerable_app_is_confirmed_through_the_escape(self) -> None:
+        app, runtime, run = _declared_root_run(confine=False)
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(
+            [item.vulnerability_type for item in app.stores.findings.list_by_run(run.run_id)],
+            ["Path Traversal"],
+        )
+        observation = next(
+            item for item in app.stores.evidence.list_by_run(run.run_id)
+            if item.observation.get("escape") == PATH_TRAVERSAL_ROOT_ESCAPE_OBSERVATION
+        )
+        self.assertEqual(observation.observation["declared_root"], "web_assets")
+        self.assertEqual(observation.observation["proof_file"], ROOT_ESCAPE_PROOF_FILE)
+
+    def test_confining_app_is_not_confirmed(self) -> None:
+        # README.md 가 앱 루트에 있어도, 정규화 후 가두는 서버는 내주지 않는다.
+        app, _, run = _declared_root_run(confine=True)
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(app.stores.findings.list_by_run(run.run_id), ())
+
+    def test_soft_error_page_is_not_confirmed(self) -> None:
+        # 없는 파일에도 200 으로 같은 안내 화면을 주는 앱. 없는 파일 대조군이 이것을 거른다.
+        app, _, run = _declared_root_run(confine=True, soft_error=True)
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(app.stores.findings.list_by_run(run.run_id), ())
+
+    def test_escape_is_tried_only_after_the_stronger_probe_fails(self) -> None:
+        _, runtime, _ = _declared_root_run(confine=False)
+
+        kinds = [
+            item.request_kind.value for item in runtime.requests
+            if item.tool == PATH_TRAVERSAL_TOOL
+        ]
+        # 고정 OS 파일 탐침이 먼저 나가고, 신호가 없을 때만 탈출 탐침이 뒤따른다.
+        self.assertLess(
+            kinds.index("path_traversal_probe"),
+            kinds.index("path_traversal_root_escape_probe"),
+        )
+
+    def test_safe_file_success_does_not_spend_escape_requests(self) -> None:
+        # os-release 가 통하는 대상에서는 탈출 탐침을 보내지 않는다.
+        _, runtime, _ = _end_to_end()
+
+        self.assertEqual(
+            [
+                item for item in runtime.requests
+                if item.request_kind
+                is HttpRequestKind.PATH_TRAVERSAL_ROOT_ESCAPE_PROBE
+            ],
+            [],
+        )
+
+    def test_validation_reproduces_the_escape_independently(self) -> None:
+        app, runtime, run = _declared_root_run(confine=False)
+
+        finding = app.stores.findings.list_by_run(run.run_id)[0]
+        escapes = [
+            item for item in runtime.requests
+            if item.request_kind is HttpRequestKind.PATH_TRAVERSAL_ROOT_ESCAPE_PROBE
+            and item.validation_id == finding.validation_id
+        ]
+        # Validation 세션이 없는 파일 대조군과 탈출 탐침을 직접 다시 보냈다.
+        self.assertEqual(len(escapes), 2)
+        by_id = {
+            item.evidence_id: item
+            for item in app.stores.evidence.list_by_run(run.run_id)
+        }
+        for evidence_id in finding.evidence_ids:
+            self.assertEqual(by_id[evidence_id].validation_id, finding.validation_id)
+
+    def test_escape_probe_replaces_the_path_value_without_a_query(self) -> None:
+        _, runtime, _ = _declared_root_run(confine=False)
+
+        for item in runtime.requests:
+            if item.request_kind is not HttpRequestKind.PATH_TRAVERSAL_ROOT_ESCAPE_PROBE:
+                continue
+            self.assertEqual(item.path_assignment_name, "file")
+            self.assertNotIn("?", item.resolved_url)
+            self.assertTrue(
+                item.resolved_url.startswith(f"{_ORIGIN}/file=web_assets/../")
+            )
 
 
 if __name__ == "__main__":
