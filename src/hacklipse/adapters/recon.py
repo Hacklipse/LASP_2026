@@ -702,21 +702,28 @@ def _script_priority(url: str) -> int:
 
 
 def _deterministic_pending(
-    urls: Sequence[str], protected: Sequence[str] | set[str] = ()
+    urls: Sequence[str],
+    protected: Sequence[str] | set[str] = (),
+    inbound: Mapping[str, set[str]] | None = None,
 ) -> list[str]:
-    """보호 URL을 먼저, 나머지를 정규 URL 순서로 고정한다."""
+    """보호 URL을 먼저, 그 안에서는 여러 문서가 가리킨 URL부터 고정한다.
+
+    고정된 frontier 상한 아래에서 순수 경로 알파벳순은 콘텐츠 페이지가 기능 페이지를
+    밀어낸다. 메뉴·사이드바에 실린 폼 페이지는 여러 문서에서 가리켜지고 기사 하나는
+    보통 한 번만 가리켜지므로, 서로 다른 몇 개의 문서가 이 URL을 가리켰는지를 알파벳
+    순서보다 먼저 본다. 같은 수면 URL 키로 끊어 재현성은 그대로다.
+    """
 
     unique = tuple(dict.fromkeys(urls))
     protected_set = set(protected)
+    counts = inbound or {}
+
+    def rank(url: str) -> tuple:
+        return (-len(counts.get(url, ())), _deterministic_url_key(url))
+
     return [
-        *sorted(
-            (url for url in unique if url in protected_set),
-            key=_deterministic_url_key,
-        ),
-        *sorted(
-            (url for url in unique if url not in protected_set),
-            key=_deterministic_url_key,
-        ),
+        *sorted((url for url in unique if url in protected_set), key=rank),
+        *sorted((url for url in unique if url not in protected_set), key=rank),
     ]
 
 
@@ -808,6 +815,9 @@ class ReconAgent:
             url: {"seed"} for url in pending
         }
         fetched: set[str] = set()
+        # URL -> 그 URL을 가리킨 서로 다른 문서들. 한 페이지에 같은 링크가 여러 번
+        # 있어도 한 번으로 센다.
+        inbound_documents: dict[str, set[str]] = {}
         responded: set[str] = set()
         successful: set[str] = set()
         parsed: set[str] = set()
@@ -1177,7 +1187,16 @@ class ReconAgent:
                 if max_visits is not None and visited >= max_visits:
                     break
                 if self._surface_collection_mode == "deterministic":
-                    pending[:] = _deterministic_pending(pending, protected)
+                    pending[:] = _deterministic_pending(pending, protected, inbound_documents)
+                else:
+                    # 메뉴·사이드바에 실린 기능 페이지는 여러 문서가 가리키고, 기사 하나는
+                    # 보통 한 번만 가리켜진다. 문서에 나온 순서는 유지하되(안정 정렬) 가리킨
+                    # 문서가 많은 쪽을 먼저 본다. 고정된 페이지 상한에서 콘텐츠 목록이 폼
+                    # 페이지를 끝까지 밀어내는 것을 막는다.
+                    pending.sort(key=lambda candidate: (
+                        candidate not in protected,
+                        -len(inbound_documents.get(candidate, ())),
+                    ))
                 url = pending.pop(0)
                 if url in fetched:
                     continue
@@ -1399,6 +1418,7 @@ class ReconAgent:
                         discovery_types=("html_link",),
                     )
                     pending_discovery_types.setdefault(link, set()).add("html_link")
+                    inbound_documents.setdefault(link, set()).add(url)
                     if link not in fetched and link not in pending:
                         pending.append(link)
                 for source in sources:
@@ -1708,7 +1728,7 @@ class ReconAgent:
                         if browser_llm_reserve else "fallback:llm_call_limit"
                     )
                 if self._surface_collection_mode == "deterministic" or provider_fallback_status:
-                    pending[:] = _deterministic_pending(pending, navigation_pages)
+                    pending[:] = _deterministic_pending(pending, navigation_pages, inbound_documents)
                 remaining_budget = max(page_budget - len(fetched), 0)
                 candidates = self._recon_candidates(
                     task.run_id, pending, pending_surface_ids
@@ -1775,7 +1795,7 @@ class ReconAgent:
                 if self._surface_collection_mode == "deterministic":
                     # Planner 호출·결과는 감사를 위해 남기되 방문 집합은
                     # LLM 순서·stop에 좌우되지 않게 고정한다.
-                    pending[:] = _deterministic_pending(pending, navigation_pages)
+                    pending[:] = _deterministic_pending(pending, navigation_pages, inbound_documents)
                 else:
                     pending[:] = self._apply_plan(
                         plan, pending, pending_surface_ids, navigation_pages

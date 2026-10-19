@@ -905,6 +905,29 @@ class ReconCrawlTests(unittest.TestCase):
         urls = {item.url for item in surfaces.list_by_run("upload-reach")}
         self.assertIn(base + "/account/delete.php", urls)
 
+    def test_a_menu_linked_page_outranks_alphabetically_earlier_content(self) -> None:
+        # XBEN-028 모양: /posts/ 아래 기사 여러 개와 사이드바의 업로드 폼 하나. 경로
+        # 알파벳순으로만 고르면 기사들이 상한을 다 먹고 폼 페이지는 끝까지 못 받는다.
+        base = "http://localhost"
+        articles = [f"/posts/Article-{letter}.php" for letter in "ABCDEFGH"]
+        menu = '<a href="/about.php">about</a><a href="/posts/upload-article.php">upload</a>'
+        pages = {base + "/": menu + "".join(f'<a href="{path}">a</a>' for path in articles),
+                 base + "/about.php": menu}
+        for path in articles:
+            pages[base + path] = "<p>content</p>"
+        pages[base + "/posts/upload-article.php"] = (
+            menu + '<form method="post" enctype="multipart/form-data">'
+            '<input type="file" name="articleFile"></form>'
+        )
+
+        agent, collector, surfaces = _crawling_agent(pages, max_pages=4)
+        agent.handle(replace(_task("menu-rank", base + "/"), request_budget=40))
+
+        self.assertIn(base + "/posts/upload-article.php", collector.calls)
+        self.assertLessEqual(
+            len([call for call in collector.calls if "/posts/Article-" in call]), 1
+        )
+
     def test_does_not_parse_html_looking_strings_inside_json_as_surfaces(self) -> None:
         api_url = "http://localhost/api/items"
         agent, collector, surfaces = _crawling_agent(
