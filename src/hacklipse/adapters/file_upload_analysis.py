@@ -61,6 +61,14 @@ UPLOAD_PROFILES = {
 _IMAGE_CONTROL_CASES = {(".png", "png_image"), (".jpg", "jpeg_image")}
 _IMAGE_CONTROL_EXTENSIONS = {extension for extension, _ in _IMAGE_CONTROL_CASES}
 _NATURAL_EXTENSION = {"png": ".png", "jpeg": ".jpg"}
+# 저장은 했지만 경로를 알려주지 않는 서버를 위한 고정 목록. 업로드 URL 기준으로
+# 풀리는 관용적인 저장 위치만 담는다. 값을 에이전트나 LLM이 고르지 못하게 하려고
+# 중앙에서 고정하며, 아래 상한만큼만 쓰고 한 번 맞으면 그 위치만 재사용한다.
+_CONVENTIONAL_DIRECTORIES = (
+    "uploads/", "upload/", "/uploads/", "/upload/", "files/", "/files/",
+    "images/", "img/", "media/", "", "static/uploads/", "/static/uploads/",
+)
+_MAX_CONVENTIONAL_PROBES = len(_CONVENTIONAL_DIRECTORIES)
 # 최소 baseline JPEG(1x1, 3성분). getimagesize나 이미지 디코더로 재검증하는 서버까지
 # 통과해야 하므로 FFD8 두 바이트가 아니라 실제로 디코딩되는 파일을 쓴다. marker는
 # 아래에서 COM segment로 끼워 넣으므로 이 상수 자체는 고정이고 요청마다 같다.
@@ -330,25 +338,38 @@ def uploaded_file_url(observation: dict, upload_url: str, filename: str) -> str 
             )
     references.sort(key=lambda reference: not (isinstance(reference, str) and filename in reference))
     for reference in references[:32]:
-        if (not isinstance(reference, str) or len(reference) > 2048
-                or any(ord(char) <= 32 or ord(char) > 126 for char in reference)):
-            continue
-        try:
-            url = urljoin(upload_url, reference)
-            parsed = urlsplit(url)
-            query = parse_qsl(parsed.query, keep_blank_values=True)
-            safe_query = all(name in {"id", "file", "file_id", "download"}
-                             and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", value) for name, value in query)
-            decoded_path = unquote(unquote(parsed.path))
-            if (parsed.scheme in {"http", "https"} and _origin(url) == _origin(upload_url)
-                    and not parsed.username and not parsed.password and not parsed.fragment
-                    and len(query) <= 4 and safe_query
-                    and (not has_state_changing_get(url) or _is_stored_file_read(parsed.path))
-                    and ".." not in decoded_path.split("/") and "\\" not in decoded_path
-                    and parsed.path and (parsed.path != urlsplit(upload_url).path or query)):
-                return url
-        except ValueError:
-            continue
+        url = safe_retrieval_url(reference, upload_url)
+        if url is not None:
+            return url
+    return None
+
+
+def safe_retrieval_url(reference: object, upload_url: str) -> str | None:
+    """업로드 뒤 자동으로 GET해도 되는 회수 대상인지 한 곳에서 판정한다.
+
+    응답이 알려준 참조든 관용 경로든 같은 규칙을 지나야 한다. 규칙이 두 군데로 갈리면
+    한쪽만 느슨해지는 것을 알아채기 어렵다.
+    """
+
+    if (not isinstance(reference, str) or len(reference) > 2048
+            or any(ord(char) <= 32 or ord(char) > 126 for char in reference)):
+        return None
+    try:
+        url = urljoin(upload_url, reference)
+        parsed = urlsplit(url)
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+    except ValueError:
+        return None
+    safe_query = all(name in {"id", "file", "file_id", "download"}
+                     and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", value) for name, value in query)
+    decoded_path = unquote(unquote(parsed.path))
+    if (parsed.scheme in {"http", "https"} and _origin(url) == _origin(upload_url)
+            and not parsed.username and not parsed.password and not parsed.fragment
+            and len(query) <= 4 and safe_query
+            and (not has_state_changing_get(url) or _is_stored_file_read(parsed.path))
+            and ".." not in decoded_path.split("/") and "\\" not in decoded_path
+            and parsed.path and (parsed.path != urlsplit(upload_url).path or query)):
+        return url
     return None
 
 
@@ -417,7 +438,59 @@ def check_upload_extensions(
              "outcome": "not_tested", "reason": "request_budget"} for extension, profile in cases]
     ids: list[str] = []
     accepted_image_kinds: set[str] = set()
+    stored_directory: list[str] = []
+    conventional_used = 0
     deadline = time.monotonic() + max(0, task.timeout_seconds - 1)
+
+    def attempt_retrieval(url: str, row: dict, marker: str, extension: str, profile: str) -> str:
+        """회수 대상 하나를 확인한다. accepted | next | stop 중 하나를 돌려준다."""
+
+        try:
+            fetch_id, fetched = collector.collect_with_result(
+                task.run_id, url,
+                EvidenceRequest(evidence_type="http_response", surface_id=surface.surface_id,
+                    reason=f"verify inert uploaded file {marker}{extension}", suggested_tool="http_get",
+                    http_request=HttpRequestSpec(method="GET")),
+                task_id=task.task_id, validation_id=task.validation_id,
+                credential_ref=task.credential_ref, timeout_seconds=min(8.0, max(0.1, deadline - time.monotonic())),
+            )
+        except (ApprovalRequired, PolicyViolation):
+            row.update(reason="retrieval_policy_blocked")
+            return "next"
+        except BudgetExceeded:
+            return "stop"
+        ids.append(fetch_id)
+        row["evidence_ids"].append(fetch_id)
+        data = fetched.observation
+        problem = upload_response_problem(data)
+        if problem:
+            row.update(outcome="blocked" if problem[0] == "blocked" else "inconclusive",
+                       reason="retrieval_" + problem[1])
+            if problem[0] == "blocked" or problem[1] == "transport_error":
+                for pending in rows:
+                    if pending["outcome"] == "not_tested":
+                        pending.update(outcome="blocked", reason=problem[1])
+                return "stop"
+            return "next"
+        payload = upload_payload(marker, profile)
+        if not (data.get("status") == 200 and not data.get("truncated")
+                and (fetched.content_hash == hashlib.sha256(payload).hexdigest()
+                     or UPLOAD_PROFILES[profile][0] == "text" and data.get("body") == marker)):
+            return "next"
+        basename = unquote(urlsplit(url).path.rsplit("/", 1)[-1])
+        suffix = next((suffix for suffix in sorted(UPLOAD_EXTENSIONS, key=len, reverse=True)
+                       if suffix and basename.casefold().endswith(suffix.casefold())),
+                      "." + basename.rsplit(".", 1)[-1].casefold() if "." in basename else "")
+        if not re.fullmatch(r"\.[A-Za-z0-9.]{1,24}", suffix):
+            suffix = ""
+        served_type = str(data.get("content_type", "")).split(";", 1)[0].strip().casefold()
+        if served_type not in {"image/png", "image/jpeg", "image/svg+xml", "text/html", "text/plain",
+                               "application/octet-stream", "application/pdf"}:
+            served_type = "other"
+        row.update(outcome="accepted", reason="stored_marker_retrieved",
+                   renamed=basename != marker + extension, stored_extension=suffix,
+                   served_content_type=served_type)
+        return "accepted"
     for (extension, profile), row in zip(cases, rows):
         if time.monotonic() >= deadline:
             row["reason"] = "time_budget"
@@ -488,55 +561,40 @@ def check_upload_extensions(
             continue
         if status not in {200, 201, 202, 204, 301, 302, 303, 307, 308}:
             continue
-        url = uploaded_file_url(observation, surface.url, marker + extension)
-        if url is None:
-            continue
-        try:
-            fetch_id, fetched = collector.collect_with_result(
-                task.run_id, url,
-                EvidenceRequest(evidence_type="http_response", surface_id=surface.surface_id,
-                    reason=f"verify inert uploaded file {marker}{extension}", suggested_tool="http_get",
-                    http_request=HttpRequestSpec(method="GET")),
-                task_id=task.task_id, validation_id=task.validation_id,
-                credential_ref=task.credential_ref, timeout_seconds=min(8.0, max(0.1, deadline - time.monotonic())),
-            )
-        except (ApprovalRequired, PolicyViolation):
-            row.update(reason="retrieval_policy_blocked")
-            continue
-        except BudgetExceeded:
-            break
-        ids.append(fetch_id)
-        row["evidence_ids"].append(fetch_id)
-        data = fetched.observation
-        problem = upload_response_problem(data)
-        if problem:
-            row.update(outcome="blocked" if problem[0] == "blocked" else "inconclusive",
-                       reason="retrieval_" + problem[1])
-            if problem[0] == "blocked" or problem[1] == "transport_error":
-                for pending in rows:
-                    if pending["outcome"] == "not_tested":
-                        pending.update(outcome="blocked", reason=problem[1])
+        # 응답이 저장 위치를 말해주지 않는 서버도 파일은 남긴다. 그때만 중앙에서 고정한
+        # 관용 위치를 상한만큼 한 번 훑고, 한 번 맞으면 이후에는 그 위치만 쓴다.
+        named = uploaded_file_url(observation, surface.url, marker + extension)
+        if named is not None:
+            targets = [named]
+        elif stored_directory:
+            targets = [url for url in (safe_retrieval_url(
+                stored_directory[0] + marker + extension, surface.url),) if url]
+        else:
+            allowance = _MAX_CONVENTIONAL_PROBES - conventional_used
+            prefixes = _CONVENTIONAL_DIRECTORIES[:max(0, allowance)]
+            conventional_used += len(prefixes)
+            targets = [url for url in (
+                safe_retrieval_url(prefix + marker + extension, surface.url) for prefix in prefixes
+            ) if url]
+        stop = False
+        for target in targets:
+            if task.request_budget - len(ids) < 1 or time.monotonic() >= deadline:
                 break
-            continue
-        payload = upload_payload(marker, profile)
-        if (data.get("status") == 200 and not data.get("truncated")
-                and (fetched.content_hash == hashlib.sha256(payload).hexdigest()
-                     or UPLOAD_PROFILES[profile][0] == "text" and data.get("body") == marker)):
-            basename = unquote(urlsplit(url).path.rsplit("/", 1)[-1])
-            suffix = next((suffix for suffix in sorted(UPLOAD_EXTENSIONS, key=len, reverse=True)
-                           if suffix and basename.casefold().endswith(suffix.casefold())),
-                          "." + basename.rsplit(".", 1)[-1].casefold() if "." in basename else "")
-            if not re.fullmatch(r"\.[A-Za-z0-9.]{1,24}", suffix):
-                suffix = ""
-            served_type = str(data.get("content_type", "")).split(";", 1)[0].strip().casefold()
-            if served_type not in {"image/png", "image/jpeg", "image/svg+xml", "text/html", "text/plain",
-                                   "application/octet-stream", "application/pdf"}:
-                served_type = "other"
-            row.update(outcome="accepted", reason="stored_marker_retrieved",
-                       renamed=basename != marker + extension, stored_extension=suffix,
-                       served_content_type=served_type)
-            if (extension, profile) in _IMAGE_CONTROL_CASES:
-                accepted_image_kinds.add(kind)
+            action = attempt_retrieval(target, row, marker, extension, profile)
+            if action == "stop":
+                stop = True
+                break
+            if action == "accepted":
+                if named is None and not stored_directory:
+                    # 우리가 만든 대상이므로 경로는 반드시 그 파일명으로 끝난다.
+                    stored_directory.append(
+                        urlsplit(target).path[: -len(marker + extension)] or "/"
+                    )
+                if (extension, profile) in _IMAGE_CONTROL_CASES:
+                    accepted_image_kinds.add(kind)
+                break
+        if stop:
+            break
     return rows, tuple(ids)
 
 

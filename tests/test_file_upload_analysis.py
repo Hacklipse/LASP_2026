@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 from urllib.parse import urlsplit
 
 from hacklipse.adapters.file_upload_analysis import (
-    UPLOAD_EXTENSIONS, UPLOAD_RESULT, uploaded_file_url, upload_form_plans, upload_request,
+    _MAX_CONVENTIONAL_PROBES, UPLOAD_EXTENSIONS, UPLOAD_RESULT, uploaded_file_url, upload_form_plans, upload_request,
     upload_payload, upload_response_problem,
 )
 from hacklipse.adapters.security import SensitiveDataSanitizer, StaticApprovalGate
@@ -104,10 +104,26 @@ class _UploadRuntime:
                     stored_name = "normalized" + str(len(self.uploads)) + ".bin"
                 if self.mode in {"rename", "rename_safe"}:
                     stored_name = "renamed" + str(len(self.uploads)) + (".bin" if self.mode == "rename_safe" else filename[len(marker):])
-                self.files["/files/" + stored_name] = payload
+                # external 모드는 관용 경로에 두지 않는다. 바깥 origin 참조를 따라가지
+                # 않는다는 것만 재려는 모드이므로, 관용 경로 탐색이 대신 찾아내면
+                # 그 질문이 가려진다.
+                directory = "/cdn-7f3b/" if self.mode == "external" else "/files/"
+                if self.mode == "silent":
+                    directory = "/media/"
+                self.files[directory + stored_name] = payload
                 media = "application/json"
                 origin = "http://outside.invalid" if self.mode == "external" else ""
-                data = {"url": origin + "/files/" + stored_name}
+                data = {"url": origin + directory + stored_name}
+                if self.mode == "silent":
+                    # 저장은 하지만 어디에 뒀는지 알려주지 않는 서버.
+                    media = "text/html"
+                    body = "<html><body><h3>Thank you for your submission.</h3></body></html>"
+                    return ExecutionResult(
+                        execution_id=request.execution_id, evidence_type="http_response",
+                        observation={"type": "http_response", "status": 200, "body": body,
+                                     "content_type": media, "requested_url": request.resolved_url},
+                        content_hash=hashlib.sha256(body.encode()).hexdigest(),
+                    )
                 if self.mode in {"csrf", "csrf_two"}:
                     data["echo"] = fields["csrf_token"]
                     data["echo_nonce"] = fields["nonce"]
@@ -116,7 +132,7 @@ class _UploadRuntime:
                     # 고전 PHP 업로드 폼의 응답 모양: 저장 경로를 HTML 링크로만 알린다.
                     media = "text/html"
                     body = ("<html><body>File is valid, and was successfully uploaded "
-                            f"<a href='/files/{stored_name}'>here</a>."
+                            f"<a href='{directory}{stored_name}'>here</a>."
                             "<a href='/logout'>Log out</a></body></html>")
         elif path in self.files:
             payload = self.files[path]
@@ -324,6 +340,25 @@ class FileUploadAnalysisTests(unittest.TestCase):
         self.assertEqual(rows[(".jpg.php", "jpeg_image")]["stored_extension"], ".jpg.php")
         self.assertEqual(app.stores.candidates.list_by_run(run.run_id)[0].status,
                          CandidateStatus.CONFIRMED)
+
+    def test_a_silent_server_is_found_through_bounded_conventional_paths(self):
+        app, runtime, run = _scan("silent")
+        self.assertEqual(run.phase, RunPhase.DONE)
+        rows = next(item.observation["results"] for item in app.stores.evidence.list_by_run(run.run_id)
+                    if item.observation.get("type") == UPLOAD_RESULT)
+        tested = [row for row in rows if row["outcome"] != "not_tested"]
+        self.assertTrue(tested)
+        self.assertTrue(all(row["outcome"] == "accepted" for row in tested))
+        self.assertEqual(app.stores.candidates.list_by_run(run.run_id)[0].status,
+                         CandidateStatus.CONFIRMED)
+        # 빗나간 관용 경로 탐색은 행마다 반복되지 않는다. 한 번 맞은 위치만 재사용한다.
+        # 분석과 독립 재현이 각각 한 번씩 훑으므로 상한은 그 두 배다.
+        self.assertGreater(len(tested), 2 * _MAX_CONVENTIONAL_PROBES)
+        missed = [request for request in runtime.requests
+                  if request.method == "GET"
+                  and urlsplit(request.resolved_url).path not in {"/", "/store", "/store2"}
+                  and not urlsplit(request.resolved_url).path.startswith("/media/")]
+        self.assertLessEqual(len(missed), 2 * _MAX_CONVENTIONAL_PROBES)
 
     def test_rotating_csrf_and_form_defaults_are_fresh_and_redacted(self):
         app, runtime, run = _scan("csrf")

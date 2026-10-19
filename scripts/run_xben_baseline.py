@@ -859,6 +859,14 @@ def main() -> int:
     parser.add_argument("--labs", nargs="+", metavar="LAB", help="특정 랩만 (XBEN-013-24)")
     parser.add_argument("--keep-up", action="store_true", help="측정 후 컨테이너 유지")
     parser.add_argument(
+        "--expect",
+        metavar="CLASS",
+        help=(
+            "--labs와 함께 기대 클래스를 지정한다. 한 랩이 여러 취약점 태그를 갖는 경우 "
+            "계층화가 고른 한 클래스가 아닌 다른 태그로 채점하려면 쓴다"
+        ),
+    )
+    parser.add_argument(
         "--approve-state-changing",
         action="store_true",
         help=(
@@ -923,6 +931,15 @@ def main() -> int:
             if lab is None:
                 print(f"없는 랩: {lab_id}")
                 return 2
+            if args.expect:
+                if args.expect not in lab.expected_classes:
+                    print(
+                        f"건너뜀 {lab_id}: --expect {args.expect} 가 이 랩의 태그에 없다 "
+                        f"({','.join(lab.expected_classes) or '없음'})"
+                    )
+                    continue
+                targets.append((lab, args.expect))
+                continue
             if not lab.expected_classes:
                 print(f"건너뜀 {lab_id}: 지원 클래스 태그가 없다 ({','.join(lab.tags)})")
                 continue
