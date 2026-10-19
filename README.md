@@ -98,6 +98,49 @@ Run the local verification suite with:
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
+The `File Upload` analyzer compares PHP variants (`.php`, `.phtml`, `.php3`–`.php8`,
+`.pht`, `.phar`, `.phps`), ASP/JSP/CGI extensions, HTML/SVG variants, images,
+documents, archives, extensionless names, mixed-case and double extensions,
+plus trailing-dot PHP filenames. The 55-name matrix is `UPLOAD_EXTENSIONS` in
+`file_upload_analysis.py`. Inert text and valid one-pixel PNGs are compared with
+`application/octet-stream` and `image/png`, changing one dimension per comparison.
+The PNG contains only a random text comment; no PHP, SVG, HTML or executable
+payload is embedded. Normal-image controls and representative server families
+run before rare suffixes. Extra MIME/content cases run only after a normal PNG
+is verified, giving up to 67 cases within the request/time budget.
+
+The standard router discovers single-file HTML POST forms with
+`multipart/form-data`. Hidden fields, selected options, checked controls, text
+defaults and an unambiguous named submit are supported. Forms with extra fields
+are fetched again before every upload so rotating CSRF values stay fresh.
+Field values stay in memory; only names/references enter the analysis plan,
+and multipart control values are redacted from stored responses. Required
+inputs without defaults, ambiguous multi-file/multi-submit forms, query-bearing
+actions and JavaScript-only upload flows are not replayed.
+Explicit HTML `form` ownership is respected, including controls outside the form.
+As with other POST probes, the central policy requires state-changing approval
+in the safe profile. Select `File Upload` through `standard_router` to run it alone.
+
+Per-extension outcomes appear in the Markdown report and
+`file_upload_extension_result` observations. `accepted` requires retrieval of
+the exact uploaded bytes/hash from a same-origin, in-scope URL advertised by the
+upload response. Nested JSON links, renamed files and bounded download-ID URLs
+are supported. The stored extension and serving Content-Type are recorded;
+normalizing a risky extension to a safe one does not establish a risky-file finding.
+A generic success, missing retrieval link or image rewritten by the server
+remains `inconclusive`. Explicit extension, MIME and content rejections are
+separated from authentication, CSRF, size and rate-limit failures. Global
+authentication/quota failures stop further uploads; untested cases remain visible.
+The same stop rules apply to download responses. CSRF form candidates reserve
+three requests for independent validation: fresh form, upload and retrieval.
+Observed MIME/content/extension differences appear in the Markdown report.
+This checks observed extension handling, not an exhaustive server
+blacklist/allowlist: MIME, content checks, and authentication can affect results.
+The form's `accept` value is recorded as client metadata, not server policy.
+Risky-extension acceptance is independently replayed and remains `suspected`,
+never a confirmed execution finding. Each probe uses a fresh filename; test
+files may remain on the target because no deletion endpoint is assumed.
+
 The Juice Shop runner accepts `--orchestrator hybrid` as an independent LLM
 option. After routing, the advisor may select one already discovered, unread,
 same-scope GET page for an extra Recon visit. The application checks the

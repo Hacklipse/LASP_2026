@@ -82,6 +82,7 @@ from .error_disclosure import (
     ERROR_ROUTE_OBSERVATION, ERROR_GRAPHQL_OBSERVATION, error_route_candidate,
 )
 from .request_safety import has_state_changing_get
+from .file_upload_analysis import UPLOAD_FORM, upload_form_plans
 
 # HttpExecutionRuntime이 GET 실행에 사용하는 도구 이름과 맞춘다(tests/test_http_runtime.py).
 RECON_TOOL = "http_get"
@@ -1233,6 +1234,23 @@ class ReconAgent:
                             observed=fields,
                             discovery_types=("javascript_request",),
                         )
+                for upload_plan in upload_form_plans(body, url):
+                    upload_surface_id = remember(
+                        upload_plan.url, "POST",
+                        tuple(dict.fromkeys((upload_plan.parameter, *(name for name, _ in upload_plan.fields)))),
+                        discovery_types=("html_form",),
+                    )
+                    upload_evidence_id = f"evi-{self._id_factory()}"
+                    self._evidence.append(Evidence(
+                        evidence_id=upload_evidence_id, run_id=task.run_id,
+                        surface_id=upload_surface_id, created_by="recon",
+                        evidence_type="observation",
+                        observation={"type": UPLOAD_FORM, "source": "html_form",
+                                     "parameter": upload_plan.parameter, "accept": upload_plan.accept,
+                                     "source_surface_id": surface_id,
+                                     "refresh_form": bool(upload_plan.fields)},
+                    ))
+                    evidence_ids.append(upload_evidence_id)
                 for form_url, method, names, content_type in forms:
                     form_surface_id = remember(
                         form_url, method, names, discovery_types=("html_form",)

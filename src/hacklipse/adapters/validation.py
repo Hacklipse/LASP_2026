@@ -90,6 +90,10 @@ from .cors_analysis import (
     CORS_TYPE, CORS_OBSERVATION, CORS_VALIDATION_ORIGIN,
     build_cors_requests, cors_reflection_signal, cors_probe_shape,
 )
+from .file_upload_analysis import (
+    UPLOAD_TYPE, UPLOAD_ANALYZER, UPLOAD_RESULT, UPLOAD_RISK_EXTENSIONS,
+    check_upload_extensions,
+)
 
 # Router가 Candidate를 만들 때 쓴 것과 같은 taxonomy. Candidate가 알려진 취약점
 # 유형을 벗어나면(Router가 만들 수 없는 값) 계약 위반으로 간주한다. Analysis
@@ -194,6 +198,8 @@ class ValidationAgent:
             if _is_reproduction_evidence(item, task.validation_id)
         ]
 
+        if candidate.vulnerability_type == UPLOAD_TYPE:
+            return self._validate_file_upload(task, candidate, evidence)
         if candidate.vulnerability_type == "SQLi":
             return self._validate_sqli(task, candidate, evidence, reproduction)
         if candidate.vulnerability_type == EXPOSURE_TYPE:
@@ -233,6 +239,61 @@ class ValidationAgent:
         if not reproduction:
             return self._needs_evidence(task, candidate.surface_id, EXPOSURE_TYPE)
         return self._decide(task, reproduction)
+
+    def _validate_file_upload(
+        self, task: TaskEnvelope, candidate: Candidate, evidence: Sequence[Evidence],
+    ) -> AgentResult:
+        analysis = next((item.observation for item in reversed(evidence)
+                         if item.surface_id == candidate.surface_id
+                         and item.created_by == UPLOAD_ANALYZER
+                         and item.observation.get("type") == UPLOAD_RESULT), None)
+        rows = analysis.get("results", ()) if analysis else ()
+        accepted = tuple(row for row in rows
+                         if row.get("outcome") == "accepted"
+                         and row.get("extension") in UPLOAD_RISK_EXTENSIONS
+                         and row.get("stored_extension", row["extension"]).casefold()
+                         in {extension.casefold() for extension in UPLOAD_RISK_EXTENSIONS})
+        if not accepted:
+            rejected = bool(rows) and all(row.get("outcome") == "rejected" for row in rows)
+            if rejected:
+                return self._validation_result(
+                    task, verdict=ValidationVerdict.REJECTED, evidence=(),
+                    reason="all tested uploads rejected; this does not establish the server extension policy",
+                    reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+                )
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED,
+                evidence=(), reason="no risky extension acceptance verified; consult per-extension observations",
+                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+            )
+        if self._collector is None:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="independent upload collector unavailable",
+                reason_code=ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR,
+            )
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        form_page = (self._surfaces.get(task.run_id, analysis["source_surface_id"])
+                     if analysis.get("refresh_form") else None)
+        reproduced, ids = check_upload_extensions(
+            self._collector, task, surface, analysis["parameter"],
+            form_page=form_page, probes=((accepted[0]["extension"], accepted[0].get("profile", "text_octet")),),
+        )
+        verified = any(row["outcome"] == "accepted" and row.get("stored_extension", "").casefold()
+                       in {extension.casefold() for extension in UPLOAD_RISK_EXTENSIONS} for row in reproduced)
+        if verified:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED,
+                evidence=self._evidence.get_many(task.run_id, ids),
+                reason="inert risky-extension upload independently accepted; this proves neither execution nor a server allowlist violation",
+                reason_code=ValidationReasonCode.GENERIC_NO_PROOF,
+            )
+        return self._validation_result(
+            task, verdict=ValidationVerdict.BLOCKED,
+            evidence=self._evidence.get_many(task.run_id, ids),
+            reason="independent upload acceptance could not be verified",
+            reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+        )
 
     def _validate_public_login(
         self, task: TaskEnvelope, candidate: Candidate, evidence: Sequence[Evidence],

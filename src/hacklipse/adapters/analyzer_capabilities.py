@@ -21,6 +21,7 @@ from .sensitive_exposure import CONFIG_ROUTE_OBSERVATION
 from .public_login_credentials import PUBLIC_LOGIN_OBSERVATION, PUBLIC_LOGIN_TYPE
 from .open_redirect_analysis import REDIRECT_PARAMETER_HINTS
 from .postmessage_plan import POSTMESSAGE_ANALYZER, POSTMESSAGE_CAPABILITY, POSTMESSAGE_PLAN
+from .file_upload_analysis import UPLOAD_TYPE, UPLOAD_ANALYZER, UPLOAD_FORM
 
 
 OPTIONAL_SOURCE_MAP_CAPABILITIES = (
@@ -38,6 +39,15 @@ OPTIONAL_SOURCE_MAP_CAPABILITIES = (
 
 
 DEFAULT_ANALYZER_CAPABILITIES = (
+    AnalyzerCapability(
+        capability_id="file_upload.multipart.extension_policy",
+        agent_type=UPLOAD_ANALYZER, vulnerability_type=UPLOAD_TYPE,
+        methods=("POST",), surface_kind="server",
+        observation_requirements=(ObservationRequirement(UPLOAD_FORM, "html_form"),),
+        exploration_parameter_source="observation",
+        supported_evidence_types=("http_response",),
+        strategy_ids=("compare_inert_file_extensions",), default_priority=0.25,
+    ),
     AnalyzerCapability(
         capability_id=POSTMESSAGE_CAPABILITY,
         agent_type=POSTMESSAGE_ANALYZER,

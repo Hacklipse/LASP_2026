@@ -20,6 +20,7 @@ from hacklipse.ports import (
 from hacklipse.ports.errors import LlmCredentialsMissing, RecordNotFound
 
 from .llm_report_narrative import ReportNarrative, ReportNarrator, deterministic_fallback
+from .file_upload_analysis import UPLOAD_ANALYZER, UPLOAD_RESULT
 from .report_contract import (
     CONTRACT_VERSION, FindingReportFact, NarratorFingerprintConfig, RunReportFacts,
     comparable_report_facts_hash, finding_fact_id, report_facts_hash,
@@ -390,6 +391,7 @@ class MarkdownReportAgent:
                     new_evidence_ids = (claim_id,)
         else:
             content = self._render_v1(task, findings)
+        content += self._upload_results(task)
         report = ReportArtifact(
             report_id=report_id,
             run_id=task.run_id,
@@ -402,6 +404,31 @@ class MarkdownReportAgent:
             new_evidence_ids=new_evidence_ids,
             reports=(report,),
         )
+
+    def _upload_results(self, task: TaskEnvelope) -> str:
+        observations = [item for item in self._evidence.list_by_run(task.run_id)
+                        if item.created_by == UPLOAD_ANALYZER
+                        and item.observation.get("type") == UPLOAD_RESULT]
+        if not observations:
+            return ""
+        lines = ["", "## 파일 업로드 확장자 검사", "",
+                 "무해한 텍스트와 정상 1픽셀 PNG를 사용해 확장자·MIME·파일 내용을 비교했습니다.",
+                 "허용은 저장된 표식의 재조회로 확인하며, 실행 취약점이나 서버 정책 위반을 확정하지 않습니다.",
+                 "거부/불명확 결과에는 MIME·파일 내용·인증 정책의 영향도 있을 수 있습니다.", ""]
+        for item in observations:
+            lines.extend([f"- Surface: {_code(item.surface_id or '')}",
+                          f"- Evidence: {_code(item.evidence_id)}", "",
+                          "| 확장자 | 내용 / MIME | 결과 | 근거 | 저장 확장자 |", "|---|---|---|---|---|"])
+            for row in item.observation.get("results", ()):
+                profile = row.get("profile", "text_octet")
+                lines.append(f"| {_code(row['extension'] or '(없음)')} | {_code(profile)} | {_code(row['outcome'])} | {_code(row['reason'])} | {_code(row.get('stored_extension', ''))} |")
+            differences = item.observation.get("policy_differences", ())
+            if differences:
+                lines.extend(["", "관측된 조건별 차이 (전체 서버 정책을 확정하지 않음):"])
+                for difference in differences:
+                    lines.append(f"- {_code(difference['dimension'])}: {_code(difference['extension'])} / {_code(difference['profile'])}, {_code(difference['control_outcome'])} → {_code(difference['probe_outcome'])}")
+            lines.append("")
+        return "\n".join(lines) + "\n"
 
     def _unrouted_post_surface_count(self, task: TaskEnvelope) -> int:
         """Count discovered POST inputs without a Candidate, without exposing values."""

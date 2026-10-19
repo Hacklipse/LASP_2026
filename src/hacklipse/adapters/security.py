@@ -7,6 +7,9 @@ import re
 import sqlite3
 import threading
 from dataclasses import asdict
+from email import policy as email_policy
+from email.parser import BytesParser
+from html import unescape
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -47,12 +50,8 @@ _JSON_SECRET = re.compile(
     r'''(?i)(["'](?:password|passwd|csrf|token|secret|session(?:id)?)["']'''
     r'''\s*:\s*["'])([^"']*)(["'])'''
 )
-_HTML_SECRET = re.compile(
-    r"(?i)(name=[\"'](?:[^\"']*(?:csrf|token|password|session)[^\"']*)[\"'][^>]*value=[\"'])([^\"']*)([\"'])"
-)
-_HTML_SECRET_VALUE_FIRST = re.compile(
-    r"(?i)(value=[\"'])([^\"']*)([\"'][^>]*name=[\"']"
-    r"[^\"']*(?:csrf|token|password|session)[^\"']*[\"'])"
+_HTML_ATTRIBUTE = re.compile(
+    r'''(\b([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*)(?:"([^"]*)"|'([^']*)'|([^\s>]+))'''
 )
 _SENSITIVE_HEADER_NAMES = frozenset(
     {"authorization", "proxy-authorization", "cookie", "set-cookie"}
@@ -64,6 +63,7 @@ _SENSITIVE_FIELD_HINTS = (
     "token",
     "secret",
     "session",
+    "nonce",
 )
 _REQUEST_SECRET_FIELD_HINTS = (*_SENSITIVE_FIELD_HINTS, "username", "email")
 
@@ -293,9 +293,7 @@ class SensitiveDataSanitizer:
         # 훼손된다. 민감 input value는 전용 패턴으로 지우고, 알려진 비밀 원문 치환은
         # 태그 바깥 텍스트에만 적용한다.
         if _looks_like_html(value):
-            sanitized = _HTML_SECRET.sub(r"\1<redacted>\3", value)
-            sanitized = _HTML_SECRET_VALUE_FIRST.sub(r"\1<redacted>\3", sanitized)
-            parts = re.split(r"(<[^>]*>)", sanitized)
+            parts = re.split(r'''(<(?:[^>"']|"[^"]*"|'[^']*')*>)''', value)
             return "".join(
                 _sanitize_html_tag(part, secrets)
                 if part.startswith("<") and part.endswith(">")
@@ -339,6 +337,24 @@ def _request_secret_values(request: ExecutionRequest) -> tuple[str, ...]:
     if not body:
         return ()
     values: list[str] = []
+    content_type = next((value for name, value in request.headers
+                         if name.casefold() == "content-type"), "")
+    if content_type.casefold().startswith("multipart/form-data"):
+        message = BytesParser(policy=email_policy.default).parsebytes(
+            f"Content-Type: {content_type}\r\n\r\n".encode("utf-8")
+            + body.encode(request.body_encoding)
+        )
+        for part in message.walk():
+            name = part.get_param("name", header="content-disposition")
+            # Multipart controls may carry anti-CSRF values under application-specific names.
+            if isinstance(name, str) and part.get_filename() is None:
+                value = part.get_payload(decode=True)
+                if value:
+                    try:
+                        values.append(value.decode(part.get_content_charset() or "utf-8", errors="replace"))
+                    except LookupError:
+                        values.append(value.decode("utf-8", errors="replace"))
+        return tuple(dict.fromkeys(values))
     try:
         payload = json.loads(body)
     except (TypeError, ValueError):
@@ -414,20 +430,26 @@ def _looks_like_html(value: str) -> bool:
 def _sanitize_html_tag(tag: str, secrets: Sequence[str]) -> str:
     """HTML 구조 속성은 보존하고, 일반 속성의 알려진 비밀값만 지운다."""
 
-    sanitized = tag
-    structural = frozenset({"class", "for", "id", "name", "type"})
-    for secret in sorted((item for item in secrets if item), key=len, reverse=True):
-        pattern = re.compile(
-            rf'''(\b([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*["']){re.escape(secret)}(["'])'''
+    attributes = {}
+    for match in _HTML_ATTRIBUTE.finditer(tag):
+        attributes.setdefault(
+            match.group(2).casefold(), unescape(next(value for value in match.groups()[2:] if value is not None))
         )
+    sensitive_input = bool(re.match(r"<input\b", tag, re.I)) and (
+        any(hint in attributes.get("name", "").casefold() for hint in _SENSITIVE_FIELD_HINTS)
+        or attributes.get("type", "").casefold() == "password"
+    )
+    structural = frozenset({"class", "for", "id", "name", "type"})
+    known = set(secrets) - {""}
 
-        def replace(match: re.Match[str]) -> str:
-            if match.group(2).casefold() in structural:
-                return match.group(0)
-            return f"{match.group(1)}{_REDACTED}{match.group(3)}"
+    def redact(match: re.Match[str]) -> str:
+        name = match.group(2).casefold()
+        value = unescape(next(value for value in match.groups()[2:] if value is not None))
+        if (sensitive_input and name == "value") or (name not in structural and value in known):
+            return f'{match.group(1)}"{_REDACTED}"'
+        return match.group(0)
 
-        sanitized = pattern.sub(replace, sanitized)
-    return sanitized
+    return _HTML_ATTRIBUTE.sub(redact, tag)
 
 
 class DenyAllApprovalGate:

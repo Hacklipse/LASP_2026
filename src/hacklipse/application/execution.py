@@ -115,6 +115,7 @@ class RuntimeEvidenceCollector:
             form_parameters=http_request.form_parameters,
             headers=http_request.headers,
             body=http_request.body,
+            body_encoding=http_request.body_encoding,
             request_kind=http_request.request_kind,
             identifier_parameter=http_request.identifier_parameter,
             identifier_location=http_request.identifier_location,

@@ -53,6 +53,7 @@ from hacklipse.adapters.graphql_introspection import GraphqlIntrospectionAnalyze
 from hacklipse.adapters.graphql_suggestions import GraphqlSuggestionAnalyzer
 from hacklipse.adapters.open_redirect_analysis import OpenRedirectAnalyzer
 from hacklipse.adapters.cors_analysis import CorsAnalyzer
+from hacklipse.adapters.file_upload_analysis import FileUploadAnalyzer
 from hacklipse.adapters.source_map_exposure import SourceMapExposureAnalyzer
 from hacklipse.adapters.error_disclosure import ErrorDisclosureAnalyzer
 from hacklipse.adapters.agentic_probe import AgenticHttpProbeAgent
@@ -365,6 +366,7 @@ def build_local_application(
 # 실제로 구현된 Analysis Agent. Router가 이 목록 밖 Candidate를 만들면 Dispatcher가
 # AgentUnavailable로 Run 전체를 실패시키므로, 배선과 라우팅 규칙이 같은 목록을 봐야 한다.
 IMPLEMENTED_ANALYZERS = (
+    "file_upload_analyzer",
     "error_disclosure_analyzer",
     "graphql_suggestion_analyzer",
     "graphql_introspection_analyzer",
@@ -777,6 +779,16 @@ def register_standard_agents(
         )
     app.dispatcher.register(
         "xss_analyzer", xss_analyzer, allowed_tools=("http_get",)
+    )
+    app.dispatcher.register(
+        "file_upload_analyzer",
+        FileUploadAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+            collector=app.collector,
+        ),
+        allowed_tools=("http_get", "http_post"),
     )
     app.dispatcher.register(
         "sensitive_exposure_analyzer",

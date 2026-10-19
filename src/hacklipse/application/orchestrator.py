@@ -659,18 +659,27 @@ class Orchestrator:
         reserve = 0
         for candidate_id in run.candidate_ids:
             candidate = self._candidates.get(run.run_id, candidate_id)
-            if not _pending_in(candidate, CandidateStatus.ANALYZED):
-                continue
-            browser_costs = [
-                min(32, 1 + count)
-                for evidence in self._evidence.get_many(run.run_id, candidate.evidence_ids)
-                if evidence.observation.get("type") == "browser_execution"
-                and evidence.observation.get("dom_reflected") is True
-                if type(count := evidence.observation.get("subrequest_count")) is int
-                and count >= 0
-            ]
-            reserve += 2 * max(browser_costs) if browser_costs else 2
+            if _pending_in(candidate, CandidateStatus.ANALYZED):
+                reserve += self._candidate_validation_floor(run, candidate)
         return reserve
+
+    def _candidate_validation_floor(self, run: Run, candidate: Candidate) -> int:
+        evidence = self._evidence.get_many(run.run_id, candidate.evidence_ids)
+        browser_costs = [
+            min(32, 1 + count)
+            for item in evidence
+            if item.observation.get("type") == "browser_execution"
+            and item.observation.get("dom_reflected") is True
+            if type(count := item.observation.get("subrequest_count")) is int and count >= 0
+        ]
+        # Upload forms with rotating tokens need refresh + POST + retrieval.
+        upload_floor = 3 if candidate.vulnerability_type == "File Upload" and any(
+            item.observation.get("type") == "file_upload_extension_result"
+            and item.observation.get("refresh_form") is True
+            and any(row.get("outcome") == "accepted" for row in item.observation.get("results", ()))
+            for item in evidence
+        ) else 2
+        return max(upload_floor, 2 * max(browser_costs) if browser_costs else 2)
 
     def _validation_floor(
         self, run: Run, candidate_id: str, remaining_ids: Sequence[str]
@@ -684,12 +693,19 @@ class Orchestrator:
         weights = dict(zip(run.budget_candidate_order, run.budget_candidate_weights))
         remaining = self._global_remaining(run.run_id)
         reserve = run.budget_validation_reserve
+        floors = {}
+        for item_id in pending:
+            candidate = self._candidates.get(run.run_id, item_id)
+            floors[item_id] = max(
+                reserve,
+                self._candidate_validation_floor(run, candidate) if candidate.vulnerability_type == "File Upload" else 0,
+            )
         total_weight = sum(weights[item] for item in pending)
         share = max(
-            reserve,
+            floors[candidate_id],
             (remaining * weights[candidate_id] + total_weight - 1) // total_weight,
         )
-        return max((len(pending) - 1) * reserve, remaining - share)
+        return max(sum(floor for item_id, floor in floors.items() if item_id != candidate_id), remaining - share)
 
     def _activate_budget_candidate(
         self, run: Run, candidate_id: str, phase: str, floor: int

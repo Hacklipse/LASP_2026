@@ -77,7 +77,7 @@ class TaskFactory:
             allowed_tools = (_ACCESS_CONTROL_TOOL,)
         elif candidate.vulnerability_type == "SSTI":
             allowed_tools = (_SSTI_TOOL,)
-        elif candidate.vulnerability_type == _PUBLIC_LOGIN_CREDENTIAL_TYPE:
+        elif candidate.vulnerability_type in {_PUBLIC_LOGIN_CREDENTIAL_TYPE, "File Upload"}:
             allowed_tools = ("http_get", "http_post")
         elif candidate.vulnerability_type == "SQLi":
             allowed_tools = (
@@ -121,7 +121,7 @@ class TaskFactory:
             allowed_tools = (_ACCESS_CONTROL_TOOL,)
         elif candidate.vulnerability_type == "SSTI":
             allowed_tools = (_SSTI_TOOL,)
-        elif candidate.vulnerability_type == _PUBLIC_LOGIN_CREDENTIAL_TYPE:
+        elif candidate.vulnerability_type in {_PUBLIC_LOGIN_CREDENTIAL_TYPE, "File Upload"}:
             allowed_tools = ("http_get", "http_post")
         elif candidate.vulnerability_type == "SQLi":
             allowed_tools = (

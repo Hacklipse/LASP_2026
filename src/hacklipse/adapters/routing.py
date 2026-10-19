@@ -31,6 +31,7 @@ from .error_disclosure import (
 )
 from .sensitive_exposure import CONFIG_ROUTE_OBSERVATION
 from .public_login_credentials import PUBLIC_LOGIN_OBSERVATION, PUBLIC_LOGIN_TYPE
+from .file_upload_analysis import UPLOAD_TYPE, UPLOAD_ANALYZER, UPLOAD_FORM
 
 
 
@@ -121,6 +122,7 @@ class IdentifierSurfaceRoutingRule:
 
 # 첫 버전은 설명 가능하고 재현하기 쉬운 명시적 규칙으로 라우팅한다.
 DEFAULT_RULES = (
+    RoutingRule(UPLOAD_FORM, UPLOAD_TYPE, UPLOAD_ANALYZER, 0.25, methods=("POST",)),
     RoutingRule(
         "postmessage_html_plan", "XSS", "postmessage_xss_analyzer",
         # A fresh browser navigation is needed for the benign probe and both

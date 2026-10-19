@@ -495,6 +495,8 @@ class HttpRequestSpec:
     # 경로 끝에 그대로 붙는 도메인 고정 접미사. 값 형태를 도메인이 강제하므로
     # Agent가 임의 경로나 임의 인코딩을 여기로 실을 수 없다.
     path_suffix: str | None = None
+    # latin-1 preserves binary multipart bytes while keeping stored specs JSON-compatible.
+    body_encoding: str = "utf-8"
 
     def __post_init__(self) -> None:
         if not self.method or _HTTP_METHOD.fullmatch(self.method) is None:
@@ -503,6 +505,13 @@ class HttpRequestSpec:
             raise DomainInvariantError("HTTP request kind must be control or probe")
         if self.body is not None and not isinstance(self.body, str):
             raise DomainInvariantError("HTTP request body must be text")
+        if self.body_encoding not in {"utf-8", "latin-1"}:
+            raise DomainInvariantError("HTTP body encoding must be utf-8 or latin-1")
+        if self.body is not None:
+            try:
+                self.body.encode(self.body_encoding)
+            except UnicodeEncodeError as error:
+                raise DomainInvariantError("HTTP body cannot use the selected encoding") from error
         if self.body is not None and self.form_parameters:
             raise DomainInvariantError(
                 "HTTP request cannot carry raw body and structured form parameters"
@@ -737,6 +746,7 @@ class EvidenceRequest:
         canonical = json.dumps(
             {
                 "body_present": request.body is not None,
+                **({"body_encoding": request.body_encoding} if request.body_encoding != "utf-8" else {}),
                 "form_names": [name for name, _ in request.form_parameters],
                 "approval_present": self.approval_ref is not None,
                 "evidence_type": self.evidence_type,
@@ -1261,6 +1271,7 @@ class ExecutionRequest:
     credential_ref: str | None = None
     approval_ref: str | None = None
     scope: RunScope | None = None
+    body_encoding: str = "utf-8"
 
     def __post_init__(self) -> None:
         # Runtime 직전 객체도 동일한 명세 검증을 통과시켜 직접 생성 경로의 우회를 막는다.
@@ -1270,6 +1281,7 @@ class ExecutionRequest:
             form_parameters=self.form_parameters,
             headers=self.headers,
             body=self.body,
+            body_encoding=self.body_encoding,
             request_kind=self.request_kind,
             identifier_parameter=self.identifier_parameter,
             identifier_location=self.identifier_location,
