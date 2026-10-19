@@ -30,6 +30,13 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from html.parser import HTMLParser
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from hacklipse.adapters.request_safety import (  # noqa: E402
+    is_object_identifier_parameter,
+)
 
 # 두 주체의 고정 이름. 측정 간 비교가 가능하도록 랩마다 바뀌지 않게 둔다.
 ACTOR_USERNAME = "lasp_actor"
@@ -300,6 +307,62 @@ def _object_ids(body: str) -> set[tuple[str, str]]:
     return set(_NUMERIC_PATH.findall(body))
 
 
+# `userId=3`, `"userId": 3`, `userId='3'` 세 모양을 함께 받는다.
+_IDENTIFIER_ASSIGNMENT = re.compile(
+    r"""([A-Za-z][A-Za-z0-9_]{1,30})\s*(?:=|["']\s*:)\s*["']?(\d{1,9})\b"""
+)
+# 세션을 끊는 링크는 따라가지 않는다. 한 번 따라가면 그 주체로는 아무것도 못 읽는다.
+_SESSION_ENDING = ("logout", "signout", "sign-out", "logoff", "delete")
+
+
+def _own_object_id(
+    opener: urllib.request.OpenerDirector,
+    landing: str,
+    label: str,
+    verbose: bool = False,
+    root: str | None = None,
+) -> str | None:
+    """한 주체의 세션에서 그 주체 **자신의** 숫자 객체 ID를 읽는다.
+
+    객체를 새로 만들 수 있는 폼이 없는 대상도 있다. 그런 곳에서는 사용자 레코드
+    자체가 객체이고, 인증된 페이지가 자기 ID를 `userId=3` 처럼 좌표에 실어 보낸다.
+    이름이 식별자로 읽히는 좌표만 받아 page=1 같은 상수를 집지 않으며, 식별자 판정은
+    LASP가 라우팅에 쓰는 함수 그대로를 쓴다. 고른 값이 맞는지는 두 주체의 ID가 서로
+    다른지로 호출자가 확인한다.
+    """
+
+    # 착지 주소가 JSON을 돌려주는 API일 수 있다. 그런 로그인은 이동을 클라이언트가
+    # 하므로 읽을 페이지가 없다. 세션은 이미 서 있으니 루트에서도 출발한다.
+    origin = urllib.parse.urlsplit(landing).netloc
+    pages = [page for page in (landing, root) if page]
+    for start in list(pages):
+        status, body, _final = _send(opener, start)
+        if status == 0 or not body:
+            continue
+        for href in re.findall(r"""href\s*=\s*['"]([^'"]{1,200})['"]""", body)[:16]:
+            target = urllib.parse.urljoin(start, href)
+            parsed = urllib.parse.urlsplit(target)
+            if parsed.netloc != origin or any(
+                word in parsed.path.casefold() for word in _SESSION_ENDING
+            ):
+                continue
+            pages.append(target)
+
+    for page_url in list(dict.fromkeys(pages))[:8]:
+        status, page_body, _final = _send(opener, page_url)
+        if status == 0 or not page_body:
+            continue
+        for name, value in _IDENTIFIER_ASSIGNMENT.findall(page_body):
+            if not is_object_identifier_parameter(name) or value == "0":
+                continue
+            if verbose:
+                print(f"  {label} 자기 객체 ID: {name}={value} ({page_url})")
+            return value
+    if verbose:
+        print(f"  {label} 자기 객체 ID를 찾지 못했다")
+    return None
+
+
 def _seed_object(
     opener: urllib.request.OpenerDirector,
     landing: str,
@@ -480,19 +543,36 @@ def provision(base_url: str, *, verbose: bool = False) -> Provisioned | None:
         login_shape=login_shape,
         actor_landing=landing.get(ACTOR_USERNAME, base_url),
         owner_landing=landing.get(OWNER_USERNAME, base_url),
-        actor_object=_seed_object(
+        actor_object=_object_for(
             sessions[ACTOR_USERNAME],
             landing.get(ACTOR_USERNAME, base_url),
             "actor",
             verbose=verbose,
+            root=base_url,
         ),
-        owner_object=_seed_object(
+        owner_object=_object_for(
             sessions[OWNER_USERNAME],
             landing.get(OWNER_USERNAME, base_url),
             "owner",
             verbose=verbose,
+            root=base_url,
         ),
     )
+
+
+def _object_for(
+    opener: urllib.request.OpenerDirector,
+    landing: str,
+    label: str,
+    verbose: bool = False,
+    root: str | None = None,
+) -> str | None:
+    """객체를 만들어 보고, 만들 폼이 없으면 그 주체 자신의 ID를 읽는다."""
+
+    seeded = _seed_object(opener, landing, label, verbose=verbose)
+    if seeded is not None:
+        return seeded
+    return _own_object_id(opener, landing, label, verbose=verbose, root=root)
 
 
 def main(argv: list[str]) -> int:

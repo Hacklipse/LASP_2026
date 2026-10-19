@@ -109,6 +109,13 @@ _JS_PATH = re.compile(
 _JS_PATH_PARAM = re.compile(
     r"""(?<![/A-Za-z0-9._~-])(/[A-Za-z0-9][A-Za-z0-9._~/-]{0,100})\?([A-Za-z0-9_]{1,40})="""
 )
+# `url: 'api/items.php?userId=3'` 처럼 **상대** 경로로 쓰인 라우트. 흔한 모양이지만
+# 리터럴이 전부 라우트는 아니므로 `?name=` 를 요구한다 — 질의가 붙은 리터럴은 요청
+# URL이라는 뜻이고, 그 질의 이름이 바로 찾고 있는 입력 좌표다. 상대 경로는 문서
+# URL 기준으로만 해석하며, 기준이 없으면 쓰지 않는다.
+_JS_RELATIVE_PATH_PARAM = re.compile(
+    r"""["'`](?:\./)?([A-Za-z0-9][A-Za-z0-9._~/-]{0,100})\?([A-Za-z0-9_]{1,40})="""
+)
 # Bundlers often build a path from adjacent constant fragments, for example
 # "/api/" + "items?term=". Only literal-to-literal addition is interpreted;
 # variable values and template interpolation are never evaluated.
@@ -390,12 +397,26 @@ def _json_links_from_response(evidence: Evidence, base_url: str) -> tuple[str, .
     return json_links_from_observation(evidence.observation, base_url)
 
 
-def _script_paths_from_body(body: str, origin) -> list[tuple[str, tuple[str, ...], bool, bool]]:
+def _script_paths_from_body(
+    body: str, origin, base_url: str | None = None
+) -> list[tuple[str, tuple[str, ...], bool, bool]]:
     """Derive same-origin route candidates from a bounded script body."""
 
     parameters: dict[str, set[str]] = {}
     for match in _JS_PATH_PARAM.finditer(body):
         parameters.setdefault(match.group(1), set()).add(match.group(2))
+    if base_url:
+        for match in _JS_RELATIVE_PATH_PARAM.finditer(body):
+            try:
+                resolved = urlsplit(urljoin(base_url, match.group(1)))
+            except ValueError:
+                continue
+            if (
+                resolved.netloc.casefold() == origin.netloc.casefold()
+                and resolved.path.startswith("/")
+                and ".." not in resolved.path.split("/")
+            ):
+                parameters.setdefault(resolved.path, set()).add(match.group(2))
     for path, names in _literal_js_query_paths(body).items():
         parameters.setdefault(path, set()).update(names)
     for path, names in _constant_js_paths(body).items():
@@ -1451,7 +1472,7 @@ class ReconAgent:
                     if inline_path_count >= _MAX_INLINE_SCRIPT_PATHS:
                         break
                     for script_url, names, should_crawl, is_navigation in _script_paths_from_body(
-                        inline_body, origin
+                        inline_body, origin, url
                     ):
                         if inline_path_count >= _MAX_INLINE_SCRIPT_PATHS:
                             break
@@ -2042,7 +2063,9 @@ class ReconAgent:
                             record_script_request_shape(
                                 url, method, names, "browser_script_request_shape"
                             )
-                        for url, names, _, _ in _script_paths_from_body(body, origin):
+                        for url, names, _, _ in _script_paths_from_body(
+                            body, origin, script_url,
+                        ):
                             if _same_origin(url, origin):
                                 remember(url, "GET", names,
                                          discovery_types=("browser_script_literal",))
@@ -2214,7 +2237,7 @@ class ReconAgent:
             return [], [], evidence, False
 
         return (
-            _script_paths_from_body(body, origin),
+            _script_paths_from_body(body, origin, source),
             _javascript_requests(body, source, javascript_globals or {}),
             evidence,
             True,

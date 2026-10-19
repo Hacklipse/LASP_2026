@@ -928,6 +928,31 @@ class ReconCrawlTests(unittest.TestCase):
             len([call for call in collector.calls if "/posts/Article-" in call]), 1
         )
 
+    def test_a_relative_script_route_keeps_its_query_coordinate(self) -> None:
+        # XBEN-069의 IDOR 좌표는 인라인 JS의 상대 경로 리터럴에 실려 있다. 절대 경로만
+        # 받으면 그 Surface가 파라미터 없이 올라와 식별자 입력이 사라진다.
+        base = "http://localhost"
+        agent, collector, surfaces = _crawling_agent(
+            {
+                base + "/profile.php": (
+                    "<script>$.ajax({url: 'api/favorites.php?userId=3', type: 'GET'});"
+                    "var mime = 'application/json'; var cls = 'My.Widget';</script>"
+                ),
+                base + "/api/favorites.php": "{}",
+            },
+            max_pages=4,
+        )
+        agent.handle(replace(_task("relative-js", base + "/profile.php"), request_budget=20))
+
+        found = {
+            (item.url, item.parameters)
+            for item in surfaces.list_by_run("relative-js")
+        }
+        self.assertIn((base + "/api/favorites.php", ("userId",)), found)
+        # 질의가 없는 리터럴은 라우트로 보지 않는다. MIME 타입과 클래스 이름이
+        # 전부 Surface가 되면 frontier가 쓰레기로 찬다.
+        self.assertFalse(any("json" in url or "Widget" in url for url, _ in found))
+
     def test_does_not_parse_html_looking_strings_inside_json_as_surfaces(self) -> None:
         api_url = "http://localhost/api/items"
         agent, collector, surfaces = _crawling_agent(
