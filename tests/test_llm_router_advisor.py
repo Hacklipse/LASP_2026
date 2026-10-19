@@ -1156,6 +1156,35 @@ class PromptHygieneTests(unittest.TestCase):
 class RouterIntegrationTests(unittest.TestCase):
     """Advisor를 실제 Router에 꽂았을 때 규칙 판정이 보존되는지 확인한다."""
 
+    def test_selected_low_precedes_deferred_low(self) -> None:
+        llm = _FakeLlmClient({"hypotheses": [{
+            "surface_id": "surface-import",
+            "capability_id": "sqli.http.query",
+            "confidence": "low",
+            "priority": "low",
+            "basis_observation_ids": [],
+            "reason_code": "query_interpreter_risk",
+            "required_evidence_types": [],
+            "analysis_strategy_id": "compare_query_mutations",
+        }]})
+        advisor = LlmRouterAdvisor(
+            llm_client=llm, analyzers=ANALYZERS, hypothesis_mode=True
+        )
+        router = RuleBasedVulnerabilityRouter(
+            advisor=advisor, advisor_mode="primary"
+        )
+
+        decisions = router.route(_run(), (_surface(),), ())
+
+        self.assertEqual(
+            [item.candidate.vulnerability_type for item in decisions],
+            ["SQLi", "XSS", "Path Traversal"],
+        )
+        self.assertEqual(
+            {item.candidate.routing_priority for item in decisions}, {"low"}
+        )
+        self.assertEqual(len({item.priority for item in decisions}), 1)
+
     def test_advisor_output_survives_the_router_guards(self) -> None:
         llm = _FakeLlmClient(
             {

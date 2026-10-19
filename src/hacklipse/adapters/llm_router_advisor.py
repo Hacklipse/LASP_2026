@@ -646,13 +646,19 @@ class LlmRouterAdvisor:
     ) -> tuple[RouteSuggestion, ...]:
         """미선택은 뒤로 보내되 LLM 실패 시 결정적 기본 순서를 유지한다."""
 
-        return tuple(
+        merged = tuple(
             overrides.get(
                 (item.surface_id, item.capability_id),
                 replace(item, priority_label="low") if defer_unselected else item,
             )
             for item in capability_suggestions
         )
+        if not defer_unselected:
+            return merged
+        return tuple(sorted(
+            merged,
+            key=lambda item: (item.surface_id, item.capability_id) not in overrides,
+        ))
 
     # ------------------------------------------------------------------
     # 제안 대상 선정
