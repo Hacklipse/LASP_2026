@@ -19,6 +19,7 @@ Validation이 별도 control/probe를 실행해 같은 차이를 재현하고 SQ
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from uuid import uuid4
 
@@ -30,6 +31,7 @@ from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 from .probing import (
     ANALYSIS_TOOL,
     build_probe_requests,
+    build_sqli_boolean_requests,
     has_observation_record,
     matching_evidence,
     probe_marker,
@@ -90,6 +92,8 @@ class HeuristicSqliAnalyzer:
             candidate_store=self._candidates,
             surface_store=self._surfaces,
             allow_parameterless_get=True,
+            required_tool=None,
+            allowed_methods=("GET", "POST"),
         )
         evidence = tuple(self._evidence.get_many(task.run_id, task.evidence_ids))
         graphql_plans = tuple(
@@ -135,12 +139,14 @@ class HeuristicSqliAnalyzer:
             raise AgentContractError("sqli baseline control evidence was not collected")
 
         new_evidence_ids: list[str] = []
+        found_error_signal = False
         for parameter, probe in zip(parameters, collected[1:]):
             if probe is None:  # missing 분기 이후에는 도달하지 않는 방어선.
                 raise AgentContractError("sqli baseline probe evidence was not collected")
             signal = sql_error_signal(control, probe)
             if signal is None:
                 continue
+            found_error_signal = True
             if has_observation_record(
                 evidence,
                 HEURISTIC_SQLI_ANALYZER,
@@ -169,6 +175,69 @@ class HeuristicSqliAnalyzer:
                 )
             )
             new_evidence_ids.append(observation_id)
+
+        if not found_error_signal:
+            boolean_requests = build_sqli_boolean_requests(
+                surface,
+                parameters,
+                probe_parameters=parameters,
+                purpose=f"SQLi candidate {candidate.candidate_id}",
+            )
+            boolean_evidence = tuple(
+                matching_evidence(evidence, surface.url, request)
+                for request in boolean_requests
+            )
+            missing_boolean = tuple(
+                request
+                for request, item in zip(boolean_requests, boolean_evidence)
+                if item is None
+            )
+            if missing_boolean:
+                if task.request_budget < len(missing_boolean):
+                    raise BudgetExceeded(
+                        "sqli baseline lacks budget for boolean differential requests"
+                    )
+                return AgentResult(
+                    task_id=task.task_id,
+                    status=AgentResultStatus.NEEDS_EVIDENCE,
+                    evidence_requests=missing_boolean,
+                    new_evidence_ids=tuple(new_evidence_ids),
+                    candidate_ids=(candidate.candidate_id,),
+                )
+
+            for index, parameter in enumerate(parameters):
+                true_response = boolean_evidence[index * 2]
+                false_response = boolean_evidence[index * 2 + 1]
+                if true_response is None or false_response is None:
+                    raise AgentContractError("SQLi boolean evidence was not collected")
+                signal = sql_boolean_signal(true_response, false_response)
+                if signal is None or has_observation_record(
+                    evidence,
+                    HEURISTIC_SQLI_ANALYZER,
+                    "sqli_differential",
+                    parameter,
+                    true_response.evidence_id,
+                    false_response.evidence_id,
+                ):
+                    continue
+                observation_id = f"evi-{self._id_factory()}"
+                self._evidence.append(
+                    Evidence(
+                        evidence_id=observation_id,
+                        run_id=task.run_id,
+                        surface_id=surface.surface_id,
+                        created_by=HEURISTIC_SQLI_ANALYZER,
+                        evidence_type="observation",
+                        observation={
+                            "type": "sqli_differential",
+                            "parameter": parameter,
+                            "control_evidence_id": true_response.evidence_id,
+                            "probe_evidence_id": false_response.evidence_id,
+                            **signal,
+                        },
+                    )
+                )
+                new_evidence_ids.append(observation_id)
 
         return AgentResult(
             task_id=task.task_id,
@@ -307,6 +376,57 @@ def sql_error_signal(control: Evidence, probe: Evidence) -> dict[str, object] | 
             "probe_status": probe_status,
         }
     return None
+
+
+def sql_boolean_signal(
+    true_response: Evidence, false_response: Evidence
+) -> dict[str, object] | None:
+    """Recognize a bounded true/false predicate response differential."""
+
+    if any(
+        item.observation.get("type") == "http_error"
+        for item in (true_response, false_response)
+    ):
+        return None
+    true_status = true_response.observation.get("status")
+    false_status = false_response.observation.get("status")
+    true_body = response_body(true_response)
+    false_body = response_body(false_response)
+    status_changed = (
+        isinstance(true_status, int)
+        and isinstance(false_status, int)
+        and true_status != false_status
+    )
+    normalized_true = _normalize_boolean_probe_reflection(true_body)
+    normalized_false = _normalize_boolean_probe_reflection(false_body)
+    body_changed = (
+        normalized_true is not None
+        and normalized_false is not None
+        and normalized_true != normalized_false
+    )
+    if not status_changed and not body_changed:
+        return None
+    return {
+        "signal": "boolean_response_differential",
+        "engine": None,
+        "true_status": true_status if isinstance(true_status, int) else None,
+        "false_status": false_status if isinstance(false_status, int) else None,
+        "true_body_bytes": len(true_body.encode("utf-8")) if isinstance(true_body, str) else None,
+        "false_body_bytes": len(false_body.encode("utf-8")) if isinstance(false_body, str) else None,
+    }
+
+
+def _normalize_boolean_probe_reflection(body: str | None) -> str | None:
+    """Remove the deliberate predicate literal before comparing response bodies."""
+
+    if body is None:
+        return None
+    normalized = re.sub(
+        r"(?i)\bAND\s+'?1'?\s*=\s*'?[12]'?",
+        "<sqli-bool-probe>",
+        body,
+    )
+    return normalized.strip()
 
 
 def _engine_of(body: str) -> str | None:

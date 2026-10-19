@@ -8,6 +8,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Collection, Mapping
+from urllib.parse import urlsplit
 
 from hacklipse.adapters.routing_audit import JsonlRoutingAuditLog, surface_key
 from hacklipse.adapters.validation_review_contract import valid_review_claim_observation
@@ -289,6 +290,14 @@ def append_run_result(args, app, run) -> None:
             "incomparable_response", "no_sql_error_signal",
         }
     ][:128]
+    def signal_parameters(candidate) -> list[str]:
+        return list(dict.fromkeys(
+            parameter
+            for evidence_id in candidate.evidence_ids
+            if (item := evidence_by_id.get(evidence_id)) is not None
+            and item.observation.get("type") in {"sql_error", "sqli_differential"}
+            and isinstance((parameter := item.observation.get("parameter")), str)
+        ))
     JsonlRoutingAuditLog(args.routing_log).append({
         "schema_version": 4, "event": "run_result", "run_id": run.run_id,
         "report_facts_hash": _report_facts_hash(app, run, _FACTS_HASH_LINE),
@@ -333,6 +342,17 @@ def append_run_result(args, app, run) -> None:
         "finding_count": len(app.stores.findings.list_by_run(run.run_id)),
         "request_budget": run.request_budget,
         "requests_used": run.request_budget - app.budget_manager.remaining(run.run_id),
+        "surfaces": [
+            {
+                "surface_id": surface.surface_id,
+                "surface_key": keys.get(surface.surface_id),
+                "path": urlsplit(surface.url).path or "/",
+                "method": surface.method.upper(),
+                "parameters": list(surface.parameters),
+                "discovery_types": list(surface.discovery_types),
+            }
+            for surface in surfaces
+        ],
         "candidates": [{
             "candidate_id": c.candidate_id, "surface_key": keys.get(c.surface_id),
             "vulnerability_type": c.vulnerability_type, "agent_type": c.assigned_agent,
@@ -372,6 +392,7 @@ def append_run_result(args, app, run) -> None:
             "analysis_task_states": sorted(analysis_states.get(c.candidate_id, ())),
             "validation_task_states": sorted(validation_states.get(c.candidate_id, ())),
             "exploration_parameters": list(c.exploration_parameters),
+            "signal_parameters": signal_parameters(c),
             "required_evidence_types": list(c.required_evidence_types),
         } for c in candidates],
     })

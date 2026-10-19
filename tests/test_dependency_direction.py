@@ -73,6 +73,27 @@ class DependencyDirectionTests(unittest.TestCase):
 
         self.assertEqual(violations, [])
 
+    def test_lasp_package_does_not_import_benchmark_integrations(self) -> None:
+        """CVE-Bench lifecycle and scoring must remain outside the product package."""
+
+        violations: list[str] = []
+        for path in PACKAGE_ROOT.rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    names = [node.module]
+                else:
+                    continue
+                for name in names:
+                    if name == "integrations" or name.startswith("integrations."):
+                        violations.append(
+                            f"{path.relative_to(PACKAGE_ROOT)} imports {name}"
+                        )
+
+        self.assertEqual(violations, [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -57,6 +57,11 @@ class _SqlRuntime:
             body = "You have an error in your SQL syntax"
         elif self.mode == "status_differential" and injected:
             status, body = 500, "internal error"
+        elif self.mode == "boolean_differential":
+            if request.request_kind is HttpRequestKind.SQLI_BOOLEAN_TRUE:
+                body = "matching row"
+            elif request.request_kind is HttpRequestKind.SQLI_BOOLEAN_FALSE:
+                body = "no rows"
         return ExecutionResult(
             execution_id=request.execution_id,
             evidence_type="http_response",
@@ -256,10 +261,35 @@ class LlmSqliAnalyzerTests(unittest.TestCase):
         )
 
         requested = agent.handle(task)
-        result = agent.handle(_collect(requested, app, task))
+        after_quote = _collect(requested, app, task)
+        boolean_requested = agent.handle(after_quote)
+        result = agent.handle(_collect(boolean_requested, app, after_quote))
 
         self.assertIs(result.status, AgentResultStatus.COMPLETED)
         self.assertEqual(_signals(app), [])
+
+    def test_boolean_differential_emits_a_separate_sqli_signal(self) -> None:
+        agent, app, _, _, task = _fixture(
+            payload={"parameters": ["id"], "reason": "identifier lookup"},
+            mode="boolean_differential",
+        )
+
+        quote_requested = agent.handle(task)
+        after_quote = _collect(quote_requested, app, task)
+        boolean_requested = agent.handle(after_quote)
+        result = agent.handle(_collect(boolean_requested, app, after_quote))
+
+        self.assertIs(result.status, AgentResultStatus.COMPLETED)
+        signals = [
+            item
+            for item in app.stores.evidence.list_by_run(_RUN_ID)
+            if item.observation.get("type") == "sqli_differential"
+        ]
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0].observation["parameter"], "id")
+        self.assertEqual(
+            signals[0].observation["signal"], "boolean_response_differential"
+        )
 
     def test_parameter_outside_surface_is_a_contract_error(self) -> None:
         agent, _, _, runtime, task = _fixture(

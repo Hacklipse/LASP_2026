@@ -105,6 +105,21 @@ def _sql_error_observation(evidence_id: str = "evi-sql-signal") -> Evidence:
     )
 
 
+def _sql_boolean_observation(evidence_id: str = "evi-sql-boolean") -> Evidence:
+    return Evidence(
+        evidence_id=evidence_id,
+        run_id=_RUN_ID,
+        surface_id=_SURFACE_ID,
+        created_by="llm_sqli_analyzer",
+        evidence_type="observation",
+        observation={
+            "type": "sqli_differential",
+            "parameter": "q",
+            "signal": "boolean_response_differential",
+        },
+    )
+
+
 def _reflection_observation(evidence_id: str = "evi-reflection") -> Evidence:
     return Evidence(
         evidence_id=evidence_id,
@@ -174,7 +189,12 @@ def _collected_for_request(
     )
 
 
-def _task(evidence_ids: tuple[str, ...], *, candidate_id: str | None = _CANDIDATE_ID) -> TaskEnvelope:
+def _task(
+    evidence_ids: tuple[str, ...],
+    *,
+    candidate_id: str | None = _CANDIDATE_ID,
+    allowed_tools: tuple[str, ...] = ("http_get",),
+) -> TaskEnvelope:
     return TaskEnvelope(
         task_id="task-validate",
         run_id=_RUN_ID,
@@ -182,13 +202,13 @@ def _task(evidence_ids: tuple[str, ...], *, candidate_id: str | None = _CANDIDAT
         surface_id=_SURFACE_ID,
         candidate_id=candidate_id,
         evidence_ids=evidence_ids,
-        allowed_tools=("http_get",),
+        allowed_tools=allowed_tools,
         request_budget=5,
         validation_id=_VALIDATION_ID,
     )
 
 
-def _make_agent() -> tuple[
+def _make_agent(*, method: str = "GET") -> tuple[
     ValidationAgent,
     InMemoryCandidateStore,
     InMemoryEvidenceStore,
@@ -202,7 +222,7 @@ def _make_agent() -> tuple[
             surface_id=_SURFACE_ID,
             run_id=_RUN_ID,
             url="http://localhost/search",
-            method="GET",
+            method=method,
             parameters=("q", "Submit"),
         )
     )
@@ -553,6 +573,28 @@ class ValidationAgentTests(unittest.TestCase):
             dict(probe.http_request.query_parameters)["Submit"], control_value
         )
 
+    def test_sqli_post_validation_uses_structured_form_requests(self) -> None:
+        agent, candidates, evidence, _ = _make_agent(method="POST")
+        candidates.add(
+            _make_candidate(
+                vulnerability_type="SQLi", evidence_ids=("evi-sql-signal",)
+            )
+        )
+        evidence.append(_sql_error_observation())
+
+        result = agent.handle(
+            _task(("evi-sql-signal",), allowed_tools=("http_post",))
+        )
+
+        self.assertIs(result.status, AgentResultStatus.NEEDS_EVIDENCE)
+        self.assertEqual(len(result.evidence_requests), 2)
+        for request in result.evidence_requests:
+            self.assertEqual(request.suggested_tool, "http_post")
+            assert request.http_request is not None
+            self.assertEqual(request.http_request.method, "POST")
+            self.assertEqual(request.http_request.query_parameters, ())
+            self.assertTrue(request.http_request.form_parameters)
+
     def test_sqli_independent_differential_creates_structured_proof(self) -> None:
         agent, candidates, evidence, _ = _make_agent()
         candidates.add(
@@ -629,6 +671,82 @@ class ValidationAgentTests(unittest.TestCase):
         assert result.validation is not None
         self.assertIs(result.validation.verdict, ValidationVerdict.REJECTED)
         self.assertIsNone(result.validation.proof)
+
+    def test_sqli_redirect_control_can_be_compared_with_error_probe(self) -> None:
+        agent, candidates, evidence, _ = _make_agent()
+        candidates.add(
+            _make_candidate(
+                vulnerability_type="SQLi", evidence_ids=("evi-sql-signal",)
+            )
+        )
+        evidence.append(_sql_error_observation())
+        first = agent.handle(_task(("evi-sql-signal",)))
+        control_request, probe_request = first.evidence_requests
+        evidence.append(
+            _collected_for_request(
+                "evi-validation-control",
+                control_request,
+                body="",
+                observation_type="http_redirect",
+                status=302,
+            )
+        )
+        evidence.append(
+            _collected_for_request(
+                "evi-validation-probe",
+                probe_request,
+                body="You have an error in your SQL syntax",
+            )
+        )
+
+        result = agent.handle(
+            _task(
+                (
+                    "evi-sql-signal",
+                    "evi-validation-control",
+                    "evi-validation-probe",
+                )
+            )
+        )
+
+        assert result.validation is not None
+        self.assertIs(result.validation.verdict, ValidationVerdict.CONFIRMED)
+        self.assertIsNotNone(result.validation.proof)
+
+    def test_sqli_boolean_differential_is_independently_reproduced(self) -> None:
+        agent, candidates, evidence, _ = _make_agent()
+        candidates.add(
+            _make_candidate(
+                vulnerability_type="SQLi", evidence_ids=("evi-sql-boolean",)
+            )
+        )
+        evidence.append(_sql_boolean_observation())
+        first = agent.handle(_task(("evi-sql-boolean",)))
+        true_request, false_request = first.evidence_requests
+        evidence.append(
+            _collected_for_request(
+                "evi-validation-true", true_request, body="matching row"
+            )
+        )
+        evidence.append(
+            _collected_for_request(
+                "evi-validation-false", false_request, body="no rows"
+            )
+        )
+
+        result = agent.handle(
+            _task(
+                (
+                    "evi-sql-boolean",
+                    "evi-validation-true",
+                    "evi-validation-false",
+                )
+            )
+        )
+
+        assert result.validation is not None
+        self.assertIs(result.validation.verdict, ValidationVerdict.CONFIRMED)
+        self.assertIsNotNone(result.validation.proof)
 
     def test_sqli_without_analysis_signal_is_rejected_without_requests(self) -> None:
         agent, candidates, evidence, _ = _make_agent()

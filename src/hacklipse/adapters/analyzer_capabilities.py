@@ -187,6 +187,21 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         strategy_ids=("compare_graphql_query_argument",), default_priority=0.30,
     ),
     AnalyzerCapability(
+        capability_id="sqli.http.form",
+        agent_type="sqli_analyzer",
+        vulnerability_type="SQLi",
+        methods=("POST",),
+        surface_kind="server",
+        exploration_parameter_source="surface",
+        supported_evidence_types=(
+            "control_response",
+            "mutated_input_response",
+            "server_error_delta",
+        ),
+        strategy_ids=("compare_form_mutations",),
+        default_priority=0.30,
+    ),
+    AnalyzerCapability(
         capability_id="path_traversal.http.query",
         agent_type="path_traversal_analyzer",
         vulnerability_type="Path Traversal",
@@ -379,8 +394,6 @@ def capability_missing_requirements(
     is_client = bool(urlsplit(surface.url).fragment)
     if is_client != (capability.surface_kind == "client"):
         missing.append("surface_kind")
-    if has_state_changing_parameters(surface.parameters):
-        missing.append("state_changing_input")
     if capability.requires_parameters and not surface.parameters:
         missing.append("input_parameter")
     if capability.parameter_hints:

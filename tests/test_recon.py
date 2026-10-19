@@ -76,6 +76,44 @@ class _FakeCollector:
         return evidence_id
 
 
+class _RedirectCollector:
+    """첫 URL은 redirect, 두 번째 URL은 HTML로 반환하는 테스트 대역."""
+
+    def __init__(self, evidence_store) -> None:
+        self._evidence = evidence_store
+        self.calls: list[str] = []
+
+    def collect(self, run_id, target_url, spec, *, task_id, **_kwargs):
+        self.calls.append(target_url)
+        evidence_id = f"evi-redirect-{len(self.calls)}"
+        redirected = len(self.calls) == 1
+        self._evidence.append(
+            Evidence(
+                evidence_id=evidence_id,
+                run_id=run_id,
+                surface_id=spec.surface_id,
+                created_by="http_execution_runtime:http_get",
+                evidence_type="http_redirect" if redirected else "http_response",
+                observation=(
+                    {
+                        "type": "http_redirect",
+                        "status": 302,
+                        "location": "/landing?category=all",
+                        "body": "",
+                    }
+                    if redirected
+                    else {
+                        "type": "http_response",
+                        "status": 200,
+                        "content_type": "text/html",
+                        "body": "<html><body>landing</body></html>",
+                    }
+                ),
+            )
+        )
+        return evidence_id
+
+
 def _make_agent(*, body: str | None = _SAMPLE_HTML):
     evidence_store = InMemoryEvidenceStore()
     surface_store = InMemorySurfaceStore()
@@ -238,6 +276,32 @@ class ReconAgentTests(unittest.TestCase):
         self.assertEqual(login.method, "POST")
         self.assertEqual(set(login.parameters), {"username", "password"})
         self.assertEqual(set(result.surface_ids), {surface.surface_id for surface in stored})
+
+    def test_follows_same_origin_redirect_as_a_separate_scoped_request(self) -> None:
+        evidence_store = InMemoryEvidenceStore()
+        surface_store = InMemorySurfaceStore()
+        collector = _RedirectCollector(evidence_store)
+        counter = iter(range(100))
+        agent = ReconAgent(
+            collector=collector,
+            evidence_store=evidence_store,
+            surface_store=surface_store,
+            id_factory=lambda: str(next(counter)),
+        )
+
+        agent.handle(_task("run-redirect", "http://localhost/start"))
+
+        self.assertEqual(
+            collector.calls,
+            ["http://localhost/start", "http://localhost/landing?category=all"],
+        )
+        landing = next(
+            surface
+            for surface in surface_store.list_by_run("run-redirect")
+            if surface.url == "http://localhost/landing"
+        )
+        self.assertEqual(landing.parameters, ("category",))
+        self.assertIn("http_redirect", landing.discovery_types)
 
     def test_flags_file_like_parameter_found_in_a_link(self) -> None:
         agent, evidence, _ = _make_agent()
@@ -1097,6 +1161,71 @@ class ReconCrawlTests(unittest.TestCase):
         self.assertFalse(any("evil.example" in surface.url for surface in found.values()))
         self.assertFalse(any("dynamicPath" in surface.url for surface in found.values()))
         self.assertFalse(any(url.endswith("/api/messages") for url in collector.calls))
+
+    def test_discovers_post_ajax_shape_and_localized_runtime_values(self) -> None:
+        html = """
+        <html><body>
+        <script>
+          var appConfig = {"ajax_url":"/wp-admin/admin-ajax.php","nonce":"abc123"};
+        </script>
+        <script src="/plugin.js"></script>
+        </body></html>
+        """
+        bundle = """
+        jQuery.ajax({
+          url: appConfig.ajax_url,
+          method: 'POST',
+          data: {action: 'lookup_states', nonce_ajax: appConfig.nonce, cnt: selected}
+        });
+        """
+        agent, _, surfaces = _crawling_agent(
+            {
+                "http://localhost/": html,
+                "http://localhost/plugin.js": bundle,
+            }
+        )
+
+        agent.handle(_task("run-js-ajax", "http://localhost/"))
+
+        ajax = next(
+            surface
+            for surface in surfaces.list_by_run("run-js-ajax")
+            if surface.url == "http://localhost/wp-admin/admin-ajax.php"
+            and surface.method == "POST"
+        )
+        self.assertEqual(ajax.parameters, ("action", "nonce_ajax", "cnt"))
+        self.assertEqual(
+            dict(ajax.observed_query),
+            {"action": "lookup_states", "nonce_ajax": "abc123", "cnt": "1"},
+        )
+        self.assertEqual(ajax.discovery_types, ("javascript_request",))
+
+    def test_preserves_javascript_array_form_shape(self) -> None:
+        html = """
+        <script>var cfg = {"ajaxurl":"/admin-ajax.php"};</script>
+        <script src="/map.js"></script>
+        """
+        bundle = """
+        var post_data = {
+          'locations_ids': [location.id],
+          'action': 'get_marker'
+        };
+        $.ajax({type: 'POST', url: cfg.ajaxurl, data: post_data});
+        """
+        agent, _, surfaces = _crawling_agent(
+            {"http://localhost/": html, "http://localhost/map.js": bundle}
+        )
+
+        agent.handle(_task("run-js-array", "http://localhost/"))
+
+        ajax = next(
+            surface
+            for surface in surfaces.list_by_run("run-js-array")
+            if surface.url == "http://localhost/admin-ajax.php"
+            and surface.method == "POST"
+        )
+        self.assertEqual(ajax.parameters, ("locations_ids[]", "action"))
+        self.assertEqual(dict(ajax.observed_query)["action"], "get_marker")
 
     def test_ignores_numeric_character_counters_but_keeps_real_numeric_routes(self) -> None:
         bundle = (

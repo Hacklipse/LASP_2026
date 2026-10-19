@@ -236,6 +236,9 @@ def _decode_task(data: str) -> TaskRecord:
             http_request["query_parameters"] = tuple(
                 tuple(item) for item in http_request["query_parameters"]
             )
+            http_request["form_parameters"] = tuple(
+                tuple(item) for item in http_request.get("form_parameters", ())
+            )
             http_request["headers"] = tuple(tuple(item) for item in http_request["headers"])
             http_request["request_kind"] = HttpRequestKind(http_request["request_kind"])
             location = http_request.get("identifier_location")

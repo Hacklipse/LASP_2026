@@ -37,6 +37,8 @@ _DISCOVERY_TYPES = {
     "browser_document_reference",
     "browser_hash_probe",
     "script_literal",
+    "javascript_request",
+    "http_redirect",
     "discovered",
 }
 _ACTION_STATUSES = {

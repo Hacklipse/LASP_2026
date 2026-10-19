@@ -870,7 +870,7 @@ def register_standard_agents(
     app.dispatcher.register(
         "sqli_analyzer",
         sqli_analyzer,
-        allowed_tools=("http_get",),
+        allowed_tools=("http_get", "http_post"),
     )
     app.dispatcher.register(
         "path_traversal_analyzer",

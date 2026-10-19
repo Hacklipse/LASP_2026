@@ -21,7 +21,12 @@ from hacklipse.domain import (
 from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 
-from .probing import build_probe_requests, matching_evidence, probe_marker
+from .probing import (
+    build_probe_requests,
+    build_sqli_boolean_requests,
+    matching_evidence,
+    probe_marker,
+)
 from .path_traversal_analysis import (
     HIDDEN_BODY_CAPABILITY,
     PATH_TRAVERSAL_BYPASS_OBSERVATION,
@@ -40,7 +45,7 @@ from .access_control_analysis import (
     unauthorized_object_exposed,
 )
 from .routing import DEFAULT_RULES, OPTIONAL_SOURCE_MAP_RULES
-from .sqli_analysis import sql_error_signal
+from .sqli_analysis import sql_boolean_signal, sql_error_signal
 from .graphql_discovery import (
     graphql_auth_blocked_response, graphql_query_plans, graphql_query_requests,
 )
@@ -161,7 +166,12 @@ class ValidationAgent:
             candidate.vulnerability_type == "SSTI" and SSTI_TOOL in task.allowed_tools
         )
         specialized_login_validation = candidate.vulnerability_type == PUBLIC_LOGIN_TYPE
-        if specialized_path_validation:
+        if candidate.vulnerability_type == "SQLi":
+            surface = self._surfaces.get(task.run_id, candidate.surface_id)
+            required_tool = (
+                "http_post" if surface.method.upper() == "POST" else _REPRODUCTION_TOOL
+            )
+        elif specialized_path_validation:
             required_tool = PATH_TRAVERSAL_TOOL
         elif specialized_access_validation:
             required_tool = ACCESS_CONTROL_TOOL
@@ -979,6 +989,16 @@ class ValidationAgent:
             return self._validate_graphql_sqli(
                 task, candidate, evidence, reproduction, surface, graphql_plans
             )
+        boolean_parameters = tuple(
+            dict.fromkeys(
+                parameter
+                for item in evidence
+                if item.surface_id == candidate.surface_id
+                and item.observation.get("type") == "sqli_differential"
+                and isinstance((parameter := item.observation.get("parameter")), str)
+                and parameter in surface.parameters
+            )
+        )
         signaled_parameters = tuple(
             dict.fromkeys(
                 parameter
@@ -989,6 +1009,68 @@ class ValidationAgent:
                 and parameter in surface.parameters
             )
         )
+        if boolean_parameters:
+            requests = build_sqli_boolean_requests(
+                surface,
+                surface.parameters,
+                probe_parameters=boolean_parameters,
+                purpose=f"SQLi validation {task.validation_id}",
+            )
+            collected = tuple(
+                matching_evidence(reproduction, surface.url, request)
+                for request in requests
+            )
+            missing = tuple(
+                request for request, item in zip(requests, collected) if item is None
+            )
+            if missing:
+                if task.request_budget < len(missing):
+                    raise BudgetExceeded(
+                        "SQLi validation lacks budget for boolean reproduction requests"
+                    )
+                return AgentResult(
+                    task_id=task.task_id,
+                    status=AgentResultStatus.NEEDS_EVIDENCE,
+                    evidence_requests=missing,
+                )
+
+            reproduced = tuple(item for item in collected if item is not None)
+            for index, parameter in enumerate(boolean_parameters):
+                true_response = collected[index * 2]
+                false_response = collected[index * 2 + 1]
+                if true_response is None or false_response is None:
+                    continue
+                if sql_boolean_signal(true_response, false_response) is None:
+                    continue
+                proof_evidence = (true_response, false_response)
+                proof = ValidationProof(
+                    proof_type=ValidationProofType.SQLI_EFFECT,
+                    evidence_ids=tuple(item.evidence_id for item in proof_evidence),
+                    summary=(
+                        "independent bounded true/false predicates reproduced an HTTP "
+                        f"response differential for parameter {parameter}"
+                    ),
+                )
+                return self._validation_result(
+                    task,
+                    verdict=ValidationVerdict.CONFIRMED,
+                    evidence=proof_evidence,
+                    reason=(
+                        "independent boolean predicate comparison reproduced the SQLi effect"
+                    ),
+                    reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+                    proof=proof,
+                )
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=reproduced,
+                reason=(
+                    "independent boolean predicates did not reproduce the response differential"
+                ),
+                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+            )
+
         if not signaled_parameters:
             return self._validation_result(
                 task,
@@ -1029,8 +1111,14 @@ class ValidationAgent:
             )
 
         reproduced = tuple(item for item in collected if item is not None)
+        # A redirect is still a complete HTTP response and can be the control
+        # side of a useful differential (for example, a normal login attempt
+        # redirects while a quote probe reaches a database error page).  The
+        # runtime deliberately does not follow redirects, so treating every
+        # 3xx as missing evidence discards exactly that signal.  Transport
+        # errors remain incomparable.
         if any(
-            item.observation.get("type") in {"http_error", "http_redirect"}
+            item.observation.get("type") == "http_error"
             for item in reproduced
         ):
             return self._validation_result(

@@ -112,6 +112,7 @@ class RuntimeEvidenceCollector:
             purpose=spec.reason,
             method=http_request.method,
             query_parameters=http_request.query_parameters,
+            form_parameters=http_request.form_parameters,
             headers=http_request.headers,
             body=http_request.body,
             request_kind=http_request.request_kind,
