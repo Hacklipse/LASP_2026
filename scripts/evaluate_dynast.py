@@ -459,6 +459,7 @@ def _run_summary(log_path: Path) -> dict:
             "recon_frontier",
             "browser_recon_enabled", "authenticated", "state_changing_approved",
             "stage_funnel", "budget_allocation_mode", "budget_validation_reserve",
+            "router_mode", "llm_model",
         )
     }
 
@@ -572,6 +573,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--iterations", type=_positive_int, default=3)
     parser.add_argument("--code-version", required=True)
     parser.add_argument("--request-budget", type=_positive_int, default=80)
+    parser.add_argument("--router", choices=("heuristic", "agentic"), default="heuristic")
+    parser.add_argument("--llm-model", help="fixed model for agentic Router comparison")
     parser.add_argument("--budget-allocation", choices=("off", "heuristic"), default="off",
                         help="candidate ordering and Validation request reservation")
     parser.add_argument("--dynast-cli", default="dynast-bench")
@@ -604,6 +607,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("app must be a short lowercase DynAST app name")
     if re.fullmatch(r"[A-Za-z0-9._/-]{1,80}", args.code_version) is None:
         parser.error("code version must be a short label")
+    if args.router == "agentic" and not args.llm_model:
+        parser.error("--router agentic requires an explicit --llm-model")
     if args.nextjs_test_session and (args.app != "nextjs" or not args.approve_state_changing):
         parser.error("--nextjs-test-session requires nextjs and --approve-state-changing")
     if args.swagger_test_session and (args.app != "swagger" or not args.approve_state_changing):
@@ -737,9 +742,12 @@ def main(argv: list[str] | None = None) -> int:
                 target, "--app", args.app, "--variant", variant,
                 "--code-version", args.code_version,
                 "--request-budget", str(args.request_budget),
+                "--router", args.router,
                 "--budget-allocation", args.budget_allocation,
                 "--report-out", str(report_path), "--routing-log", str(log_path),
             ]
+            if args.llm_model:
+                command.extend(("--llm-model", args.llm_model))
             if session_authorization is not None:
                 command.append("--session-authorization-stdin")
             elif session_cookie is None:
@@ -787,6 +795,10 @@ def main(argv: list[str] | None = None) -> int:
                     or leg.get("authenticated") is not authenticated_test_session
                     or leg.get("state_changing_approved") is not args.approve_state_changing
                     or leg.get("budget_allocation_mode") != args.budget_allocation
+                    or (args.router == "agentic" and (
+                        leg.get("router_mode") != "agentic"
+                        or leg.get("llm_model") != args.llm_model
+                    ))
                     or leg.get("browser_recon_enabled") is not (not args.no_browser_recon)
                 ):
                     leg["error"] = "run_conditions_mismatch"
@@ -871,6 +883,7 @@ def main(argv: list[str] | None = None) -> int:
         "app": args.app, "code_version": args.code_version,
         "request_budget": args.request_budget, "browser_recon": not args.no_browser_recon,
         "budget_allocation_mode": args.budget_allocation,
+        "router_mode": args.router, "llm_model": args.llm_model or "",
         "target_mode": "solo" if args.solo else "compose",
         "target_images_reused": args.no_build,
         "state_changing_approved": args.approve_state_changing,

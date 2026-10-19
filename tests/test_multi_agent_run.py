@@ -454,6 +454,47 @@ class _PriorityRouter:
 class CandidatePriorityTests(unittest.TestCase):
     """예산이 모자라면 뒤쪽이 잘리므로 실행 순서가 곧 무엇을 포기할지의 결정이다."""
 
+    def test_same_type_capabilities_survive_orchestrator_storage(self) -> None:
+        from hacklipse.bootstrap import build_local_application
+        from hacklipse.domain import RouteDecision
+
+        class _TwoCapabilityRouter:
+            def route(self, run, surfaces, evidence):
+                return tuple(
+                    RouteDecision(
+                        candidate=Candidate(
+                            candidate_id=f"cand-{capability_id}",
+                            run_id=run.run_id,
+                            surface_id="surface-search",
+                            vulnerability_type="Custom",
+                            hypothesis="h",
+                            assigned_agent="custom_analyzer",
+                            evidence_ids=(),
+                            routing_capability_id=capability_id,
+                        ),
+                        priority=0.5,
+                    )
+                    for capability_id in ("custom.first", "custom.second")
+                )
+
+        app = build_local_application({}, router=_TwoCapabilityRouter())
+        app.dispatcher.register(
+            "recon", _SurfaceOnlyReconAgent(app.stores.surfaces),
+            allowed_tools=("http_get",),
+        )
+        app.dispatcher.register(
+            "custom_analyzer", _CompletingAnalyzer(), allowed_tools=("http_get",),
+        )
+        app.dispatcher.register(
+            "validation", _RejectingValidator(), allowed_tools=("http_get",),
+        )
+
+        run = _start(app)
+
+        self.assertEqual(
+            set(run.candidate_ids), {"cand-custom.first", "cand-custom.second"}
+        )
+
     def test_candidates_run_in_priority_order(self) -> None:
         from hacklipse.bootstrap import build_local_application
 

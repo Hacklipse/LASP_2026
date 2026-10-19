@@ -754,6 +754,21 @@ class RuleBasedVulnerabilityRouter:
                     ),
                     None,
                 )
+            required_observations = (
+                tuple(
+                    item.evidence_id
+                    for requirement in capability.observation_requirements
+                    for item in evidence
+                    if item.run_id == run.run_id
+                    and item.surface_id == surface.surface_id
+                    and item.evidence_type == "observation"
+                    and item.observation.get("type") == requirement.observation_type
+                    and (
+                        requirement.source is None
+                        or item.observation.get("source") == requirement.source
+                    )
+                ) if capability is not None else ()
+            )
             candidate = Candidate(
                 candidate_id=f"candidate-{self._id_factory()}",
                 run_id=run.run_id,
@@ -768,9 +783,11 @@ class RuleBasedVulnerabilityRouter:
                     )
                 ),
                 assigned_agent=suggestion.agent_type,
-                # Agentic mode의 ID는 LLM 주장 자체가 아니라 Router가 현재 Run과
-                # Surface 소속을 재검증한 직접 Observation만 가리킨다.
-                evidence_ids=suggestion.basis_evidence_ids,
+                # LLM이 근거를 생략해도 capability가 요구한 직접 관측은 Analyzer에
+                # 전달한다. 모든 ID는 현재 Run·Surface에서 재검증한 것뿐이다.
+                evidence_ids=tuple(dict.fromkeys((
+                    *suggestion.basis_evidence_ids, *required_observations,
+                ))),
                 exploration_parameters=(
                     exploration_parameters(capability, surface, evidence)
                     if capability is not None

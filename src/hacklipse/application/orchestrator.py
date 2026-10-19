@@ -418,7 +418,7 @@ class Orchestrator:
         # A process may stop after CandidateStore.add but before Run.save. Reconcile
         # stored candidates as well as suppressing duplicates on the second ROUTE pass.
         existing = {
-            (item.surface_id, item.vulnerability_type): item.candidate_id
+            (item.surface_id, item.routing_capability_id or item.vulnerability_type): item.candidate_id
             for item in self._candidates.list_by_run(run.run_id)
         }
         candidate_ids = list(run.candidate_ids)
@@ -428,7 +428,7 @@ class Orchestrator:
             # Router가 다른 Run의 Candidate를 섞는 계약 위반을 차단한다.
             if candidate.run_id != run.run_id:
                 raise AgentContractError("router returned a candidate for another run")
-            key = (candidate.surface_id, candidate.vulnerability_type)
+            key = (candidate.surface_id, candidate.routing_capability_id or candidate.vulnerability_type)
             if key in existing:
                 stored = self._candidates.get(run.run_id, existing[key])
                 enriched = stored.add_evidence(candidate.evidence_ids)
