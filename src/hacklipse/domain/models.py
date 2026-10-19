@@ -73,6 +73,8 @@ class ValidationReasonCode(str, Enum):
     PROBE_SIGNAL_NOT_REPRODUCED = "probe_signal_not_reproduced"
     REPRODUCTION_EXECUTION_ERROR = "reproduction_execution_error"
     COMPARABLE_RESPONSES_MISSING = "comparable_responses_missing"
+    FILE_READ_BUDGET_EXHAUSTED = "file_read_budget_exhausted"
+    FILE_READ_CONFIGURATION_MISMATCH = "file_read_configuration_mismatch"
     ACCESS_PLAN_MISSING = "access_plan_missing"
     ACCESS_BUDGET_EXHAUSTED = "access_budget_exhausted"
     VALIDATION_SESSION_MISMATCH = "validation_session_mismatch"
@@ -89,6 +91,7 @@ class ValidationProofType(str, Enum):
     SQLI_EFFECT = "sqli_effect"
     UNAUTHORIZED_OBJECT_ACCESS = "unauthorized_object_access"
     PATH_TRAVERSAL_FILE_READ = "path_traversal_file_read"
+    ARBITRARY_FILE_READ = "arbitrary_file_read"
     SSTI_EXECUTION = "ssti_execution"
 
 
@@ -98,6 +101,8 @@ class HttpRequestKind(str, Enum):
     CONTROL = "control"
     PROBE = "probe"
     PATH_TRAVERSAL_PROBE = "path_traversal_probe"
+    ARBITRARY_FILE_READ_PROBE = "arbitrary_file_read_probe"
+    FILE_READ_PUBLIC_CHECK = "file_read_public_check"
     ACCESS_CONTROL_PROBE = "access_control_probe"
     SSTI_PROBE = "ssti_probe"
     SSTI_CLEANUP = "ssti_cleanup"
@@ -466,6 +471,13 @@ class HttpRequestSpec:
     # 경로 끝에 그대로 붙는 도메인 고정 접미사. 값 형태를 도메인이 강제하므로
     # Agent가 임의 경로나 임의 인코딩을 여기로 실을 수 없다.
     path_suffix: str | None = None
+    # AFR may replace one observed URL segment with an approved safe-file path.
+    file_read_path_index: int | None = None
+    file_read_path_value: str | None = None
+    # Query AFR probes identify the one coordinate that may differ from the
+    # observed request template. Policy validation uses this instead of
+    # treating every query value as attacker-controlled probe text.
+    file_read_parameter: str | None = None
 
     def __post_init__(self) -> None:
         if not self.method or _HTTP_METHOD.fullmatch(self.method) is None:
@@ -504,6 +516,28 @@ class HttpRequestSpec:
                 raise DomainInvariantError(
                     f"path suffix must be the fixed bypass suffix: {self.path_suffix!r}"
                 )
+        if (self.file_read_path_index is None) != (self.file_read_path_value is None):
+            raise DomainInvariantError("file-read path index and value must be paired")
+        if self.file_read_path_index is not None:
+            if (self.request_kind not in {
+                HttpRequestKind.CONTROL, HttpRequestKind.ARBITRARY_FILE_READ_PROBE
+            } or self.file_read_path_index < 1 or not self.file_read_path_value):
+                raise DomainInvariantError("invalid file-read path mutation")
+        if self.file_read_parameter is not None:
+            if (
+                self.request_kind not in {
+                    HttpRequestKind.CONTROL,
+                    HttpRequestKind.ARBITRARY_FILE_READ_PROBE,
+                }
+                or self.file_read_path_index is not None
+                or not self.file_read_parameter
+                or sum(
+                    name == self.file_read_parameter
+                    for name, _ in self.query_parameters
+                )
+                != 1
+            ):
+                raise DomainInvariantError("invalid file-read query mutation")
         if self.request_kind is HttpRequestKind.ACCESS_CONTROL_PROBE:
             self._validate_access_control_probe()
 
@@ -582,6 +616,7 @@ class EvidenceRequest:
     reason: str
     suggested_tool: str
     http_request: HttpRequestSpec | None = None
+    target_url_override: str | None = None
     # Agent는 어떤 자격증명을 쓸지 고를 수 없고 역할만 지정한다. 역할 → credential_ref
     # 해석은 중앙 Collector가 Run에 등록된 매핑으로만 수행한다.
     principal_role: AccessPrincipalRole | None = None
@@ -590,6 +625,8 @@ class EvidenceRequest:
     approval_ref: str | None = None
 
     def __post_init__(self) -> None:
+        if self.target_url_override is not None and not self.target_url_override:
+            raise DomainInvariantError("evidence target override cannot be blank")
         if self.principal_role is not None and not isinstance(
             self.principal_role, AccessPrincipalRole
         ):
@@ -631,6 +668,9 @@ class EvidenceRequest:
                 ),
                 "path_identifier_index": request.path_identifier_index,
                 "path_identifier_present": request.path_identifier_value is not None,
+                "file_read_path_index": request.file_read_path_index,
+                "file_read_path_present": request.file_read_path_value is not None,
+                "file_read_parameter": request.file_read_parameter,
                 "surface_id": self.surface_id,
                 "target": [
                     parsed.scheme.casefold(),
@@ -819,6 +859,9 @@ class Candidate:
     # 이 Candidate만 실패했을 때의 사유. 다른 Candidate는 계속 진행하므로 실패를
     # Run 전체가 아니라 Candidate에 남겨야 무엇이 검사되지 않았는지 알 수 있다.
     last_error: str | None = None
+    # Structured, target-content-free outcome from the latest independent
+    # validation. This survives persistence without copying response text.
+    validation_reason_code: ValidationReasonCode | None = None
     # 예산 때문에 건너뛴 Candidate가 어느 단계에서 멈췄는지. 재개할 때 이 값으로
     # 분석부터 다시 할지 검증만 다시 할지 정한다. 이것이 없으면 검증 직전에 멈춘
     # Candidate를 재개 시 처음부터 다시 분석하게 된다.
@@ -877,6 +920,17 @@ class Candidate:
                 raise DomainInvariantError(
                     f"unknown candidate status: {value!r}"
                 ) from error
+        if self.validation_reason_code is not None:
+            try:
+                object.__setattr__(
+                    self,
+                    "validation_reason_code",
+                    ValidationReasonCode(self.validation_reason_code),
+                )
+            except ValueError as error:
+                raise DomainInvariantError(
+                    f"unknown validation reason code: {self.validation_reason_code!r}"
+                ) from error
 
     def add_evidence(self, evidence_ids: tuple[str, ...]) -> Candidate:
         """기존 순서를 유지하면서 중복 없이 Evidence 참조를 합친다."""
@@ -885,7 +939,8 @@ class Candidate:
         return replace(self, evidence_ids=merged)
 
     def set_status(
-        self, status: CandidateStatus, *, reason: str | None = None
+        self, status: CandidateStatus, *, reason: str | None = None,
+        validation_reason_code: ValidationReasonCode | None = None,
     ) -> Candidate:
         """분석·검증 진행 상태가 변경된 Candidate 복사본을 만든다.
 
@@ -894,7 +949,10 @@ class Candidate:
         검증을 완료하지 못한 상태는 일반화된 사유를 명시적으로 보존할 수 있다.
         """
 
-        return replace(self, status=status, last_error=reason, resume_status=None)
+        return replace(
+            self, status=status, last_error=reason, resume_status=None,
+            validation_reason_code=validation_reason_code,
+        )
 
     def fail(self, reason: str) -> Candidate:
         """이 Candidate만 실패로 표시한다.
@@ -903,7 +961,10 @@ class Candidate:
         남긴다. 사유가 없으면 실패한 Candidate가 안전한 Candidate처럼 보인다.
         """
 
-        return replace(self, status=CandidateStatus.FAILED, last_error=reason)
+        return replace(
+            self, status=CandidateStatus.FAILED, last_error=reason,
+            validation_reason_code=None,
+        )
 
     def skip_for_budget(self, reason: str) -> Candidate:
         """예산이 모자라 시도조차 하지 못한 Candidate로 표시한다.
@@ -923,6 +984,7 @@ class Candidate:
             self,
             status=CandidateStatus.SKIPPED_BUDGET,
             last_error=reason,
+            validation_reason_code=None,
             resume_status=origin,
         )
 
@@ -1105,6 +1167,9 @@ class ExecutionRequest:
     path_identifier_index: int | None = None
     path_identifier_value: str | None = None
     path_suffix: str | None = None
+    file_read_path_index: int | None = None
+    file_read_path_value: str | None = None
+    file_read_parameter: str | None = None
     validation_id: str | None = None
     timeout_seconds: float = 120.0
     credential_ref: str | None = None
@@ -1124,6 +1189,9 @@ class ExecutionRequest:
             path_identifier_index=self.path_identifier_index,
             path_identifier_value=self.path_identifier_value,
             path_suffix=self.path_suffix,
+            file_read_path_index=self.file_read_path_index,
+            file_read_path_value=self.file_read_path_value,
+            file_read_parameter=self.file_read_parameter,
         )
         if self.timeout_seconds <= 0:
             raise DomainInvariantError("execution timeout must be positive")
@@ -1150,6 +1218,14 @@ class ExecutionRequest:
             # 도메인이 고정한 접미사이며 이미 인코딩된 문자열이다. 다시 quote하면
             # `%25`가 `%2525`가 되어 우회가 성립하지 않는다.
             path = f"{path}{self.path_suffix}"
+        if self.file_read_path_index is not None:
+            segments = path.split("/")
+            index = self.file_read_path_index
+            if not (1 <= index < len(segments)):
+                raise DomainInvariantError("file-read path index is outside the target URL")
+            assert self.file_read_path_value is not None
+            segments[index] = quote(self.file_read_path_value, safe="")
+            path = "/".join(segments)
         encoded = urlencode(self.query_parameters)
         query = parsed.query
         if encoded:

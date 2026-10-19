@@ -32,6 +32,8 @@ PROOF_DESCRIPTIONS = MappingProxyType({
         "분리된 주체 세션에서 다른 소유자의 객체 접근 확인",
     ValidationProofType.PATH_TRAVERSAL_FILE_READ:
         "제한된 safe-file control/probe 비교에서 파일 읽기 확인",
+    ValidationProofType.ARBITRARY_FILE_READ:
+        "허용된 비민감 파일의 독립 control/probe 비교에서 파일 읽기 확인",
     ValidationProofType.SSTI_EXECUTION:
         "고정 산술 control/probe 비교에서 서버 측 평가 확인",
 })

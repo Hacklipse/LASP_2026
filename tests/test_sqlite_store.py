@@ -31,6 +31,7 @@ from hacklipse.domain import (
     TaskRecord,
     TaskStatus,
     ValidationProofType,
+    ValidationReasonCode,
 )
 from hacklipse.ports.errors import (
     BudgetExceeded,
@@ -198,7 +199,10 @@ class SQLiteStoreTests(unittest.TestCase):
         task = self._task()
         evidence = self._evidence()
         surface = self._surface()
-        candidate = self._candidate()
+        candidate = replace(
+            self._candidate(), status="rejected",
+            validation_reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+        )
         finding = self._finding()
         report = self._report()
 

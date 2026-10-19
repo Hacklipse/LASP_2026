@@ -88,3 +88,34 @@ fact preservation, offered-set citation containment, status representation, and
 narrator cost. Neither establishes semantic accuracy: the fixed-fixture human
 blind review that the measurement contract also requires is not part of this
 tool. Keep the target and its state fixed when collecting the runs.
+
+# Arbitrary File Read detector
+
+The standard `Arbitrary File Read` analysis agent probes observed GET query inputs
+and file-serving URL path segments with approved, non-sensitive local-file
+targets. It compares a control response
+with the file probe, then independently repeats the pair during validation.
+Validation also checks whether the proof file is directly public on the same
+origin.
+Only that reproduction can create an `arbitrary_file_read` proof and a finding.
+The existing `Path Traversal` agent and proof remain separate.
+
+Run the common pipeline against an authorized local application:
+
+```bash
+python scripts/run_baseline.py 'http://127.0.0.1:8000/download?file=sample' 80
+```
+
+The defaults probe a bounded set of absolute, relative-depth, and encoded forms
+of `/etc/os-release`. Keep target startup and scoring outside the detector
+process.
+
+The common local runner accepts only `localhost` and `127.0.0.1`. The execution policy
+allows one configured proof path per request and the stored evidence omits file
+contents. The detector preserves observed query options, mutates one declared
+input at a time, shares controls across proof targets, and retries independently
+observed signals during validation. It handles GET query and selected file-serving
+path inputs. Validation reason codes are retained on non-confirmed candidates and
+included in the JSON summary; verified POST templates and JSON bodies remain future
+work. The detector is included in `standard_router()` alongside the other implemented
+analysis pipelines and does not require a vulnerability-specific runner.

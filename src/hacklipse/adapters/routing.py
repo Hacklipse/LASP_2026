@@ -137,7 +137,7 @@ OPTIONAL_RESTRICTED_FILE_BYPASS_RULES = (
 # Observation이 아직 없어도 입력 가능한 Surface를 담당 Analyzer까지 보낸다.
 # 실제 취약점 판정이 아니라 탐색 대상을 만드는 규칙이므로 기존 Evidence 규칙보다
 # 낮은 priority를 사용한다.
-DEFAULT_SURFACE_RULES = (
+_CORE_SURFACE_RULES = (
     SurfaceRoutingRule("XSS", "xss_analyzer", priority=0.30),
     # SPA 라우트의 DOM sink 는 브라우저로만 관측된다.
     SurfaceRoutingRule(
@@ -154,6 +154,43 @@ DEFAULT_SURFACE_RULES = (
     IdentifierSurfaceRoutingRule(
         "Access Control", "access_control_analyzer", priority=0.35
     ),
+)
+
+# Arbitrary File Read uses a lower priority than the established exploration
+# rules because it probes a broad set of GET inputs with a separate request
+# budget.
+FILE_READ_SURFACE_RULE = SurfaceRoutingRule(
+    "Arbitrary File Read", "arbitrary_file_read_analyzer", priority=0.18,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class FileReadPathSurfaceRule(SurfaceRoutingRule):
+    """Parameterless file-serving URLs with a replaceable final segment."""
+
+    requires_parameters: bool = False
+
+    def matches(self, surface: Surface) -> bool:
+        if not SurfaceRoutingRule.matches(self, surface) or surface.parameters:
+            return False
+        segments = [part.casefold() for part in urlsplit(surface.url).path.split("/") if part]
+        if len(segments) < 2:
+            return False
+        cues = {"download", "downloads", "file", "files", "asset", "assets",
+                "attachment", "attachments", "document", "documents", "view",
+                "include", "template", "templates"}
+        return bool(set(segments[:-1]) & cues)
+
+
+FILE_READ_PATH_SURFACE_RULE = FileReadPathSurfaceRule(
+    "Arbitrary File Read", "arbitrary_file_read_analyzer", priority=0.17,
+)
+
+
+DEFAULT_SURFACE_RULES = (
+    *_CORE_SURFACE_RULES,
+    FILE_READ_SURFACE_RULE,
+    FILE_READ_PATH_SURFACE_RULE,
 )
 
 

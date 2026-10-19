@@ -13,9 +13,11 @@ from hacklipse.domain import (
     Surface,
     TaskEnvelope,
     credential_for_vulnerability,
+    HttpRequestKind,
 )
 
 _PATH_TRAVERSAL_TOOL = "path_traversal_probe"
+_FILE_READ_TOOL = "file_read_probe"
 _ACCESS_CONTROL_TOOL = "access_control_probe"
 _SSTI_TOOL = "ssti_probe"
 _BROWSER_XSS_TOOL = "browser_xss"
@@ -68,6 +70,8 @@ class TaskFactory:
             allowed_tools = (_BROWSER_XSS_TOOL,)
         elif candidate.vulnerability_type == "Path Traversal":
             allowed_tools = (_PATH_TRAVERSAL_TOOL,)
+        elif candidate.vulnerability_type == "Arbitrary File Read":
+            allowed_tools = (_FILE_READ_TOOL,)
         elif candidate.vulnerability_type == "Access Control":
             # 권한 우회 탐침은 전용 도구로만 나간다. 일반 http_get을 허용하면 Agent가
             # 식별자 제약과 헤더 금지 규칙을 우회한 요청을 만들 수 있다.
@@ -107,6 +111,8 @@ class TaskFactory:
             allowed_tools = ("http_get", "browser_xss")
         elif candidate.vulnerability_type == "Path Traversal":
             allowed_tools = (_PATH_TRAVERSAL_TOOL,)
+        elif candidate.vulnerability_type == "Arbitrary File Read":
+            allowed_tools = (_FILE_READ_TOOL,)
         elif candidate.vulnerability_type == "Access Control":
             allowed_tools = (_ACCESS_CONTROL_TOOL,)
         elif candidate.vulnerability_type == "SSTI":
@@ -140,11 +146,17 @@ class TaskFactory:
     ) -> TaskEnvelope:
         """추가 증적 요청을 공통 Runtime Worker용 Task로 변환한다."""
 
+        if request.target_url_override is not None and not (
+            request.suggested_tool == _FILE_READ_TOOL
+            and request.http_request is not None
+            and request.http_request.request_kind is HttpRequestKind.FILE_READ_PUBLIC_CHECK
+        ):
+            raise ValueError("target URL override is reserved for file-read public checks")
         return self._base(
             run,
             agent_type=agent_type,
             request_budget=request_budget,
-            target_url=target_url,
+            target_url=request.target_url_override or target_url,
             surface_id=candidate.surface_id,
             candidate_id=candidate.candidate_id,
             evidence_ids=candidate.evidence_ids,

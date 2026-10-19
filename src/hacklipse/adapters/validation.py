@@ -34,6 +34,11 @@ from .path_traversal_analysis import (
     path_traversal_bypass_signal,
     path_traversal_signal,
 )
+from .arbitrary_file_read_analysis import (
+    DEFAULT_SAFE_FILE_TARGETS, FILE_READ_OBSERVATION, FILE_READ_TOOL,
+    PATH_INPUT, SafeFileTarget, build_file_read_requests,
+    build_public_file_check, file_read_signal,
+)
 from .access_control_analysis import (
     ACCESS_CONTROL_TOOL,
     build_access_control_requests,
@@ -54,6 +59,7 @@ from .xss_execution import BROWSER_XSS_TOOL, XSS_EXECUTION_MARKER_PREFIX
 # 유형을 벗어나면(Router가 만들 수 없는 값) 계약 위반으로 간주한다. Analysis
 # Agent의 자유 서술 결론(hypothesis)은 여기서도 참고하지 않는다.
 _EXPECTED_SIGNAL = {rule.vulnerability_type: rule.observation_type for rule in DEFAULT_RULES}
+_EXPECTED_SIGNAL["Arbitrary File Read"] = FILE_READ_OBSERVATION
 
 # HttpExecutionRuntime(및 그 대역)이 실제 재현 요청 결과에 붙이는 Observation 유형.
 # 최초 Recon이 남긴 신호 관측(예: "url_or_file_parameter")과는 구분되는, Validator
@@ -86,10 +92,12 @@ class ValidationAgent:
         candidate_store: CandidateStore,
         evidence_store: EvidenceStore,
         surface_store: SurfaceStore,
+        file_read_targets: tuple[SafeFileTarget, ...] = DEFAULT_SAFE_FILE_TARGETS,
     ) -> None:
         self._candidates = candidate_store
         self._evidence = evidence_store
         self._surfaces = surface_store
+        self._file_read_targets = {target.key: target for target in file_read_targets}
 
     def handle(self, task: TaskEnvelope) -> AgentResult:
         """독립 재현 Evidence가 있으면 판정하고, 없으면 재현 요청을 반환한다."""
@@ -112,6 +120,10 @@ class ValidationAgent:
             candidate.vulnerability_type == "Path Traversal"
             and PATH_TRAVERSAL_TOOL in task.allowed_tools
         )
+        specialized_file_read_validation = (
+            candidate.vulnerability_type == "Arbitrary File Read"
+            and FILE_READ_TOOL in task.allowed_tools
+        )
         specialized_access_validation = (
             candidate.vulnerability_type == "Access Control"
             and ACCESS_CONTROL_TOOL in task.allowed_tools
@@ -121,6 +133,8 @@ class ValidationAgent:
         )
         if specialized_path_validation:
             required_tool = PATH_TRAVERSAL_TOOL
+        elif specialized_file_read_validation:
+            required_tool = FILE_READ_TOOL
         elif specialized_access_validation:
             required_tool = ACCESS_CONTROL_TOOL
         elif specialized_ssti_validation:
@@ -146,6 +160,8 @@ class ValidationAgent:
             return self._validate_path_traversal(
                 task, candidate, evidence, reproduction
             )
+        if specialized_file_read_validation:
+            return self._validate_file_read(task, candidate, evidence, reproduction)
         if specialized_access_validation:
             return self._validate_access_control(task, candidate, evidence)
         if specialized_ssti_validation:
@@ -498,6 +514,163 @@ class ValidationAgent:
                 reason_code=ValidationReasonCode.CONFIRMED_PROOF,
                 proof=proof,
             ).validation,
+        )
+
+    def _validate_file_read(
+        self, task: TaskEnvelope, candidate: Candidate,
+        evidence: Sequence[Evidence], reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """Reproduce only the observed input coordinate with fresh validation requests."""
+
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        raw_signals = tuple(
+            item for item in evidence
+            if item.surface_id == surface.surface_id
+            and item.observation.get("type") == FILE_READ_OBSERVATION
+            and isinstance(item.observation.get("parameter"), str)
+            and item.observation["parameter"] in (*surface.parameters, PATH_INPUT)
+            and isinstance(item.observation.get("target_key"), str)
+            and item.observation["target_key"] in self._file_read_targets
+        )
+        signals = tuple(
+            item for item in raw_signals
+            if item.observation.get("target_fingerprint")
+            == self._file_read_targets[
+                item.observation["target_key"]
+            ].configuration_fingerprint
+        )
+        configuration_mismatch = len(signals) != len(raw_signals)
+        if raw_signals and not signals:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="file-read proof-target configuration changed after analysis",
+                reason_code=ValidationReasonCode.FILE_READ_CONFIGURATION_MISMATCH,
+            )
+        if not signals:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.REJECTED, evidence=(),
+                reason="analysis produced no approved safe-file signal",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        distinct_signals = tuple({
+            (item.observation["parameter"], item.observation["target_key"]): item
+            for item in signals
+        }.values())
+        available = len(reproduction) + task.request_budget
+        plans: list[tuple[str, SafeFileTarget, tuple[EvidenceRequest, ...]]] = []
+        planned_requests: dict[str, EvidenceRequest] = {}
+        for signal in distinct_signals:
+            parameter = signal.observation["parameter"]
+            target = self._file_read_targets[signal.observation["target_key"]]
+            pair = build_file_read_requests(
+                surface, parameter, target,
+                purpose=f"validation {task.validation_id}",
+            )
+            public_check = build_public_file_check(
+                surface, target, purpose=f"validation {task.validation_id}"
+            )
+            proposed = (*pair, public_check)
+            combined = dict(planned_requests)
+            for request in proposed:
+                combined[request.request_fingerprint(
+                    request.target_url_override or surface.url
+                )] = request
+            if len(combined) > available:
+                continue
+            planned_requests = combined
+            plans.append((parameter, target, proposed))
+        requests = tuple(planned_requests.values())
+        if not plans:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduction,
+                reason="file-read signals exist but validation budget is insufficient",
+                reason_code=ValidationReasonCode.FILE_READ_BUDGET_EXHAUSTED,
+            )
+        collected = tuple(
+            matching_evidence(
+                reproduction, request.target_url_override or surface.url, request
+            )
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded("file-read validation lacks an independent request pair")
+            return AgentResult(
+                task_id=task.task_id, status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+        reproduced = tuple(item for item in collected if item is not None)
+        saw_blocked = False
+        saw_public = False
+        for parameter, target, proposed in plans:
+            triplet = tuple(
+                matching_evidence(
+                    reproduction, request.target_url_override or surface.url, request
+                )
+                for request in proposed
+            )
+            if any(item is None for item in triplet):
+                raise AgentContractError("file-read validation evidence is incomplete")
+            control, probe, public = triplet
+            assert control is not None and probe is not None and public is not None
+            if any(
+                item.observation.get("type") in {"http_error", "http_redirect"}
+                or item.observation.get("truncated") is True
+                for item in triplet
+            ):
+                saw_blocked = True
+                continue
+            if public.observation.get("file_read_marker_match") is True:
+                saw_public = True
+                continue
+            if not file_read_signal(control, probe):
+                continue
+            proof = ValidationProof(
+                proof_type=ValidationProofType.ARBITRARY_FILE_READ,
+                evidence_ids=(control.evidence_id, probe.evidence_id, public.evidence_id),
+                summary=(
+                    "independent safe-file read for "
+                    + ("URL path" if parameter == PATH_INPUT else f"query parameter {parameter}")
+                    + f" using proof target {target.key}"
+                ),
+            )
+            return self._validation_result(
+                task, verdict=ValidationVerdict.CONFIRMED,
+                evidence=reproduced,
+                reason="independent safe-file response reproduced the file read",
+                reason_code=ValidationReasonCode.CONFIRMED_PROOF, proof=proof,
+            )
+        if saw_blocked:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=reproduced,
+                reason="one or more file-read validation responses were not comparable",
+                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+            )
+        if configuration_mismatch:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=reproduced,
+                reason="one or more file-read proof-target configurations changed",
+                reason_code=ValidationReasonCode.FILE_READ_CONFIGURATION_MISMATCH,
+            )
+        if len(plans) < len(distinct_signals):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduced,
+                reason="file-read validation budget did not cover every analysis signal",
+                reason_code=ValidationReasonCode.FILE_READ_BUDGET_EXHAUSTED,
+            )
+        if saw_public:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.REJECTED, evidence=reproduced,
+                reason="the matching proof file is already directly public",
+                reason_code=ValidationReasonCode.CONTROL_SIGNAL_PRESENT,
+            )
+        return self._validation_result(
+            task, verdict=ValidationVerdict.REJECTED, evidence=reproduced,
+            reason="independent safe-file probes did not reproduce the read",
+            reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
         )
 
     def _validate_path_traversal(

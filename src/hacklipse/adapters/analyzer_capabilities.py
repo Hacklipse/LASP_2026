@@ -11,7 +11,7 @@ from hacklipse.ports import AnalyzerCapability, ObservationRequirement
 from .request_safety import has_state_changing_parameters, object_identifier_parameters
 
 
-DEFAULT_ANALYZER_CAPABILITIES = (
+_CORE_ANALYZER_CAPABILITIES = (
     AnalyzerCapability(
         capability_id="xss.http.query",
         agent_type="xss_analyzer",
@@ -124,6 +124,36 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         strategy_ids=("compare_object_ownership",),
         default_priority=0.35,
     ),
+)
+
+FILE_READ_CAPABILITY = AnalyzerCapability(
+    capability_id="file_read.http.query",
+    agent_type="arbitrary_file_read_analyzer",
+    vulnerability_type="Arbitrary File Read",
+    methods=("GET",), surface_kind="server",
+    exploration_parameter_source="surface",
+    supported_evidence_types=("control_response", "file_read_marker"),
+    strategy_ids=("compare_safe_file_read",), default_priority=0.18,
+)
+
+FILE_READ_PATH_CAPABILITY = AnalyzerCapability(
+    capability_id="file_read.http.path",
+    agent_type="arbitrary_file_read_analyzer",
+    vulnerability_type="Arbitrary File Read",
+    methods=("GET",), surface_kind="server",
+    requires_parameters=False,
+    exploration_parameter_source="none",
+    supported_evidence_types=("control_response", "file_read_marker"),
+    strategy_ids=("compare_safe_file_path",), default_priority=0.17,
+)
+
+# Arbitrary File Read is a standard analysis capability.  Keeping it in the
+# same registry as the other implemented analyzers lets standard_router() and
+# the agentic router offer it without a vulnerability-specific opt-in.
+DEFAULT_ANALYZER_CAPABILITIES = (
+    *_CORE_ANALYZER_CAPABILITIES,
+    FILE_READ_CAPABILITY,
+    FILE_READ_PATH_CAPABILITY,
 )
 
 

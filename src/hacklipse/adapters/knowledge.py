@@ -70,6 +70,7 @@ _PROOF_TYPE_BY_VULNERABILITY = {
     "SQLi": "sqli_effect",
     "Access Control": "unauthorized_object_access",
     "Path Traversal": "path_traversal_file_read",
+    "Arbitrary File Read": "arbitrary_file_read",
     "SSTI": "ssti_execution",
 }
 
@@ -428,7 +429,11 @@ def _confirmed_signal_parameters(
 ) -> tuple[str, ...]:
     """확정 Candidate에서 구조화된 probe 신호를 만든 안전한 좌표만 추출한다."""
 
-    signal_type = _PROOF_TYPE_BY_VULNERABILITY.get(finding.vulnerability_type)
+    signal_type = (
+        "arbitrary_file_read_signal"
+        if finding.vulnerability_type == "Arbitrary File Read"
+        else _PROOF_TYPE_BY_VULNERABILITY.get(finding.vulnerability_type)
+    )
     if signal_type is None:
         return ()
     allowed_ids = set(candidate.evidence_ids)

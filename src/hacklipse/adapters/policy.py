@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from urllib.parse import urlsplit
 
-from hacklipse.domain import ExecutionRequest, Run, RunRequest, RunScope
-from hacklipse.ports import ApprovalGate
-from hacklipse.ports.errors import ApprovalRequired, PolicyViolation
+from hacklipse.domain import ExecutionRequest, HttpRequestKind, Run, RunRequest, RunScope
+from hacklipse.ports import ApprovalGate, SurfaceStore
+from hacklipse.ports.errors import ApprovalRequired, PolicyViolation, RecordNotFound
 
 from .request_safety import has_state_changing_get
 from .security import DenyAllApprovalGate
@@ -20,6 +20,10 @@ from .access_control_analysis import (
 )
 from .ssti_analysis import SSTI_TOOL, validate_ssti_request
 from .xss_execution import BROWSER_XSS_TOOL, validate_browser_xss_request
+from .arbitrary_file_read_analysis import (
+    FILE_READ_TOOL, DEFAULT_SAFE_FILE_TARGETS, SafeFileTarget,
+    validate_file_read_request,
+)
 
 
 class AllowlistPolicyGate:
@@ -28,8 +32,14 @@ class AllowlistPolicyGate:
     # safe 프로필에서는 서버 상태를 바꿀 가능성이 낮은 메서드만 허용한다.
     _safe_methods = frozenset({"GET", "HEAD", "OPTIONS"})
 
-    def __init__(self, approval_gate: ApprovalGate | None = None) -> None:
+    def __init__(
+        self, approval_gate: ApprovalGate | None = None,
+        file_read_targets: tuple[SafeFileTarget, ...] = DEFAULT_SAFE_FILE_TARGETS,
+        surface_store: SurfaceStore | None = None,
+    ) -> None:
         self._approval = approval_gate or DenyAllApprovalGate()
+        self._file_read_targets = file_read_targets
+        self._surfaces = surface_store
 
     def validate_run(self, request: RunRequest) -> None:
         """Run 시작 대상이 선언된 Scope 안에 있는지 검사한다."""
@@ -58,6 +68,35 @@ class AllowlistPolicyGate:
                 validate_path_traversal_request(request)
             except ValueError as error:
                 raise PolicyViolation(str(error)) from error
+        if request.tool == FILE_READ_TOOL:
+            try:
+                surface = None
+                if request.request_kind is not HttpRequestKind.FILE_READ_PUBLIC_CHECK:
+                    if self._surfaces is None or request.surface_id is None:
+                        raise ValueError(
+                            "file-read probe requires a policy-visible surface"
+                        )
+                    surface = self._surfaces.get(run.run_id, request.surface_id)
+                validate_file_read_request(
+                    request, self._file_read_targets, surface
+                )
+            except (ValueError, RecordNotFound) as error:
+                raise PolicyViolation(str(error)) from error
+            if request.request_kind is HttpRequestKind.FILE_READ_PUBLIC_CHECK:
+                run_origin = urlsplit(run.target_url)
+                target_origin = urlsplit(request.target_url)
+                if (run_origin.scheme, run_origin.netloc) != (
+                    target_origin.scheme, target_origin.netloc
+                ):
+                    raise PolicyViolation("file-read public check must stay on the run origin")
+        elif (
+            request.request_kind in {
+                HttpRequestKind.ARBITRARY_FILE_READ_PROBE,
+                HttpRequestKind.FILE_READ_PUBLIC_CHECK,
+            }
+            or request.file_read_path_index is not None
+        ):
+            raise PolicyViolation("file-read probe kind requires the dedicated tool")
         if request.tool == SSTI_TOOL:
             try:
                 validate_ssti_request(request)

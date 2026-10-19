@@ -31,6 +31,7 @@ from hacklipse.ports.llm import LlmClient, LlmUsage
 from .llm_parameter_names import alias_parameter_names
 from .llm_validation_review import LlmValidationReviewer
 from .validation import ValidationAgent
+from .arbitrary_file_read_analysis import DEFAULT_SAFE_FILE_TARGETS, SafeFileTarget
 from .validation_review_contract import (
     CONTRACT_VERSION,
     ValidationOutcomeClass,
@@ -47,6 +48,7 @@ _EXPECTED_PROOF = {
     "SQLi": ValidationProofType.SQLI_EFFECT,
     "Access Control": ValidationProofType.UNAUTHORIZED_OBJECT_ACCESS,
     "Path Traversal": ValidationProofType.PATH_TRAVERSAL_FILE_READ,
+    "Arbitrary File Read": ValidationProofType.ARBITRARY_FILE_READ,
     "SSTI": ValidationProofType.SSTI_EXECUTION,
 }
 
@@ -243,6 +245,7 @@ def build_llm_reviewing_validation_agent(
     *, llm_client: LlmClient, candidate_store: CandidateStore,
     evidence_store: EvidenceStore, surface_store: SurfaceStore,
     timeout_seconds: float = 60.0,
+    file_read_targets: tuple[SafeFileTarget, ...] = DEFAULT_SAFE_FILE_TARGETS,
 ) -> ReviewingValidationAgent:
     """Opt-in assembly point; common bootstrap can register this Agent unchanged."""
 
@@ -253,6 +256,7 @@ def build_llm_reviewing_validation_agent(
             candidate_store=candidate_store,
             evidence_store=evidence_store,
             surface_store=surface_store,
+            file_read_targets=file_read_targets,
         ),
         reviewer=LlmValidationReviewer(llm_client=llm_client),
         candidate_store=candidate_store,

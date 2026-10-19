@@ -25,6 +25,7 @@ from .llm_xss_analysis import LlmXssAnalyzer
 from .memory import CallbackProgressLog, InMemoryProgressLog, MemoryStoreBundle
 from .policy import AllowlistPolicyGate
 from .path_traversal_analysis import HeuristicPathTraversalAnalyzer
+from .arbitrary_file_read_analysis import ArbitraryFileReadAnalyzer, SafeFileTarget
 from .access_control_analysis import HeuristicAccessControlAnalyzer
 from .llm_access_control_analysis import LlmAccessControlAnalyzer
 from .recon import ReconAgent
@@ -74,6 +75,8 @@ __all__ = [
     "HeuristicSqliAnalyzer",
     "HeuristicSstiAnalyzer",
     "HeuristicPathTraversalAnalyzer",
+    "ArbitraryFileReadAnalyzer",
+    "SafeFileTarget",
     "BrowserXssAnalyzer",
     "LLM_BROWSER_XSS_ANALYZER",
     "LlmBrowserXssAnalyzer",

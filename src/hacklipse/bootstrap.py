@@ -40,6 +40,11 @@ from hacklipse.adapters import (
     ValidationAgent,
 )
 from hacklipse.adapters.llm_router_advisor import LlmRouterAdvisor
+from hacklipse.adapters.arbitrary_file_read_analysis import (
+    ArbitraryFileReadAnalyzer, DEFAULT_SAFE_FILE_TARGETS, SafeFileTarget,
+    project_file_read_result,
+    validate_safe_file_targets,
+)
 from hacklipse.adapters.analyzer_capabilities import DEFAULT_ANALYZER_CAPABILITIES
 from hacklipse.adapters.agentic_probe import AgenticHttpProbeAgent
 from hacklipse.adapters.analysis_llm_fallback import (
@@ -169,6 +174,7 @@ class LocalApplication:
     runtime: ExecutionRuntime
     collector: RuntimeEvidenceCollector
     audit_log: ExecutionAuditLog
+    file_read_targets: tuple[SafeFileTarget, ...] = DEFAULT_SAFE_FILE_TARGETS
 
 
 def build_local_application(
@@ -198,8 +204,11 @@ def build_local_application(
     report_llm_client: LlmClient | None = None,
     report_llm_model: str = "",
     report_llm_usage: RunLlmUsageSource | None = None,
+    file_read_targets: tuple[SafeFileTarget, ...] = DEFAULT_SAFE_FILE_TARGETS,
 ) -> LocalApplication:
     """기본적으로 네트워크를 활성화하지 않는 로컬 시스템을 조립한다."""
+
+    validate_safe_file_targets(file_read_targets)
 
     # 모든 컴포넌트는 여기에서 생성하여 의존 관계가 코드 전역에 흩어지지 않게 한다.
     selected_stores = stores if stores is not None else MemoryStoreBundle()
@@ -207,7 +216,10 @@ def build_local_application(
     selected_budget = ReservedBudgetManager(
         budget_manager if budget_manager is not None else InMemoryBudgetManager()
     )
-    policy = AllowlistPolicyGate(approval_gate=approval_gate)
+    policy = AllowlistPolicyGate(
+        approval_gate=approval_gate, file_read_targets=file_read_targets,
+        surface_store=selected_stores.surfaces,
+    )
     # 명시적인 Runtime 주입이 없으면 외부 실행을 전부 거부하는 구현을 선택한다.
     selected_runtime = runtime or DisabledExecutionRuntime()
     selected_config = config or OrchestratorConfig()
@@ -227,6 +239,9 @@ def build_local_application(
         evidence_sanitizer=selected_sanitizer,
         audit_log=selected_audit,
         default_approval_ref=default_approval_ref,
+        evidence_projection=lambda request, result: project_file_read_result(
+            request, result, file_read_targets
+        ),
     )
 
     for agent_type, agent in agents.items():
@@ -271,6 +286,7 @@ def build_local_application(
                 "http_post",
                 "browser_xss",
                 "path_traversal_probe",
+                "file_read_probe",
                 "access_control_probe",
                 "ssti_probe",
             ),
@@ -343,6 +359,7 @@ def build_local_application(
         runtime=selected_runtime,
         collector=collector,
         audit_log=selected_audit,
+        file_read_targets=file_read_targets,
     )
 
 
@@ -354,6 +371,7 @@ IMPLEMENTED_ANALYZERS = (
     "browser_xss_analyzer",
     "sqli_analyzer",
     "path_traversal_analyzer",
+    "arbitrary_file_read_analyzer",
     "ssti_analyzer",
 )
 
@@ -607,6 +625,12 @@ def register_standard_agents(
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
         )
+        file_read_analyzer: Agent = ArbitraryFileReadAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+            targets=app.file_read_targets,
+        )
         access_control_analyzer: Agent = HeuristicAccessControlAnalyzer(
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
@@ -644,6 +668,12 @@ def register_standard_agents(
             candidate_store=app.stores.candidates,
             surface_store=app.stores.surfaces,
             evidence_store=app.stores.evidence,
+        )
+        file_read_analyzer = ArbitraryFileReadAnalyzer(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+            targets=app.file_read_targets,
         )
         access_control_analyzer = LlmAccessControlAnalyzer(
             llm_client=analysis_llm_client,
@@ -758,6 +788,11 @@ def register_standard_agents(
         allowed_tools=("path_traversal_probe",),
     )
     app.dispatcher.register(
+        "arbitrary_file_read_analyzer",
+        file_read_analyzer,
+        allowed_tools=("file_read_probe",),
+    )
+    app.dispatcher.register(
         "access_control_analyzer",
         access_control_analyzer,
         allowed_tools=("access_control_probe",),
@@ -774,6 +809,7 @@ def register_standard_agents(
         candidate_store=app.stores.candidates,
         evidence_store=app.stores.evidence,
         surface_store=app.stores.surfaces,
+        file_read_targets=app.file_read_targets,
     )
     if validation_review:
         validation_agent = build_llm_reviewing_validation_agent(
@@ -781,6 +817,7 @@ def register_standard_agents(
             candidate_store=app.stores.candidates,
             evidence_store=app.stores.evidence,
             surface_store=app.stores.surfaces,
+            file_read_targets=app.file_read_targets,
         )
     app.dispatcher.register(
         "validation",
@@ -789,6 +826,7 @@ def register_standard_agents(
             "http_get",
             "browser_xss",
             "path_traversal_probe",
+            "file_read_probe",
             "access_control_probe",
             "ssti_probe",
         ),

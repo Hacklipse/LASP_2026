@@ -34,6 +34,7 @@ _HTTP_TOOLS = frozenset(
         "http_get",
         "http_post",
         "path_traversal_probe",
+        "file_read_probe",
         "access_control_probe",
         "ssti_probe",
     }
@@ -322,7 +323,9 @@ class HttpExecutionRuntime:
         }
 
         # 텍스트만 디코딩한다. 바이너리는 강제 문자열화하지 않고 크기·해시만 남긴다.
-        if method != "HEAD" and _is_textual(content_type):
+        if method != "HEAD" and (
+            _is_textual(content_type) or request.tool == "file_read_probe"
+        ):
             observation["body"] = raw.decode(_charset(content_type), errors="replace")
         else:
             observation["body"] = None

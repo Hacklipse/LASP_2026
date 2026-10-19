@@ -64,6 +64,7 @@ _PROOF_TYPE_BY_VULNERABILITY = {
     "SQLi": ValidationProofType.SQLI_EFFECT,
     "Access Control": ValidationProofType.UNAUTHORIZED_OBJECT_ACCESS,
     "Path Traversal": ValidationProofType.PATH_TRAVERSAL_FILE_READ,
+    "Arbitrary File Read": ValidationProofType.ARBITRARY_FILE_READ,
     "SSTI": ValidationProofType.SSTI_EXECUTION,
 }
 
@@ -989,7 +990,10 @@ class Orchestrator:
         # Validator의 reason은 외부 응답을 포함할 수 있어 그대로 저장하지 않는다.
         # BLOCKED는 판정은 났지만 검증을 완료하지 못했다는 사실만 일반화해 남긴다.
         reason = "validation blocked" if status is CandidateStatus.BLOCKED else None
-        candidate = candidate.set_status(status, reason=reason)
+        candidate = candidate.set_status(
+            status, reason=reason,
+            validation_reason_code=validation.reason_code,
+        )
         self._candidates.save(candidate)
         self._emit(
             current,
