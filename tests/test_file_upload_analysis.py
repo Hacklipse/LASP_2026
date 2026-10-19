@@ -64,7 +64,8 @@ class _UploadRuntime:
             part = file_parts[0]
             filename, payload = part.get_filename(), part.get_payload(decode=True)
             marker = filename.split(".", 1)[0]
-            assert payload in (upload_payload(marker, "text_octet"), upload_payload(marker, "png_image"))
+            assert payload in (upload_payload(marker, "text_octet"), upload_payload(marker, "png_image"),
+                               upload_payload(marker, "jpeg_image"))
             self.uploads.append(filename)
             denied = (self.mode == "allowlist" and not filename.endswith((".jpg", ".png"))
                       or self.mode == "blocklist" and filename.endswith(".php"))
@@ -83,6 +84,10 @@ class _UploadRuntime:
                 status, body = 422, '{"errors":{"file":["Unsupported MIME type"]}}'
             elif self.mode == "magic" and not payload.startswith(b"\x89PNG"):
                 status, body = 400, '{"message":"Invalid image content"}'
+            elif self.mode == "jpeg_magic" and not (
+                (".jpg" in filename or ".jpeg" in filename) and payload.startswith(b"\xff\xd8")
+            ):
+                status, body = 415, "Invalid Image file. We only support JPG files."
             else:
                 fields = {part.get_param("name", header="content-disposition"): part.get_content()
                           for part in parts if part.get_filename() is None}
@@ -283,6 +288,42 @@ class FileUploadAnalysisTests(unittest.TestCase):
         self.assertIsNone(located(f"/logout/{marker}.php"))
         # 확장자 없는 경로는 정적 파일 읽기로 보지 않는다.
         self.assertIsNone(located(f"upload/{marker}", extension=""))
+
+    def test_jpeg_probe_is_a_decodable_image_carrying_only_the_marker(self):
+        marker = "upload" + "c" * 32
+        jpeg = upload_payload(marker, "jpeg_image")
+        self.assertEqual(jpeg[:2], b"\xff\xd8")
+        self.assertEqual(jpeg[-2:], b"\xff\xd9")
+        offset, segments, comments = 2, [], []
+        while offset < len(jpeg) - 1:
+            self.assertEqual(jpeg[offset], 0xFF)
+            kind = jpeg[offset + 1]
+            segments.append(kind)
+            if kind == 0xDA:  # SOS 뒤는 엔트로피 데이터이므로 segment 순회를 멈춘다.
+                break
+            size = struct.unpack(">H", jpeg[offset + 2:offset + 4])[0]
+            if kind == 0xFE:
+                comments.append(jpeg[offset + 4:offset + 2 + size])
+            if kind == 0xC0:  # SOF0: 1x1
+                self.assertEqual(struct.unpack(">HH", jpeg[offset + 5:offset + 9]), (1, 1))
+            offset += 2 + size
+        self.assertEqual(comments, [marker.encode() + b"\x00"])
+        self.assertIn(0xC0, segments)
+        self.assertIn(0xDA, segments)
+
+    def test_a_jpeg_only_server_still_unlocks_the_image_matrix(self):
+        app, _, run = _scan("jpeg_magic")
+        self.assertEqual(run.phase, RunPhase.DONE)
+        result = next(item.observation for item in app.stores.evidence.list_by_run(run.run_id)
+                      if item.observation.get("type") == UPLOAD_RESULT)
+        rows = {(row["extension"], row["profile"]): row for row in result["results"]}
+        # PNG는 거부되므로 PNG 수락을 잠금 해제 조건으로 두면 변형을 영구히 못 보낸다.
+        self.assertEqual(rows[(".png", "png_image")]["outcome"], "rejected")
+        self.assertEqual(rows[(".jpg", "jpeg_image")]["outcome"], "accepted")
+        self.assertEqual(rows[(".jpg.php", "jpeg_image")]["outcome"], "accepted")
+        self.assertEqual(rows[(".jpg.php", "jpeg_image")]["stored_extension"], ".jpg.php")
+        self.assertEqual(app.stores.candidates.list_by_run(run.run_id)[0].status,
+                         CandidateStatus.CONFIRMED)
 
     def test_rotating_csrf_and_form_defaults_are_fresh_and_redacted(self):
         app, runtime, run = _scan("csrf")

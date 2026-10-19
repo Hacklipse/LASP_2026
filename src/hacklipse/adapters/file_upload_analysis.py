@@ -12,6 +12,7 @@ import re
 import struct
 import time
 import zlib
+from base64 import b64decode
 from dataclasses import dataclass, field, replace
 from urllib.parse import parse_qsl, unquote, urljoin, urlsplit
 from uuid import uuid4
@@ -52,7 +53,28 @@ UPLOAD_PROFILES = {
     "text_image": ("text", "image/png"),
     "png_octet": ("png", "application/octet-stream"),
     "png_image": ("png", "image/png"),
+    "jpeg_octet": ("jpeg", "application/octet-stream"),
+    "jpeg_image": ("jpeg", "image/jpeg"),
 }
+# 각 이미지 종류의 기준 요청. "정상 이미지를 아예 수락하지 않는 서버"인지를 이 좌표로
+# 판정하므로, PNG만 두면 JPEG 매직바이트를 요구하는 서버에서 모든 변형이 영구히 스킵된다.
+_IMAGE_CONTROL_CASES = {(".png", "png_image"), (".jpg", "jpeg_image")}
+_IMAGE_CONTROL_EXTENSIONS = {extension for extension, _ in _IMAGE_CONTROL_CASES}
+_NATURAL_EXTENSION = {"png": ".png", "jpeg": ".jpg"}
+# 최소 baseline JPEG(1x1, 3성분). getimagesize나 이미지 디코더로 재검증하는 서버까지
+# 통과해야 하므로 FFD8 두 바이트가 아니라 실제로 디코딩되는 파일을 쓴다. marker는
+# 아래에서 COM segment로 끼워 넣으므로 이 상수 자체는 고정이고 요청마다 같다.
+_JPEG_TEMPLATE = b64decode(
+    "/9j/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQA"
+    "AAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVW"
+    "V1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ"
+    "2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQA"
+    "AQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RV"
+    "VldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX"
+    "2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9sAQwATExMTExMgExMgLSAgIC09LS0tLT1NPT09PT1NXU1NTU1NTV1dXV1dXV1dcHBw"
+    "cHBwg4ODg4OTk5OTk5OTk5OT/9sAQwEXGBglIyVAIyNAmWhVaJmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZ"
+    "mZmZmZmZmZmZmZmZmZmZ/90ABAAB/9oADAMBAAIRAxEAPwDiqKKKAP/Z"
+)
 
 
 @dataclass(frozen=True)
@@ -64,11 +86,16 @@ class UploadFormPlan:
 
 
 def upload_payload(marker: str, profile: str) -> bytes:
-    """A real one-pixel PNG carries only an inert, unique text comment."""
+    """A real one-pixel PNG or JPEG carries only an inert, unique text comment."""
     if not re.fullmatch(r"upload[a-f0-9]{32}", marker) or profile not in UPLOAD_PROFILES:
         raise ValueError("upload payload needs a bounded marker and profile")
-    if UPLOAD_PROFILES[profile][0] == "text":
+    kind = UPLOAD_PROFILES[profile][0]
+    if kind == "text":
         return marker.encode("ascii")
+    if kind == "jpeg":
+        comment = marker.encode("ascii") + b"\x00"
+        return (_JPEG_TEMPLATE[:2] + b"\xff\xfe"
+                + struct.pack(">H", len(comment) + 2) + comment + _JPEG_TEMPLATE[2:])
 
     def chunk(kind: bytes, data: bytes) -> bytes:
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
@@ -327,12 +354,19 @@ def uploaded_file_url(observation: dict, upload_url: str, filename: str) -> str 
 
 def upload_probe_plan(extensions: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
     """Prioritize genuine controls and distinct server families before rare suffixes."""
-    controls = ((".png", "png_image"), (".png", "png_octet"), (".png", "text_image"))
+    controls = ((".png", "png_image"), (".jpg", "jpeg_image"),
+                (".png", "png_octet"), (".png", "text_image"), (".jpg", "jpeg_octet"))
     primary = (".txt", ".png", ".jpg", ".php", ".svg", ".html", ".asp", ".aspx", ".jsp", ".cgi")
     cases = [case for case in controls if case[0] in extensions]
     cases.extend((extension, "text_octet") for extension in primary if extension in extensions)
     cases.extend((extension, profile) for extension in (".php", ".svg", ".html") if extension in extensions
-                 for profile in ("text_image", "png_octet", "png_image"))
+                 for profile in ("text_image", "png_octet", "png_image", "jpeg_image"))
+    # 확장자와 내용을 동시에 보는 서버는 "정상 이미지 + 이미지 확장자를 포함한 위험
+    # 확장자" 조합에서만 갈린다. 이중 확장자는 그에 맞는 이미지 종류로만 보낸다.
+    cases.extend(case for case in (
+        (".jpg.php", "jpeg_image"), (".jpg.php", "jpeg_octet"),
+        (".png.php", "png_image"), (".jpg.svg", "jpeg_image"),
+    ) if case[0] in extensions)
     cases.extend((extension, "text_octet") for extension in extensions)
     return tuple(dict.fromkeys(cases))
 
@@ -343,12 +377,14 @@ def upload_policy_differences(rows: list[dict]) -> list[dict]:
     differences = []
     for row in rows:
         comparisons = []
-        if row["profile"] in {"text_image", "png_image"}:
-            comparisons.append(("mime", row["extension"], row["profile"].replace("image", "octet")))
-        if row["profile"] in {"png_octet", "png_image"}:
-            comparisons.append(("content", row["extension"], row["profile"].replace("png", "text")))
-        if row["extension"] != ".png":
-            comparisons.append(("extension", ".png", row["profile"]))
+        kind, _ = UPLOAD_PROFILES[row["profile"]]
+        if row["profile"].endswith("_image"):
+            comparisons.append(("mime", row["extension"], kind + "_octet"))
+        if kind != "text":
+            comparisons.append(("content", row["extension"], "text_" + row["profile"].split("_", 1)[1]))
+        natural = _NATURAL_EXTENSION.get(kind, ".png")
+        if row["extension"] != natural:
+            comparisons.append(("extension", natural, row["profile"]))
         for dimension, extension, profile in comparisons:
             control = by_case.get((extension, profile))
             if (control and {control["outcome"], row["outcome"]} == {"accepted", "rejected"}):
@@ -380,6 +416,7 @@ def check_upload_extensions(
              "content_kind": UPLOAD_PROFILES[profile][0], "mime_type": UPLOAD_PROFILES[profile][1],
              "outcome": "not_tested", "reason": "request_budget"} for extension, profile in cases]
     ids: list[str] = []
+    accepted_image_kinds: set[str] = set()
     deadline = time.monotonic() + max(0, task.timeout_seconds - 1)
     for (extension, profile), row in zip(cases, rows):
         if time.monotonic() >= deadline:
@@ -387,11 +424,12 @@ def check_upload_extensions(
             continue
         if task.request_budget - len(ids) < (3 if form_page else 2):
             continue
-        # Content/MIME comparisons help when a genuine PNG succeeds; otherwise retain the text matrix.
-        if profile != "text_octet" and extension != ".png" and not any(
-            prior["extension"] == ".png" and prior["profile"] == "png_image"
-            and prior["outcome"] == "accepted" for prior in rows
-        ) and probes is None:
+        # 정상 이미지를 아예 수락하지 않는 서버에서는 MIME·내용 변형에 요청을 쓰지
+        # 않는다. 각 이미지 종류의 기준 확장자는 그 판단의 재료이므로 먼저 보낸다.
+        kind = UPLOAD_PROFILES[profile][0]
+        unlocked = accepted_image_kinds if kind == "text" else accepted_image_kinds & {kind}
+        if (profile != "text_octet" and extension not in _IMAGE_CONTROL_EXTENSIONS
+                and not unlocked and probes is None):
             row["reason"] = "normal_image_not_verified"
             continue
         marker = "upload" + uuid4().hex
@@ -497,6 +535,8 @@ def check_upload_extensions(
             row.update(outcome="accepted", reason="stored_marker_retrieved",
                        renamed=basename != marker + extension, stored_extension=suffix,
                        served_content_type=served_type)
+            if (extension, profile) in _IMAGE_CONTROL_CASES:
+                accepted_image_kinds.add(kind)
     return rows, tuple(ids)
 
 
