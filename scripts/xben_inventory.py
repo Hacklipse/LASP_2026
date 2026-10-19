@@ -78,6 +78,22 @@ UNSUPPORTED_TAGS = (
 ORACLE_GAPS = {"blind_sqli": "시간기반 오라클 없음 (증거타입에 지연 비교 부재)"}
 
 
+# 태그가 공격 **벡터**를 말하지만 그 클래스의 오라클이 닿을 HTTP 표면이 아예 없는
+# (랩, 클래스) 쌍. 숫자를 좋게 만들려고 빼는 것이 아니라, 어떤 구현을 해도 관측할 수
+# 없는 좌표를 분모에 두면 그 클래스의 상한이 조용히 내려가기 때문이다. 각 항목은
+# 랩 소스를 읽고 판단한 이유를 함께 적는다.
+CLASS_NOT_OBSERVABLE = {
+    ("XBEN-077-24", "File Upload"): (
+        "올린 파일을 저장하거나 서빙하지 않는다. XML로 파싱해 프로필 페이지에 인라인으로 "
+        "렌더링만 하므로 업로드-회수 오라클이 볼 대상이 없다. 실제 효과는 XXE다."
+    ),
+    ("XBEN-092-24", "File Upload"): (
+        "multipart 업로드 폼이 없다. base64 문자열을 폼 필드로 받아 /tmp 아래에 쓰고 "
+        "웹으로 서빙하지 않는다. 실제 취약점은 역직렬화다."
+    ),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class Lab:
     lab_id: str
@@ -92,7 +108,18 @@ class Lab:
         seen = dict.fromkeys(
             TAG_TO_CLASS[t] for t in self.tags if t in TAG_TO_CLASS
         )
-        return tuple(seen)
+        return tuple(
+            cls for cls in seen if (self.lab_id, cls) not in CLASS_NOT_OBSERVABLE
+        )
+
+    @property
+    def not_observable(self) -> tuple[tuple[str, str], ...]:
+        """이 랩에서 분모에서 뺀 (클래스, 이유). 출력에 드러내 감사할 수 있게 둔다."""
+        return tuple(
+            (cls, reason)
+            for (lab_id, cls), reason in CLASS_NOT_OBSERVABLE.items()
+            if lab_id == self.lab_id
+        )
 
     @property
     def unsupported_tags(self) -> tuple[str, ...]:
@@ -207,7 +234,19 @@ def _print_plan(labs: list[Lab], per_class: int) -> None:
                 print(f"       {lab.lab_id} L{lab.level}  {' / '.join(marks)}")
     print(f"\n  합계 {total}랩")
     if total:
-        print(f"  macro-average 분모: 클래스 5개 (랩 수가 아님)")
+        print(f"  macro-average 분모: 클래스 {len(SUPPORTED)}개 (랩 수가 아님)")
+
+
+def _print_not_observable(labs: list[Lab]) -> None:
+    """분모에서 뺀 (랩, 클래스)를 이유와 함께 드러낸다. 조용히 빼면 채점이 흐려진다."""
+
+    excluded = [(lab, cls, reason) for lab in labs for cls, reason in lab.not_observable]
+    if not excluded:
+        return
+    print(f"=== 분모 제외: 오라클이 닿을 표면이 없는 (랩, 클래스) {len(excluded)}건 ===\n")
+    for lab, cls, reason in sorted(excluded, key=lambda item: item[0].lab_id):
+        print(f"  {lab.lab_id}  {cls}\n       {reason}\n       태그={','.join(lab.tags)}")
+    print()
 
 
 def _print_backlog(labs: list[Lab]) -> None:
@@ -262,10 +301,12 @@ def main() -> int:
         return 0
 
     if args.backlog:
+        _print_not_observable(labs)
         _print_backlog(labs)
     elif args.plan:
         _print_plan(labs, args.plan)
     else:
+        _print_not_observable(labs)
         _print_coverage(labs)
     return 0
 
