@@ -286,25 +286,6 @@ def upload_request(
 
 
 _REFERENCE_ATTRIBUTE = re.compile(r"""(?:href|src)\s*=\s*("|')([^"']{1,2048})\1""", re.IGNORECASE)
-# 저장 디렉터리 이름은 동작이 아니다. /upload/<marker>.php 를 받아오는 것은 업로드를
-# 일으키는 것이 아니라 방금 만들어진 파일을 읽는 것이다. has_state_changing_get의 경로
-# 판정이 디렉터리 이름 때문에만 걸리는 경우를 읽기로 돌려놓는다. query 쪽은 아래
-# safe_query가 이름과 값을 따로 묶으므로 이 예외가 거기까지 넓어지지 않는다.
-_STORAGE_SEGMENTS = frozenset({
-    "upload", "uploads", "uploaded", "file", "files", "media", "image", "images",
-    "img", "photo", "photos", "static", "assets", "storage", "attachment",
-    "attachments", "document", "documents", "avatar", "avatars", "userfile", "userfiles",
-})
-
-
-def _is_stored_file_read(path: str) -> bool:
-    segments = [segment for segment in unquote(unquote(path)).split("/") if segment]
-    if not segments or "." not in segments[-1]:
-        return False
-    return not has_state_changing_get("/" + "/".join(
-        segment for segment in segments if segment.casefold() not in _STORAGE_SEGMENTS
-    ))
-
 
 def uploaded_file_url(observation: dict, upload_url: str, filename: str) -> str | None:
     """Never fetch arbitrary response links or follow a redirect automatically."""
@@ -365,8 +346,7 @@ def safe_retrieval_url(reference: object, upload_url: str) -> str | None:
     decoded_path = unquote(unquote(parsed.path))
     if (parsed.scheme in {"http", "https"} and _origin(url) == _origin(upload_url)
             and not parsed.username and not parsed.password and not parsed.fragment
-            and len(query) <= 4 and safe_query
-            and (not has_state_changing_get(url) or _is_stored_file_read(parsed.path))
+            and len(query) <= 4 and safe_query and not has_state_changing_get(url)
             and ".." not in decoded_path.split("/") and "\\" not in decoded_path
             and parsed.path and (parsed.path != urlsplit(upload_url).path or query)):
         return url

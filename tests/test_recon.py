@@ -880,6 +880,31 @@ class ReconCrawlTests(unittest.TestCase):
         self.assertTrue(any(s.url == base + "/api/find" and s.parameters == ("q",)
                             for s in surfaces.list_by_run("script-priority")))
 
+    def test_an_upload_page_is_fetched_while_an_action_page_is_not(self) -> None:
+        # 업로드는 요청 본문이 있어야 성립하므로 /upload.php 를 GET으로 읽는 것은
+        # 동작이 아니다. 이 페이지를 받지 못하면 업로드 폼 자체를 관측할 수 없어
+        # 임의 파일 업로드가 영구히 보이지 않는다.
+        base = "http://localhost"
+        agent, collector, surfaces = _crawling_agent(
+            {
+                base + "/": ('<a href="/posts/upload-article.php">upload</a>'
+                             '<a href="/account/delete.php">delete</a>'),
+                base + "/posts/upload-article.php": (
+                    '<form method="post" enctype="multipart/form-data">'
+                    '<input type="file" name="articleFile"></form>'
+                ),
+                base + "/account/delete.php": "<p>gone</p>",
+            },
+            max_pages=5,
+        )
+        agent.handle(replace(_task("upload-reach", base + "/"), request_budget=40))
+
+        self.assertIn(base + "/posts/upload-article.php", collector.calls)
+        self.assertNotIn(base + "/account/delete.php", collector.calls)
+        # 가져오지 않은 것도 Surface로는 남아 "검사하지 않았다"가 결과에 드러난다.
+        urls = {item.url for item in surfaces.list_by_run("upload-reach")}
+        self.assertIn(base + "/account/delete.php", urls)
+
     def test_does_not_parse_html_looking_strings_inside_json_as_surfaces(self) -> None:
         api_url = "http://localhost/api/items"
         agent, collector, surfaces = _crawling_agent(

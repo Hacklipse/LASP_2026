@@ -285,7 +285,7 @@ class FileUploadAnalysisTests(unittest.TestCase):
         self.assertFalse(any(urlsplit(request.resolved_url).path == "/logout"
                              for request in runtime.requests))
 
-    def test_a_storage_directory_name_is_not_a_state_changing_action(self):
+    def test_an_upload_path_is_readable_but_an_action_path_is_not(self):
         marker = "upload" + "b" * 32
         def located(href, extension=".php"):
             body = f"<html><body>stored <a href='{href}'>here</a></body></html>"
@@ -294,16 +294,15 @@ class FileUploadAnalysisTests(unittest.TestCase):
                 "http://local.test/index.php", marker + extension,
             )
 
-        # /upload/<marker>.php 를 받아오는 것은 업로드가 아니라 방금 만들어진 파일 읽기다.
+        # 업로드는 요청 본문이 있어야 성립한다. /upload/<marker>.php 를 GET으로 받아오는
+        # 것은 업로드가 아니라 방금 만들어진 파일 읽기다.
         for directory in ("upload", "uploads", "media/img"):
             with self.subTest(directory=directory):
                 self.assertEqual(located(f"{directory}/{marker}.php"),
                                  f"http://local.test/{directory}/{marker}.php")
-        # 디렉터리 이름이 실제 동작이면 그대로 막힌다.
+        # GET 하나로 성립하는 동작이면 그대로 막힌다.
         self.assertIsNone(located(f"delete/{marker}.php"))
         self.assertIsNone(located(f"/logout/{marker}.php"))
-        # 확장자 없는 경로는 정적 파일 읽기로 보지 않는다.
-        self.assertIsNone(located(f"upload/{marker}", extension=""))
 
     def test_jpeg_probe_is_a_decodable_image_carrying_only_the_marker(self):
         marker = "upload" + "c" * 32

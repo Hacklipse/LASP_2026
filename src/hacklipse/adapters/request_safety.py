@@ -21,12 +21,22 @@ _STATE_CHANGE_TOKENS = frozenset(
         "reset",
         "transfer",
         "update",
-        "upload",
     }
 )
+# 요청 **본문**이 있어야 성립하는 동작. 파일 전송은 GET으로 일어날 수 없으므로,
+# 경로에 이 낱말이 있다는 것은 그 주소가 업로드 폼이나 업로드 엔드포인트라는 뜻이고
+# 그 주소를 읽는 것은 상태 변경이 아니다. /upload 를 받지 못하면 업로드 폼 자체를
+# 관측할 수 없어 그 취약점이 영구히 보이지 않는다. 필드 이름 쪽에서는 보수적으로
+# 그대로 상태 변경으로 본다.
+_BODY_ONLY_STATE_CHANGE_TOKENS = frozenset({"upload"})
 _ACTION_PARAMETER_NAMES = frozenset(
     {"action", "button", "cmd", "command", "mode", "op", "operation", "submit", "task"}
 )
+
+
+def _tokens(value: str) -> set[str]:
+    expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+    return {token for token in re.split(r"[^a-z0-9]+", expanded.casefold()) if token}
 
 
 def has_state_changing_parameters(parameters: Sequence[str]) -> bool:
@@ -37,16 +47,8 @@ def has_state_changing_parameters(parameters: Sequence[str]) -> bool:
     결정적 규칙을 사용한다.
     """
 
-    for parameter in parameters:
-        expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", parameter)
-        tokens = {
-            token
-            for token in re.split(r"[^a-z0-9]+", expanded.casefold())
-            if token
-        }
-        if tokens & _STATE_CHANGE_TOKENS:
-            return True
-    return False
+    changing = _STATE_CHANGE_TOKENS | _BODY_ONLY_STATE_CHANGE_TOKENS
+    return any(_tokens(parameter) & changing for parameter in parameters)
 
 
 def has_state_changing_get(url: str, parameters: Sequence[str] = ()) -> bool:
@@ -54,13 +56,17 @@ def has_state_changing_get(url: str, parameters: Sequence[str] = ()) -> bool:
 
     검색어에 'delete'가 등장한 것만으로는 차단하지 않지만, action=delete처럼
     동작 선택 필드의 값이 상태 변경을 지시하면 승인 없는 자동 실행을 막는다.
+
+    경로는 "이 주소를 열어보는 것 자체가 동작인가"를 묻는다. /delete 처럼 기본 대상이
+    암시된 경로는 여는 것만으로 상태가 바뀔 수 있지만, 업로드는 본문 없이는 성립하지
+    않으므로 경로 판정에서 제외한다.
     """
 
     parsed = urlsplit(url)
     query = parse_qsl(parsed.query, keep_blank_values=True)
-    if has_state_changing_parameters((
-        unquote(unquote(parsed.path)), *(name for name, _ in query), *parameters
-    )):
+    if _tokens(unquote(unquote(parsed.path))) & _STATE_CHANGE_TOKENS:
+        return True
+    if has_state_changing_parameters((*(name for name, _ in query), *parameters)):
         return True
     return any(
         name.casefold() in _ACTION_PARAMETER_NAMES
