@@ -18,6 +18,7 @@ from hacklipse.adapters.validation import ValidationAgent
 from hacklipse.adapters.sqli_analysis import HEURISTIC_SQLI_ANALYZER, sql_boolean_signal
 from hacklipse.application.errors import AgentContractError
 from hacklipse.ports.errors import BudgetExceeded
+import re
 from collections import Counter
 
 from hacklipse.adapters.probing import build_sqli_boolean_requests, sqli_boolean_plan
@@ -479,11 +480,37 @@ class SqliBooleanPredicateTests(unittest.TestCase):
 
     def test_a_page_that_only_echoes_the_predicate_is_not_a_differential(self) -> None:
         # 지우지 못한 술어 모양이 하나라도 있으면 반사만으로 차등이 생겨 오탐이 된다.
-        for _name, true_suffix, false_suffix in SQLI_BOOLEAN_PREDICATES:
-            with self.subTest(predicate=_name):
+        for name, true_suffix, false_suffix in SQLI_BOOLEAN_PREDICATES:
+            with self.subTest(predicate=name):
                 true_response = _echo_response(f"You searched for 1{true_suffix}")
                 false_response = _echo_response(f"You searched for 1{false_suffix}")
+                self.assertIsNone(
+                    sql_boolean_signal(true_response, false_response, name)
+                )
+                # 어떤 쌍을 보냈는지 모르는 호출자에게도 보수적이어야 한다.
                 self.assertIsNone(sql_boolean_signal(true_response, false_response))
+
+    def test_a_filter_that_strips_the_quotes_is_still_only_a_reflection(self) -> None:
+        # XBEN-047은 SQL이 없는 앱인데 쌍따옴표를 지우고 되돌려준다. `1"or"1"="1` 이
+        # `1or1=1` 로 붙어 나오므로 단어 경계를 요구하는 패턴은 그것을 보지 못했고,
+        # 그 반사가 차등으로 읽혀 SQLi가 확정됐다.
+        manglings = (
+            lambda value: value.replace('"', "").replace("'", ""),
+            lambda value: re.sub(r"\s+", "", value),
+            lambda value: value.replace('"', "&quot;"),
+        )
+        for name, true_suffix, false_suffix in SQLI_BOOLEAN_PREDICATES:
+            for index, mangle in enumerate(manglings):
+                with self.subTest(predicate=name, mangling=index):
+                    true_response = _echo_response(
+                        f'<iframe src="{mangle("1" + true_suffix)}"></iframe>'
+                    )
+                    false_response = _echo_response(
+                        f'<iframe src="{mangle("1" + false_suffix)}"></iframe>'
+                    )
+                    self.assertIsNone(
+                        sql_boolean_signal(true_response, false_response, name)
+                    )
 
     def test_a_real_content_change_is_still_a_differential(self) -> None:
         true_response = _echo_response("User exists: admin")

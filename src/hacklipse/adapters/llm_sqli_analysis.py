@@ -228,7 +228,7 @@ class LlmSqliAnalyzer:
             false_response = boolean_evidence[index * 2 + 1]
             if true_response is None or false_response is None:
                 raise AgentContractError("SQLi boolean evidence was not collected")
-            signal = sql_boolean_signal(true_response, false_response)
+            signal = sql_boolean_signal(true_response, false_response, predicate)
             if signal is not None:
                 signalled.add(parameter)
             if signal is None or has_observation_record(

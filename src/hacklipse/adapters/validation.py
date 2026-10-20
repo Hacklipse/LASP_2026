@@ -1174,7 +1174,9 @@ class ValidationAgent:
                 false_response = collected[index * 2 + 1]
                 if true_response is None or false_response is None:
                     continue
-                if sql_boolean_signal(true_response, false_response) is None:
+                if sql_boolean_signal(
+                    true_response, false_response, _predicate
+                ) is None:
                     continue
                 proof_evidence = (true_response, false_response)
                 proof = ValidationProof(
