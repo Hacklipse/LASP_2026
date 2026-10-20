@@ -19,6 +19,7 @@ from hacklipse.adapters.path_traversal_analysis import (
     PATH_TRAVERSAL_PROOF_MARKERS,
 )
 from hacklipse.domain import ExecutionRequest, ExecutionResult, RunPhase, RunRequest, RunScope
+from hacklipse.adapters.probing import sqli_boolean_plan
 from hacklipse.ports.llm import LlmRequest, LlmResponse
 
 _HOST = "local.test"
@@ -167,8 +168,15 @@ class LlmWiringEndToEndTests(unittest.TestCase):
                 "evidence_collector",
                 "evidence_collector",
                 "sqli_analyzer",
-                "evidence_collector",
-                "evidence_collector",
+                # boolean 차등은 술어 쌍마다 참/거짓 두 요청을 보낸다. 쌍 수가
+                # 바뀌어도 배선 검사가 깨지지 않게 상수에서 센다.
+                *(["evidence_collector"] * (2 * len(sqli_boolean_plan(
+                    next(
+                        item for item in app.stores.surfaces.list_by_run(run.run_id)
+                        if "q" in item.parameters
+                    ),
+                    ("q",),
+                )))),
                 "sqli_analyzer",
                 "validation",
                 "evidence_collector",

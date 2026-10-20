@@ -32,6 +32,7 @@ from .probing import (
     ANALYSIS_TOOL,
     build_probe_requests,
     build_sqli_boolean_requests,
+    sqli_boolean_plan,
     has_observation_record,
     matching_evidence,
     probe_marker,
@@ -177,6 +178,7 @@ class HeuristicSqliAnalyzer:
             new_evidence_ids.append(observation_id)
 
         if not found_error_signal:
+            boolean_plan = sqli_boolean_plan(surface, parameters)
             boolean_requests = build_sqli_boolean_requests(
                 surface,
                 parameters,
@@ -205,12 +207,18 @@ class HeuristicSqliAnalyzer:
                     candidate_ids=(candidate.candidate_id,),
                 )
 
-            for index, parameter in enumerate(parameters):
+            signalled: set[str] = set()
+            for index, (parameter, predicate) in enumerate(boolean_plan):
+                if parameter in signalled:
+                    # 한 좌표에 두 술어가 모두 통하면 사실은 하나다. 관측을 늘리지 않는다.
+                    continue
                 true_response = boolean_evidence[index * 2]
                 false_response = boolean_evidence[index * 2 + 1]
                 if true_response is None or false_response is None:
                     raise AgentContractError("SQLi boolean evidence was not collected")
                 signal = sql_boolean_signal(true_response, false_response)
+                if signal is not None:
+                    signalled.add(parameter)
                 if signal is None or has_observation_record(
                     evidence,
                     HEURISTIC_SQLI_ANALYZER,
@@ -233,6 +241,9 @@ class HeuristicSqliAnalyzer:
                             "parameter": parameter,
                             "control_evidence_id": true_response.evidence_id,
                             "probe_evidence_id": false_response.evidence_id,
+                            # 어떤 술어 쌍이 차등을 만들었는지 남긴다. Validation이
+                            # 그 쌍 하나만 다시 보내므로 재현이 싸고 증명이 구체적이다.
+                            "predicate": predicate,
                             **signal,
                         },
                     )
@@ -416,17 +427,21 @@ def sql_boolean_signal(
     }
 
 
+# 술어 리터럴을 지우고 비교해야 "응답이 달라졌다"와 "보낸 값이 그대로 되돌아왔다"가
+# 갈린다. 지우지 못한 모양이 하나라도 있으면 반사만으로 차등이 생겨 오탐이 된다.
+# 따옴표는 HTML escape를 거쳐 돌아올 수 있으므로 escape된 형태도 함께 받는다.
+_QUOTE = r"""(?:["']|&quot;|&apos;|&#0?39;|&#0?34;)?"""
+_BOOLEAN_PROBE_REFLECTION = re.compile(
+    rf"""(?i)(?:\bAND\b|\bOR\b|&&|\|\||&amp;&amp;)\s*{_QUOTE}1{_QUOTE}\s*=\s*{_QUOTE}[12]{_QUOTE}"""
+)
+
+
 def _normalize_boolean_probe_reflection(body: str | None) -> str | None:
     """Remove the deliberate predicate literal before comparing response bodies."""
 
     if body is None:
         return None
-    normalized = re.sub(
-        r"(?i)\bAND\s+'?1'?\s*=\s*'?[12]'?",
-        "<sqli-bool-probe>",
-        body,
-    )
-    return normalized.strip()
+    return _BOOLEAN_PROBE_REFLECTION.sub("<sqli-bool-probe>", body).strip()
 
 
 def _engine_of(body: str) -> str | None:

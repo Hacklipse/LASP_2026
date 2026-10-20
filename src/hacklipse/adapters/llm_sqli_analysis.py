@@ -25,6 +25,7 @@ from hacklipse.ports.llm import LlmMessage, LlmRequest
 from .probing import (
     build_probe_requests,
     build_sqli_boolean_requests,
+    sqli_boolean_plan,
     has_observation_record,
     matching_evidence,
     probe_marker,
@@ -190,6 +191,7 @@ class LlmSqliAnalyzer:
                 candidate_ids=(candidate.candidate_id,),
             )
 
+        boolean_plan = sqli_boolean_plan(surface, selected)
         boolean_requests = build_sqli_boolean_requests(
             surface,
             parameters,
@@ -218,12 +220,17 @@ class LlmSqliAnalyzer:
                 candidate_ids=(candidate.candidate_id,),
             )
 
-        for index, parameter in enumerate(selected):
+        signalled: set[str] = set()
+        for index, (parameter, predicate) in enumerate(boolean_plan):
+            if parameter in signalled:
+                continue
             true_response = boolean_evidence[index * 2]
             false_response = boolean_evidence[index * 2 + 1]
             if true_response is None or false_response is None:
                 raise AgentContractError("SQLi boolean evidence was not collected")
             signal = sql_boolean_signal(true_response, false_response)
+            if signal is not None:
+                signalled.add(parameter)
             if signal is None or has_observation_record(
                 evidence,
                 LLM_SQLI_ANALYZER,
@@ -249,6 +256,8 @@ class LlmSqliAnalyzer:
                         "plan_evidence_id": plan_id,
                         "selection_source": "llm",
                         "selection_reason": reason,
+                        # 차등을 만든 술어 쌍. Validation이 그 쌍만 다시 보낸다.
+                        "predicate": predicate,
                         **signal,
                     },
                 )

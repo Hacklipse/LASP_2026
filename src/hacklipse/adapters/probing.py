@@ -17,6 +17,9 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from hacklipse.application.errors import AgentContractError, LlmOutputContractError
 from hacklipse.domain import (
+    SQLI_BOOLEAN_PREDICATES,
+    SQLI_NUMERIC_PREDICATES,
+    SQLI_STRING_PREDICATES,
     Candidate,
     Evidence,
     EvidenceRequest,
@@ -226,12 +229,89 @@ def build_probe_requests(
     return tuple(requests)
 
 
+# 한 분석에서 boolean 차등에 쓸 요청 수 상한. 좌표 수 × 술어 수가 예산을 먹지 않게
+# 묶는다. 쌍 단위이므로 항상 짝수다.
+_MAX_SQLI_BOOLEAN_REQUESTS = 8
+_SQLI_NUMERIC_BASELINE = re.compile(r"[+-]?\d+(?:\.\d+)?")
+_ALL_PREDICATES = SQLI_BOOLEAN_PREDICATES
+
+
+def sqli_boolean_predicates(
+    baseline: str | None,
+) -> tuple[tuple[str, str, str], ...]:
+    """그 좌표에 보낼 술어 쌍들을 고정 순서로 돌려준다.
+
+    관측된 값이 숫자면 숫자 술어만, 문자열이면 문자열 술어만 쓴다. 값을 관측하지
+    못한 좌표는 컬럼 타입을 알 수 없으므로 양쪽을 모두 보낸다 — 빈 입력을 "1"로
+    채운 뒤 그 모양만 보고 숫자로 단정하면, 문자열 컬럼에서는 성립하는 쌍을 한 번도
+    보내지 않게 된다.
+    """
+
+    if baseline is None:
+        # 상한에 걸려 뒤가 잘리므로 값이 큰 순서로 섞는다: 고전적인 문자열·숫자 쌍을
+        # 먼저, 그다음 공백·`and`를 지우는 필터를 지나는 쌍을 둔다.
+        by_name = {name: pair for pair in _ALL_PREDICATES for name in (pair[0],)}
+        return tuple(by_name[name] for name in (
+            "single_and_spaced", "and_spaced", "double_or_tight",
+            "single_or_tight", "double_and_spaced", "or_tight",
+        ))
+    if _SQLI_NUMERIC_BASELINE.fullmatch(baseline) is not None:
+        return SQLI_NUMERIC_PREDICATES
+    return SQLI_STRING_PREDICATES
+
+
+def sqli_boolean_plan(
+    surface: Surface,
+    probe_parameters: Sequence[str],
+    *,
+    predicates: Sequence[str] | None = None,
+    per_parameter_limit: int | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """어느 좌표에 어떤 술어 쌍을 보낼지 (좌표, 술어이름) 순서로 고정한다.
+
+    요청 목록과 소비자의 해석이 각자 색인을 계산하면 쌍이 늘어날 때 어긋난다. 계획을
+    한 곳에서 만들고 양쪽이 같은 것을 보게 한다. ``predicates``를 주면 그 이름만
+    남겨 Validation이 신호를 만든 쌍 하나만 재현한다.
+
+    상한에 걸릴 때 한 좌표가 예산을 다 먹지 않게 술어를 번갈아 돌린다.
+    ``per_parameter_limit``은 좌표마다 쓸 쌍의 수를 묶는다 — 어떤 쌍이 통했는지 적어
+    두지 않은 옛 Evidence를 재현할 때, 재현이 분석보다 비싸지지 않게 한다.
+    """
+
+    observed = dict(surface.observed_query)
+    wanted = None if predicates is None else set(predicates)
+    per_parameter = [
+        (
+            parameter,
+            [
+                name
+                for name, _true, _false in sqli_boolean_predicates(
+                    observed.get(parameter) or None
+                )
+                if wanted is None or name in wanted
+            ][:per_parameter_limit],
+        )
+        for parameter in dict.fromkeys(probe_parameters)
+    ]
+    plan: list[tuple[str, str]] = []
+    for round_index in range(max((len(names) for _, names in per_parameter), default=0)):
+        for parameter, names in per_parameter:
+            if round_index >= len(names):
+                continue
+            if 2 * (len(plan) + 1) > _MAX_SQLI_BOOLEAN_REQUESTS:
+                return tuple(plan)
+            plan.append((parameter, names[round_index]))
+    return tuple(plan)
+
+
 def build_sqli_boolean_requests(
     surface: Surface,
     parameters: Sequence[str],
     *,
     probe_parameters: Sequence[str],
     purpose: str,
+    predicates: Sequence[str] | None = None,
+    per_parameter_limit: int | None = None,
 ) -> tuple[EvidenceRequest, ...]:
     """Build bounded true/false SQL predicates while preserving request prerequisites.
 
@@ -254,17 +334,18 @@ def build_sqli_boolean_requests(
         return observed.get(name) or "1"
 
     requests: list[EvidenceRequest] = []
-    for parameter in selected:
-        base = baseline(parameter)
-        numeric = re.fullmatch(r"[+-]?\d+(?:\.\d+)?", base) is not None
-        suffixes = (
-            (" AND 1=1", " AND 1=2")
-            if numeric
-            else ("' AND '1'='1", "' AND '1'='2")
+    for parameter, predicate in sqli_boolean_plan(
+        surface, selected, predicates=predicates,
+        per_parameter_limit=per_parameter_limit,
+    ):
+        true_suffix, false_suffix = next(
+            (true, false)
+            for name, true, false in SQLI_BOOLEAN_PREDICATES
+            if name == predicate
         )
         for suffix, kind, label in (
-            (suffixes[0], HttpRequestKind.SQLI_BOOLEAN_TRUE, "true"),
-            (suffixes[1], HttpRequestKind.SQLI_BOOLEAN_FALSE, "false"),
+            (true_suffix, HttpRequestKind.SQLI_BOOLEAN_TRUE, f"{predicate} true"),
+            (false_suffix, HttpRequestKind.SQLI_BOOLEAN_FALSE, f"{predicate} false"),
         ):
             requests.append(
                 _request(

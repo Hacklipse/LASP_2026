@@ -24,6 +24,7 @@ from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 from .probing import (
     build_probe_requests,
     build_sqli_boolean_requests,
+    sqli_boolean_plan,
     matching_evidence,
     probe_marker,
 )
@@ -1102,9 +1103,12 @@ class ValidationAgent:
             return self._validate_graphql_sqli(
                 task, candidate, evidence, reproduction, surface, graphql_plans
             )
-        boolean_parameters = tuple(
+        # Analysis가 차등을 만든 술어 쌍까지 적어 둔다. 그 쌍 하나만 다시 보내면
+        # 재현이 싸고, 증명이 "어떤 모양으로 성립했는지"까지 가리킨다. 옛 Evidence에는
+        # 그 이름이 없으므로 없으면 전체 쌍으로 되돌아간다.
+        boolean_signals = tuple(
             dict.fromkeys(
-                parameter
+                (parameter, item.observation.get("predicate"))
                 for item in evidence
                 if item.surface_id == candidate.surface_id
                 and item.observation.get("type") == "sqli_differential"
@@ -1112,6 +1116,17 @@ class ValidationAgent:
                 and parameter in surface.parameters
             )
         )
+        boolean_parameters = tuple(dict.fromkeys(name for name, _ in boolean_signals))
+        boolean_predicates = tuple(
+            dict.fromkeys(
+                predicate for _, predicate in boolean_signals
+                if isinstance(predicate, str)
+            )
+        )
+        # 술어 이름을 적지 않던 Evidence는 어떤 쌍이 통했는지 알려주지 않는다. 전체
+        # 쌍으로 넓히면 재현이 분석보다 비싸지므로 좌표마다 첫 쌍 하나만 다시 보낸다.
+        boolean_limit = None if boolean_predicates else 1
+        boolean_predicates = boolean_predicates or None
         signaled_parameters = tuple(
             dict.fromkeys(
                 parameter
@@ -1128,6 +1143,12 @@ class ValidationAgent:
                 surface.parameters,
                 probe_parameters=boolean_parameters,
                 purpose=f"SQLi validation {task.validation_id}",
+                predicates=boolean_predicates,
+                per_parameter_limit=boolean_limit,
+            )
+            boolean_plan = sqli_boolean_plan(
+                surface, boolean_parameters, predicates=boolean_predicates,
+                per_parameter_limit=boolean_limit,
             )
             collected = tuple(
                 matching_evidence(reproduction, surface.url, request)
@@ -1148,7 +1169,7 @@ class ValidationAgent:
                 )
 
             reproduced = tuple(item for item in collected if item is not None)
-            for index, parameter in enumerate(boolean_parameters):
+            for index, (parameter, _predicate) in enumerate(boolean_plan):
                 true_response = collected[index * 2]
                 false_response = collected[index * 2 + 1]
                 if true_response is None or false_response is None:

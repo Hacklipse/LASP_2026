@@ -102,6 +102,24 @@ class ValidationProofType(str, Enum):
     FILE_UPLOAD_RETRIEVAL = "file_upload_retrieval"
 
 
+# SQLi boolean 차등에 쓰는 고정 술어 쌍 (이름, 참, 거짓). 문자열 리터럴의 따옴표는
+# 대상마다 다르고(MySQL은 홑·쌍을 모두 받는다) 공백이나 `and`를 지우는 입력 필터도
+# 흔하다. 한 쌍만 두면 "취약하지 않다"와 "이 모양이 그 대상에서 성립하지 않는다"가
+# 구분되지 않는다. 목록이 도메인에 있는 이유는 요청을 만드는 쪽과 불변식이 같은 집합을
+# 봐야 하기 때문이다 — 두 곳으로 갈라지면 한쪽만 넓혀도 다른 쪽이 거부한다.
+SQLI_NUMERIC_PREDICATES = (
+    ("and_spaced", " AND 1=1", " AND 1=2"),
+    ("or_tight", "||1=1", "||1=2"),
+)
+SQLI_STRING_PREDICATES = (
+    ("single_and_spaced", "' AND '1'='1", "' AND '1'='2"),
+    ("double_and_spaced", '" AND "1"="1', '" AND "1"="2'),
+    ("double_or_tight", '"or"1"="1', '"or"1"="2'),
+    ("single_or_tight", "'or'1'='1", "'or'1'='2"),
+)
+SQLI_BOOLEAN_PREDICATES = (*SQLI_NUMERIC_PREDICATES, *SQLI_STRING_PREDICATES)
+
+
 class HttpRequestKind(str, Enum):
     """비교 기준 요청과 취약점 탐색 요청을 기계적으로 구분한다."""
 
@@ -585,20 +603,14 @@ class HttpRequestSpec:
             HttpRequestKind.SQLI_BOOLEAN_TRUE,
             HttpRequestKind.SQLI_BOOLEAN_FALSE,
         }:
-            expected_suffix = (
-                " AND 1=1"
-                if self.request_kind is HttpRequestKind.SQLI_BOOLEAN_TRUE
-                else " AND 1=2"
+            index = (
+                1 if self.request_kind is HttpRequestKind.SQLI_BOOLEAN_TRUE else 2
             )
-            string_suffix = (
-                "' AND '1'='1"
-                if self.request_kind is HttpRequestKind.SQLI_BOOLEAN_TRUE
-                else "' AND '1'='2"
-            )
+            suffixes = tuple(pair[index] for pair in SQLI_BOOLEAN_PREDICATES)
             mutations = [
                 value
                 for _, value in (*self.query_parameters, *self.form_parameters)
-                if value.endswith(expected_suffix) or value.endswith(string_suffix)
+                if value.endswith(suffixes)
             ]
             if len(mutations) != 1:
                 raise DomainInvariantError(
