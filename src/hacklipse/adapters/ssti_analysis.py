@@ -49,10 +49,16 @@ SSTI_PARAMETER_HINTS = frozenset({"username", "name", "template", "content", "me
 # 한 문자열로 유지된다. #{...}만 쓰면 Jinja2·Twig·FreeMarker 계열에서는 평가 자체가
 # 일어나지 않아 "취약하지 않다"와 "문법이 안 맞았다"를 구분할 수 없다.
 SSTI_QUERY_PROBES = (
-    ("curly", "{{713*17}}"),      # Jinja2, Twig, Liquid, Django
+    ("curly", "{{713*17}}"),      # Jinja2, Twig, Liquid
     ("dollar", "${713*17}"),      # FreeMarker, JSP EL, Thymeleaf
     ("hash", "#{713*17}"),        # Ruby/Slim, Pug
     ("erb", "<%=713*17%>"),       # ERB, EJS
+    # Django 템플릿 언어는 산술식을 평가하지 않는다. {{713*17}}은 Django에서 빈
+    # 문자열로 렌더되므로 산술 probe만으로는 "취약하지 않다"와 "이 엔진은 그 문법을
+    # 모른다"를 구분할 수 없다. Django는 더하기를 필터로 하므로 같은 기대 문자열
+    # 12121이 나오는 필터 표현식을 따로 보낸다. 따옴표 없는 인자를 쓰는 이유는
+    # 따옴표를 지우는 필터에 대입이 잘리지 않게 하기 위해서다.
+    ("django", "{{12104|add:17}}"),
 )
 # 쿼리 probe가 보낼 수 있는 값 전체. 안전 검증기가 이 집합 밖의 값을 거부한다.
 SSTI_PROBE_EXPRESSIONS = frozenset(

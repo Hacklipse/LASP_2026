@@ -10,6 +10,7 @@ from hacklipse.adapters import HeuristicSstiAnalyzer, StaticApprovalGate
 from hacklipse.adapters.policy import AllowlistPolicyGate
 from hacklipse.adapters.ssti_analysis import (
     HEURISTIC_SSTI_ANALYZER,
+    ssti_query_execution_signal,
     SSTI_APPROVAL_REF,
     SSTI_CLEANUP_VALUE,
     SSTI_CONTROL_VALUE,
@@ -23,6 +24,7 @@ from hacklipse.adapters.ssti_analysis import (
 from hacklipse.bootstrap import build_local_application
 from hacklipse.domain import (
     AgentResultStatus,
+    Evidence,
     Candidate,
     ExecutionRequest,
     ExecutionResult,
@@ -175,6 +177,49 @@ def _form_request(
     }
     defaults.update(overrides)
     return ExecutionRequest(**defaults)
+
+
+def _ssti_body(text: str) -> Evidence:
+    return Evidence(
+        evidence_id=f"evi-{text[:8]}", run_id=_RUN_ID, surface_id=_SURFACE_ID,
+        created_by="test", evidence_type="http_response",
+        observation={"type": "http_response", "status": 200, "body": text},
+    )
+
+
+class SstiDialectCoverageTests(unittest.TestCase):
+    """엔진마다 평가되는 문법이 다르다. 한 방언만 보내면 미탐과 문법 불일치가 섞인다."""
+
+    def test_every_probe_targets_the_one_expected_result(self) -> None:
+        # 기대 문자열이 방언마다 달라지면 신호 판정이 방언 수만큼 갈라진다.
+        self.assertGreaterEqual(len(SSTI_QUERY_PROBES), 5)
+        self.assertEqual(
+            len({dialect for dialect, _ in SSTI_QUERY_PROBES}), len(SSTI_QUERY_PROBES)
+        )
+        for _dialect, expression in SSTI_QUERY_PROBES:
+            self.assertNotIn(SSTI_EXPECTED_RESULT, expression)
+
+    def test_an_engine_without_arithmetic_is_still_detected(self) -> None:
+        # Django 템플릿 언어는 {{713*17}}을 평가하지 않고 빈 문자열로 렌더한다.
+        # 산술 probe만 보내면 "취약하지 않다"와 "이 엔진은 그 문법을 모른다"가 섞인다.
+        dialects = dict(SSTI_QUERY_PROBES)
+        self.assertIn("django", dialects)
+        collected = [_ssti_body(f"Hello, {SSTI_CONTROL_VALUE}")]
+        for dialect, expression in SSTI_QUERY_PROBES:
+            rendered = (
+                SSTI_EXPECTED_RESULT if dialect == "django"
+                else ""  # 산술식은 이 엔진에서 평가되지 않는다
+            )
+            collected.append(_ssti_body(f"Hello, {rendered}"))
+
+        self.assertEqual(ssti_query_execution_signal(collected), "django")
+
+    def test_an_engine_that_only_echoes_produces_no_signal(self) -> None:
+        collected = [_ssti_body(f"Hello, {SSTI_CONTROL_VALUE}")]
+        collected.extend(
+            _ssti_body(f"Hello, {expression}") for _, expression in SSTI_QUERY_PROBES
+        )
+        self.assertIsNone(ssti_query_execution_signal(collected))
 
 
 class SstiStatelessFormContractTests(unittest.TestCase):
