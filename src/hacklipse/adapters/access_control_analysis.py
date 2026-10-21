@@ -47,7 +47,9 @@ from .request_safety import object_identifier_parameters
 ACCESS_CONTROL_TOOL = "access_control_probe"
 HEURISTIC_ACCESS_CONTROL_ANALYZER = "heuristic_access_control_analyzer"
 
-_OBSERVATION_TYPE = "object_id_auth"
+# Knowledge 와 Router 가 같은 문자열을 베끼지 않도록 공개한다.
+OBSERVATION_TYPE = "object_id_auth"
+_OBSERVATION_TYPE = OBSERVATION_TYPE
 _PATH_IDENTIFIER_PREFIX = "path:"
 
 # 접근이 거부됐거나 세션이 끊겼음을 나타내는 문구. 이런 응답을 정상 객체 접근으로
