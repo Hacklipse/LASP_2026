@@ -222,6 +222,7 @@ def build_local_application(
     selected_budget = ReservedBudgetManager(
         budget_manager if budget_manager is not None else InMemoryBudgetManager()
     )
+
     policy = AllowlistPolicyGate(approval_gate=approval_gate)
     # 명시적인 Runtime 주입이 없으면 외부 실행을 전부 거부하는 구현을 선택한다.
     selected_runtime = runtime or DisabledExecutionRuntime()
@@ -381,9 +382,10 @@ IMPLEMENTED_ANALYZERS = (
     "postmessage_xss_analyzer",
     "sqli_analyzer",
     "path_traversal_analyzer",
-    "ssti_analyzer",
     "arbitrary_file_read_analyzer",
+    "ssti_analyzer",
 )
+
 
 def standard_router(
     vulnerability_types: Collection[str] | None = None,

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from urllib.parse import urlsplit
 
-from hacklipse.domain import ExecutionRequest, Run, RunRequest, RunScope
-from hacklipse.ports import ApprovalGate
-from hacklipse.ports.errors import ApprovalRequired, PolicyViolation
+from hacklipse.domain import ExecutionRequest, HttpRequestKind, Run, RunRequest, RunScope
+from hacklipse.ports import ApprovalGate, SurfaceStore
+from hacklipse.ports.errors import ApprovalRequired, PolicyViolation, RecordNotFound
 
 from .request_safety import has_state_changing_get
 from .security import DenyAllApprovalGate
@@ -34,6 +34,7 @@ class AllowlistPolicyGate:
 
     def __init__(self, approval_gate: ApprovalGate | None = None) -> None:
         self._approval = approval_gate or DenyAllApprovalGate()
+
 
     def validate_run(self, request: RunRequest) -> None:
         """Run 시작 대상이 선언된 Scope 안에 있는지 검사한다."""

@@ -13,6 +13,7 @@ from hacklipse.domain import (
     Surface,
     TaskEnvelope,
     credential_for_vulnerability,
+    HttpRequestKind,
 )
 
 _PATH_TRAVERSAL_TOOL = "path_traversal_probe"
@@ -162,11 +163,17 @@ class TaskFactory:
     ) -> TaskEnvelope:
         """추가 증적 요청을 공통 Runtime Worker용 Task로 변환한다."""
 
+        if request.target_url_override is not None and not (
+            request.suggested_tool == _ARBITRARY_FILE_READ_TOOL
+            and request.http_request is not None
+            and request.http_request.request_kind is HttpRequestKind.FILE_READ_PUBLIC_CHECK
+        ):
+            raise ValueError("target URL override is reserved for file-read public checks")
         return self._base(
             run,
             agent_type=agent_type,
             request_budget=request_budget,
-            target_url=target_url,
+            target_url=request.target_url_override or target_url,
             surface_id=candidate.surface_id,
             candidate_id=candidate.candidate_id,
             evidence_ids=candidate.evidence_ids,

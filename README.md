@@ -138,3 +138,37 @@ fact preservation, offered-set citation containment, status representation, and
 narrator cost. Neither establishes semantic accuracy: the fixed-fixture human
 blind review that the measurement contract also requires is not part of this
 tool. Keep the target and its state fixed when collecting the runs.
+
+# Arbitrary File Read detector
+
+The `Arbitrary File Read` agent proves that a server opens a path it was not
+meant to serve. The `Path Traversal` agent stays separate and proves a different
+fact — that the server follows an escape sequence it was handed.
+
+It works three ways, all on observed GET coordinates:
+
+- an observed query input, carrying the fixed absolute proof path;
+- a path that carries its input as `name=value` (`/file=web_assets/app.js`),
+  replacing only the span the value occupies, never appending a query;
+- when the absolute path is refused, a read that leaves the directory the
+  observed values live in. That one escalation is why a target which rejects
+  both the escape sequence and the absolute path can still be proven.
+
+The file to read is fixed per probe kind in the domain, so neither an agent nor
+a model can choose another one, and only a marker seen in the probe and absent
+from the control confirms. Validation repeats the pair independently. Analyzer
+and module docstrings carry the probe contract and the cases it cannot reach;
+bodies of any kind are the main one.
+
+Run the common pipeline against an authorized local application:
+
+```bash
+python scripts/run_baseline.py 'http://127.0.0.1:8000/download?file=sample' 80
+```
+
+Being merged in from `feat/arbitrary-file-read-detection-plan`: a table of
+probe values (relative depths and encoded forms beside the absolute path), a
+coordinate that replaces one path segment, and a check of whether the proof
+file is already public on the same origin. Until those land the agent sends one
+value per coordinate, reaches no path-segment input, and does not check whether
+the file was public to begin with.

@@ -75,6 +75,8 @@ class ValidationReasonCode(str, Enum):
     PROBE_SIGNAL_NOT_REPRODUCED = "probe_signal_not_reproduced"
     REPRODUCTION_EXECUTION_ERROR = "reproduction_execution_error"
     COMPARABLE_RESPONSES_MISSING = "comparable_responses_missing"
+    FILE_READ_BUDGET_EXHAUSTED = "file_read_budget_exhausted"
+    FILE_READ_CONFIGURATION_MISMATCH = "file_read_configuration_mismatch"
     ACCESS_PLAN_MISSING = "access_plan_missing"
     ACCESS_BUDGET_EXHAUSTED = "access_budget_exhausted"
     VALIDATION_SESSION_MISMATCH = "validation_session_mismatch"
@@ -121,6 +123,9 @@ class HttpRequestKind(str, Enum):
     SQLI_BOOLEAN_TRUE = "sqli_boolean_true"
     SQLI_BOOLEAN_FALSE = "sqli_boolean_false"
     PATH_TRAVERSAL_PROBE = "path_traversal_probe"
+    # 증명 파일이 정상 경로로도 공개돼 있는지 확인하는 요청. 앱이 원래 공개하는 파일을
+    # 읽기 취약점으로 오인하지 않기 위한 대조군이다.
+    FILE_READ_PUBLIC_CHECK = "file_read_public_check"
     ACCESS_CONTROL_PROBE = "access_control_probe"
     SSTI_PROBE = "ssti_probe"
     SSTI_CLEANUP = "ssti_cleanup"
@@ -574,6 +579,13 @@ class HttpRequestSpec:
     path_assignment_value_start: int | None = None
     path_assignment_value_end: int | None = None
     path_assignment_value: str | None = None
+    # AFR may replace one observed URL segment with an approved safe-file path.
+    file_read_path_index: int | None = None
+    file_read_path_value: str | None = None
+    # Query AFR probes identify the one coordinate that may differ from the
+    # observed request template. Policy validation uses this instead of
+    # treating every query value as attacker-controlled probe text.
+    file_read_parameter: str | None = None
 
     def __post_init__(self) -> None:
         if not self.method or _HTTP_METHOD.fullmatch(self.method) is None:
@@ -673,6 +685,28 @@ class HttpRequestSpec:
                     f"path suffix must be the fixed bypass suffix: {self.path_suffix!r}"
                 )
         self._validate_path_assignment()
+        if (self.file_read_path_index is None) != (self.file_read_path_value is None):
+            raise DomainInvariantError("file-read path index and value must be paired")
+        if self.file_read_path_index is not None:
+            if (self.request_kind not in {
+                HttpRequestKind.CONTROL, HttpRequestKind.ARBITRARY_FILE_READ_PROBE
+            } or self.file_read_path_index < 1 or not self.file_read_path_value):
+                raise DomainInvariantError("invalid file-read path mutation")
+        if self.file_read_parameter is not None:
+            if (
+                self.request_kind not in {
+                    HttpRequestKind.CONTROL,
+                    HttpRequestKind.ARBITRARY_FILE_READ_PROBE,
+                }
+                or self.file_read_path_index is not None
+                or not self.file_read_parameter
+                or sum(
+                    name == self.file_read_parameter
+                    for name, _ in self.query_parameters
+                )
+                != 1
+            ):
+                raise DomainInvariantError("invalid file-read query mutation")
         if self.request_kind is HttpRequestKind.ACCESS_CONTROL_PROBE:
             self._validate_access_control_probe()
         if self.request_kind is HttpRequestKind.OPEN_REDIRECT_PROBE and (
@@ -735,6 +769,13 @@ class HttpRequestSpec:
         )
         if all(value is None for value in span):
             return
+        # 경로를 고치는 좌표가 둘 있다 — 세그먼트 교체와 `이름=값`의 값 교체. 둘은
+        # 같은 자리를 다르게 보는 대안이므로 함께 실으면 결과 경로를 어느 쪽도
+        # 책임지지 못한다.
+        if self.file_read_path_index is not None:
+            raise DomainInvariantError(
+                "a request may replace a path segment or a path assignment, not both"
+            )
         if any(value is None for value in span):
             raise DomainInvariantError(
                 "path assignment name, span, and value must be provided together"
@@ -837,6 +878,7 @@ class EvidenceRequest:
     reason: str
     suggested_tool: str
     http_request: HttpRequestSpec | None = None
+    target_url_override: str | None = None
     # Agent는 어떤 자격증명을 쓸지 고를 수 없고 역할만 지정한다. 역할 → credential_ref
     # 해석은 중앙 Collector가 Run에 등록된 매핑으로만 수행한다.
     principal_role: AccessPrincipalRole | None = None
@@ -848,6 +890,8 @@ class EvidenceRequest:
     approval_ref: str | None = None
 
     def __post_init__(self) -> None:
+        if self.target_url_override is not None and not self.target_url_override:
+            raise DomainInvariantError("evidence target override cannot be blank")
         if self.principal_role is not None and not isinstance(
             self.principal_role, AccessPrincipalRole
         ):
@@ -902,6 +946,9 @@ class EvidenceRequest:
                     if request.path_assignment_name is not None
                     else None
                 ),
+                "file_read_path_index": request.file_read_path_index,
+                "file_read_path_present": request.file_read_path_value is not None,
+                "file_read_parameter": request.file_read_parameter,
                 "surface_id": self.surface_id,
                 "target": [
                     parsed.scheme.casefold(),
@@ -1226,11 +1273,14 @@ class Candidate:
         if self.validation_reason_code is not None:
             try:
                 object.__setattr__(
-                    self, "validation_reason_code",
+                    self,
+                    "validation_reason_code",
                     ValidationReasonCode(self.validation_reason_code),
                 )
             except ValueError as error:
-                raise DomainInvariantError("unknown candidate validation reason code") from error
+                raise DomainInvariantError(
+                    f"unknown validation reason code: {self.validation_reason_code!r}"
+                ) from error
 
     def add_evidence(self, evidence_ids: tuple[str, ...]) -> Candidate:
         """기존 순서를 유지하면서 중복 없이 Evidence 참조를 합친다."""
@@ -1478,6 +1528,9 @@ class ExecutionRequest:
     path_assignment_value_start: int | None = None
     path_assignment_value_end: int | None = None
     path_assignment_value: str | None = None
+    file_read_path_index: int | None = None
+    file_read_path_value: str | None = None
+    file_read_parameter: str | None = None
     validation_id: str | None = None
     timeout_seconds: float = 120.0
     credential_ref: str | None = None
@@ -1502,6 +1555,9 @@ class ExecutionRequest:
             path_assignment_value_start=self.path_assignment_value_start,
             path_assignment_value_end=self.path_assignment_value_end,
             path_assignment_value=self.path_assignment_value,
+            file_read_path_index=self.file_read_path_index,
+            file_read_path_value=self.file_read_path_value,
+            file_read_parameter=self.file_read_parameter,
         )
         if self.timeout_seconds <= 0:
             raise DomainInvariantError("execution timeout must be positive")
@@ -1530,6 +1586,14 @@ class ExecutionRequest:
             path = f"{path}{self.path_suffix}"
         if self.path_assignment_name is not None:
             path = self._replace_path_assignment(path)
+        if self.file_read_path_index is not None:
+            segments = path.split("/")
+            index = self.file_read_path_index
+            if not (1 <= index < len(segments)):
+                raise DomainInvariantError("file-read path index is outside the target URL")
+            assert self.file_read_path_value is not None
+            segments[index] = quote(self.file_read_path_value, safe="")
+            path = "/".join(segments)
         encoded = urlencode(self.query_parameters)
         query = parsed.query
         if encoded:

@@ -367,6 +367,7 @@ DEFAULT_ANALYZER_CAPABILITIES = (
 )
 
 
+
 @dataclass(frozen=True, slots=True)
 class AnalyzerCapabilityCoverage:
     """등록된 Analyzer capability의 현재 Run 실행 가능 여부."""
