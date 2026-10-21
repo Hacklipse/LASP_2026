@@ -100,6 +100,9 @@ class ValidationProofType(str, Enum):
     ERROR_DETAIL_EXPOSURE = "error_detail_exposure"
     OPEN_REDIRECT = "open_redirect"
     ARBITRARY_FILE_READ = "arbitrary_file_read"
+    # 선언된 하위 디렉터리를 벗어나 읽은 경우. 같은 Agent가 다루지만 증명하는 사실이
+    # 절대 경로 읽기와 달라, 수출 단계에서 같은 CWE로 뭉개지지 않도록 분리한다.
+    DIRECTORY_ESCAPE_FILE_READ = "directory_escape_file_read"
     CORS_ORIGIN_REFLECTION = "cors_origin_reflection"
 
 
@@ -122,7 +125,7 @@ class HttpRequestKind(str, Enum):
     SSTI_PROBE = "ssti_probe"
     SSTI_CLEANUP = "ssti_cleanup"
     ARBITRARY_FILE_READ_PROBE = "arbitrary_file_read_probe"
-    PATH_TRAVERSAL_ROOT_ESCAPE_PROBE = "path_traversal_root_escape_probe"
+    DIRECTORY_ESCAPE_PROBE = "directory_escape_probe"
 
 
 class AccessPrincipalRole(str, Enum):
@@ -186,21 +189,21 @@ PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH = "../package.json"
 #
 # 왜 README.md 인가 — 프로젝트 루트의 공개 설명 파일이라 비밀이 아니고, 언어 생태계를
 # 가리지 않고 가장 흔하다. 없으면 증명하지 못한 채로 남기지, 다른 파일을 고르지 않는다.
-PATH_TRAVERSAL_DECLARED_ROOT_PROOF_FILE = "README.md"
+DIRECTORY_ESCAPE_PROOF_FILE = "README.md"
 # 존재할 리 없는 이름. 같은 자리에서 "파일 없음" 응답이 어떻게 생겼는지 받아 두면,
 # 200으로 오류 화면을 돌려주는 앱을 증명으로 오인하지 않는다.
-PATH_TRAVERSAL_DECLARED_ROOT_ABSENT_FILE = "hacklipse-absent-proof.md"
+DIRECTORY_ESCAPE_ABSENT_FILE = "hacklipse-absent-proof.md"
 # 탈출 탐침의 형태. 앞의 한 세그먼트는 관측된 값의 첫 디렉터리 이름이고 나머지는 고정이다.
 # 경로가 어휘적으로 정규화되므로 `X/../README.md`는 X가 무엇이든 base의 README.md 하나만
 # 가리킨다 — 즉 앞 세그먼트는 "선언된 디렉터리를 벗어난다"는 형태를 만들 뿐 읽는 파일을
 # 바꾸지 못한다. 그래서 이 탐침이 읽을 수 있는 실재 파일은 끝까지 하나뿐이다.
-_PATH_TRAVERSAL_ROOT_ESCAPE = re.compile(
+_DIRECTORY_ESCAPE = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}/\.\./(?:"
     + "|".join(
         re.escape(name)
         for name in (
-            PATH_TRAVERSAL_DECLARED_ROOT_PROOF_FILE,
-            PATH_TRAVERSAL_DECLARED_ROOT_ABSENT_FILE,
+            DIRECTORY_ESCAPE_PROOF_FILE,
+            DIRECTORY_ESCAPE_ABSENT_FILE,
         )
     )
     + r")"
@@ -250,10 +253,10 @@ def is_path_traversal_safe_form_probe_value(value: str) -> bool:
     return value == PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH
 
 
-def is_path_traversal_root_escape_value(value: str) -> bool:
+def is_directory_escape_value(value: str) -> bool:
     """선언된 하위 디렉터리를 벗어나는 고정 형태의 탐침 값인지 확인한다."""
 
-    return _PATH_TRAVERSAL_ROOT_ESCAPE.fullmatch(value) is not None
+    return _DIRECTORY_ESCAPE.fullmatch(value) is not None
 
 
 def is_path_traversal_bypass_suffix(value: str) -> bool:
@@ -274,7 +277,7 @@ def is_path_traversal_bypass_suffix(value: str) -> bool:
 _PATH_ASSIGNMENT_PROBE_VALUES: dict[HttpRequestKind, Callable[[str], bool]] = {
     HttpRequestKind.PATH_TRAVERSAL_PROBE: is_path_traversal_safe_probe_value,
     HttpRequestKind.ARBITRARY_FILE_READ_PROBE: is_arbitrary_file_read_safe_probe_value,
-    HttpRequestKind.PATH_TRAVERSAL_ROOT_ESCAPE_PROBE: is_path_traversal_root_escape_value,
+    HttpRequestKind.DIRECTORY_ESCAPE_PROBE: is_directory_escape_value,
 }
 
 

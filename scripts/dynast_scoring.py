@@ -35,6 +35,9 @@ _CWE = {
     # 이 분석기가 따로 있는 이유 자체가 ``..`` 를 거르는 필터가 절대 경로는 막지
     # 못한다는 것이므로, 부모로 뭉개지 않고 정확한 쪽을 쓴다.
     ValidationProofType.ARBITRARY_FILE_READ: "CWE-36",
+    # 탈출 탐침 값은 상대 경로에 탈출 시퀀스를 담으므로 CWE-23 이다. 절대 경로(CWE-36)와
+    # 같은 Agent 가 내보내지만 증명한 사실이 다르므로 같은 값으로 뭉개지 않는다.
+    ValidationProofType.DIRECTORY_ESCAPE_FILE_READ: "CWE-23",
     # 사용자가 바꿀 수 있는 객체 식별자로 남의 객체를 읽는 IDOR.
     ValidationProofType.UNAUTHORIZED_OBJECT_ACCESS: "CWE-639",
     ValidationProofType.SSTI_EXECUTION: "CWE-1336",

@@ -26,6 +26,8 @@ MAX_PATH_HINT_LENGTH = 160
 PROOF_DESCRIPTIONS = MappingProxyType({
     ValidationProofType.ARBITRARY_FILE_READ:
         "고정 절대 경로 control/probe 비교에서 파일 읽기 확인",
+    ValidationProofType.DIRECTORY_ESCAPE_FILE_READ:
+        "선언된 하위 디렉터리 밖 고정 파일 읽기를 control/probe 비교로 확인",
     ValidationProofType.CORS_ORIGIN_REFLECTION:
         "독립 GET 요청에서 외부 Origin 반사와 credential 허용 확인",
     ValidationProofType.XSS_EXECUTION:

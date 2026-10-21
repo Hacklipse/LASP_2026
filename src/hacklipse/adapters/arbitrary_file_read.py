@@ -17,8 +17,12 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from hacklipse.application.errors import AgentContractError
+import re
+
 from hacklipse.domain import (
     ARBITRARY_FILE_READ_SAFE_PROBE_PATH,
+    DIRECTORY_ESCAPE_ABSENT_FILE,
+    DIRECTORY_ESCAPE_PROOF_FILE,
     AgentResult,
     AgentResultStatus,
     Evidence,
@@ -29,6 +33,7 @@ from hacklipse.domain import (
     Surface,
     TaskEnvelope,
     is_arbitrary_file_read_safe_probe_value,
+    is_directory_escape_value,
 )
 from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 from hacklipse.ports.errors import BudgetExceeded
@@ -56,6 +61,12 @@ ARBITRARY_FILE_READ_PROOF_MARKERS = ("PRETTY_NAME=", "VERSION_ID=")
 # 경로에 실린 입력 자리를 절대 경로로 탐침하는 capability. Path Traversal 쪽과 좌표는
 # 같지만 싣는 값과 증명하는 사실이 다르므로 별도로 둔다.
 ARBITRARY_FILE_READ_PATH_CAPABILITY = "arbitrary_file_read.http.path_assignment"
+# 선언된 하위 디렉터리를 벗어나 읽는 전략. 고정 절대 경로가 앱 루트 밖이라 영영 거부되는
+# 대상에서도 "읽어선 안 되는 자리를 연다"는 사실은 이쪽으로 증명된다. 증명하는 사실이
+# 달라 Observation과 proof type을 따로 둔다.
+DIRECTORY_ESCAPE_CAPABILITY = "arbitrary_file_read.http.directory_escape"
+DIRECTORY_ESCAPE_OBSERVATION = "directory_escape"
+_ROOT_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # 탐침이 바뀌지 않은 파라미터에 싣는 값. Path Traversal control 과 같은 역할이다.
 CONTROL_VALUE = "hacklipse-control"
 # Recon의 ``url_or_file_parameter`` 관측은 파일 이름과 URL 이름을 한 목록으로 묶는다
@@ -109,15 +120,24 @@ def validate_arbitrary_file_read_request(request: ExecutionRequest) -> None:
         # 경로에 실린 입력의 값만 바꾸는 탐침. 도메인이 이미 종류별 고정 값 하나만
         # 허용했고, 여기서는 이 도구로 들어온 요청에도 같은 계약이 적용됐는지
         # 독립적으로 다시 확인한다.
-        if request.request_kind is not HttpRequestKind.ARBITRARY_FILE_READ_PROBE:
-            raise ValueError("path assignment replacement requires the probe kind")
-        if not is_arbitrary_file_read_safe_probe_value(
-            request.path_assignment_value or ""
-        ):
-            raise ValueError("path assignment probe may only use the fixed safe path")
+        value = request.path_assignment_value or ""
+        if request.request_kind is HttpRequestKind.DIRECTORY_ESCAPE_PROBE:
+            if not is_directory_escape_value(value):
+                raise ValueError(
+                    "directory escape probe may only use the fixed escape shape"
+                )
+        elif request.request_kind is HttpRequestKind.ARBITRARY_FILE_READ_PROBE:
+            if not is_arbitrary_file_read_safe_probe_value(value):
+                raise ValueError("path assignment probe may only use the fixed safe path")
+        else:
+            raise ValueError("path assignment replacement requires a probe kind")
         if request.query_parameters:
             raise ValueError("path assignment probe cannot add query parameters")
         return
+
+    if request.request_kind is HttpRequestKind.DIRECTORY_ESCAPE_PROBE:
+        # 이 전략은 관측된 경로 좌표에서만 성립한다. 좌표 없이 오면 바꿀 자리가 없다.
+        raise ValueError("directory escape probe requires an observed path assignment")
 
     values = tuple(value for _, value in request.query_parameters)
     if request.request_kind is HttpRequestKind.CONTROL:
@@ -246,6 +266,162 @@ def build_arbitrary_file_read_path_requests(
             ),
         ),
     )
+
+
+def declared_root_of(assignment) -> str | None:
+    """관측된 값의 첫 디렉터리 이름. 이 표면이 의도한 하위 디렉터리로 본다.
+
+    값에 디렉터리가 없으면(``/file=app.js``) 벗어날 하위 디렉터리 자체가 없으므로
+    이 탐침은 성립하지 않는다.
+    """
+
+    head, separator, _ = assignment.observed_value.partition("/")
+    if not separator or not head or head in {".", ".."}:
+        return None
+    return head if _ROOT_SEGMENT.fullmatch(head) else None
+
+
+_ROOT_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+UNLINKED_RENDER_PARAMETER_OBSERVATION = "unlinked_render_parameter_candidate"
+PATH_TRAVERSAL_POST_APPROVAL_REF = "approved-path-traversal-form-probe"
+_INFERRED_PARAMETER_SOURCE = "bounded_unlinked_render_parameter"
+HIDDEN_BODY_CAPABILITY = "path_traversal.hidden_body_parameter"
+HIDDEN_PLAN_OBSERVATION = "hidden_body_parameter_plan"
+_HIDDEN_BENIGN_PATH = "package.json"
+
+
+def build_directory_escape_requests(
+    surface: Surface, *, purpose: str
+) -> tuple[EvidenceRequest, ...]:
+    """관측 URL control, 없는 파일 대조, 그리고 디렉터리 탈출 탐침을 만든다.
+
+    세 번째가 증명이다. ``web_assets/../README.md``는 어휘 정규화 후 base 의
+    ``README.md`` 하나만 가리키지만, 정규화 전에는 선언된 디렉터리 밖을 지난다.
+    그 디렉터리로 읽기를 가두는 서버는 이 경로를 거부해야 한다. 내려주면 제한이
+    강제되지 않는다는 뜻이다.
+
+    두 번째는 "없는 파일"을 같은 자리에서 받아 본다. 200으로 오류 화면을 돌려주는
+    앱에서 그 화면을 증명으로 오인하지 않기 위한 대조군이다.
+    """
+
+    assignment = surface.path_assignment
+    if assignment is None:
+        raise AgentContractError(
+            "directory escape probe requires an observed coordinate"
+        )
+    declared_root = declared_root_of(assignment)
+    if declared_root is None:
+        raise AgentContractError(
+            "directory escape probe requires an observed directory to escape"
+        )
+    if surface.method.upper() != "GET":
+        raise AgentContractError("directory escape probe supports GET surfaces only")
+    if not assignment.matches(surface.url):
+        raise AgentContractError("path assignment span does not match the surface URL")
+
+    def escape(file_name: str, reason: str) -> EvidenceRequest:
+        return EvidenceRequest(
+            evidence_type="http_response",
+            surface_id=surface.surface_id,
+            reason=reason,
+            suggested_tool=ARBITRARY_FILE_READ_TOOL,
+            http_request=HttpRequestSpec(
+                method="GET",
+                request_kind=HttpRequestKind.DIRECTORY_ESCAPE_PROBE,
+                path_assignment_name=assignment.name,
+                path_assignment_value_start=assignment.value_start,
+                path_assignment_value_end=assignment.value_end,
+                path_assignment_value=f"{declared_root}/../{file_name}",
+            ),
+        )
+
+    return (
+        EvidenceRequest(
+            evidence_type="http_response",
+            surface_id=surface.surface_id,
+            reason=f"observed path control request for {purpose}",
+            suggested_tool=ARBITRARY_FILE_READ_TOOL,
+            http_request=HttpRequestSpec(
+                method="GET", request_kind=HttpRequestKind.CONTROL
+            ),
+        ),
+        escape(
+            DIRECTORY_ESCAPE_ABSENT_FILE,
+            f"absent-file control outside the declared root for {purpose}",
+        ),
+        escape(
+            DIRECTORY_ESCAPE_PROOF_FILE,
+            f"declared directory escape probe for path assignment "
+            f"{assignment.name} on {purpose}",
+        ),
+    )
+
+
+def directory_escape_signal(
+    control: Evidence, absent: Evidence, escape: Evidence
+) -> bool:
+    """선언된 디렉터리 밖의 파일이 실제로 제공되었는지 판정한다.
+
+    상태 코드 차이만으로는 확정하지 않는다. 탈출 경로가 2xx 로 비어 있지 않은 본문을
+    돌려주고, 그 본문이 관측 파일과도 "없는 파일" 응답과도 달라야 한다. 세 번째 조건이
+    200 으로 오류 화면을 주는 앱을 걸러 낸다.
+    """
+
+    status = escape.observation.get("status")
+    body = response_body(escape)
+    if not isinstance(status, int) or not 200 <= status < 300 or not body:
+        return False
+    return body != response_body(control) and body != response_body(absent)
+
+
+def record_directory_escape_observation(
+    *,
+    task: TaskEnvelope,
+    surface: Surface,
+    control: Evidence,
+    absent: Evidence,
+    escape: Evidence,
+    evidence: Sequence[Evidence],
+    evidence_store: EvidenceStore,
+    created_by: str,
+    id_factory: Callable[[], str],
+) -> list[str]:
+    """Python 이 확인한 디렉터리 탈출 읽기만 Observation 으로 저장한다."""
+
+    assignment = surface.path_assignment
+    assert assignment is not None
+    if not directory_escape_signal(control, absent, escape):
+        return []
+    if has_observation_record(
+        evidence,
+        created_by,
+        ARBITRARY_FILE_READ_OBSERVATION,
+        assignment.name,
+        control.evidence_id,
+        escape.evidence_id,
+    ):
+        return []
+    observation_id = f"evi-{id_factory()}"
+    evidence_store.append(
+        Evidence(
+            evidence_id=observation_id,
+            run_id=task.run_id,
+            surface_id=surface.surface_id,
+            created_by=created_by,
+            evidence_type="observation",
+            observation={
+                "type": ARBITRARY_FILE_READ_OBSERVATION,
+                "parameter": assignment.name,
+                "location": "path_assignment",
+                "escape": DIRECTORY_ESCAPE_OBSERVATION,
+                "declared_root": declared_root_of(assignment),
+                "proof_file": DIRECTORY_ESCAPE_PROOF_FILE,
+                "control_evidence_id": control.evidence_id,
+                "probe_evidence_id": escape.evidence_id,
+            },
+        )
+    )
+    return [observation_id]
 
 
 def arbitrary_file_read_signal(control: Evidence, probe: Evidence) -> bool:
@@ -426,10 +602,8 @@ class HeuristicArbitraryFileReadAnalyzer:
 
         assignment = surface.path_assignment
         assert assignment is not None  # prefers_path_assignment 가 이미 확인했다.
-        requests = build_arbitrary_file_read_path_requests(
-            surface,
-            purpose=f"Arbitrary File Read candidate {candidate.candidate_id}",
-        )
+        purpose = f"Arbitrary File Read candidate {candidate.candidate_id}"
+        requests = build_arbitrary_file_read_path_requests(surface, purpose=purpose)
         collected = tuple(
             matching_evidence(evidence, surface.url, request) for request in requests
         )
@@ -461,6 +635,49 @@ class HeuristicArbitraryFileReadAnalyzer:
             created_by=HEURISTIC_ARBITRARY_FILE_READ_ANALYZER,
             id_factory=self._id_factory,
             extra={"location": "path_assignment"},
+        )
+        if new_ids or declared_root_of(assignment) is None:
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.COMPLETED,
+                new_evidence_ids=tuple(new_ids),
+                candidate_ids=(candidate.candidate_id,),
+            )
+
+        # 경로를 그대로 열지는 않았다. 그래도 선언된 디렉터리 밖으로 나갈 수는 있다 —
+        # 앱 루트 밖을 막는 대상에서는 이쪽만 성립한다. 절대 경로가 통하는 대상에서는
+        # 여기까지 오지 않으므로 표면당 요청이 늘지 않는다.
+        escalated = build_directory_escape_requests(surface, purpose=purpose)
+        collected = tuple(
+            matching_evidence(evidence, surface.url, request) for request in escalated
+        )
+        missing = tuple(
+            request for request, item in zip(escalated, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "directory escape lacks budget for its evidence requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+                candidate_ids=(candidate.candidate_id,),
+            )
+        escape_control, absent, escape = collected
+        if escape_control is None or absent is None or escape is None:
+            raise AgentContractError("directory escape evidence was not collected")
+        new_ids = record_directory_escape_observation(
+            task=task,
+            surface=surface,
+            control=escape_control,
+            absent=absent,
+            escape=escape,
+            evidence=evidence,
+            evidence_store=self._evidence,
+            created_by=HEURISTIC_ARBITRARY_FILE_READ_ANALYZER,
+            id_factory=self._id_factory,
         )
         return AgentResult(
             task_id=task.task_id,

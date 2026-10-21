@@ -19,10 +19,12 @@ from .error_disclosure import (
 )
 from .sensitive_exposure import CONFIG_ROUTE_OBSERVATION
 from .public_login_credentials import PUBLIC_LOGIN_OBSERVATION, PUBLIC_LOGIN_TYPE
-from .arbitrary_file_read import ARBITRARY_FILE_READ_PATH_CAPABILITY
+from .arbitrary_file_read import (
+    ARBITRARY_FILE_READ_PATH_CAPABILITY,
+    DIRECTORY_ESCAPE_CAPABILITY,
+)
 from .open_redirect_analysis import REDIRECT_PARAMETER_HINTS
 from .path_traversal_analysis import (
-    ROOT_ESCAPE_CAPABILITY,
     FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION,
     PATH_ASSIGNMENT_CAPABILITY,
     PATH_ASSIGNMENT_OBSERVATION,
@@ -246,27 +248,6 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         default_priority=0.26,
     ),
     AnalyzerCapability(
-        # 고정 OS 파일이 앱 루트 밖이라 영영 거부되는 대상에서도, 선언된 하위 디렉터리
-        # 제한이 강제되지 않는다는 사실은 증명할 수 있다.
-        capability_id=ROOT_ESCAPE_CAPABILITY,
-        agent_type="path_traversal_analyzer",
-        vulnerability_type="Path Traversal",
-        methods=("GET",),
-        surface_kind="server",
-        requires_parameters=False,
-        requires_path_assignment=True,
-        observation_requirements=(
-            ObservationRequirement(PATH_ASSIGNMENT_OBSERVATION, PATH_ASSIGNMENT_SOURCE),
-            ObservationRequirement(
-                FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION, PATH_ASSIGNMENT_SOURCE
-            ),
-        ),
-        exploration_parameter_source="none",
-        supported_evidence_types=("control_response", "file_read_marker"),
-        strategy_ids=("probe_declared_root_escape",),
-        default_priority=0.25,
-    ),
-    AnalyzerCapability(
         capability_id="path_traversal.bounded_render_form",
         agent_type="path_traversal_analyzer",
         vulnerability_type="Path Traversal",
@@ -350,6 +331,27 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         supported_evidence_types=("control_response", "file_read_marker"),
         strategy_ids=("probe_observed_path_assignment_absolute",),
         default_priority=0.24,
+    ),
+    AnalyzerCapability(
+        # 같은 경로 좌표의 세 번째 전략. 고정 절대 경로가 앱 루트 밖이라 영영 거부되는
+        # 대상에서도, 선언된 하위 디렉터리 제한이 강제되지 않는다는 사실은 증명된다.
+        capability_id=DIRECTORY_ESCAPE_CAPABILITY,
+        agent_type="arbitrary_file_read_analyzer",
+        vulnerability_type="Arbitrary File Read",
+        methods=("GET",),
+        surface_kind="server",
+        requires_parameters=False,
+        requires_path_assignment=True,
+        observation_requirements=(
+            ObservationRequirement(PATH_ASSIGNMENT_OBSERVATION, PATH_ASSIGNMENT_SOURCE),
+            ObservationRequirement(
+                FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION, PATH_ASSIGNMENT_SOURCE
+            ),
+        ),
+        exploration_parameter_source="none",
+        supported_evidence_types=("control_response", "file_read_marker"),
+        strategy_ids=("probe_directory_escape",),
+        default_priority=0.23,
     ),
     AnalyzerCapability(
         capability_id="arbitrary_file_read.http.query",

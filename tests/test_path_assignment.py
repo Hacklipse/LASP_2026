@@ -21,10 +21,6 @@ from hacklipse.adapters.analyzer_capabilities import (
 )
 from hacklipse.adapters.http_runtime import HttpExecutionRuntime
 from hacklipse.adapters.path_traversal_analysis import (
-    PATH_TRAVERSAL_ROOT_ESCAPE_OBSERVATION,
-    ROOT_ESCAPE_ABSENT_FILE,
-    ROOT_ESCAPE_PROOF_FILE,
-    declared_root_of,
     FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION,
     PATH_ASSIGNMENT_CAPABILITY,
     PATH_ASSIGNMENT_OBSERVATION,
@@ -38,6 +34,12 @@ from hacklipse.adapters.path_traversal_analysis import (
 )
 from hacklipse.adapters.arbitrary_file_read import (
     ARBITRARY_FILE_READ_PATH_CAPABILITY,
+    DIRECTORY_ESCAPE_ABSENT_FILE,
+    DIRECTORY_ESCAPE_CAPABILITY,
+    DIRECTORY_ESCAPE_OBSERVATION,
+    DIRECTORY_ESCAPE_PROOF_FILE,
+    build_directory_escape_requests,
+    declared_root_of,
     ARBITRARY_FILE_READ_PROBE_PATH,
     ARBITRARY_FILE_READ_PROOF_MARKERS,
     ARBITRARY_FILE_READ_TOOL,
@@ -71,7 +73,7 @@ from hacklipse.domain import (
     Surface,
     TaskEnvelope,
     ValidationProofType,
-    is_path_traversal_root_escape_value,
+    is_directory_escape_value,
 )
 from hacklipse.ports.errors import ApprovalRequired, PolicyViolation
 
@@ -1182,12 +1184,16 @@ class ArbitraryFileReadWiringTests(unittest.TestCase):
         self.assertEqual(analysis.allowed_tools, (ARBITRARY_FILE_READ_TOOL,))
         self.assertEqual(validation.allowed_tools, (ARBITRARY_FILE_READ_TOOL,))
 
-    def test_confirmed_proof_type_is_accepted_by_the_orchestrator(self) -> None:
+    def test_confirmed_proof_types_are_accepted_by_the_orchestrator(self) -> None:
         from hacklipse.application.orchestrator import _PROOF_TYPE_BY_VULNERABILITY
 
+        # 한 Agent 가 여러 전략을 가지므로 확정 근거도 여럿이다.
         self.assertEqual(
             _PROOF_TYPE_BY_VULNERABILITY["Arbitrary File Read"],
-            ValidationProofType.ARBITRARY_FILE_READ,
+            (
+                ValidationProofType.ARBITRARY_FILE_READ,
+                ValidationProofType.DIRECTORY_ESCAPE_FILE_READ,
+            ),
         )
 
     def test_one_observation_can_reach_both_file_analyzers(self) -> None:
@@ -1290,7 +1296,9 @@ def _declared_root_run(**options):
     runtime = _DeclaredRootRuntime(**options)
     app = build_local_application(
         {}, runtime=runtime,
-        router=standard_router(vulnerability_types=("Path Traversal",)),
+        router=standard_router(
+            vulnerability_types=("Path Traversal", "Arbitrary File Read")
+        ),
     )
     register_standard_agents(app, recon_max_pages=2)
     run = app.orchestrator.start(
@@ -1308,11 +1316,11 @@ class DeclaredRootEscapeTests(unittest.TestCase):
 
     def test_escape_value_shape_is_fixed(self) -> None:
         for value in (
-            f"web_assets/../{ROOT_ESCAPE_PROOF_FILE}",
-            f"static/../{ROOT_ESCAPE_ABSENT_FILE}",
+            f"web_assets/../{DIRECTORY_ESCAPE_PROOF_FILE}",
+            f"static/../{DIRECTORY_ESCAPE_ABSENT_FILE}",
         ):
             with self.subTest(value=value):
-                self.assertTrue(is_path_traversal_root_escape_value(value))
+                self.assertTrue(is_directory_escape_value(value))
         # 한 단계만 올라가고, 읽는 파일은 고정된 둘 중 하나뿐이다.
         for value in (
             "web_assets/../../README.md",
@@ -1323,7 +1331,7 @@ class DeclaredRootEscapeTests(unittest.TestCase):
             "README.md",
         ):
             with self.subTest(value=value):
-                self.assertFalse(is_path_traversal_root_escape_value(value))
+                self.assertFalse(is_directory_escape_value(value))
 
     def test_kind_is_bound_to_the_escape_shape(self) -> None:
         base = {
@@ -1332,15 +1340,15 @@ class DeclaredRootEscapeTests(unittest.TestCase):
             "path_assignment_value_end": _VALUE_END,
         }
         spec = HttpRequestSpec(
-            request_kind=HttpRequestKind.PATH_TRAVERSAL_ROOT_ESCAPE_PROBE,
-            path_assignment_value=f"web_assets/../{ROOT_ESCAPE_PROOF_FILE}", **base,
+            request_kind=HttpRequestKind.DIRECTORY_ESCAPE_PROBE,
+            path_assignment_value=f"web_assets/../{DIRECTORY_ESCAPE_PROOF_FILE}", **base,
         )
-        self.assertTrue(spec.path_assignment_value.endswith(ROOT_ESCAPE_PROOF_FILE))
+        self.assertTrue(spec.path_assignment_value.endswith(DIRECTORY_ESCAPE_PROOF_FILE))
         # 다른 종류의 고정 값을 이 종류로 실을 수 없고, 그 반대도 안 된다.
         for kind, value in (
-            (HttpRequestKind.PATH_TRAVERSAL_ROOT_ESCAPE_PROBE, PATH_TRAVERSAL_PROBE_PATH),
-            (HttpRequestKind.PATH_TRAVERSAL_ROOT_ESCAPE_PROBE, ARBITRARY_FILE_READ_PROBE_PATH),
-            (HttpRequestKind.PATH_TRAVERSAL_PROBE, f"web_assets/../{ROOT_ESCAPE_PROOF_FILE}"),
+            (HttpRequestKind.DIRECTORY_ESCAPE_PROBE, PATH_TRAVERSAL_PROBE_PATH),
+            (HttpRequestKind.DIRECTORY_ESCAPE_PROBE, ARBITRARY_FILE_READ_PROBE_PATH),
+            (HttpRequestKind.PATH_TRAVERSAL_PROBE, f"web_assets/../{DIRECTORY_ESCAPE_PROOF_FILE}"),
         ):
             with self.subTest(kind=kind, value=value), self.assertRaises(
                 DomainInvariantError
@@ -1352,8 +1360,8 @@ class DeclaredRootEscapeTests(unittest.TestCase):
         for prefix in ("a/b", "..", ".", "a/../b", "/abs"):
             with self.subTest(prefix=prefix):
                 self.assertFalse(
-                    is_path_traversal_root_escape_value(
-                        f"{prefix}/../{ROOT_ESCAPE_PROOF_FILE}"
+                    is_directory_escape_value(
+                        f"{prefix}/../{DIRECTORY_ESCAPE_PROOF_FILE}"
                     )
                 )
 
@@ -1372,14 +1380,14 @@ class DeclaredRootEscapeTests(unittest.TestCase):
         self.assertIs(run.phase, RunPhase.DONE)
         self.assertEqual(
             [item.vulnerability_type for item in app.stores.findings.list_by_run(run.run_id)],
-            ["Path Traversal"],
+            ["Arbitrary File Read"],
         )
         observation = next(
             item for item in app.stores.evidence.list_by_run(run.run_id)
-            if item.observation.get("escape") == PATH_TRAVERSAL_ROOT_ESCAPE_OBSERVATION
+            if item.observation.get("escape") == DIRECTORY_ESCAPE_OBSERVATION
         )
         self.assertEqual(observation.observation["declared_root"], "web_assets")
-        self.assertEqual(observation.observation["proof_file"], ROOT_ESCAPE_PROOF_FILE)
+        self.assertEqual(observation.observation["proof_file"], DIRECTORY_ESCAPE_PROOF_FILE)
 
     def test_confining_app_is_not_confirmed(self) -> None:
         # README.md 가 앱 루트에 있어도, 정규화 후 가두는 서버는 내주지 않는다.
@@ -1400,12 +1408,12 @@ class DeclaredRootEscapeTests(unittest.TestCase):
 
         kinds = [
             item.request_kind.value for item in runtime.requests
-            if item.tool == PATH_TRAVERSAL_TOOL
+            if item.tool == ARBITRARY_FILE_READ_TOOL
         ]
-        # 고정 OS 파일 탐침이 먼저 나가고, 신호가 없을 때만 탈출 탐침이 뒤따른다.
+        # 고정 절대 경로 탐침이 먼저 나가고, 신호가 없을 때만 탈출 탐침이 뒤따른다.
         self.assertLess(
-            kinds.index("path_traversal_probe"),
-            kinds.index("path_traversal_root_escape_probe"),
+            kinds.index("arbitrary_file_read_probe"),
+            kinds.index("directory_escape_probe"),
         )
 
     def test_safe_file_success_does_not_spend_escape_requests(self) -> None:
@@ -1416,7 +1424,7 @@ class DeclaredRootEscapeTests(unittest.TestCase):
             [
                 item for item in runtime.requests
                 if item.request_kind
-                is HttpRequestKind.PATH_TRAVERSAL_ROOT_ESCAPE_PROBE
+                is HttpRequestKind.DIRECTORY_ESCAPE_PROBE
             ],
             [],
         )
@@ -1427,7 +1435,7 @@ class DeclaredRootEscapeTests(unittest.TestCase):
         finding = app.stores.findings.list_by_run(run.run_id)[0]
         escapes = [
             item for item in runtime.requests
-            if item.request_kind is HttpRequestKind.PATH_TRAVERSAL_ROOT_ESCAPE_PROBE
+            if item.request_kind is HttpRequestKind.DIRECTORY_ESCAPE_PROBE
             and item.validation_id == finding.validation_id
         ]
         # Validation 세션이 없는 파일 대조군과 탈출 탐침을 직접 다시 보냈다.
@@ -1443,7 +1451,7 @@ class DeclaredRootEscapeTests(unittest.TestCase):
         _, runtime, _ = _declared_root_run(confine=False)
 
         for item in runtime.requests:
-            if item.request_kind is not HttpRequestKind.PATH_TRAVERSAL_ROOT_ESCAPE_PROBE:
+            if item.request_kind is not HttpRequestKind.DIRECTORY_ESCAPE_PROBE:
                 continue
             self.assertEqual(item.path_assignment_name, "file")
             self.assertNotIn("?", item.resolved_url)

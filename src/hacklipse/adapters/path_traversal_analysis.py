@@ -23,8 +23,6 @@ from hacklipse.domain import (
     HttpRequestKind,
     HttpRequestSpec,
     PATH_TRAVERSAL_BYPASS_SUFFIX,
-    PATH_TRAVERSAL_DECLARED_ROOT_ABSENT_FILE,
-    PATH_TRAVERSAL_DECLARED_ROOT_PROOF_FILE,
     PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH,
     PATH_TRAVERSAL_SAFE_PROBE_PATH,
     ExecutionRequest,
@@ -32,7 +30,6 @@ from hacklipse.domain import (
     TaskEnvelope,
     is_path_traversal_safe_probe_value,
     is_path_traversal_safe_form_probe_value,
-    is_path_traversal_root_escape_value,
 )
 from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
@@ -72,34 +69,13 @@ FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION = "file_like_path_assignment"
 # 무엇을 건너뛰었는지 감사할 수 있게 남긴다.
 PATH_ASSIGNMENT_SKIPPED_OBSERVATION = "path_assignment_skipped"
 PATH_ASSIGNMENT_CAPABILITY = "path_traversal.http.path_assignment"
-# 선언된 하위 디렉터리 밖으로 나가는지 확인하는 좌표. 고정 OS 파일이 앱 루트 밖이라
-# 영영 거부되는 대상에서도, 실제 취약점인 "디렉터리 탈출"은 증명할 수 있다.
-ROOT_ESCAPE_CAPABILITY = "path_traversal.http.declared_root_escape"
-PATH_TRAVERSAL_ROOT_ESCAPE_OBSERVATION = "declared_root_escape"
-ROOT_ESCAPE_PROOF_FILE = PATH_TRAVERSAL_DECLARED_ROOT_PROOF_FILE
-ROOT_ESCAPE_ABSENT_FILE = PATH_TRAVERSAL_DECLARED_ROOT_ABSENT_FILE
-
-
-def declared_root_of(assignment) -> str | None:
-    """관측된 값의 첫 디렉터리 이름. 이 표면이 의도한 하위 디렉터리로 본다.
-
-    값에 디렉터리가 없으면(``/file=app.js``) 벗어날 하위 디렉터리 자체가 없으므로
-    이 탐침은 성립하지 않는다.
-    """
-
-    head, separator, _ = assignment.observed_value.partition("/")
-    if not separator or not head or head in {".", ".."}:
-        return None
-    return head if _ROOT_SEGMENT.fullmatch(head) else None
-
-
-_ROOT_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 UNLINKED_RENDER_PARAMETER_OBSERVATION = "unlinked_render_parameter_candidate"
 PATH_TRAVERSAL_POST_APPROVAL_REF = "approved-path-traversal-form-probe"
 _INFERRED_PARAMETER_SOURCE = "bounded_unlinked_render_parameter"
 HIDDEN_BODY_CAPABILITY = "path_traversal.hidden_body_parameter"
 HIDDEN_PLAN_OBSERVATION = "hidden_body_parameter_plan"
 _HIDDEN_BENIGN_PATH = "package.json"
+
 
 
 def validate_path_traversal_request(request: ExecutionRequest) -> None:
@@ -133,12 +109,6 @@ def validate_path_traversal_request(request: ExecutionRequest) -> None:
         return
     if method != "GET" or request.body is not None or request.headers:
         raise ValueError("path traversal safe-file probe supports GET or approved POST")
-    if (
-        request.request_kind is HttpRequestKind.PATH_TRAVERSAL_ROOT_ESCAPE_PROBE
-        and request.path_assignment_name is None
-    ):
-        # 이 종류는 관측된 경로 좌표에서만 성립한다. 좌표 없이 오면 바꿀 자리가 없다.
-        raise ValueError("root escape probe requires an observed path assignment")
     if request.path_suffix is not None:
         # 우회 탐침은 표면이 이미 가리키는 파일에 고정 접미사만 덧붙인다. 다른 파일을
         # 고를 수 없으므로 파라미터도 필요 없다. 접미사 값은 도메인이 검증했다.
@@ -151,17 +121,10 @@ def validate_path_traversal_request(request: ExecutionRequest) -> None:
         # 경로에 실린 입력의 값만 바꾸는 탐침. 도메인이 이미 "고정 증명 경로 하나,
         # GET, 다른 변형 없음"을 강제했고, 여기서는 이 도구로 들어온 요청에도 같은
         # 계약이 적용됐는지 독립적으로 다시 확인한다.
-        value = request.path_assignment_value or ""
-        if request.request_kind is HttpRequestKind.PATH_TRAVERSAL_ROOT_ESCAPE_PROBE:
-            if not is_path_traversal_root_escape_value(value):
-                raise ValueError(
-                    "root escape probe may only use the fixed escape shape"
-                )
-        elif request.request_kind is HttpRequestKind.PATH_TRAVERSAL_PROBE:
-            if not is_path_traversal_safe_probe_value(value):
-                raise ValueError("path assignment probe may only use the fixed safe path")
-        else:
-            raise ValueError("path assignment replacement requires a probe kind")
+        if request.request_kind is not HttpRequestKind.PATH_TRAVERSAL_PROBE:
+            raise ValueError("path assignment replacement requires the probe kind")
+        if not is_path_traversal_safe_probe_value(request.path_assignment_value or ""):
+            raise ValueError("path assignment probe may only use the fixed safe path")
         if request.query_parameters:
             raise ValueError("path assignment probe cannot add query parameters")
         return
@@ -249,10 +212,7 @@ class HeuristicPathTraversalAnalyzer:
             )
 
         selected = path_parameters_from_evidence(evidence, surface, parameters)
-        if prefers_path_assignment(
-            candidate, surface, evidence, selected,
-            capability_id=ROOT_ESCAPE_CAPABILITY,
-        ) or prefers_path_assignment(candidate, surface, evidence, selected):
+        if prefers_path_assignment(candidate, surface, evidence, selected):
             return handle_path_assignment(
                 task=task,
                 candidate=candidate,
@@ -374,30 +334,6 @@ def prefers_path_assignment(
     return not selected and not candidate.exploration_parameters
 
 
-def build_path_assignment_plan_requests(
-    surface: Surface,
-    *,
-    purpose: str,
-    safe_file: bool,
-    root_escape: bool,
-) -> tuple[EvidenceRequest, ...]:
-    """선택된 탐침들을 control 하나를 공유하는 한 벌의 요청으로 만든다.
-
-    control 은 관측된 URL 그대로라 어느 탐침에나 같은 비교 기준이다. 따로 보내면
-    같은 요청을 두 번 쓰게 되므로 공유한다.
-    """
-
-    if not safe_file and not root_escape:
-        raise AgentContractError("path assignment plan must select at least one probe")
-    requests = list(build_path_assignment_requests(surface, purpose=purpose))
-    if not safe_file:
-        requests = requests[:1]
-    if root_escape:
-        # 첫 요소는 같은 control 이므로 버리고 탐침만 덧붙인다.
-        requests.extend(build_root_escape_requests(surface, purpose=purpose)[1:])
-    return tuple(requests)
-
-
 def build_path_assignment_requests(
     surface: Surface, *, purpose: str
 ) -> tuple[EvidenceRequest, ...]:
@@ -461,19 +397,16 @@ def handle_path_assignment(
 
     assignment = surface.path_assignment
     assert assignment is not None  # prefers_path_assignment 가 이미 확인했다.
-    safe_file, root_escape = path_assignment_probe_plan(candidate, surface)
-    purpose = f"Path Traversal candidate {candidate.candidate_id}"
-
-    def gather(requests: tuple[EvidenceRequest, ...]):
-        collected = tuple(
-            matching_evidence(evidence, surface.url, request) for request in requests
-        )
-        missing = tuple(
-            request for request, item in zip(requests, collected) if item is None
-        )
-        return collected, missing
-
-    def needs(missing: tuple[EvidenceRequest, ...]) -> AgentResult:
+    requests = build_path_assignment_requests(
+        surface, purpose=f"Path Traversal candidate {candidate.candidate_id}"
+    )
+    collected = tuple(
+        matching_evidence(evidence, surface.url, request) for request in requests
+    )
+    missing = tuple(
+        request for request, item in zip(requests, collected) if item is None
+    )
+    if missing:
         if task.request_budget < len(missing):
             raise BudgetExceeded(
                 "path assignment probe lacks budget for its evidence requests"
@@ -485,54 +418,20 @@ def handle_path_assignment(
             candidate_ids=(candidate.candidate_id,),
         )
 
-    # 디렉터리 밖 OS 파일을 직접 읽은 쪽이 더 강한 증명이므로 먼저 시도하고, 신호가
-    # 없을 때만 탈출 탐침으로 넘어간다. 한꺼번에 보내면 OS 파일이 통하는 대상에서도
-    # 표면마다 요청을 두 배로 쓴다.
-    if safe_file:
-        requests = build_path_assignment_requests(surface, purpose=purpose)
-        collected, missing = gather(requests)
-        if missing:
-            return needs(missing)
-        control, probe = collected
-        if control is None or probe is None:
-            raise AgentContractError("path assignment evidence was not collected")
-        new_ids = record_path_traversal_observations(
-            task=task,
-            surface=surface,
-            selected=(assignment.name,),
-            control=control,
-            probes=(probe,),
-            evidence=evidence,
-            evidence_store=evidence_store,
-            created_by=created_by,
-            id_factory=id_factory,
-            extra={"location": "path_assignment"},
-        )
-        if new_ids or not root_escape:
-            return AgentResult(
-                task_id=task.task_id,
-                status=AgentResultStatus.COMPLETED,
-                new_evidence_ids=tuple(new_ids),
-                candidate_ids=(candidate.candidate_id,),
-            )
-
-    requests = build_root_escape_requests(surface, purpose=purpose)
-    collected, missing = gather(requests)
-    if missing:
-        return needs(missing)
-    control, absent, escape = collected
-    if control is None or absent is None or escape is None:
-        raise AgentContractError("declared root escape evidence was not collected")
-    new_ids = record_root_escape_observation(
+    control, probe = collected
+    if control is None or probe is None:  # missing 이후에는 도달하지 않는다.
+        raise AgentContractError("path assignment evidence was not collected")
+    new_ids = record_path_traversal_observations(
         task=task,
         surface=surface,
+        selected=(assignment.name,),
         control=control,
-        absent=absent,
-        escape=escape,
+        probes=(probe,),
         evidence=evidence,
         evidence_store=evidence_store,
         created_by=created_by,
         id_factory=id_factory,
+        extra={"location": "path_assignment"},
     )
     return AgentResult(
         task_id=task.task_id,
@@ -540,156 +439,6 @@ def handle_path_assignment(
         new_evidence_ids=tuple(new_ids),
         candidate_ids=(candidate.candidate_id,),
     )
-
-
-def path_assignment_probe_plan(
-    candidate: Candidate, surface: Surface
-) -> tuple[bool, bool]:
-    """이 Candidate가 경로 좌표에서 어떤 탐침을 보낼지 정한다.
-
-    capability Router는 좌표·전략마다 Candidate를 따로 만들므로 선언된 것만 보낸다.
-    규칙 Router는 (Surface, 취약점 유형)당 Candidate 하나뿐이라 한쪽만 고르면 다른
-    증명 기회가 영영 사라진다. 그래서 규칙 모드에서는 둘 다 보내고 control을 공유한다.
-    """
-
-    escapable = declared_root_of(surface.path_assignment) is not None
-    if candidate.routing_capability_id == PATH_ASSIGNMENT_CAPABILITY:
-        return True, False
-    if candidate.routing_capability_id == ROOT_ESCAPE_CAPABILITY:
-        return False, escapable
-    return True, escapable
-
-
-def build_root_escape_requests(
-    surface: Surface, *, purpose: str
-) -> tuple[EvidenceRequest, ...]:
-    """관측 URL control, 없는 파일 대조, 그리고 디렉터리 탈출 탐침을 만든다.
-
-    세 번째가 증명이다. ``web_assets/../README.md``는 어휘 정규화 후 base 의
-    ``README.md`` 하나만 가리키지만, 정규화 전에는 선언된 디렉터리 밖을 지난다.
-    그 디렉터리로 읽기를 가두는 서버는 이 경로를 거부해야 한다. 내려주면 제한이
-    강제되지 않는다는 뜻이다.
-
-    두 번째는 "없는 파일"을 같은 자리에서 받아 본다. 200으로 오류 화면을 돌려주는
-    앱에서 그 화면을 증명으로 오인하지 않기 위한 대조군이다.
-    """
-
-    assignment = surface.path_assignment
-    if assignment is None:
-        raise AgentContractError("root escape probe requires an observed coordinate")
-    declared_root = declared_root_of(assignment)
-    if declared_root is None:
-        raise AgentContractError(
-            "root escape probe requires an observed directory to escape"
-        )
-    if surface.method.upper() != "GET":
-        raise AgentContractError("root escape probe supports GET surfaces only")
-    if not assignment.matches(surface.url):
-        raise AgentContractError("path assignment span does not match the surface URL")
-
-    def escape(file_name: str, reason: str) -> EvidenceRequest:
-        return EvidenceRequest(
-            evidence_type="http_response",
-            surface_id=surface.surface_id,
-            reason=reason,
-            suggested_tool=PATH_TRAVERSAL_TOOL,
-            http_request=HttpRequestSpec(
-                method="GET",
-                request_kind=HttpRequestKind.PATH_TRAVERSAL_ROOT_ESCAPE_PROBE,
-                path_assignment_name=assignment.name,
-                path_assignment_value_start=assignment.value_start,
-                path_assignment_value_end=assignment.value_end,
-                path_assignment_value=f"{declared_root}/../{file_name}",
-            ),
-        )
-
-    return (
-        EvidenceRequest(
-            evidence_type="http_response",
-            surface_id=surface.surface_id,
-            reason=f"observed path control request for {purpose}",
-            suggested_tool=PATH_TRAVERSAL_TOOL,
-            http_request=HttpRequestSpec(
-                method="GET", request_kind=HttpRequestKind.CONTROL
-            ),
-        ),
-        escape(
-            ROOT_ESCAPE_ABSENT_FILE,
-            f"absent-file control outside the declared root for {purpose}",
-        ),
-        escape(
-            ROOT_ESCAPE_PROOF_FILE,
-            f"declared root escape probe for path assignment "
-            f"{assignment.name} on {purpose}",
-        ),
-    )
-
-
-def root_escape_signal(
-    control: Evidence, absent: Evidence, escape: Evidence
-) -> bool:
-    """선언된 디렉터리 밖의 파일이 실제로 제공되었는지 판정한다.
-
-    상태 코드 차이만으로는 확정하지 않는다. 탈출 경로가 2xx 로 비어 있지 않은 본문을
-    돌려주고, 그 본문이 관측 파일과도 "없는 파일" 응답과도 달라야 한다. 세 번째 조건이
-    200 으로 오류 화면을 주는 앱을 걸러 낸다.
-    """
-
-    status = escape.observation.get("status")
-    body = response_body(escape)
-    if not isinstance(status, int) or not 200 <= status < 300 or not body:
-        return False
-    return body != response_body(control) and body != response_body(absent)
-
-
-def record_root_escape_observation(
-    *,
-    task: TaskEnvelope,
-    surface: Surface,
-    control: Evidence,
-    absent: Evidence,
-    escape: Evidence,
-    evidence: Sequence[Evidence],
-    evidence_store: EvidenceStore,
-    created_by: str,
-    id_factory: Callable[[], str],
-) -> list[str]:
-    """Python 이 확인한 디렉터리 탈출 읽기만 Observation 으로 저장한다."""
-
-    assignment = surface.path_assignment
-    assert assignment is not None
-    if not root_escape_signal(control, absent, escape):
-        return []
-    if has_observation_record(
-        evidence,
-        created_by,
-        PATH_TRAVERSAL_OBSERVATION,
-        assignment.name,
-        control.evidence_id,
-        escape.evidence_id,
-    ):
-        return []
-    observation_id = f"evi-{id_factory()}"
-    evidence_store.append(
-        Evidence(
-            evidence_id=observation_id,
-            run_id=task.run_id,
-            surface_id=surface.surface_id,
-            created_by=created_by,
-            evidence_type="observation",
-            observation={
-                "type": PATH_TRAVERSAL_OBSERVATION,
-                "parameter": assignment.name,
-                "location": "path_assignment",
-                "escape": PATH_TRAVERSAL_ROOT_ESCAPE_OBSERVATION,
-                "declared_root": declared_root_of(assignment),
-                "proof_file": ROOT_ESCAPE_PROOF_FILE,
-                "control_evidence_id": control.evidence_id,
-                "probe_evidence_id": escape.evidence_id,
-            },
-        )
-    )
-    return [observation_id]
 
 
 def is_restricted_file_surface(
