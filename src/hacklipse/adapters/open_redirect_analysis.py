@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Sequence
 from html.parser import HTMLParser
 from uuid import uuid4
@@ -39,6 +40,13 @@ def redirected_to_probe(evidence: Evidence | None, expected_url: str) -> bool:
     if evidence is None:
         return False
     observation = evidence.observation
+    destination_hashes = observation.get("open_redirect_destination_hashes")
+    if (
+        isinstance(destination_hashes, (list, tuple))
+        and hashlib.sha256(expected_url.encode("utf-8")).hexdigest()
+        in destination_hashes
+    ):
+        return True
     if (
         evidence.evidence_type == "http_redirect"
         and observation.get("status") in {301, 302, 303, 307, 308}

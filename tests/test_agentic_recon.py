@@ -149,10 +149,11 @@ class AgenticPlannerContractTests(unittest.TestCase):
 
 
 class _Collector:
-    def __init__(self, evidence_store, bodies: dict[str, str], statuses=None) -> None:
+    def __init__(self, evidence_store, bodies: dict[str, str], statuses=None, content_types=None) -> None:
         self._evidence = evidence_store
         self._bodies = bodies
         self._statuses = statuses or {}
+        self._content_types = content_types or {}
         self.calls: list[str] = []
         self._next_id = 0
 
@@ -180,7 +181,9 @@ class _Collector:
                 observation={
                     "type": "http_response",
                     "status": self._statuses.get(target_url, 200),
-                    "content_type": "text/html; charset=utf-8",
+                    "content_type": self._content_types.get(
+                        target_url, "text/html; charset=utf-8"
+                    ),
                     "headers": (("set-cookie", "must-not-reach-the-planner"),),
                     "body": self._bodies[target_url],
                 },
@@ -286,6 +289,42 @@ class _CaptureStopPlanner:
 
 
 class AgenticReconIntegrationTests(unittest.TestCase):
+    def test_failed_only_link_still_discovers_public_openapi_request_shape(self) -> None:
+        root = "http://localhost/"
+        posts = "http://localhost/posts"
+        schema_url = "http://localhost/openapi.json"
+        schema = {"openapi": "3.0.0", "paths": {
+            "/api/fetch": {"get": {"parameters": [
+                {"name": "url", "in": "query", "schema": {"type": "string"}},
+            ]}},
+        }}
+        evidence_store = InMemoryEvidenceStore()
+        surface_store = InMemorySurfaceStore()
+        collector = _Collector(
+            evidence_store,
+            {root: '<a href="/posts">Posts</a>', posts: "", schema_url: json.dumps(schema)},
+            statuses={posts: 405},
+            content_types={schema_url: "application/json"},
+        )
+        agent = ReconAgent(
+            collector=collector, evidence_store=evidence_store,
+            surface_store=surface_store, iterative_planner=_SelectPathPlanner("/posts"),
+            max_pages=5,
+        )
+
+        agent.handle(replace(_TASK, request_budget=20))
+
+        self.assertEqual(collector.calls, [root, posts, schema_url])
+        self.assertTrue(any(
+            surface.url == "http://localhost/api/fetch"
+            and surface.parameters == ("url",)
+            for surface in surface_store.list_by_run(_TASK.run_id)
+        ))
+        self.assertTrue(any(
+            item.observation.get("type") == "openapi_request_structure"
+            for item in evidence_store.list_by_run(_TASK.run_id)
+        ))
+
     def test_browser_choice_uses_reserved_third_recon_llm_call(self) -> None:
         class FirstOfferedLlm:
             calls = 0

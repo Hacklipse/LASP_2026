@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import math
 import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -80,6 +82,33 @@ class ValidationReasonCode(str, Enum):
     ACCESS_NOT_EXPOSED = "access_not_exposed"
     CLEANUP_FAILED = "cleanup_failed"
     GENERIC_NO_PROOF = "generic_no_proof"
+    SSRF_CALLBACK_ONLY = "ssrf_callback_only"
+    SSRF_CALLBACK_NOT_OBSERVED = "ssrf_callback_not_observed"
+    SSRF_CALLBACK_PROVIDER_UNAVAILABLE = "ssrf_callback_provider_unavailable"
+    SSRF_OWNED_RECEIVER_UNAVAILABLE = "ssrf_owned_receiver_unavailable"
+    SSRF_OWNED_RECEIVER_NOT_OBSERVED = "ssrf_owned_receiver_not_observed"
+    SSRF_OWNED_RECEIVER_ONLY = "ssrf_owned_receiver_only"
+    SSRF_CANARY_ANALYSIS_NOT_ESTABLISHED = "ssrf_canary_analysis_not_established"
+    SSRF_CANARY_NOT_REPRODUCED = "ssrf_canary_not_reproduced"
+    SSRF_DESTINATION_POLICY_MISSING = "ssrf_destination_policy_missing"
+    SSRF_DESTINATION_POLICY_MISMATCH = "ssrf_destination_policy_mismatch"
+    SSRF_DESTINATION_POLICY_SURFACE_MISMATCH = (
+        "ssrf_destination_policy_surface_mismatch"
+    )
+    SSRF_DESTINATION_POLICY_ORIGIN_MISMATCH = (
+        "ssrf_destination_policy_origin_mismatch"
+    )
+    SSRF_DESTINATION_POLICY_EVIDENCE_INVALID = (
+        "ssrf_destination_policy_evidence_invalid"
+    )
+    SSRF_DESTINATION_POLICY_ALLOWS_ACCESS = (
+        "ssrf_destination_policy_allows_access"
+    )
+    SSRF_CONFIRMED_DESTINATION_POLICY_VIOLATION = (
+        "ssrf_confirmed_destination_policy_violation"
+    )
+    SSRF_PROOF_BUDGET_EXHAUSTED = "ssrf_proof_budget_exhausted"
+    SSRF_MANUAL_REVIEW_REQUIRED = "ssrf_manual_review_required"
     CONFIRMED_PROOF = "confirmed_proof"
 
 
@@ -99,6 +128,85 @@ class ValidationProofType(str, Enum):
     ERROR_DETAIL_EXPOSURE = "error_detail_exposure"
     OPEN_REDIRECT = "open_redirect"
     CORS_ORIGIN_REFLECTION = "cors_origin_reflection"
+    SSRF_UNAUTHORIZED_FETCH = "ssrf_unauthorized_fetch"
+
+
+class SsrfDestinationRule(str, Enum):
+    """Closed destination-policy conclusions."""
+
+    FORBIDDEN = "forbidden"
+    ALLOWED = "allowed"
+
+
+class SsrfPolicySource(str, Enum):
+    """Trusted sources that may attest an SSRF destination rule."""
+
+    OPERATOR_ATTESTATION = "operator_attestation"
+    CONFIG_ALLOWLIST = "config_allowlist"
+    OPENAPI_ALLOWLIST = "openapi_allowlist"
+    # Compatibility names serialize to the canonical three-value contract.
+    TRUSTED_CONFIG_ALLOWLIST = "config_allowlist"
+    TRUSTED_DEPLOYMENT_POLICY = "config_allowlist"
+    TRUSTED_API_POLICY = "openapi_allowlist"
+
+
+class SsrfPolicyAssertion(str, Enum):
+    """Closed security assertion supported by SSRF confirmation."""
+
+    TARGET_MUST_NOT_REACH_DESTINATION = "target_must_not_reach_destination"
+    TARGET_MAY_REACH_DESTINATION = "target_may_reach_destination"
+
+
+class SsrfPolicyEvidenceStatus(str, Enum):
+    """How the structured destination rule was established."""
+
+    ATTESTED = "attested"
+    VERIFIED = "verified"
+
+
+class SsrfObservationPhase(str, Enum):
+    """Independent passive verification phases."""
+
+    ANALYSIS = "analysis"
+    VALIDATION = "validation"
+
+
+class SsrfObservationSource(str, Enum):
+    """Allowed provenance for manually supplied server-request observations."""
+
+    OPERATOR_OWNED_SERVICE = "operator_owned_service"
+
+
+class SsrfObservationProviderStatus(str, Enum):
+    """Availability of the passive observation source."""
+
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+
+
+class SsrfAssessmentReason(str, Enum):
+    """Closed reasons for deterministic passive SSRF assessment."""
+
+    MANUAL_REVIEW_REQUIRED = "manual_review_required"
+    EXECUTION_APPROVAL_MISSING = "execution_approval_missing"
+    EXECUTION_APPROVAL_SURFACE_MISMATCH = "execution_approval_surface_mismatch"
+    VERIFICATION_ENDPOINT_MISMATCH = "verification_endpoint_mismatch"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    REQUEST_BUDGET_UNAVAILABLE = "request_budget_unavailable"
+    VERIFICATION_SESSION_MISSING = "verification_session_missing"
+    OBSERVATION_SOURCE_UNVERIFIED = "observation_source_unverified"
+    NO_SERVER_REQUEST_OBSERVED = "no_server_request_observed"
+    INDEPENDENT_OBSERVATION_MISSING = "independent_observation_missing"
+    SERVER_REQUEST_OBSERVED_WITHOUT_DESTINATION_POLICY = (
+        "server_request_observed_without_destination_policy"
+    )
+    DESTINATION_POLICY_SURFACE_MISMATCH = "destination_policy_surface_mismatch"
+    DESTINATION_POLICY_ORIGIN_MISMATCH = "destination_policy_origin_mismatch"
+    DESTINATION_POLICY_EVIDENCE_INVALID = "destination_policy_evidence_invalid"
+    DESTINATION_POLICY_ALLOWS_ACCESS = "destination_policy_allows_access"
+    CONFIRMED_DESTINATION_POLICY_VIOLATION = (
+        "confirmed_destination_policy_violation"
+    )
 
 
 class HttpRequestKind(str, Enum):
@@ -112,6 +220,10 @@ class HttpRequestKind(str, Enum):
     GRAPHQL_QUERY_CONTROL = "graphql_query_control"
     GRAPHQL_QUERY_PROBE = "graphql_query_probe"
     OPEN_REDIRECT_PROBE = "open_redirect_probe"
+    SSRF_CONTROL = "ssrf_control"
+    SSRF_PROBE = "ssrf_probe"
+    SSRF_CANARY_PROBE = "ssrf_canary_probe"
+    SSRF_OWNED_RECEIVER_PROBE = "ssrf_owned_receiver_probe"
     CORS_PROBE = "cors_probe"
     SQLI_BOOLEAN_TRUE = "sqli_boolean_true"
     SQLI_BOOLEAN_FALSE = "sqli_boolean_false"
@@ -224,6 +336,557 @@ class RunScope:
             raise DomainInvariantError("allowed path prefixes must start with '/'")
 
 
+_SSRF_REFERENCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/#-]{0,199}\Z")
+_SSRF_SURFACE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z")
+_SSRF_PARAMETER = re.compile(r"[A-Za-z_][A-Za-z0-9_.:-]{0,63}\Z")
+_SSRF_REFERENCE_JWT = re.compile(
+    r"(?:^|[:/#._-])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\."
+    r"[A-Za-z0-9_-]{8,}(?:$|[:/#._-])"
+)
+_SSRF_REFERENCE_SECRET_PREFIX = re.compile(
+    r"(?i)(?:^|[:/#._-])(?:sk|secret|token|password|passwd|credential|"
+    r"api[_-]?key|ghp|github_pat|xox[baprs])[-_:][A-Za-z0-9_-]{8,}"
+)
+_SSRF_REFERENCE_AWS_KEY = re.compile(r"(?:^|[^A-Z0-9])AKIA[A-Z0-9]{16}(?:$|[^A-Z0-9])")
+_SSRF_GENERATED_ENDPOINT_REFERENCE = re.compile(r"endpoint-[0-9a-f]{32}\Z")
+_SSRF_LONG_HEX_REFERENCE = re.compile(r"[0-9a-f]{32,}\Z", re.IGNORECASE)
+_SSRF_LONG_TOKEN_REFERENCE = re.compile(r"[A-Za-z0-9_-]{24,}\Z")
+
+
+def _reference_entropy(value: str) -> float:
+    if not value:
+        return 0.0
+    return -sum(
+        (count / len(value)) * math.log2(count / len(value))
+        for count in (value.count(char) for char in set(value))
+    )
+
+
+def validate_ssrf_opaque_reference(
+    value: str, label: str = "SSRF reference", *, reject_secret_like: bool = True,
+) -> None:
+    """Reject URLs and credential-like material before a reference reaches Evidence."""
+
+    if not isinstance(value, str) or _SSRF_REFERENCE.fullmatch(value) is None:
+        raise DomainInvariantError(f"{label} must be a short opaque reference")
+    if not reject_secret_like:
+        return
+    if _SSRF_GENERATED_ENDPOINT_REFERENCE.fullmatch(value) is not None:
+        return
+    if (
+        _SSRF_REFERENCE_JWT.search(value) is not None
+        or _SSRF_REFERENCE_SECRET_PREFIX.search(value) is not None
+        or _SSRF_REFERENCE_AWS_KEY.search(value) is not None
+    ):
+        raise DomainInvariantError(f"{label} must not contain secret material")
+    for component in re.split(r"[:/#]", value):
+        if _SSRF_LONG_HEX_REFERENCE.fullmatch(component) is not None:
+            raise DomainInvariantError(f"{label} must not contain secret material")
+        if (
+            _SSRF_LONG_TOKEN_REFERENCE.fullmatch(component) is not None
+            and sum((
+                any(char.islower() for char in component),
+                any(char.isupper() for char in component),
+                any(char.isdigit() for char in component),
+            )) >= 2
+            and len(set(component)) / len(component) >= 0.55
+            and _reference_entropy(component) >= 3.6
+        ):
+            raise DomainInvariantError(f"{label} must not contain secret material")
+
+
+def _validate_ssrf_reference(
+    value: str, label: str, *, reject_secret_like: bool = False,
+) -> None:
+    validate_ssrf_opaque_reference(
+        value, label, reject_secret_like=reject_secret_like,
+    )
+
+
+def _validate_aware_datetime(value: datetime, label: str) -> None:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise DomainInvariantError(f"{label} must be timezone-aware")
+
+
+def ssrf_destination_origin(url: str) -> str:
+    """Return a normalized HTTP(S) origin without retaining path or credentials."""
+
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except (TypeError, ValueError) as error:
+        raise DomainInvariantError("SSRF destination origin is invalid") from error
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise DomainInvariantError("SSRF destination must have a plain HTTP(S) origin")
+    if port is not None and not 0 < port <= 65535:
+        raise DomainInvariantError("SSRF destination port is invalid")
+    if (parsed.scheme.casefold(), port) in {("http", 80), ("https", 443)}:
+        port = None
+    rendered_host = f"[{host}]" if ":" in host else host
+    return (
+        f"{parsed.scheme.casefold()}://{rendered_host}:{port}"
+        if port is not None
+        else f"{parsed.scheme.casefold()}://{rendered_host}"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SsrfExecutionApproval:
+    """Explicit permission to verify exactly one already-observed Surface."""
+
+    approval_id: str
+    surface_id: str
+    verification_endpoint_ref: str
+    approved_by: str
+    approved_at: datetime
+    scope: str = "single_surface"
+
+    def __post_init__(self) -> None:
+        _validate_ssrf_reference(self.approval_id, "SSRF approval id")
+        if _SSRF_SURFACE_ID.fullmatch(self.surface_id) is None:
+            raise DomainInvariantError("SSRF approval requires an exact surface id")
+        if self.scope != "single_surface":
+            raise DomainInvariantError("SSRF execution approval scope must be single_surface")
+        _validate_ssrf_reference(
+            self.verification_endpoint_ref,
+            "SSRF verification endpoint reference",
+            reject_secret_like=True,
+        )
+        _validate_ssrf_reference(
+            self.approved_by, "SSRF approval principal", reject_secret_like=True,
+        )
+        _validate_aware_datetime(self.approved_at, "SSRF approval timestamp")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class SsrfDestinationPolicy:
+    """Trusted destination rule bound to explicit Surfaces and one exact origin."""
+
+    policy_id: str
+    surface_ids: tuple[str, ...]
+    destination_origin: str
+    destination_rule: SsrfDestinationRule
+    assertion: SsrfPolicyAssertion | None
+    source_type: SsrfPolicySource
+    source_reference: str
+    approved_by: str
+    created_at: datetime
+    evidence_status: SsrfPolicyEvidenceStatus | None
+
+    def __init__(
+        self,
+        policy_id: str,
+        destination_rule: SsrfDestinationRule,
+        source_type: SsrfPolicySource,
+        source_reference: str,
+        approved_by: str,
+        created_at: datetime,
+        *,
+        surface_ids: tuple[str, ...] | None = None,
+        destination_origin: str = "",
+        assertion: SsrfPolicyAssertion | None = None,
+        evidence_status: SsrfPolicyEvidenceStatus | None = None,
+        surface_id: str | None = None,
+    ) -> None:
+        """Accept legacy ``surface_id`` only as an unambiguous singleton view."""
+
+        if surface_ids is None:
+            surface_ids = () if surface_id is None else (surface_id,)
+        elif surface_id is not None and surface_ids != (surface_id,):
+            raise DomainInvariantError("SSRF policy surface aliases disagree")
+        object.__setattr__(self, "policy_id", policy_id)
+        object.__setattr__(self, "surface_ids", surface_ids)
+        object.__setattr__(self, "destination_origin", destination_origin)
+        object.__setattr__(self, "destination_rule", destination_rule)
+        object.__setattr__(self, "assertion", assertion)
+        object.__setattr__(self, "source_type", source_type)
+        object.__setattr__(self, "source_reference", source_reference)
+        object.__setattr__(self, "approved_by", approved_by)
+        object.__setattr__(self, "created_at", created_at)
+        object.__setattr__(self, "evidence_status", evidence_status)
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        _validate_ssrf_reference(self.policy_id, "SSRF policy id")
+        if (
+            not isinstance(self.surface_ids, tuple)
+            or not self.surface_ids
+            or len(set(self.surface_ids)) != len(self.surface_ids)
+            or any(_SSRF_SURFACE_ID.fullmatch(item) is None for item in self.surface_ids)
+        ):
+            raise DomainInvariantError(
+                "SSRF policy requires unique exact surface ids"
+            )
+        if not isinstance(self.destination_rule, SsrfDestinationRule):
+            raise DomainInvariantError(
+                "SSRF destination rule must use SsrfDestinationRule"
+            )
+        if not isinstance(self.source_type, SsrfPolicySource):
+            raise DomainInvariantError(
+                "SSRF policy source must use the trusted SsrfPolicySource enum"
+            )
+        _validate_ssrf_reference(
+            self.source_reference,
+            "SSRF policy source reference",
+            reject_secret_like=True,
+        )
+        required_prefix = {
+            SsrfPolicySource.OPERATOR_ATTESTATION: "operator:",
+            SsrfPolicySource.CONFIG_ALLOWLIST: "config:",
+            SsrfPolicySource.OPENAPI_ALLOWLIST: "openapi:",
+        }[self.source_type]
+        if not self.source_reference.startswith(required_prefix):
+            raise DomainInvariantError(
+                "SSRF policy reference does not match its trusted source type"
+            )
+        _validate_ssrf_reference(
+            self.approved_by, "SSRF policy principal", reject_secret_like=True,
+        )
+        _validate_aware_datetime(self.created_at, "SSRF policy timestamp")
+        if self.destination_origin:
+            parsed = urlsplit(self.destination_origin)
+            if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+                raise DomainInvariantError("SSRF policy destination must be an origin only")
+            normalized = ssrf_destination_origin(self.destination_origin)
+            object.__setattr__(self, "destination_origin", normalized)
+        if self.assertion is not None and not isinstance(
+            self.assertion, SsrfPolicyAssertion
+        ):
+            raise DomainInvariantError("SSRF policy assertion must use the closed enum")
+        if self.evidence_status is not None and not isinstance(
+            self.evidence_status, SsrfPolicyEvidenceStatus
+        ):
+            raise DomainInvariantError("SSRF policy evidence status must use the closed enum")
+        structured_fields = (
+            bool(self.destination_origin),
+            self.assertion is not None,
+            self.evidence_status is not None,
+        )
+        if any(structured_fields) and not all(structured_fields):
+            raise DomainInvariantError(
+                "SSRF destination, assertion, and evidence status must be stored together"
+            )
+        if all(structured_fields):
+            expected_assertion = (
+                SsrfPolicyAssertion.TARGET_MUST_NOT_REACH_DESTINATION
+                if self.destination_rule is SsrfDestinationRule.FORBIDDEN
+                else SsrfPolicyAssertion.TARGET_MAY_REACH_DESTINATION
+            )
+            if self.assertion is not expected_assertion:
+                raise DomainInvariantError(
+                    "SSRF destination rule and assertion are inconsistent"
+                )
+            if (
+                self.source_type
+                in {
+                    SsrfPolicySource.CONFIG_ALLOWLIST,
+                    SsrfPolicySource.OPENAPI_ALLOWLIST,
+                }
+                and self.evidence_status is not SsrfPolicyEvidenceStatus.VERIFIED
+            ):
+                raise DomainInvariantError(
+                    "SSRF config and OpenAPI policies must be verified"
+                )
+
+    @property
+    def surface_id(self) -> str:
+        """Singleton compatibility view for existing per-Surface integrations."""
+
+        if len(self.surface_ids) != 1:
+            raise DomainInvariantError("SSRF policy applies to multiple surfaces")
+        return self.surface_ids[0]
+
+    def require_surface(self, surface_id: str) -> None:
+        """Reject reusing this policy for any other Surface."""
+
+        if surface_id not in self.surface_ids:
+            raise DomainInvariantError(
+                "SSRF destination policy does not apply to this surface"
+            )
+
+    def confirms_for(self, surface_id: str, destination_url: str) -> bool:
+        """Return whether this policy can authorize an SSRF CONFIRMED verdict."""
+
+        return (
+            surface_id in self.surface_ids
+            and self.destination_rule is SsrfDestinationRule.FORBIDDEN
+            and self.assertion
+            is SsrfPolicyAssertion.TARGET_MUST_NOT_REACH_DESTINATION
+            and self.evidence_status
+            in {SsrfPolicyEvidenceStatus.ATTESTED, SsrfPolicyEvidenceStatus.VERIFIED}
+            and bool(self.destination_origin)
+            and self.destination_origin == ssrf_destination_origin(destination_url)
+        )
+
+
+# Public contract name. The SSRF-prefixed alias remains for code that already
+# imported the in-progress model while policy consumers migrate in later work.
+DestinationPolicy = SsrfDestinationPolicy
+
+
+@dataclass(frozen=True, slots=True)
+class SsrfReviewRegistration:
+    """Sanitized approval and optional policy for one observed input coordinate."""
+
+    run_id: str
+    parameter: str
+    hint_evidence_id: str | None
+    execution_approval: SsrfExecutionApproval
+    destination_policy: SsrfDestinationPolicy | None = None
+    hint_use_approved: bool = False
+
+    @property
+    def surface_id(self) -> str:
+        return self.execution_approval.surface_id
+
+    def __post_init__(self) -> None:
+        _validate_ssrf_reference(self.run_id, "SSRF review Run id")
+        if _SSRF_PARAMETER.fullmatch(self.parameter) is None:
+            raise DomainInvariantError(
+                "SSRF review requires one exact safe parameter name"
+            )
+        if self.hint_evidence_id is not None:
+            _validate_ssrf_reference(
+                self.hint_evidence_id, "SSRF review hint Evidence id"
+            )
+        if type(self.hint_use_approved) is not bool:
+            raise DomainInvariantError("SSRF hint-use approval must be boolean")
+        if self.hint_use_approved and self.hint_evidence_id is None:
+            raise DomainInvariantError(
+                "SSRF hint-use approval requires one destination hint Evidence"
+            )
+        if not isinstance(self.execution_approval, SsrfExecutionApproval):
+            raise DomainInvariantError("SSRF review requires structured approval")
+        if self.destination_policy is not None:
+            if not isinstance(self.destination_policy, SsrfDestinationPolicy):
+                raise DomainInvariantError("SSRF review policy must be structured")
+            self.destination_policy.require_surface(self.surface_id)
+
+
+@dataclass(frozen=True, slots=True)
+class ServerRequestObservation:
+    """Sanitized, manually supplied proof that the target server sent a request."""
+
+    observation_id: str
+    run_id: str
+    surface_id: str
+    parameter: str
+    verification_endpoint_ref: str
+    verification_session_id: str
+    phase: SsrfObservationPhase
+    observed_at: datetime
+    source_verified: bool
+    destination_origin: str = ""
+    request_method: str = "GET"
+    source_type: SsrfObservationSource = SsrfObservationSource.OPERATOR_OWNED_SERVICE
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.observation_id, "SSRF observation id"),
+            (self.run_id, "SSRF observation run id"),
+            (self.verification_endpoint_ref, "SSRF verification endpoint reference"),
+            (self.verification_session_id, "SSRF verification session id"),
+        ):
+            _validate_ssrf_reference(
+                value,
+                label,
+                reject_secret_like=label in {
+                    "SSRF verification endpoint reference",
+                    "SSRF verification session id",
+                },
+            )
+        if _SSRF_SURFACE_ID.fullmatch(self.surface_id) is None:
+            raise DomainInvariantError("SSRF observation requires an exact surface id")
+        if _SSRF_PARAMETER.fullmatch(self.parameter) is None:
+            raise DomainInvariantError("SSRF observation parameter must be an exact safe name")
+        try:
+            phase = SsrfObservationPhase(self.phase)
+            source_type = SsrfObservationSource(self.source_type)
+        except (TypeError, ValueError) as error:
+            raise DomainInvariantError("unsupported SSRF observation value") from error
+        object.__setattr__(self, "phase", phase)
+        object.__setattr__(self, "source_type", source_type)
+        if self.request_method != "GET":
+            raise DomainInvariantError("passive SSRF observation method must be GET")
+        if type(self.source_verified) is not bool:
+            raise DomainInvariantError("SSRF observation source flag must be boolean")
+        if self.destination_origin:
+            parsed = urlsplit(self.destination_origin)
+            if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+                raise DomainInvariantError(
+                    "SSRF observation destination must be an origin only"
+                )
+            object.__setattr__(
+                self,
+                "destination_origin",
+                ssrf_destination_origin(self.destination_origin),
+            )
+        _validate_aware_datetime(self.observed_at, "SSRF observation timestamp")
+
+
+@dataclass(frozen=True, slots=True)
+class SsrfAssessment:
+    """Deterministic passive assessment result without raw request material."""
+
+    verdict: ValidationVerdict
+    reason_code: SsrfAssessmentReason
+    # Provider observation ids are not central Evidence ids and must never be
+    # copied into ValidationResult without RuntimeEvidenceCollector mapping.
+    observation_ids: tuple[str, ...] = ()
+    policy_id: str | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            verdict = ValidationVerdict(self.verdict)
+            reason_code = SsrfAssessmentReason(self.reason_code)
+        except (TypeError, ValueError) as error:
+            raise DomainInvariantError("unsupported SSRF assessment value") from error
+        object.__setattr__(self, "verdict", verdict)
+        object.__setattr__(self, "reason_code", reason_code)
+        expected_verdicts = {
+            SsrfAssessmentReason.MANUAL_REVIEW_REQUIRED: ValidationVerdict.SUSPECTED,
+            SsrfAssessmentReason.EXECUTION_APPROVAL_MISSING: ValidationVerdict.BLOCKED,
+            SsrfAssessmentReason.EXECUTION_APPROVAL_SURFACE_MISMATCH: ValidationVerdict.BLOCKED,
+            SsrfAssessmentReason.VERIFICATION_ENDPOINT_MISMATCH: ValidationVerdict.BLOCKED,
+            SsrfAssessmentReason.PROVIDER_UNAVAILABLE: ValidationVerdict.BLOCKED,
+            SsrfAssessmentReason.REQUEST_BUDGET_UNAVAILABLE: ValidationVerdict.BLOCKED,
+            SsrfAssessmentReason.VERIFICATION_SESSION_MISSING: ValidationVerdict.BLOCKED,
+            SsrfAssessmentReason.OBSERVATION_SOURCE_UNVERIFIED: ValidationVerdict.BLOCKED,
+            SsrfAssessmentReason.NO_SERVER_REQUEST_OBSERVED: ValidationVerdict.REJECTED,
+            SsrfAssessmentReason.INDEPENDENT_OBSERVATION_MISSING: (
+                ValidationVerdict.SUSPECTED
+            ),
+            SsrfAssessmentReason.SERVER_REQUEST_OBSERVED_WITHOUT_DESTINATION_POLICY: (
+                ValidationVerdict.SUSPECTED
+            ),
+            SsrfAssessmentReason.DESTINATION_POLICY_SURFACE_MISMATCH: (
+                ValidationVerdict.SUSPECTED
+            ),
+            SsrfAssessmentReason.DESTINATION_POLICY_ORIGIN_MISMATCH: (
+                ValidationVerdict.SUSPECTED
+            ),
+            SsrfAssessmentReason.DESTINATION_POLICY_EVIDENCE_INVALID: (
+                ValidationVerdict.SUSPECTED
+            ),
+            SsrfAssessmentReason.DESTINATION_POLICY_ALLOWS_ACCESS: ValidationVerdict.REJECTED,
+            SsrfAssessmentReason.CONFIRMED_DESTINATION_POLICY_VIOLATION: (
+                ValidationVerdict.CONFIRMED
+            ),
+        }
+        if expected_verdicts[reason_code] is not verdict:
+            raise DomainInvariantError("SSRF assessment verdict does not match its reason")
+        if (
+            not isinstance(self.observation_ids, tuple)
+            or len(set(self.observation_ids)) != len(self.observation_ids)
+        ):
+            raise DomainInvariantError("SSRF assessment observation ids must be a unique tuple")
+        for observation_id in self.observation_ids:
+            _validate_ssrf_reference(observation_id, "SSRF assessment observation id")
+        if self.policy_id is not None:
+            _validate_ssrf_reference(self.policy_id, "SSRF assessment policy id")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class SsrfCanaryProofTarget:
+    """Operator-owned endpoint; execution approval and policy stay separate."""
+
+    url: str
+    marker: str
+    surface_id: str
+    destination_policy: SsrfDestinationPolicy | None
+    operator_approved: bool = False
+
+    def __init__(
+        self,
+        url: str,
+        marker: str,
+        destination_policy: SsrfDestinationPolicy | None = None,
+        operator_approved: bool = False,
+        *,
+        surface_id: str | None = None,
+        policy_reference: str | None = None,
+    ) -> None:
+        # Accept the legacy keyword only to fail with a domain error that callers
+        # can handle. A raw string is never converted into a trusted policy.
+        if policy_reference is not None:
+            raise DomainInvariantError(
+                "SSRF policy_reference is no longer accepted; use DestinationPolicy"
+            )
+        object.__setattr__(self, "url", url)
+        object.__setattr__(self, "marker", marker)
+        if surface_id is None and isinstance(
+            destination_policy, SsrfDestinationPolicy
+        ):
+            surface_id = destination_policy.surface_id
+        object.__setattr__(self, "surface_id", surface_id)
+        object.__setattr__(self, "destination_policy", destination_policy)
+        object.__setattr__(self, "operator_approved", operator_approved)
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        parsed = urlsplit(self.url)
+        host = (parsed.hostname or "").casefold().rstrip(".")
+        try:
+            ipaddress.ip_address(host)
+            is_ip_literal = True
+        except ValueError:
+            is_ip_literal = False
+        try:
+            valid_port = parsed.port is None or parsed.port > 0
+        except ValueError:
+            valid_port = False
+        if not self.operator_approved:
+            raise DomainInvariantError("SSRF canary requires explicit operator approval")
+        if _SSRF_SURFACE_ID.fullmatch(self.surface_id or "") is None:
+            raise DomainInvariantError(
+                "SSRF canary requires one exact approved surface id"
+            )
+        if self.destination_policy is not None:
+            if not isinstance(self.destination_policy, SsrfDestinationPolicy):
+                raise DomainInvariantError("SSRF canary policy must be structured")
+            self.destination_policy.require_surface(self.surface_id)
+        if (
+            parsed.scheme not in {"http", "https"} or not host or not valid_port
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment or is_ip_literal
+            or re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,252}", host) is None
+            or host == "localhost" or host.endswith(".localhost")
+            or host == "metadata.google.internal"
+        ):
+            raise DomainInvariantError("SSRF canary must be an exact HTTP(S) service URL")
+        if (
+            not isinstance(self.marker, str) or not 16 <= len(self.marker) <= 128
+            or re.fullmatch(r"[A-Za-z0-9._:-]{16,128}", self.marker) is None
+            or self.marker in self.url
+        ):
+            raise DomainInvariantError(
+                "SSRF canary marker must be a distinct, serialization-safe "
+                "16-128 character value"
+            )
+
+    @property
+    def policy_reference(self) -> str:
+        """Read-only compatibility view; raw strings cannot construct a policy."""
+
+        return (
+            self.destination_policy.source_reference
+            if self.destination_policy is not None
+            else ""
+        )
+
+    def require_surface(self, surface_id: str) -> None:
+        if surface_id != self.surface_id:
+            raise DomainInvariantError("SSRF canary does not apply to this surface")
+        if self.destination_policy is not None:
+            self.destination_policy.require_surface(surface_id)
+
+
 @dataclass(frozen=True, slots=True)
 class RunExecutionProfile:
     """재현·비교를 위해 Run과 함께 영속화하는 실제 실행 조건."""
@@ -244,6 +907,14 @@ class RunExecutionProfile:
     # Validation·Report LLM 보조가 연결되기 전에도 계약을 먼저 고정한다.
     validation_mode: str = "heuristic"
     report_mode: str = "heuristic"
+    ssrf_analysis_mode: str = "passive"
+    ssrf_execution_approval_registered: bool = False
+    ssrf_destination_policy_registered: bool = False
+    ssrf_destination_policy_source: SsrfPolicySource | None = None
+    # Legacy read-compatible fields. These never imply structured approval or policy.
+    ssrf_oast_mode: str = "off"
+    ssrf_public_oast_consented: bool = False
+    ssrf_canary_policy_ref: str = ""
     # 비밀값은 저장하지 않고, 실제 호출에 쓴 provider/model만 남긴다.
     llm_provider: str = ""
     llm_model: str = ""
@@ -254,6 +925,15 @@ class RunExecutionProfile:
     state_changing_approved: bool = False
 
     def __post_init__(self) -> None:
+        try:
+            policy_source = (
+                None
+                if self.ssrf_destination_policy_source is None
+                else SsrfPolicySource(self.ssrf_destination_policy_source)
+            )
+        except (TypeError, ValueError) as error:
+            raise DomainInvariantError("unsupported SSRF destination policy source") from error
+        object.__setattr__(self, "ssrf_destination_policy_source", policy_source)
         modes = {
             "analysis profile": (self.analysis_profile, {"heuristic", "llm"}),
             "recon mode": (self.recon_mode, {"heuristic", "hybrid", "agentic"}),
@@ -277,6 +957,11 @@ class RunExecutionProfile:
             ),
             "validation mode": (self.validation_mode, {"heuristic", "llm"}),
             "report mode": (self.report_mode, {"heuristic", "llm"}),
+            "SSRF analysis mode": (self.ssrf_analysis_mode, {"passive"}),
+            "SSRF OAST mode": (
+                self.ssrf_oast_mode,
+                {"off", "local_test", "public_interactsh", "private_interactsh"},
+            ),
         }
         for label, (value, allowed) in modes.items():
             if value not in allowed:
@@ -287,6 +972,35 @@ class RunExecutionProfile:
             raise DomainInvariantError("compare routers flag must be boolean")
         if type(self.browser_recon_enabled) is not bool:
             raise DomainInvariantError("browser recon flag must be boolean")
+        for label, value in (
+            ("SSRF execution approval registered", self.ssrf_execution_approval_registered),
+            ("SSRF destination policy registered", self.ssrf_destination_policy_registered),
+        ):
+            if type(value) is not bool:
+                raise DomainInvariantError(f"{label} flag must be boolean")
+        if self.ssrf_destination_policy_registered != (
+            self.ssrf_destination_policy_source is not None
+        ):
+            raise DomainInvariantError(
+                "SSRF destination policy and trusted source must be recorded together"
+            )
+        if type(self.ssrf_public_oast_consented) is not bool:
+            raise DomainInvariantError("SSRF public OAST consent flag must be boolean")
+        if self.ssrf_oast_mode == "public_interactsh" and not self.ssrf_public_oast_consented:
+            raise DomainInvariantError("public SSRF OAST requires explicit consent")
+        if self.ssrf_canary_policy_ref:
+            if (
+                "://" in self.ssrf_canary_policy_ref
+                or self.ssrf_canary_policy_ref.startswith("//")
+            ):
+                raise DomainInvariantError(
+                    "legacy SSRF canary policy reference must not contain a URL"
+                )
+            validate_ssrf_opaque_reference(
+                self.ssrf_canary_policy_ref,
+                "legacy SSRF canary policy reference",
+                reject_secret_like=True,
+            )
         if type(self.state_changing_approved) is not bool:
             raise DomainInvariantError(
                 "state-changing approval flag must be boolean"
@@ -601,6 +1315,55 @@ class HttpRequestSpec:
                        for _, value in self.query_parameters)
         ):
             raise DomainInvariantError("open redirect probe must be a bounded GET request")
+        if self.request_kind in {HttpRequestKind.SSRF_CONTROL, HttpRequestKind.SSRF_PROBE}:
+            callback_values = [
+                value for _, value in self.query_parameters
+                if value.startswith((
+                    "https://", "http://127.0.0.1:",
+                    "http://host.docker.internal:",
+                ))
+            ]
+            if (
+                self.method.upper() != "GET" or self.body is not None
+                or self.form_parameters or self.headers
+                or not self.query_parameters
+                or len(callback_values) != (
+                    1 if self.request_kind is HttpRequestKind.SSRF_PROBE else 0
+                )
+                or any(
+                    value != "hacklipse-control"
+                    and value not in callback_values
+                    and re.fullmatch(r"[A-Za-z0-9._~-]{0,128}", value) is None
+                    for _, value in self.query_parameters
+                )
+            ):
+                raise DomainInvariantError(
+                    "SSRF request must be a bounded GET with one registered callback"
+                )
+        if self.request_kind is HttpRequestKind.SSRF_CANARY_PROBE:
+            urls = [value for _, value in self.query_parameters
+                    if value.startswith(("http://", "https://"))]
+            if (
+                self.method.upper() != "GET" or self.body is not None
+                or self.form_parameters or self.headers or len(urls) != 1
+                or any(value not in urls and
+                       re.fullmatch(r"[A-Za-z0-9._~-]{0,128}", value) is None
+                       for _, value in self.query_parameters)
+            ):
+                raise DomainInvariantError("SSRF canary probe must be a bounded GET")
+        if self.request_kind is HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE:
+            urls = [value for _, value in self.query_parameters
+                    if value.startswith(("http://", "https://"))]
+            if (
+                self.method.upper() != "GET" or self.body is not None
+                or self.form_parameters or self.headers or len(urls) != 1
+                or any(value not in urls and
+                       re.fullmatch(r"[A-Za-z0-9._~-]{0,128}", value) is None
+                       for _, value in self.query_parameters)
+            ):
+                raise DomainInvariantError(
+                    "SSRF owned-receiver probe must be a bounded GET"
+                )
         if self.request_kind is HttpRequestKind.CORS_PROBE and (
             self.method.upper() != "GET" or self.body is not None
             or (
@@ -793,6 +1556,9 @@ class TaskEnvelope:
     finding_ids: tuple[str, ...] = ()
     allowed_tools: tuple[str, ...] = ()
     request_budget: int = 0
+    # Optional budget allocation may already reserve Validation requests outside
+    # this Task. An Analyzer subtracts only the missing part of its own proof cost.
+    validation_request_reserve: int = 0
     policy_profile: str = "safe"
     timeout_seconds: int = 120
     credential_ref: str | None = None
@@ -803,6 +1569,8 @@ class TaskEnvelope:
         # Task 자체가 유효하지 않으면 Dispatcher에 도달하기 전에 차단한다.
         if self.request_budget < 0:
             raise DomainInvariantError("task request budget cannot be negative")
+        if self.validation_request_reserve < 0:
+            raise DomainInvariantError("validation request reserve cannot be negative")
         if self.timeout_seconds <= 0:
             raise DomainInvariantError("task timeout must be positive")
         if len(self.knowledge_hints) > 10:
@@ -1303,7 +2071,11 @@ class ExecutionRequest:
             # `%25`가 `%2525`가 되어 우회가 성립하지 않는다.
             path = f"{path}{self.path_suffix}"
         encoded = urlencode(self.query_parameters)
-        query = parsed.query
+        query = "" if self.request_kind in {
+            HttpRequestKind.SSRF_CONTROL, HttpRequestKind.SSRF_PROBE,
+            HttpRequestKind.SSRF_CANARY_PROBE,
+            HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE,
+        } else parsed.query
         if encoded:
             query = f"{query}&{encoded}" if query else encoded
         # URL fragment는 HTTP 요청 대상에 포함되지 않는다.

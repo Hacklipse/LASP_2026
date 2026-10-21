@@ -11,6 +11,7 @@ from collections.abc import Collection, Mapping
 from urllib.parse import urlsplit
 
 from hacklipse.adapters.routing_audit import JsonlRoutingAuditLog, surface_key
+from hacklipse.adapters.security import redacted_internal_url_path
 from hacklipse.adapters.validation_review_contract import valid_review_claim_observation
 from hacklipse.application.orchestrator import VALIDATION_ROUNDS_EXHAUSTED_REASON
 from hacklipse.bootstrap import standard_router
@@ -38,6 +39,29 @@ class NoLlmUsage:
     calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+
+
+def close_ssrf_services(*services) -> None:
+    """Close each configured SSRF service once without exposing its endpoint."""
+
+    seen: set[int] = set()
+    for service in services:
+        if service is None or id(service) in seen:
+            continue
+        seen.add(id(service))
+        service.close()
+
+
+def assemble_with_ssrf_cleanup(
+    factory, callback, *args, ssrf_cleanup_services=(), **kwargs,
+):
+    """Do not leave callback or owned-receiver listeners after assembly failure."""
+
+    try:
+        return factory(*args, **kwargs)
+    except BaseException:
+        close_ssrf_services(callback, *ssrf_cleanup_services)
+        raise
 
 
 def add_routing_arguments(
@@ -158,6 +182,25 @@ def execution_profile_from_args(
             "llm" if getattr(args, "validation_review", False) else "heuristic"
         ),
         report_mode=getattr(args, "report", "heuristic"),
+        ssrf_analysis_mode=getattr(args, "ssrf_analysis_mode", "passive"),
+        ssrf_execution_approval_registered=bool(
+            getattr(args, "ssrf_execution_approval_registered", False)
+        ),
+        ssrf_destination_policy_registered=bool(
+            getattr(args, "ssrf_destination_policy_registered", False)
+        ),
+        ssrf_destination_policy_source=(
+            getattr(args, "ssrf_destination_policy_source", "") or None
+        ),
+        ssrf_oast_mode=(
+            "local_test" if getattr(args, "ssrf_local_callback", False)
+            else getattr(args, "ssrf_oast", "off")
+        ),
+        ssrf_public_oast_consented=(
+            getattr(args, "ssrf_oast", "off") == "public_interactsh"
+            and getattr(args, "ssrf_public_oast_consent", False)
+        ),
+        ssrf_canary_policy_ref=getattr(args, "ssrf_canary_policy_ref", "") or "",
         llm_provider=getattr(args, "llm_provider", "") if selected_model else "",
         llm_model=selected_model,
         llm_rpm_limit=llm_rpm_limit,
@@ -171,11 +214,13 @@ def execution_profile_from_args(
 def build_run_router(
     args: argparse.Namespace, *, vulnerability_types: Collection[str] | None,
     llm_client: LlmClient | None, selected_model: str,
+    ssrf_callback_service=None,
 ) -> VulnerabilityRouter:
     log = JsonlRoutingAuditLog(args.routing_log)
     router = standard_router(
         vulnerability_types, mode=args.router, llm_client=llm_client, audit_log=log,
         review_policy=args.router_review, compare=args.compare_routers,
+        ssrf_callback_service=ssrf_callback_service,
         audit_metadata={
             "analysis_profile": args.profile,
             "llm_provider": args.llm_provider if llm_client is not None else "",
@@ -321,6 +366,20 @@ def append_run_result(args, app, run) -> None:
         "budget_allocation_mode": profile.budget_allocation_mode,
         "validation_mode": profile.validation_mode,
         "report_mode": profile.report_mode,
+        "ssrf_analysis_mode": profile.ssrf_analysis_mode,
+        "ssrf_execution_approval_registered": (
+            profile.ssrf_execution_approval_registered
+        ),
+        "ssrf_destination_policy_registered": (
+            profile.ssrf_destination_policy_registered
+        ),
+        "ssrf_destination_policy_source": (
+            profile.ssrf_destination_policy_source.value
+            if profile.ssrf_destination_policy_source is not None else None
+        ),
+        "ssrf_oast_mode": profile.ssrf_oast_mode,
+        "ssrf_public_oast_consented": profile.ssrf_public_oast_consented,
+        "ssrf_canary_policy_ref_present": bool(profile.ssrf_canary_policy_ref),
         "llm_provider": profile.llm_provider,
         "llm_model": profile.llm_model,
         "llm_rpm_limit": profile.llm_rpm_limit,
@@ -342,11 +401,29 @@ def append_run_result(args, app, run) -> None:
         "finding_count": len(app.stores.findings.list_by_run(run.run_id)),
         "request_budget": run.request_budget,
         "requests_used": run.request_budget - app.budget_manager.remaining(run.run_id),
+        "ssrf_callback": {
+            "analysis_http_hits": sum(
+                item.observation.get("type") == "ssrf_callback_http"
+                and item.validation_id is None for item in run_evidence
+            ),
+            "validation_http_hits": sum(
+                item.observation.get("type") == "ssrf_callback_http"
+                and item.validation_id is not None for item in run_evidence
+            ),
+            "analysis_outcomes": dict(Counter(
+                str(item.observation.get("status")) for item in run_evidence
+                if item.observation.get("type") == "ssrf_probe_result"
+            )),
+            "issue_calls": getattr(getattr(app, "collector", None), "ssrf_callback_usage", (0, 0))[0],
+            "poll_calls": getattr(getattr(app, "collector", None), "ssrf_callback_usage", (0, 0))[1],
+        },
         "surfaces": [
             {
                 "surface_id": surface.surface_id,
                 "surface_key": keys.get(surface.surface_id),
-                "path": urlsplit(surface.url).path or "/",
+                "path": redacted_internal_url_path(
+                    urlsplit(surface.url).path or "/"
+                ),
                 "method": surface.method.upper(),
                 "parameters": list(surface.parameters),
                 "discovery_types": list(surface.discovery_types),

@@ -74,10 +74,18 @@ from dashboard_core import (  # noqa: E402
     RunOptions,
     RunSecrets,
     RunSupervisor,
+    SsrfReviewSubmission,
 )
 from hacklipse.bootstrap import (  # noqa: E402
     ANTHROPIC_API_KEY_ENV,
     GEMINI_API_KEY_ENV,
+)
+from hacklipse.application.errors import AgentContractError  # noqa: E402
+from hacklipse.domain import (  # noqa: E402
+    DomainInvariantError,
+    SsrfDestinationRule,
+    SsrfPolicySource,
+    validate_ssrf_opaque_reference,
 )
 
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
@@ -92,6 +100,12 @@ CONTAINER_BIND_ENV = "HACKLIPSE_DASHBOARD_CONTAINER"
 # 본문 상한. 비밀 네 개와 옵션 몇 개면 충분하고, 그 이상은 받을 이유가 없다.
 MAX_BODY_BYTES = 16 * 1024
 CSRF_HEADER = "X-Hacklipse-CSRF"
+_OPAQUE_REVIEW_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:#-]{0,199}\Z")
+_SSRF_POLICY_REFERENCE_PREFIX = {
+    SsrfPolicySource.OPERATOR_ATTESTATION: "operator:",
+}
+_SURFACE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z")
+_PARAMETER_REF = re.compile(r"[A-Za-z_][A-Za-z0-9_.:-]{0,63}\Z")
 
 # 화면이 고를 수 있는 LLM 구성. 키가 필요한 항목은 환경변수 이름을 함께 들고 있어야
 # "왜 못 고르는지"를 화면이 설명할 수 있다. 키 값 자체는 절대 내보내지 않는다.
@@ -112,12 +126,21 @@ ADVANCED_CHOICES = (
     {"field": "orchestrator", "label": "Orchestrator", "choices": ("heuristic", "hybrid"), "llm": ("hybrid",)},
     {"field": "budget_allocation", "label": "예산 배분", "choices": ("off", "heuristic", "hybrid"), "llm": ("hybrid",)},
     {"field": "report", "label": "Report", "choices": ("heuristic", "llm"), "llm": ("llm",)},
+    {"field": "ssrf_oast", "label": "SSRF OAST", "choices": ("off", "public_interactsh", "private_interactsh"), "llm": ()},
 )
 BOOLEAN_OPTIONS = (
     {"field": "validation_review", "label": "Validation review", "llm": True},
     {"field": "compare_routers", "label": "Router 비교", "llm": True},
     {"field": "browser", "label": "브라우저 검증", "llm": False},
     {"field": "browser_recon", "label": "브라우저 Recon", "llm": False},
+    {"field": "ssrf_review_gate", "label": "SSRF Recon 후 운영자 검토", "llm": False},
+    {"field": "ssrf_local_callback", "label": "로컬 SSRF callback (loopback 실험)", "llm": False},
+    {
+        "field": "ssrf_owned_local_receiver",
+        "label": "운영자 소유 로컬 SSRF Receiver (격리 연구)",
+        "llm": False,
+    },
+    {"field": "ssrf_public_oast_consent", "label": "공개 OAST 제3자 메타데이터 전송 동의", "llm": False},
 )
 
 _STATIC = {
@@ -179,6 +202,134 @@ def _optional_rpm(payload: dict) -> int | None:
     return value
 
 
+def _opaque_review_ref(payload: dict, key: str, *, required: bool = True) -> str:
+    value = _require_str(payload, key, max_length=200).strip()
+    if not value and not required:
+        return ""
+    try:
+        validate_ssrf_opaque_reference(value, key)
+    except DomainInvariantError as error:
+        raise RequestRejected(
+            f"{key} 는 URL이나 비밀값이 아닌 사전 등록된 짧은 참조여야 한다."
+        ) from error
+    if not value or _OPAQUE_REVIEW_REF.fullmatch(value) is None or "://" in value:
+        raise RequestRejected(
+            f"{key} 는 URL이나 비밀값이 아닌 사전 등록된 짧은 참조여야 한다."
+        )
+    return value
+
+
+def parse_ssrf_review_payload(payload) -> tuple[str, SsrfReviewSubmission | None]:
+    """Parse an exact-coordinate review without accepting URL or request material."""
+
+    if not isinstance(payload, dict):
+        raise RequestRejected("본문은 JSON 객체여야 한다.")
+    action = _require_choice(payload, "action", ("register", "skip"), default="register")
+    run_id = _require_str(payload, "run_id", max_length=200).strip()
+    if not run_id or _SURFACE_REF.fullmatch(run_id) is None:
+        raise RequestRejected("run_id 가 올바르지 않다.")
+    if action == "skip":
+        return action, None
+
+    surface_id = _require_str(payload, "surface_id", max_length=200).strip()
+    parameter = _require_str(payload, "parameter", max_length=64).strip()
+    hint_evidence_id = _require_str(
+        payload, "hint_evidence_id", max_length=200,
+    ).strip()
+    if _SURFACE_REF.fullmatch(surface_id) is None:
+        raise RequestRejected("surface_id 가 올바르지 않다.")
+    if _PARAMETER_REF.fullmatch(parameter) is None:
+        raise RequestRejected("parameter 가 올바르지 않다.")
+    if hint_evidence_id and _SURFACE_REF.fullmatch(hint_evidence_id) is None:
+        raise RequestRejected("hint_evidence_id 가 올바르지 않다.")
+
+    rule_value = _require_choice(
+        payload,
+        "destination_rule",
+        ("unknown", *(item.value for item in SsrfDestinationRule)),
+        default="unknown",
+    )
+    source_value = _require_str(payload, "policy_source", max_length=40).strip()
+    source_reference = _require_str(
+        payload, "source_reference", max_length=200,
+    ).strip()
+    verification_url = _require_str(
+        payload, "verification_url", max_length=2048,
+    ).strip()
+    execution_consent = _require_bool(payload, "execution_consent")
+    hint_use_approved = _require_bool(payload, "hint_use_approved")
+    use_owned_receiver = _require_bool(payload, "use_owned_receiver")
+    if use_owned_receiver and verification_url:
+        raise RequestRejected("Receiver와 별도 내부 확인 주소를 함께 선택할 수 없다.")
+    if use_owned_receiver and not execution_consent:
+        raise RequestRejected("Receiver 사용에는 별도 실행 동의가 필요하다.")
+    if use_owned_receiver and hint_use_approved:
+        raise RequestRejected("생성된 Receiver 주소는 Recon 단서로 승인할 수 없다.")
+    if verification_url and not execution_consent:
+        raise RequestRejected("내부 확인 주소 사용에는 별도 실행 동의가 필요하다.")
+    if execution_consent and not (verification_url or use_owned_receiver):
+        raise RequestRejected("실행 동의에는 정확한 주소 또는 소유 Receiver가 필요하다.")
+    if hint_use_approved and (not hint_evidence_id or not verification_url):
+        raise RequestRejected(
+            "Recon 단서 사용 승인에는 단서와 정확한 내부 확인 주소가 필요하다."
+        )
+    destination_rule = None
+    policy_source = None
+    if rule_value == "unknown":
+        if source_value or source_reference:
+            raise RequestRejected("unknown 규칙에는 정책 출처를 함께 보낼 수 없다.")
+    else:
+        try:
+            destination_rule = SsrfDestinationRule(rule_value)
+            policy_source = SsrfPolicySource(source_value)
+        except ValueError as error:
+            raise RequestRejected("policy_source 가 신뢰 가능한 열거값이 아니다.") from error
+        if policy_source is not SsrfPolicySource.OPERATOR_ATTESTATION:
+            raise RequestRejected(
+                "수동 검토에서는 operator_attestation 정책만 등록할 수 있다."
+            )
+        try:
+            validate_ssrf_opaque_reference(
+                source_reference, "source_reference",
+            )
+        except DomainInvariantError as error:
+            raise RequestRejected(
+                "source_reference 는 비밀값이 아닌 짧은 불투명 정책 참조여야 한다."
+            ) from error
+        if not source_reference or _OPAQUE_REVIEW_REF.fullmatch(source_reference) is None:
+            raise RequestRejected("source_reference 는 짧은 불투명 정책 참조여야 한다.")
+        if not source_reference.startswith(_SSRF_POLICY_REFERENCE_PREFIX[policy_source]):
+            raise RequestRejected(
+                "source_reference must use the prefix required by policy_source"
+            )
+        if not (verification_url or use_owned_receiver):
+            raise RequestRejected(
+                "a structured destination policy requires an approved destination"
+            )
+    verification_endpoint_ref = _opaque_review_ref(
+        payload, "verification_endpoint_ref",
+        required=not bool(verification_url or use_owned_receiver),
+    )
+    if (verification_url or use_owned_receiver) and verification_endpoint_ref:
+        raise RequestRejected("실행 목적지와 기존 서비스 참조를 함께 등록할 수 없다.")
+
+    return action, SsrfReviewSubmission(
+        run_id=run_id,
+        surface_id=surface_id,
+        parameter=parameter,
+        hint_evidence_id=hint_evidence_id,
+        verification_endpoint_ref=verification_endpoint_ref,
+        approved_by=_opaque_review_ref(payload, "approved_by"),
+        destination_rule=destination_rule,
+        policy_source=policy_source,
+        source_reference=source_reference,
+        verification_url=verification_url,
+        execution_consent=execution_consent,
+        hint_use_approved=hint_use_approved,
+        use_owned_receiver=use_owned_receiver,
+    )
+
+
 def parse_run_payload(payload, defaults: RunOptions) -> tuple[RunOptions, RunSecrets]:
     """요청 본문을 실행 옵션과 비밀로 나눈다. 비밀은 RunOptions 에 넣지 않는다."""
 
@@ -208,6 +359,10 @@ def parse_run_payload(payload, defaults: RunOptions) -> tuple[RunOptions, RunSec
         llm_rpm_limit=_optional_rpm(payload),
         knowledge_db=_require_str(payload, "knowledge_db", max_length=300).strip(),
         juice_shop_db=_require_str(payload, "juice_shop_db", max_length=300).strip(),
+        ssrf_interactsh_server=_require_str(payload, "ssrf_interactsh_server", max_length=200).strip(),
+        ssrf_interactsh_callback_domain=_require_str(
+            payload, "ssrf_interactsh_callback_domain", max_length=200,
+        ).strip(),
         **{
             spec["field"]: _require_choice(
                 payload, spec["field"], spec["choices"], default=spec["choices"][0]
@@ -233,6 +388,7 @@ def parse_run_payload(payload, defaults: RunOptions) -> tuple[RunOptions, RunSec
             owner_password=_require_str(accounts, "owner_password", max_length=200),
         ),
         ssti_token=_require_str(payload, "ssti_token", max_length=4096),
+        interactsh_token=_require_str(payload, "interactsh_token", max_length=4096),
     )
     return options, run_secrets
 
@@ -382,7 +538,8 @@ def make_handler(supervisor: RunSupervisor, options: argparse.Namespace, csrf_to
             }
 
         def do_POST(self) -> None:  # noqa: N802
-            if urlsplit(self.path).path != "/api/run":
+            path = urlsplit(self.path).path
+            if path not in {"/api/run", "/api/ssrf-review"}:
                 self._json(404, {"error": "not found"})
                 return
 
@@ -399,6 +556,28 @@ def make_handler(supervisor: RunSupervisor, options: argparse.Namespace, csrf_to
                 payload = json.loads(self.rfile.read(length) or b"{}")
             except json.JSONDecodeError:
                 self._json(400, {"error": "본문이 올바른 JSON이 아니다."})
+                return
+
+            if path == "/api/ssrf-review":
+                try:
+                    action, submission = parse_ssrf_review_payload(payload)
+                    if action == "skip":
+                        supervisor.skip_ssrf_review(
+                            _require_str(payload, "run_id", max_length=200).strip()
+                        )
+                    else:
+                        assert submission is not None
+                        supervisor.register_ssrf_review(submission)
+                except RequestRejected as error:
+                    self._json(400, {"error": str(error)})
+                    return
+                except (AgentContractError, DomainInvariantError, ValueError) as error:
+                    self._json(400, {"error": str(error)})
+                    return
+                except RuntimeError as error:
+                    self._json(409, {"error": str(error)})
+                    return
+                self._json(200, {"status": "registered" if action == "register" else "skipped"})
                 return
 
             try:

@@ -27,6 +27,7 @@ from hacklipse.domain import (
     Surface,
     ValidationProofType,
     ValidationVerdict,
+    redacted_internal_url_path,
 )
 from hacklipse.ports import (
     BudgetManager,
@@ -73,6 +74,7 @@ _PROOF_TYPE_BY_VULNERABILITY = {
     "Access Control": ValidationProofType.UNAUTHORIZED_OBJECT_ACCESS,
     "Path Traversal": ValidationProofType.PATH_TRAVERSAL_FILE_READ,
     "SSTI": ValidationProofType.SSTI_EXECUTION,
+    "SSRF": ValidationProofType.SSRF_UNAUTHORIZED_FETCH,
 }
 
 VALIDATION_ROUNDS_EXHAUSTED_REASON = "validation rounds exhausted"
@@ -94,6 +96,9 @@ class OrchestratorConfig:
     min_budget_for_extra_recon: int = 3
     budget_allocation_enabled: bool = False
     max_validation_reserve_per_candidate: int = 2
+    # Optional UI checkpoint. The callback may block while an operator reviews
+    # the persisted Recon result; CLI/default assembly leaves it unset.
+    post_recon_gate: Callable[[Run], None] | None = None
 
     def __post_init__(self) -> None:
         if self.max_evidence_rounds < 0:
@@ -143,6 +148,7 @@ class Orchestrator:
         | None = None,
         orchestration_advisor: OrchestrationAdvisor | None = None,
         budget_allocation_advisor: BudgetAllocationAdvisor | None = None,
+        run_finalizer: Callable[[str], None] | None = None,
     ) -> None:
         self._runs = run_store
         self._evidence = evidence_store
@@ -164,6 +170,7 @@ class Orchestrator:
         self._knowledge_context = knowledge_context_provider
         self._orchestration_advisor = orchestration_advisor
         self._budget_allocation_advisor = budget_allocation_advisor
+        self._run_finalizer = run_finalizer
         # 발행 결과. 조용히 사라지지 않도록 RUN_COMPLETED에 함께 싣는다.
         self._knowledge_failures: list[str] = []
         self._knowledge_published: tuple[int, int] | None = None
@@ -212,16 +219,20 @@ class Orchestrator:
             # 취약점 Run의 완료와 Knowledge 발행 성공은 서로 다른 상태다. 발행 오류는
             # Run을 실패로 뒤집지 않으므로, 완료된 Run을 resume하면 멱등적으로 다시
             # 발행한다. 이미 저장된 관측은 DuplicateRecord로 성공 처리된다.
-            if self._knowledge is not None and self._knowledge_case is not None:
-                self._continue_progress(run_id)
-                self._publish_knowledge(run)
-                self._emit(
-                    run,
-                    ProgressEventKind.RUN_COMPLETED,
-                    detail=self._knowledge_publication_detail(),
-                )
-            return run
+            try:
+                if self._knowledge is not None and self._knowledge_case is not None:
+                    self._continue_progress(run_id)
+                    self._publish_knowledge(run)
+                    self._emit(
+                        run,
+                        ProgressEventKind.RUN_COMPLETED,
+                        detail=self._knowledge_publication_detail(),
+                    )
+                return run
+            finally:
+                self._finalize_terminal_run(run_id)
         if run.phase is RunPhase.FAILED:
+            self._finalize_terminal_run(run_id)
             return run
         self._continue_progress(run_id)
 
@@ -252,6 +263,14 @@ class Orchestrator:
                 self._emit(run, ProgressEventKind.PHASE_CHANGED)
                 if run.phase is RunPhase.RECON:
                     run = self._recon(run)
+                    # Persist discovered Surface/Evidence references before a UI gate
+                    # waits. A reviewer must only select coordinates from this Run.
+                    self._runs.save(run)
+                    if self._config.post_recon_gate is not None:
+                        self._config.post_recon_gate(run)
+                        # The gate may persist structured approval/policy facts.
+                        # Reload before transition so this local copy cannot overwrite them.
+                        run = self._runs.get(run.run_id)
                     run = self._state.transition(run, RunPhase.ROUTE)
                 elif run.phase is RunPhase.ROUTE:
                     run = self._route(run)
@@ -302,6 +321,17 @@ class Orchestrator:
             raise WorkflowExecutionError(
                 run.run_id, run.phase.value, safe_error_reason(error)
             ) from error
+        finally:
+            self._finalize_terminal_run(run_id)
+
+    def _finalize_terminal_run(self, run_id: str) -> None:
+        """Release process-local secrets only after the Run cannot be resumed."""
+
+        if self._run_finalizer is None:
+            return
+        run = self._runs.get(run_id)
+        if run.phase in {RunPhase.DONE, RunPhase.FAILED}:
+            self._run_finalizer(run_id)
 
     def _recon(self, run: Run) -> Run:
         """Recon Task를 실행하고 새 Evidence·Surface 참조를 Run에 병합한다."""
@@ -661,16 +691,46 @@ class Orchestrator:
             candidate = self._candidates.get(run.run_id, candidate_id)
             if not _pending_in(candidate, CandidateStatus.ANALYZED):
                 continue
-            browser_costs = [
-                min(32, 1 + count)
-                for evidence in self._evidence.get_many(run.run_id, candidate.evidence_ids)
-                if evidence.observation.get("type") == "browser_execution"
-                and evidence.observation.get("dom_reflected") is True
-                if type(count := evidence.observation.get("subrequest_count")) is int
-                and count >= 0
-            ]
-            reserve += 2 * max(browser_costs) if browser_costs else 2
+            reserve += self._candidate_validation_requirement(
+                run, candidate, fallback=2,
+            )
         return reserve
+
+    def _candidate_validation_requirement(
+        self, run: Run, candidate: Candidate, *, fallback: int,
+    ) -> int:
+        """Return the known proof cost without weakening the configured floor."""
+
+        browser_costs = [
+            min(32, 1 + count)
+            for evidence in self._evidence.get_many(run.run_id, candidate.evidence_ids)
+            if evidence.observation.get("type") == "browser_execution"
+            and evidence.observation.get("dom_reflected") is True
+            if type(count := evidence.observation.get("subrequest_count")) is int
+            and count >= 0
+        ]
+        if browser_costs:
+            return max(fallback, 2 * max(browser_costs))
+        if candidate.vulnerability_type == "SSRF":
+            # Callback and internal-canary strategies both need a fresh
+            # Validation control/probe pair.
+            return max(fallback, 2)
+        return fallback
+
+    def _deferred_analysis_floor(self, run: Run, candidate_id: str) -> int:
+        """Protect prior proofs and the retried Candidate's own proof reserve."""
+
+        reserve = 0
+        for item_id in run.candidate_ids:
+            candidate = self._candidates.get(run.run_id, item_id)
+            if _pending_in(candidate, CandidateStatus.ANALYZED):
+                reserve += self._candidate_validation_requirement(
+                    run, candidate, fallback=run.budget_validation_reserve,
+                )
+        current = self._candidates.get(run.run_id, candidate_id)
+        return reserve + self._candidate_validation_requirement(
+            run, current, fallback=run.budget_validation_reserve,
+        )
 
     def _validation_floor(
         self, run: Run, candidate_id: str, remaining_ids: Sequence[str]
@@ -684,12 +744,24 @@ class Orchestrator:
         weights = dict(zip(run.budget_candidate_order, run.budget_candidate_weights))
         remaining = self._global_remaining(run.run_id)
         reserve = run.budget_validation_reserve
+        requirements = {
+            item: self._candidate_validation_requirement(
+                run,
+                self._candidates.get(run.run_id, item),
+                fallback=reserve,
+            )
+            for item in pending
+        }
         total_weight = sum(weights[item] for item in pending)
         share = max(
-            reserve,
+            requirements[candidate_id],
             (remaining * weights[candidate_id] + total_weight - 1) // total_weight,
         )
-        return max((len(pending) - 1) * reserve, remaining - share)
+        other_floor = sum(
+            requirement for item, requirement in requirements.items()
+            if item != candidate_id
+        )
+        return max(other_floor, remaining - share)
 
     def _activate_budget_candidate(
         self, run: Run, candidate_id: str, phase: str, floor: int
@@ -757,9 +829,11 @@ class Orchestrator:
                 current = self._fail_candidate(current, candidate_id, error)
             current = self._clear_active_budget_candidate(current)
         # Redistribute unused analysis shares after every candidate had a
-        # first turn. Preserve one validation unit per already analyzed
-        # candidate. Only a declared request batch is retried, so a partially
-        # spent probe cannot consume the last validation units.
+        # first turn. Preserve the actual proof floor already earned by prior
+        # Analysis plus this Candidate's configured reserve. The deferred
+        # Agent's ``required_requests`` carries any strategy-specific shortfall
+        # (SSRF needs two Validation requests), so both parts are required
+        # before retrying a whole declared batch.
         if run.budget_candidate_order:
             for candidate_id in order:
                 required = deferred_costs.get(candidate_id)
@@ -769,10 +843,7 @@ class Orchestrator:
                     and candidate.resume_status is CandidateStatus.ROUTED
                 ):
                     continue
-                floor = (
-                    self._pending_validation_count(current, run.candidate_ids)
-                    * run.budget_validation_reserve
-                )
+                floor = self._deferred_analysis_floor(current, candidate_id)
                 if self._global_remaining(run.run_id) - floor < required:
                     continue
                 current, floor = self._activate_budget_candidate(
@@ -810,6 +881,10 @@ class Orchestrator:
                 surface_method=surface.method,
                 request_budget=self._budget.remaining(run.run_id),
                 knowledge_hints=knowledge_hints,
+                validation_request_reserve=(
+                    run.budget_validation_reserve
+                    if run.budget_candidate_order else 0
+                ),
             )
             result = self._tasks.execute(task)
 
@@ -1359,13 +1434,11 @@ class Orchestrator:
 
 
 def _path_only(url: str | None) -> str | None:
-    """진행 사건에 남길 경로만 뽑는다. query와 fragment는 버린다."""
+    """진행 사건에 남길 비밀값 없는 경로 형태만 뽑는다."""
 
     if url is None:
         return None
-    from urllib.parse import urlsplit
-
-    return urlsplit(url).path or "/"
+    return redacted_internal_url_path(urlsplit(url).path or "/")
 
 
 _UNSAFE_RECON_PATH_PARTS = frozenset(

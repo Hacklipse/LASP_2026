@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from ipaddress import ip_address
 from urllib.parse import urlsplit
 
-from hacklipse.domain import ExecutionRequest, Run, RunRequest, RunScope
+from hacklipse.domain import (
+    ExecutionRequest, HttpRequestKind, Run, RunRequest, RunScope,
+    SsrfCanaryProofTarget,
+)
 from hacklipse.ports import ApprovalGate
 from hacklipse.ports.errors import ApprovalRequired, PolicyViolation
+from hacklipse.ports.ssrf_callback import callback_url_matches_origin
 
 from .request_safety import has_state_changing_get
 from .security import DenyAllApprovalGate
@@ -28,8 +33,106 @@ class AllowlistPolicyGate:
     # safe 프로필에서는 서버 상태를 바꿀 가능성이 낮은 메서드만 허용한다.
     _safe_methods = frozenset({"GET", "HEAD", "OPTIONS"})
 
-    def __init__(self, approval_gate: ApprovalGate | None = None) -> None:
+    def __init__(
+        self, approval_gate: ApprovalGate | None = None,
+        *, ssrf_callback_origin: str | None = None,
+        ssrf_local_test_mode: bool = False,
+        ssrf_canary_proof: SsrfCanaryProofTarget | None = None,
+        ssrf_owned_receiver_origin: str | None = None,
+    ) -> None:
         self._approval = approval_gate or DenyAllApprovalGate()
+        self._ssrf_local_test_mode = ssrf_local_test_mode
+        self._ssrf_canary_proof = ssrf_canary_proof
+        self._ssrf_run_canaries: dict[str, SsrfCanaryProofTarget] = {}
+        self._ssrf_owned_receiver_origin = None
+        self._ssrf_owned_receiver_tickets: dict[
+            str, dict[str, tuple[str, str]]
+        ] = {}
+        if ssrf_callback_origin is not None:
+            parsed = urlsplit(ssrf_callback_origin)
+            host = (parsed.hostname or "").casefold().rstrip(".")
+            try:
+                is_ip_literal = bool(ip_address(host))
+            except ValueError:
+                is_ip_literal = False
+            local_origin = (
+                ssrf_local_test_mode and parsed.scheme == "http"
+                and host in {"127.0.0.1", "host.docker.internal"}
+                and parsed.port is not None
+            )
+            if (
+                not (parsed.scheme == "https" and not is_ip_literal
+                     and host != "localhost" and not host.endswith((".localhost", ".local")))
+                and not local_origin
+            ) or (
+                not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.path not in {"", "/"} or parsed.query or parsed.fragment
+            ):
+                raise ValueError(
+                    "SSRF callback origin must be public HTTPS or explicit loopback test HTTP"
+                )
+            # shortcut: origin-only gating cannot prove a ticket was issued; bind
+            # issued tokens when the callback service adapter is connected.
+            self._ssrf_callback_origin = ssrf_callback_origin.rstrip("/")
+        else:
+            self._ssrf_callback_origin = None
+        if ssrf_owned_receiver_origin is not None:
+            parsed = urlsplit(ssrf_owned_receiver_origin)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    "owned SSRF receiver must expose a plain HTTP(S) origin"
+                )
+            self._ssrf_owned_receiver_origin = ssrf_owned_receiver_origin.rstrip("/")
+
+    def register_ssrf_canary_proof(
+        self, run_id: str, canary: SsrfCanaryProofTarget,
+    ) -> None:
+        """Keep a late operator approval scoped to one Run."""
+
+        existing = self._ssrf_run_canaries.get(run_id)
+        if existing is not None and existing != canary:
+            raise ValueError("SSRF canary was already bound to this Run")
+        self._ssrf_run_canaries[run_id] = canary
+
+    def discard_ssrf_run_secrets(self, run_id: str) -> None:
+        """Drop exact canary material once the owning Run is terminal."""
+
+        self._ssrf_run_canaries.pop(run_id, None)
+        self._ssrf_owned_receiver_tickets.pop(run_id, None)
+        self._ssrf_canary_proof = None
+
+    def register_ssrf_owned_receiver_ticket(
+        self, run_id: str, surface_id: str, parameter: str, url: str,
+    ) -> None:
+        """Allow exactly one centrally issued receiver URL at one coordinate."""
+
+        if (
+            self._ssrf_owned_receiver_origin is None
+            or not callback_url_matches_origin(
+                url, self._ssrf_owned_receiver_origin,
+            )
+            or not run_id
+            or not surface_id
+            or not parameter
+        ):
+            raise PolicyViolation("owned SSRF receiver ticket is invalid")
+        tickets = self._ssrf_owned_receiver_tickets.setdefault(run_id, {})
+        binding = (surface_id, parameter)
+        existing = tickets.get(url)
+        if existing is not None and existing != binding:
+            raise PolicyViolation(
+                "owned SSRF receiver ticket is bound to another coordinate"
+            )
+        tickets[url] = binding
 
     def validate_run(self, request: RunRequest) -> None:
         """Run 시작 대상이 선언된 Scope 안에 있는지 검사한다."""
@@ -41,6 +144,59 @@ class AllowlistPolicyGate:
 
         if request.run_id != run.run_id:
             raise PolicyViolation("execution request belongs to another run")
+        if request.request_kind is HttpRequestKind.SSRF_PROBE:
+            callbacks = [
+                value for _, value in request.query_parameters
+                if value.startswith((
+                    "https://", "http://127.0.0.1:",
+                    "http://host.docker.internal:",
+                ))
+            ]
+            if (
+                request.tool != "http_get" or request.method.upper() != "GET"
+                or self._ssrf_callback_origin is None or len(callbacks) != 1
+                or not callback_url_matches_origin(callbacks[0], self._ssrf_callback_origin)
+            ):
+                raise PolicyViolation("SSRF probe requires the registered callback origin")
+            if self._ssrf_local_test_mode and self._ssrf_callback_origin.startswith("http://"):
+                target_host = (urlsplit(run.target_url).hostname or "").casefold()
+                allowed = {host.casefold() for host in run.scope.allowed_hosts}
+                if target_host not in {"localhost", "127.0.0.1"} or not allowed.issubset(
+                    {"localhost", "127.0.0.1"}
+                ):
+                    raise PolicyViolation("loopback callback is limited to loopback targets")
+        if request.request_kind is HttpRequestKind.SSRF_CANARY_PROBE:
+            canary = self._ssrf_run_canaries.get(run.run_id, self._ssrf_canary_proof)
+            if (
+                canary is None or request.surface_id != canary.surface_id
+                or request.tool != "http_get"
+                or request.method.upper() != "GET"
+                or sum(value == canary.url for _, value in request.query_parameters) != 1
+                or any(value.startswith(("http://", "https://")) and value != canary.url
+                       for _, value in request.query_parameters)
+            ):
+                raise PolicyViolation("SSRF canary probe requires the approved exact URL")
+        if request.request_kind is HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE:
+            receiver_values = [
+                (name, value) for name, value in request.query_parameters
+                if value.startswith(("http://", "https://"))
+            ]
+            tickets = self._ssrf_owned_receiver_tickets.get(run.run_id, {})
+            if (
+                request.tool != "http_get"
+                or request.method.upper() != "GET"
+                or len(receiver_values) != 1
+                or tickets.get(receiver_values[0][1])
+                != (request.surface_id, receiver_values[0][0])
+                or any(
+                    value.startswith(("http://", "https://"))
+                    and value != receiver_values[0][1]
+                    for _, value in request.query_parameters
+                )
+            ):
+                raise PolicyViolation(
+                    "SSRF owned-receiver probe requires its exact issued ticket"
+                )
         if request.tool == BROWSER_XSS_TOOL:
             if request.scope != run.scope:
                 raise PolicyViolation("browser execution scope does not match its run")

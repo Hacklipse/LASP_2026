@@ -105,6 +105,25 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
         and baseline_result.get("authenticated") is not None
         and baseline_result.get("authenticated") == hybrid_result.get("authenticated")
     )
+    def canary_policy_registered(result: dict) -> bool:
+        if "ssrf_canary_policy_ref_present" in result:
+            return result.get("ssrf_canary_policy_ref_present") is True
+        # Old JSONL records may contain the value. Compare presence only; never
+        # copy the legacy string into new output.
+        return bool(result.get("ssrf_canary_policy_ref", ""))
+
+    same_ssrf_proof = bool(
+        baseline_result and hybrid_result
+        and all(
+            baseline_result.get(field, default) == hybrid_result.get(field, default)
+            for field, default in (
+                ("ssrf_oast_mode", "off"),
+                ("ssrf_public_oast_consented", False),
+            )
+        )
+        and canary_policy_registered(baseline_result)
+        == canary_policy_registered(hybrid_result)
+    )
     code_versions = (
         baseline_result.get("code_version") if baseline_result else None,
         hybrid_result.get("code_version") if hybrid_result else None,
@@ -141,6 +160,7 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
             (same_budget, "request_budget_mismatch"),
             (same_approval, "approval_mismatch"),
             (same_authentication, "authentication_mismatch"),
+            (same_ssrf_proof, "ssrf_proof_setup_mismatch"),
             (not paired, "paired_run_has_one_analysis_branch"),
         )
         analysis_unavailable_reasons = [reason for passed, reason in checks if not passed]
@@ -161,6 +181,7 @@ def compare_records(baseline, hybrid, baseline_result=None, hybrid_result=None):
         "same_request_budget": same_budget if baseline_result and hybrid_result else None,
         "same_state_changing_approval": same_approval if baseline_result and hybrid_result else None,
         "same_authentication": same_authentication if baseline_result and hybrid_result else None,
+        "same_ssrf_proof_setup": same_ssrf_proof if baseline_result and hybrid_result else None,
         "same_code_version": same_code_version if baseline_result and hybrid_result else None,
         "comparison_axis": "router_mode",
         "analysis_unavailable_reasons": analysis_unavailable_reasons,

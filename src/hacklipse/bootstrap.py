@@ -23,6 +23,7 @@ from hacklipse.adapters import (
     InMemoryBudgetManager,
     InMemoryExecutionAuditLog,
     InMemoryProgressLog,
+    InMemorySsrfReviewRegistry,
     LlmSqliAnalyzer,
     LlmSstiAnalyzer,
     LlmPathTraversalAnalyzer,
@@ -36,6 +37,7 @@ from hacklipse.adapters import (
     NarratorFingerprintConfig,
     ReconAgent,
     RuleBasedVulnerabilityRouter,
+    SsrfReviewAwareRouter,
     SensitiveDataSanitizer,
     ValidationAgent,
 )
@@ -45,8 +47,19 @@ from hacklipse.adapters.browser_runtime import PlaywrightBrowserRuntime
 from hacklipse.adapters.postmessage_xss_analysis import PostMessageXssAnalyzer
 from hacklipse.adapters.analyzer_capabilities import (
     DEFAULT_ANALYZER_CAPABILITIES, OPTIONAL_SOURCE_MAP_CAPABILITIES,
+    OPTIONAL_SSRF_CALLBACK_CAPABILITIES, OPTIONAL_SSRF_CANARY_CAPABILITIES,
+    OPTIONAL_SSRF_OWNED_RECEIVER_CAPABILITIES,
 )
-from hacklipse.adapters.routing import OPTIONAL_SOURCE_MAP_RULES
+from hacklipse.adapters.routing import (
+    OPTIONAL_SOURCE_MAP_RULES,
+    OPTIONAL_SSRF_OBSERVATION_RULES, OPTIONAL_SSRF_SURFACE_RULES,
+    OPTIONAL_SSRF_CANARY_OBSERVATION_RULES, OPTIONAL_SSRF_CANARY_SURFACE_RULES,
+    OPTIONAL_SSRF_OWNED_RECEIVER_OBSERVATION_RULES,
+    OPTIONAL_SSRF_OWNED_RECEIVER_SURFACE_RULES,
+    OPTIONAL_SSRF_REVIEW_OBSERVATION_RULES, OPTIONAL_SSRF_REVIEW_SURFACE_RULES,
+)
+from hacklipse.adapters.ssrf_analysis import SSRF_ANALYZER, SSRF_ANALYSIS_TOOLS, SsrfAnalyzer
+from hacklipse.adapters.llm_ssrf_analysis import LlmSsrfAnalyzer
 from hacklipse.adapters.sensitive_exposure import SensitiveExposureAnalyzer
 from hacklipse.adapters.public_login_credentials import PublicLoginCredentialsAnalyzer
 from hacklipse.adapters.graphql_introspection import GraphqlIntrospectionAnalyzer
@@ -83,7 +96,7 @@ from hacklipse.application import (
     TaskExecutor,
     TaskFactory,
 )
-from hacklipse.domain import TaskEnvelope
+from hacklipse.domain import SsrfCanaryProofTarget, TaskEnvelope
 from hacklipse.ports import (
     ProgressSink,
     Agent,
@@ -100,6 +113,10 @@ from hacklipse.ports import (
     ReportStore,
     RetryPolicy,
     RunStore,
+    SsrfCallbackService,
+    OwnedSsrfReceiverService,
+    ServerRequestObservationProvider,
+    SsrfReviewRegistry,
     SurfaceStore,
     LlmClient,
     IterativeReconPlanner,
@@ -170,6 +187,20 @@ class StoreBundle(Protocol):
     reports: ReportStore
 
 
+def _discard_ssrf_run_secrets(
+    run_id: str,
+    *,
+    collector: RuntimeEvidenceCollector,
+    policy: AllowlistPolicyGate,
+    reviews: SsrfReviewRegistry,
+) -> None:
+    """Clear exact SSRF endpoints after Analysis and Validation are terminal."""
+
+    collector.discard_ssrf_run_secrets(run_id)
+    policy.discard_ssrf_run_secrets(run_id)
+    reviews.discard(run_id)
+
+
 @dataclass(slots=True)
 class LocalApplication:
     """조립된 Orchestrator와 로컬 Adapter를 호출자에게 제공한다."""
@@ -183,6 +214,43 @@ class LocalApplication:
     runtime: ExecutionRuntime
     collector: RuntimeEvidenceCollector
     audit_log: ExecutionAuditLog
+    ssrf_reviews: SsrfReviewRegistry
+    ssrf_review_gate_enabled: bool = False
+
+    def ssrf_verification_endpoint_ref(self, run_id: str, url: str) -> str:
+        return self.collector.ssrf_verification_endpoint_ref(run_id, url)
+
+    def ssrf_owned_receiver_endpoint_ref(self, run_id: str) -> str:
+        """Return the approval ref for the explicitly injected receiver."""
+
+        return self.collector.ssrf_owned_receiver_endpoint_ref(run_id)
+
+    @property
+    def ssrf_owned_receiver_origin(self) -> str | None:
+        """Return the in-memory receiver origin for trusted policy binding only."""
+
+        return self.collector.ssrf_owned_receiver_origin
+
+    def register_ssrf_canary_proof(
+        self, run_id: str, canary: SsrfCanaryProofTarget,
+    ) -> None:
+        """Attach a reviewed, exact-Surface endpoint without saving its URL."""
+
+        if not isinstance(canary, SsrfCanaryProofTarget):
+            raise TypeError("SSRF canary must use SsrfCanaryProofTarget")
+        # Collector checks the Run review, exact endpoint fingerprint and policy.
+        self.collector.register_ssrf_canary_proof(run_id, canary)
+        self.policy_gate.register_ssrf_canary_proof(run_id, canary)
+
+    def discard_ssrf_run_secrets(self, run_id: str) -> None:
+        """Idempotently release one terminal Run's protected SSRF memory."""
+
+        _discard_ssrf_run_secrets(
+            run_id,
+            collector=self.collector,
+            policy=self.policy_gate,
+            reviews=self.ssrf_reviews,
+        )
 
 
 def build_local_application(
@@ -199,6 +267,13 @@ def build_local_application(
     audit_log: ExecutionAuditLog | None = None,
     approval_gate: ApprovalGate | None = None,
     default_approval_ref: str | None = None,
+    ssrf_callback_origin: str | None = None,
+    ssrf_callback_service: SsrfCallbackService | None = None,
+    ssrf_owned_receiver_service: OwnedSsrfReceiverService | None = None,
+    ssrf_local_test_mode: bool = False,
+    ssrf_canary_proof: SsrfCanaryProofTarget | None = None,
+    ssrf_observation_provider: ServerRequestObservationProvider | None = None,
+    ssrf_review_registry: SsrfReviewRegistry | None = None,
     agent_allowed_tools: Mapping[str, tuple[str, ...]] | None = None,
     task_progress_callback: Callable[[str, TaskEnvelope, int, float], None]
     | None = None,
@@ -221,11 +296,35 @@ def build_local_application(
     selected_budget = ReservedBudgetManager(
         budget_manager if budget_manager is not None else InMemoryBudgetManager()
     )
-    policy = AllowlistPolicyGate(approval_gate=approval_gate)
+    if ssrf_callback_service is not None:
+        if (
+            ssrf_callback_origin is not None
+            and ssrf_callback_origin.rstrip("/").casefold()
+            != ssrf_callback_service.origin.rstrip("/").casefold()
+        ):
+            raise ValueError("SSRF callback service and configured origin disagree")
+        ssrf_callback_origin = ssrf_callback_service.origin
+    if (
+        ssrf_owned_receiver_service is not None
+        and getattr(ssrf_owned_receiver_service, "operator_owned", False) is not True
+    ):
+        raise ValueError(
+            "SSRF owned receiver must explicitly attest operator_owned=True"
+        )
+    policy = AllowlistPolicyGate(
+        approval_gate=approval_gate, ssrf_callback_origin=ssrf_callback_origin,
+        ssrf_local_test_mode=ssrf_local_test_mode,
+        ssrf_canary_proof=ssrf_canary_proof,
+        ssrf_owned_receiver_origin=(
+            ssrf_owned_receiver_service.origin
+            if ssrf_owned_receiver_service is not None else None
+        ),
+    )
     # 명시적인 Runtime 주입이 없으면 외부 실행을 전부 거부하는 구현을 선택한다.
     selected_runtime = runtime or DisabledExecutionRuntime()
     selected_config = config or OrchestratorConfig()
     selected_audit = audit_log or InMemoryExecutionAuditLog()
+    selected_ssrf_reviews = ssrf_review_registry or InMemorySsrfReviewRegistry()
     selected_sanitizer = evidence_sanitizer or SensitiveDataSanitizer(
         credential_resolver
     )
@@ -241,6 +340,11 @@ def build_local_application(
         evidence_sanitizer=selected_sanitizer,
         audit_log=selected_audit,
         default_approval_ref=default_approval_ref,
+        ssrf_callback_service=ssrf_callback_service,
+        ssrf_owned_receiver_service=ssrf_owned_receiver_service,
+        ssrf_canary_proof=ssrf_canary_proof,
+        ssrf_observation_provider=ssrf_observation_provider,
+        ssrf_review_registry=selected_ssrf_reviews,
     )
     if isinstance(selected_runtime, PlaywrightBrowserRuntime):
         selected_runtime.bind_collector(collector)
@@ -318,6 +422,30 @@ def build_local_application(
         or getattr(selected_stores, "progress", None)
         or InMemoryProgressLog()
     )
+    selected_router = router or (
+        standard_router(ssrf_callback_service=ssrf_callback_service)
+        if ssrf_callback_service is not None else RuleBasedVulnerabilityRouter()
+    )
+    review_ssrf_router = standard_router(
+        ("SSRF",), ssrf_review_registry=selected_ssrf_reviews,
+        ssrf_canary_enabled=True,
+        ssrf_owned_receiver_enabled=ssrf_owned_receiver_service is not None,
+    )
+    selected_router = SsrfReviewAwareRouter(
+        selected_router,
+        review_ssrf_router,
+        selected_ssrf_reviews,
+        preserve_unregistered_ssrf=ssrf_callback_service is not None,
+        enable_registered_ssrf=(
+            collector.ssrf_enabled or collector.ssrf_observation_enabled
+            or collector.ssrf_owned_receiver_enabled
+            or collector.ssrf_canary_proof is not None
+            or selected_config.post_recon_gate is not None
+        ),
+        registration_loader=collector.restore_ssrf_review,
+        canary_loader=collector.ssrf_canary_proof_for_run,
+        owned_receiver_enabled=collector.ssrf_owned_receiver_enabled,
+    )
     orchestrator = Orchestrator(
         run_store=selected_stores.runs,
         evidence_store=selected_stores.evidence,
@@ -327,7 +455,7 @@ def build_local_application(
         surface_store=selected_stores.surfaces,
         policy_gate=policy,
         budget_manager=selected_budget,
-        router=router or RuleBasedVulnerabilityRouter(),
+        router=selected_router,
         task_executor=task_executor,
         state_machine=RunStateMachine(),
         task_factory=TaskFactory(),
@@ -348,6 +476,12 @@ def build_local_application(
         ),
         orchestration_advisor=orchestration_advisor,
         budget_allocation_advisor=budget_allocation_advisor,
+        run_finalizer=lambda run_id: _discard_ssrf_run_secrets(
+            run_id,
+            collector=collector,
+            policy=policy,
+            reviews=selected_ssrf_reviews,
+        ),
     )
     return LocalApplication(
         orchestrator=orchestrator,
@@ -359,6 +493,8 @@ def build_local_application(
         runtime=selected_runtime,
         collector=collector,
         audit_log=selected_audit,
+        ssrf_reviews=selected_ssrf_reviews,
+        ssrf_review_gate_enabled=selected_config.post_recon_gate is not None,
     )
 
 
@@ -380,6 +516,7 @@ IMPLEMENTED_ANALYZERS = (
     "sqli_analyzer",
     "path_traversal_analyzer",
     "ssti_analyzer",
+    SSRF_ANALYZER,
 )
 
 def standard_router(
@@ -395,6 +532,10 @@ def standard_router(
     review_policy: str = "weak",
     compare: bool = False,
     router_advisor: bool | None = None,
+    ssrf_callback_service: SsrfCallbackService | None = None,
+    ssrf_review_registry: SsrfReviewRegistry | None = None,
+    ssrf_canary_enabled: bool = False,
+    ssrf_owned_receiver_enabled: bool = False,
 ) -> VulnerabilityRouter:
     """구현된 Analyzer로만 라우팅하는 Router를 만든다.
 
@@ -424,11 +565,19 @@ def standard_router(
                 vulnerability_types, analyzer_capabilities=analyzer_capabilities,
                 mode="heuristic", audit_log=audit_log,
                 audit_metadata=audit_metadata, review_policy=review_policy,
+                ssrf_callback_service=ssrf_callback_service,
+                ssrf_review_registry=ssrf_review_registry,
+                ssrf_canary_enabled=ssrf_canary_enabled,
+                ssrf_owned_receiver_enabled=ssrf_owned_receiver_enabled,
             ),
             hybrid=standard_router(
                 vulnerability_types, analyzer_capabilities=analyzer_capabilities,
                 mode="hybrid", llm_client=llm_client,
                 audit_log=audit_log, audit_metadata=audit_metadata, review_policy=review_policy,
+                ssrf_callback_service=ssrf_callback_service,
+                ssrf_review_registry=ssrf_review_registry,
+                ssrf_canary_enabled=ssrf_canary_enabled,
+                ssrf_owned_receiver_enabled=ssrf_owned_receiver_enabled,
             ),
         )
     selected_types = (
@@ -439,13 +588,35 @@ def standard_router(
         for rule in (
             *DEFAULT_RULES,
             *(OPTIONAL_SOURCE_MAP_RULES if selected_types and "Source Map Exposure" in selected_types else ()),
+            *(OPTIONAL_SSRF_OBSERVATION_RULES
+              if ssrf_callback_service is not None else ()),
+            *(OPTIONAL_SSRF_CANARY_OBSERVATION_RULES
+              if ssrf_canary_enabled else ()),
+            *(OPTIONAL_SSRF_OWNED_RECEIVER_OBSERVATION_RULES
+              if ssrf_owned_receiver_enabled else ()),
+            *(OPTIONAL_SSRF_REVIEW_OBSERVATION_RULES
+              if ssrf_review_registry is not None
+              and not ssrf_canary_enabled
+              and not ssrf_owned_receiver_enabled else ()),
         )
         if rule.agent_type in IMPLEMENTED_ANALYZERS
         and (selected_types is None or rule.vulnerability_type in selected_types)
     )
     surface_rules = tuple(
         rule
-        for rule in DEFAULT_SURFACE_RULES
+        for rule in (
+            *DEFAULT_SURFACE_RULES,
+            *(OPTIONAL_SSRF_SURFACE_RULES
+              if ssrf_callback_service is not None else ()),
+            *(OPTIONAL_SSRF_CANARY_SURFACE_RULES
+              if ssrf_canary_enabled else ()),
+            *(OPTIONAL_SSRF_OWNED_RECEIVER_SURFACE_RULES
+              if ssrf_owned_receiver_enabled else ()),
+            *(OPTIONAL_SSRF_REVIEW_SURFACE_RULES
+              if ssrf_review_registry is not None
+              and not ssrf_canary_enabled
+              and not ssrf_owned_receiver_enabled else ()),
+        )
         if rule.agent_type in IMPLEMENTED_ANALYZERS
         and (selected_types is None or rule.vulnerability_type in selected_types)
     )
@@ -457,6 +628,12 @@ def standard_router(
         else (
             *DEFAULT_ANALYZER_CAPABILITIES,
             *(OPTIONAL_SOURCE_MAP_CAPABILITIES if selected_types and "Source Map Exposure" in selected_types else ()),
+            *(OPTIONAL_SSRF_CALLBACK_CAPABILITIES
+              if ssrf_callback_service is not None else ()),
+            *(OPTIONAL_SSRF_CANARY_CAPABILITIES
+              if ssrf_canary_enabled else ()),
+            *(OPTIONAL_SSRF_OWNED_RECEIVER_CAPABILITIES
+              if ssrf_owned_receiver_enabled else ()),
         )
     )
     capabilities = tuple(
@@ -887,6 +1064,24 @@ def register_standard_agents(
         ssti_analyzer,
         allowed_tools=("ssti_probe",),
     )
+    if (
+        app.collector.ssrf_enabled or app.collector.ssrf_observation_enabled
+        or app.collector.ssrf_owned_receiver_enabled
+        or app.collector.ssrf_canary_proof is not None
+        or app.ssrf_review_gate_enabled
+    ):
+        ssrf_kwargs = dict(
+            candidate_store=app.stores.candidates,
+            surface_store=app.stores.surfaces,
+            evidence_store=app.stores.evidence,
+            collector=app.collector,
+        )
+        app.dispatcher.register(
+            SSRF_ANALYZER,
+            (LlmSsrfAnalyzer(llm_client=analysis_llm_client, **ssrf_kwargs)
+             if llm_client is not None else SsrfAnalyzer(**ssrf_kwargs)),
+            allowed_tools=("http_get", *SSRF_ANALYSIS_TOOLS),
+        )
     # Validation verdict와 proof는 어느 구성에서나 결정적 Validator가 만든다.
     # validation_review는 그 위에 LLM 분류 Claim을 덧붙일 뿐이고, 기본값이 off인
     # 이유는 대조군/LLM 두 구성의 LLM 호출 수를 비교 가능하게 유지하기 위해서다.

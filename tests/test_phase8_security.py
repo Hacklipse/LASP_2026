@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import threading
 import time
@@ -34,6 +35,7 @@ from hacklipse.domain import (
     AgentResult,
     AgentResultStatus,
     ExecutionRequest,
+    ExecutionResult,
     RunPhase,
     RunRequest,
     RunScope,
@@ -540,6 +542,249 @@ class SanitizerStructurePreservationTests(unittest.TestCase):
 
         self.assertEqual(parsed.path, "/search")
         self.assertEqual(parse_qs(parsed.query), {"csrf_token": ["<redacted>"]})
+
+    def test_internal_urls_are_redacted_before_response_evidence_storage(self) -> None:
+        jwt = (
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+            "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        )
+        private_url = (
+            "http://URL-USER-SECRET:URL-PASSWORD-SECRET@mailpit:8025/"
+            "private/token/DEMO-SECRET?api_key=QUERY-SECRET-987"
+            "#FRAGMENT-SECRET-654"
+        )
+        body = json.dumps({
+            "description": f"relay {private_url}",
+            "status": "http://10.0.0.8:9000/api/status",
+            "callback": f"http://service.local/session/{jwt}",
+        })
+        request = ExecutionRequest(
+            execution_id="exec-internal-url", run_id="run-internal-url",
+            task_id="task-internal-url", tool="http_get",
+            target_url="http://local.test/openapi.json", surface_id="surface-openapi",
+            purpose="read public API description",
+        )
+        result = ExecutionResult(
+            execution_id=request.execution_id, evidence_type="http_response",
+            observation={
+                "type": "http_response", "status": 200,
+                "content_type": "application/json",
+                "requested_url": (
+                    "http://127.0.0.1:3456/search?q=hacklipse-control"
+                ),
+                "body": body,
+            },
+        )
+
+        stored = SensitiveDataSanitizer().sanitize(request, result).observation
+        json.loads(stored["body"])
+        serialized = json.dumps(stored, sort_keys=True)
+
+        for secret in (
+            "URL-USER-SECRET", "URL-PASSWORD-SECRET", "DEMO-SECRET",
+            "QUERY-SECRET-987", "FRAGMENT-SECRET-654", jwt,
+        ):
+            self.assertNotIn(secret, serialized)
+        self.assertIn("http://mailpit:8025/private/token/redacted", serialized)
+        self.assertIn("http://10.0.0.8:9000/api/status", serialized)
+        self.assertIn("http://service.local/session/redacted", serialized)
+        self.assertNotIn("QUERY-SECRET-987", serialized)
+        self.assertNotIn("FRAGMENT-SECRET-654", serialized)
+        self.assertEqual(
+            stored["requested_url"],
+            "http://127.0.0.1:3456/search?q=hacklipse-control",
+        )
+
+    def test_embedded_internal_url_is_redacted_in_javascript_body(self) -> None:
+        secret = "pR8vQ2xN7mK4zT9wD6sF1aH5"
+        script = (
+            'const endpoint = "http://service.local/private/credential/'
+            + secret + '?token=QUERY-VALUE#PRIVATE-FRAGMENT";'
+        )
+
+        request = ExecutionRequest(
+            execution_id="exec-js-url", run_id="run-js-url", task_id="task-js-url",
+            tool="http_get", target_url="http://local.test/app.js",
+            surface_id="surface-js", purpose="read public JavaScript",
+        )
+        result = ExecutionResult(
+            execution_id=request.execution_id, evidence_type="http_response",
+            observation={
+                "type": "http_response", "status": 200,
+                "content_type": "application/javascript", "body": script,
+            },
+        )
+
+        sanitized = SensitiveDataSanitizer().sanitize(
+            request, result,
+        ).observation["body"]
+
+        for value in (secret, "QUERY-VALUE", "PRIVATE-FRAGMENT"):
+            self.assertNotIn(value, sanitized)
+        self.assertIn(
+            "http://service.local/private/credential/redacted", sanitized,
+        )
+
+    def test_internal_url_is_redacted_in_headers_nested_observation_and_artifacts(
+        self,
+    ) -> None:
+        internal = (
+            "http://URL-USER:URL-PASSWORD@mailpit:8025/private/token/"
+            "DEMO-SECRET?api_key=QUERY-SECRET#FRAGMENT-SECRET"
+        )
+        request = ExecutionRequest(
+            execution_id="exec-nested-url", run_id="run-nested-url",
+            task_id="task-nested-url", tool="http_get",
+            target_url="http://local.test/openapi.json", surface_id="surface-openapi",
+            purpose="read public API description",
+        )
+        result = ExecutionResult(
+            execution_id=request.execution_id, evidence_type="http_response",
+            observation={
+                "type": "http_redirect", "status": 302, "location": internal,
+                "headers": [["X-Backend", internal]],
+                "nested": {"destinations": [internal]},
+            },
+            artifact_refs={"trace": f"destination={internal}"},
+        )
+
+        stored = SensitiveDataSanitizer().sanitize(request, result)
+        serialized = json.dumps(
+            {"observation": stored.observation, "artifacts": stored.artifact_refs},
+            sort_keys=True,
+        )
+
+        for secret in (
+            "URL-USER", "URL-PASSWORD", "DEMO-SECRET", "QUERY-SECRET",
+            "FRAGMENT-SECRET",
+        ):
+            self.assertNotIn(secret, serialized)
+        self.assertEqual(
+            stored.observation["location"],
+            "http://mailpit:8025/private/token/redacted?api_key=%3Credacted%3E",
+        )
+        self.assertIn("http://mailpit:8025/private/token/redacted", serialized)
+
+    def test_origin_only_header_keeps_empty_path(self) -> None:
+        """URL masking must not alter an exact reflected CORS Origin value."""
+
+        origin = "https://probe-a.invalid"
+        request = ExecutionRequest(
+            execution_id="exec-cors-origin", run_id="run-cors-origin",
+            task_id="task-cors-origin", tool="http_get",
+            target_url="http://local.test/search", surface_id="surface-search",
+            purpose="CORS probe",
+        )
+        result = ExecutionResult(
+            execution_id=request.execution_id, evidence_type="http_response",
+            observation={
+                "type": "http_response", "status": 200,
+                "headers": [["Access-Control-Allow-Origin", origin]],
+            },
+        )
+
+        stored = SensitiveDataSanitizer().sanitize(request, result)
+
+        self.assertEqual(
+            stored.observation["headers"],
+            [["Access-Control-Allow-Origin", origin]],
+        )
+
+    def test_public_open_redirect_location_and_comparison_hash_are_preserved(self) -> None:
+        destination = "https://outside.example/landing?next=public#section"
+        request = ExecutionRequest(
+            execution_id="exec-public-redirect", run_id="run-public-redirect",
+            task_id="task-public-redirect", tool="http_get",
+            target_url="http://local.test/goto?next=outside",
+            surface_id="surface-redirect", purpose="redirect control for next",
+        )
+        result = ExecutionResult(
+            execution_id=request.execution_id, evidence_type="http_redirect",
+            observation={
+                "type": "http_redirect", "status": 302,
+                "location": destination, "headers": [["Location", destination]],
+                "body": "",
+            },
+        )
+
+        stored = SensitiveDataSanitizer().sanitize(request, result).observation
+
+        redacted_destination = (
+            "https://outside.example/landing?next=%3Credacted%3E"
+        )
+        self.assertEqual(stored["location"], redacted_destination)
+        self.assertEqual(stored["headers"], [["Location", redacted_destination]])
+        self.assertEqual(
+            stored["open_redirect_destination_hashes"],
+            [hashlib.sha256(destination.encode("utf-8")).hexdigest()],
+        )
+
+    def test_public_signed_urls_are_redacted_in_body_location_and_artifacts(self) -> None:
+        uuid = "123e4567-e89b-12d3-a456-426614174000"
+        jwt = (
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+            "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        )
+        signed_value = "SIGNED-QUERY-VALUE-0123456789"
+        token = "PUBLIC-PATH-TOKEN-0123456789"
+        artifact_secret = "aB3dE5fG7hJ9kL2mN4pQ6rS8tU0vW1xY"
+        body_url = (
+            f"https://URL-USER:URL-PASSWORD@CDN.Example.:8443/download/{uuid}/{jwt}"
+            f"?X-Amz-Signature={signed_value}#private-fragment"
+        )
+        location_url = (
+            f"https://api.example/private/token/{token}?tenant=private#details"
+        )
+        artifact_url = f"https://files.example/archive/{artifact_secret}?download=1"
+        request = ExecutionRequest(
+            execution_id="exec-public-urls", run_id="run-public-urls",
+            task_id="task-public-urls", tool="http_get",
+            target_url="http://local.test/openapi.json", surface_id="surface-openapi",
+            purpose="read public API description",
+        )
+        result = ExecutionResult(
+            execution_id=request.execution_id, evidence_type="http_response",
+            observation={
+                "type": "http_response", "status": 200,
+                "body": json.dumps({"signed_download": body_url}),
+                "location": location_url,
+                "headers": [["X-Signed-URL", body_url]],
+            },
+            artifact_refs={"download": artifact_url},
+        )
+
+        stored = SensitiveDataSanitizer().sanitize(request, result)
+        serialized = json.dumps(
+            {"observation": stored.observation, "artifacts": stored.artifact_refs},
+            sort_keys=True,
+        )
+
+        for secret in (
+            "URL-USER", "URL-PASSWORD", uuid, jwt, signed_value,
+            "private-fragment", token, artifact_secret,
+        ):
+            self.assertNotIn(secret, serialized)
+        self.assertIn(
+            "https://cdn.example:8443/download/redacted/redacted"
+            "?X-Amz-Signature=%3Credacted%3E",
+            serialized,
+        )
+        self.assertEqual(
+            stored.observation["location"],
+            "https://api.example/private/token/redacted?tenant=%3Credacted%3E",
+        )
+        self.assertEqual(
+            stored.observation["headers"],
+            [[
+                "X-Signed-URL",
+                "https://cdn.example:8443/download/redacted/redacted"
+                "?X-Amz-Signature=%3Credacted%3E",
+            ]],
+        )
+        self.assertEqual(
+            stored.artifact_refs["download"],
+            "https://files.example/archive/redacted?download=%3Credacted%3E",
+        )
 
 
 class InMemoryCredentialResolverRegistrationTests(unittest.TestCase):

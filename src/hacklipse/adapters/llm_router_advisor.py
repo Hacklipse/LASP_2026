@@ -46,6 +46,7 @@ from hacklipse.ports.errors import (
 from hacklipse.ports.llm import LlmClient, LlmMessage, LlmRequest, LlmUsage
 
 from .request_safety import has_state_changing_parameters
+from .security import redacted_internal_url_path
 from .llm_parameter_names import alias_parameter_names
 from .analyzer_capabilities import (
     AnalyzerCapabilityCoverage,
@@ -69,7 +70,6 @@ DEFAULT_MAX_SURFACES = 40
 _AGENTIC_CACHE_LIMIT = 32
 
 _NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,63}$")
-_PATH_SEGMENT = re.compile(r"^[A-Za-z][A-Za-z_-]{0,63}(?:\.[A-Za-z]{1,10})?$")
 
 _SUGGESTION_SCHEMA = {
     "type": "object",
@@ -1347,10 +1347,7 @@ def surface_routing_summary(
 
 
 def _path_hint(path: str) -> str:
-    return "/".join(
-        segment if not segment or _PATH_SEGMENT.fullmatch(segment) else "{value}"
-        for segment in path.split("/")
-    )
+    return redacted_internal_url_path(path)
 
 
 def _add_usage(left: LlmUsage, right: LlmUsage) -> LlmUsage:

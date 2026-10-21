@@ -24,6 +24,9 @@ _BROWSER_XSS_TOOL = "browser_xss"
 _BROWSER_XSS_ANALYZER = "browser_xss_analyzer"
 _POSTMESSAGE_XSS_ANALYZER = "postmessage_xss_analyzer"
 _PUBLIC_LOGIN_CREDENTIAL_TYPE = "Exposed Working Credentials"
+_SSRF_TOOLS = (
+    "get_surface_context", "probe_observed_url_input", "read_probe_result",
+)
 
 
 class TaskFactory:
@@ -64,6 +67,7 @@ class TaskFactory:
         request_budget: int,
         surface_method: str = "GET",
         knowledge_hints: tuple[KnowledgeHint, ...] = (),
+        validation_request_reserve: int = 0,
     ) -> TaskEnvelope:
         """Candidate의 실제 Surface URL과 Evidence 참조를 Analysis Task에 담는다."""
 
@@ -77,6 +81,8 @@ class TaskFactory:
             allowed_tools = (_ACCESS_CONTROL_TOOL,)
         elif candidate.vulnerability_type == "SSTI":
             allowed_tools = (_SSTI_TOOL,)
+        elif candidate.vulnerability_type == "SSRF":
+            allowed_tools = ("http_get", *_SSRF_TOOLS)
         elif candidate.vulnerability_type == _PUBLIC_LOGIN_CREDENTIAL_TYPE:
             allowed_tools = ("http_get", "http_post")
         elif candidate.vulnerability_type == "SQLi":
@@ -89,6 +95,7 @@ class TaskFactory:
             run,
             agent_type=candidate.assigned_agent,
             request_budget=request_budget,
+            validation_request_reserve=validation_request_reserve,
             target_url=target_url,
             surface_id=candidate.surface_id,
             candidate_id=candidate.candidate_id,
@@ -226,6 +233,7 @@ class TaskFactory:
         validation_id: str | None = None,
         evidence_request: EvidenceRequest | None = None,
         credential_ref: str | None = None,
+        validation_request_reserve: int = 0,
     ) -> TaskEnvelope:
         """모든 Task에 공통인 Run·정책·예산 정보를 조립한다.
 
@@ -245,6 +253,7 @@ class TaskFactory:
             finding_ids=finding_ids,
             allowed_tools=allowed_tools,
             request_budget=request_budget,
+            validation_request_reserve=validation_request_reserve,
             policy_profile=run.policy_profile,
             timeout_seconds=run.timeout_seconds,
             credential_ref=credential_ref,

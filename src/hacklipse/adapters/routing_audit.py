@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hmac
 import math
 import os
 import re
+import secrets
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
@@ -21,6 +23,12 @@ from hacklipse.ports.agents import VulnerabilityRouter
 from .analyzer_capabilities import capability_missing_requirements
 from .llm_router_advisor import surface_routing_summary
 from .routing import ADVISOR_PRIORITY, RuleBasedVulnerabilityRouter
+
+
+# Strict audit fingerprints must be comparable for paired Router A/B calls in
+# this process, but must not be an offline dictionary oracle for persisted URL,
+# query, or response values. A restart deliberately creates a new scope.
+_PRIVATE_FINGERPRINT_KEY = secrets.token_bytes(32)
 
 
 class RoutingAuditSink(Protocol):
@@ -384,7 +392,7 @@ def surface_key(surface: Surface) -> str:
     data = asdict(surface)
     data.pop("run_id")
     data.pop("surface_id")
-    return _fingerprint(data)
+    return _private_fingerprint(data)
 
 
 def routing_surface_key(surface: Surface, evidence: Sequence[Evidence]) -> str:
@@ -413,7 +421,7 @@ def routing_surface_identities(
 
 def input_fingerprint(run: Run, surfaces: Sequence[Surface], evidence: Sequence[Evidence]) -> str:
     keys = {surface.surface_id: surface_key(surface) for surface in surfaces}
-    return _fingerprint({
+    return _private_fingerprint({
         "surfaces": [keys[surface.surface_id] for surface in surfaces],
         "evidence": [
             {"surface": keys.get(item.surface_id), "type": item.evidence_type,
@@ -464,7 +472,9 @@ def routing_input_manifest(
                     else None
                 ),
                 # strict 입력이 달라졌을 때 어느 관측이 원인인지 원문 없이 찾는다.
-                "observation_fingerprint": _fingerprint(dict(item.observation)),
+                "observation_fingerprint": _private_fingerprint(
+                    dict(item.observation)
+                ),
             }
             for index, item in enumerate(evidence)
         ],
@@ -498,8 +508,21 @@ def routing_input_fingerprint(
 
 
 def _fingerprint(value: object) -> str:
+    """Fingerprint an already-redacted structural summary."""
+
     serialized = json.dumps(value, sort_keys=True, ensure_ascii=True, default=str)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _private_fingerprint(value: object) -> str:
+    """Key raw audit inputs without persisting a reusable dictionary oracle."""
+
+    serialized = json.dumps(value, sort_keys=True, ensure_ascii=True, default=str)
+    return hmac.new(
+        _PRIVATE_FINGERPRINT_KEY,
+        serialized.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _priority(value: object) -> int | float | None:
