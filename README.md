@@ -166,9 +166,19 @@ Run the common pipeline against an authorized local application:
 python scripts/run_baseline.py 'http://127.0.0.1:8000/download?file=sample' 80
 ```
 
-Being merged in from `feat/arbitrary-file-read-detection-plan`: a table of
-probe values (relative depths and encoded forms beside the absolute path), a
-coordinate that replaces one path segment, and a check of whether the proof
-file is already public on the same origin. Until those land the agent sends one
-value per coordinate, reaches no path-segment input, and does not check whether
-the file was public to begin with.
+Three coordinates, then. A query input, a value carried in the path as
+`name=value`, and the final segment of a parameterless file route such as
+`/download/report.pdf` — the last one asks for a directory cue before it
+offers a candidate, so it does not attach to every GET without a query.
+
+Each coordinate is tried in every spelling the domain fixes for its probe
+kind, because filters reject a shape rather than a file: a target that refuses
+`/etc/os-release` may still serve it when the separator arrives encoded. Every
+spelling resolves to the same file, so what gets read is still not a choice.
+Reading it two ways is one finding, not two.
+
+Before confirming, the proof file is fetched directly on the same origin. If
+the app already publishes it, the read proves nothing and the candidate is
+rejected.
+
+Merged in from `feat/arbitrary-file-read-detection-plan`.
