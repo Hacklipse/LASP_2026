@@ -63,6 +63,7 @@ import re
 
 from hacklipse.domain import (
     ARBITRARY_FILE_READ_SAFE_PROBE_PATH,
+    ARBITRARY_FILE_READ_SAFE_PROBE_VALUES,
     DIRECTORY_ESCAPE_ABSENT_FILE,
     DIRECTORY_ESCAPE_PROOF_FILE,
     AgentResult,
@@ -211,7 +212,12 @@ def build_arbitrary_file_read_requests(
     *,
     purpose: str,
 ) -> tuple[EvidenceRequest, ...]:
-    """control 1개와 파라미터별 고정 절대 경로 probe를 만든다."""
+    """control 1개와 (파라미터 x 표기)별 고정 절대 경로 probe를 만든다.
+
+    표기를 여러 개 보내는 이유는 필터가 내용이 아니라 형태로 막는 경우가 많기 때문이다.
+    한 표기가 거부되는 것만 보고 끝내면 읽을 수 있는 대상을 놓친다. 읽는 파일은 모든
+    표기가 같으므로 "무엇을 읽는가"는 여전히 하나로 고정돼 있다.
+    """
 
     all_parameters = tuple(dict.fromkeys(parameters))
     selected_parameters = tuple(dict.fromkeys(selected))
@@ -238,28 +244,35 @@ def build_arbitrary_file_read_requests(
         )
     ]
     for parameter in selected_parameters:
-        requests.append(
-            EvidenceRequest(
-                evidence_type="http_response",
-                surface_id=surface.surface_id,
-                reason=f"absolute path probe for parameter {parameter} on {purpose}",
-                suggested_tool=ARBITRARY_FILE_READ_TOOL,
-                http_request=HttpRequestSpec(
-                    method="GET",
-                    query_parameters=tuple(
-                        (
-                            name,
-                            ARBITRARY_FILE_READ_PROBE_PATH
-                            if name == parameter
-                            else CONTROL_VALUE,
-                        )
-                        for name in query_names
+        for form in ARBITRARY_FILE_READ_SAFE_PROBE_VALUES:
+            requests.append(
+                EvidenceRequest(
+                    evidence_type="http_response",
+                    surface_id=surface.surface_id,
+                    # 표기가 reason 에 들어가야 같은 파라미터의 여러 표기가 서로 다른
+                    # 지문을 받아 증적이 섞이지 않는다.
+                    reason=(
+                        f"absolute path probe ({_form_label(form)}) for parameter "
+                        f"{parameter} on {purpose}"
                     ),
-                    request_kind=HttpRequestKind.ARBITRARY_FILE_READ_PROBE,
-                ),
+                    suggested_tool=ARBITRARY_FILE_READ_TOOL,
+                    http_request=HttpRequestSpec(
+                        method="GET",
+                        query_parameters=tuple(
+                            (name, form if name == parameter else CONTROL_VALUE)
+                            for name in query_names
+                        ),
+                        request_kind=HttpRequestKind.ARBITRARY_FILE_READ_PROBE,
+                    ),
+                )
             )
-        )
     return tuple(requests)
+
+
+def _form_label(value: str) -> str:
+    """증적 지문에 쓰는 표기 이름. 경로 자체를 reason 에 싣지 않는다."""
+
+    return "percent-encoded" if "%" in value else "literal"
 
 
 def build_arbitrary_file_read_path_requests(
@@ -291,21 +304,25 @@ def build_arbitrary_file_read_path_requests(
                 method="GET", request_kind=HttpRequestKind.CONTROL
             ),
         ),
-        EvidenceRequest(
-            evidence_type="http_response",
-            surface_id=surface.surface_id,
-            reason=(
-                f"absolute path probe for path assignment {assignment.name} on {purpose}"
-            ),
-            suggested_tool=ARBITRARY_FILE_READ_TOOL,
-            http_request=HttpRequestSpec(
-                method="GET",
-                request_kind=HttpRequestKind.ARBITRARY_FILE_READ_PROBE,
-                path_assignment_name=assignment.name,
-                path_assignment_value_start=assignment.value_start,
-                path_assignment_value_end=assignment.value_end,
-                path_assignment_value=ARBITRARY_FILE_READ_PROBE_PATH,
-            ),
+        *(
+            EvidenceRequest(
+                evidence_type="http_response",
+                surface_id=surface.surface_id,
+                reason=(
+                    f"absolute path probe ({_form_label(form)}) for path assignment "
+                    f"{assignment.name} on {purpose}"
+                ),
+                suggested_tool=ARBITRARY_FILE_READ_TOOL,
+                http_request=HttpRequestSpec(
+                    method="GET",
+                    request_kind=HttpRequestKind.ARBITRARY_FILE_READ_PROBE,
+                    path_assignment_name=assignment.name,
+                    path_assignment_value_start=assignment.value_start,
+                    path_assignment_value_end=assignment.value_end,
+                    path_assignment_value=form,
+                ),
+            )
+            for form in ARBITRARY_FILE_READ_SAFE_PROBE_VALUES
         ),
     )
 
@@ -494,14 +511,23 @@ def record_arbitrary_file_read_observations(
     id_factory: Callable[[], str],
     extra: dict[str, object] | None = None,
 ) -> list[str]:
-    """Python이 확인한 고정 파일 읽기만 Observation으로 저장한다."""
+    """Python이 확인한 고정 파일 읽기만 Observation으로 저장한다.
+
+    한 좌표에 표기가 여러 개 보내지므로 ``probes`` 는 좌표마다 표기 수만큼 들어온다.
+    좌표 하나에 Observation 은 하나만 남긴다 — 같은 파일을 두 표기로 읽은 것은 발견이
+    둘이 아니라 하나이고, 표기별로 남기면 Candidate 수와 보고서가 부풀려진다.
+    """
 
     new_ids: list[str] = []
-    for parameter, probe in zip(selected, probes):
+    forms = max(1, len(probes) // max(1, len(selected)))
+    recorded: set[str] = set()
+    for index, probe in enumerate(probes):
+        parameter = selected[min(index // forms, len(selected) - 1)]
         if probe is None:
             raise AgentContractError("arbitrary file read probe evidence was not collected")
-        if not arbitrary_file_read_signal(control, probe):
+        if parameter in recorded or not arbitrary_file_read_signal(control, probe):
             continue
+        recorded.add(parameter)
         if has_observation_record(
             evidence,
             created_by,
@@ -664,14 +690,14 @@ class HeuristicArbitraryFileReadAnalyzer:
                 candidate_ids=(candidate.candidate_id,),
             )
 
-        control, probe = collected
-        if control is None or probe is None:  # missing 이후에는 도달하지 않는다.
+        control, probes = collected[0], collected[1:]
+        if control is None or any(item is None for item in probes):
             raise AgentContractError("arbitrary file read path evidence was not collected")
         new_ids = record_arbitrary_file_read_observations(
             task=task,
             selected=(assignment.name,),
             control=control,
-            probes=(probe,),
+            probes=probes,
             evidence=evidence,
             evidence_store=self._evidence,
             created_by=HEURISTIC_ARBITRARY_FILE_READ_ANALYZER,

@@ -1833,7 +1833,11 @@ class ValidationAgent:
             )
 
         control = reproduced[0]
-        for parameter, probe in zip(signaled, reproduced[1:]):
+        # 좌표마다 표기가 여러 개 재현되므로 1:1 로 짝지으면 첫 표기만 보고 기각한다.
+        # 형태로 막는 대상에서는 그 첫 표기가 거부되는 쪽이라 특히 문제가 된다.
+        forms = max(1, len(reproduced[1:]) // max(1, len(signaled)))
+        for index, probe in enumerate(reproduced[1:]):
+            parameter = signaled[min(index // forms, len(signaled) - 1)]
             if not arbitrary_file_read_signal(control, probe):
                 continue
             proof_evidence = (control, probe)
@@ -1916,11 +1920,17 @@ class ValidationAgent:
                 evidence_requests=missing,
             )
 
-        control, probe = collected
-        if control is None or probe is None:  # missing 이후에는 도달하지 않는다.
+        control, probes = collected[0], collected[1:]
+        if control is None or any(item is None for item in probes):
             raise AgentContractError(
                 "arbitrary file read path reproduction was not collected"
             )
+        # 표기 중 하나라도 재현되면 확정이다. 같은 파일을 다른 표기로 읽은 것이므로
+        # 발견이 여럿이 되는 것은 아니다.
+        probe = next(
+            (item for item in probes if arbitrary_file_read_signal(control, item)),
+            probes[0],
+        )
         if any(
             item.observation.get("type") in {"http_error", "http_redirect"}
             for item in (control, probe)

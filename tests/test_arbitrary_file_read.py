@@ -25,6 +25,7 @@ from hacklipse.bootstrap import (
 )
 from hacklipse.domain import (
     ARBITRARY_FILE_READ_SAFE_PROBE_PATH,
+    ARBITRARY_FILE_READ_SAFE_PROBE_VALUES,
     Evidence,
     ExecutionRequest,
     ExecutionResult,
@@ -66,30 +67,42 @@ def _request(**overrides) -> ExecutionRequest:
 
 
 class ProbeShapeTests(unittest.TestCase):
-    def test_probe_sends_the_fixed_absolute_path(self) -> None:
-        control, probe = build_arbitrary_file_read_requests(
+    def test_probe_sends_every_form_of_the_one_fixed_file(self) -> None:
+        control, *probes = build_arbitrary_file_read_requests(
             _surface(), ("file",), ("file",), purpose="probe"
         )
-        self.assertEqual(
-            dict(probe.http_request.query_parameters)["file"],
-            ARBITRARY_FILE_READ_SAFE_PROBE_PATH,
-        )
-        self.assertIs(
-            probe.http_request.request_kind,
-            HttpRequestKind.ARBITRARY_FILE_READ_PROBE,
-        )
         self.assertIs(control.http_request.request_kind, HttpRequestKind.CONTROL)
+        # 표기는 여럿이지만 가리키는 파일은 하나다. 그게 안전 성질이다.
+        self.assertEqual(
+            [dict(item.http_request.query_parameters)["file"] for item in probes],
+            list(ARBITRARY_FILE_READ_SAFE_PROBE_VALUES),
+        )
+        for item in probes:
+            self.assertIs(
+                item.http_request.request_kind,
+                HttpRequestKind.ARBITRARY_FILE_READ_PROBE,
+            )
+
+    def test_each_form_gets_its_own_fingerprint(self) -> None:
+        """표기가 같은 지문을 받으면 두 번째 표기의 증적이 첫 번째로 오인된다."""
+
+        _, *probes = build_arbitrary_file_read_requests(
+            _surface(), ("file",), ("file",), purpose="probe"
+        )
+        prints = [item.request_fingerprint("http://localhost/view") for item in probes]
+        self.assertEqual(len(set(prints)), len(prints))
 
     def test_only_the_selected_parameter_carries_the_probe(self) -> None:
         """한 요청에서 바뀌는 자리가 둘이면 무엇이 신호를 만들었는지 말할 수 없다."""
 
-        _, probe = build_arbitrary_file_read_requests(
+        _, *probes = build_arbitrary_file_read_requests(
             _surface(parameters=("file", "lang")), ("file", "lang"), ("file",),
             purpose="probe",
         )
-        values = dict(probe.http_request.query_parameters)
-        self.assertEqual(values["file"], ARBITRARY_FILE_READ_SAFE_PROBE_PATH)
-        self.assertNotEqual(values["lang"], ARBITRARY_FILE_READ_SAFE_PROBE_PATH)
+        for item in probes:
+            values = dict(item.http_request.query_parameters)
+            self.assertIn(values["file"], ARBITRARY_FILE_READ_SAFE_PROBE_VALUES)
+            self.assertNotIn(values["lang"], ARBITRARY_FILE_READ_SAFE_PROBE_VALUES)
 
 
 class FileParameterNameTests(unittest.TestCase):
@@ -281,9 +294,9 @@ class ArbitraryFileReadPipelineTests(unittest.TestCase):
         ]
         self.assertTrue(probes)
         for probe in probes:
-            self.assertEqual(
+            self.assertIn(
                 dict(parse_qsl(urlsplit(probe.resolved_url).query))["page"],
-                ARBITRARY_FILE_READ_PROBE_PATH,
+                ARBITRARY_FILE_READ_SAFE_PROBE_VALUES,
             )
         candidates = app.stores.candidates.list_by_run(run.run_id)
         self.assertTrue(candidates)
@@ -299,10 +312,12 @@ class ArbitraryFileReadPipelineTests(unittest.TestCase):
             item for item in runtime.requests
             if item.validation_id == finding.validation_id
         ]
-        # 독립 Validation 세션이 control 과 probe 를 직접 다시 보냈다.
+        # 독립 Validation 세션이 control 과 표기별 probe 를 직접 다시 보냈다.
+        kinds = [item.request_kind.value for item in replayed]
+        self.assertEqual(kinds.count("control"), 1)
         self.assertEqual(
-            sorted(item.request_kind.value for item in replayed),
-            ["arbitrary_file_read_probe", "control"],
+            kinds.count("arbitrary_file_read_probe"),
+            len(ARBITRARY_FILE_READ_SAFE_PROBE_VALUES),
         )
         by_id = {
             item.evidence_id: item
@@ -324,6 +339,77 @@ class ArbitraryFileReadPipelineTests(unittest.TestCase):
         self.assertEqual(
             app.budget_manager.remaining(run.run_id), 30 - len(runtime.requests)
         )
+
+
+class _SingleDecodeRuntime:
+    """한 번만 디코딩하는 대상. 평문 절대 경로는 거부하고 이중 인코딩만 통과시킨다.
+
+    필터가 내용이 아니라 형태로 막는 전형이다. 표기가 하나뿐이면 이 대상은 "읽을 수
+    없다"로 보고되는데, 실제로는 읽힌다.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[ExecutionRequest] = []
+
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        self.requests.append(request)
+        parsed = urlsplit(request.resolved_url)
+        raw = dict(parse_qsl(parsed.query, keep_blank_values=True)).get("page", "")
+        if parsed.path in ("/", "/index.html"):
+            body, status = '<a href="/view?page=readme.txt">doc</a>', 200
+        elif raw.startswith("/"):
+            # 디코딩된 결과가 절대 경로면 형태로 거부한다.
+            body, status = '{"detail":"absolute path rejected"}', 403
+        elif raw == "%2fetc%2fos-release":
+            # 한 번 더 디코딩해 파일을 연다.
+            body, status = "\n".join(ARBITRARY_FILE_READ_PROOF_MARKERS), 200
+        else:
+            body, status = "a readme", 200
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            evidence_type="http_response",
+            observation={
+                "type": "http_response", "status": status, "body": body,
+                "requested_url": request.resolved_url,
+            },
+        )
+
+
+class ProbeFormCoverageTests(unittest.TestCase):
+    """한 표기로는 못 찾는 대상을 다른 표기가 찾는지 확인한다."""
+
+    def test_encoded_form_reaches_a_target_the_literal_form_cannot(self) -> None:
+        runtime = _SingleDecodeRuntime()
+        app, run = _pipeline_run(runtime)
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(
+            [
+                item.vulnerability_type
+                for item in app.stores.findings.list_by_run(run.run_id)
+            ],
+            ["Arbitrary File Read"],
+        )
+        sent = [
+            dict(parse_qsl(urlsplit(item.resolved_url).query)).get("page")
+            for item in runtime.requests
+            if item.request_kind is HttpRequestKind.ARBITRARY_FILE_READ_PROBE
+        ]
+        # 평문은 403을 받았고, 그래도 이중 인코딩 표기까지 시도해 확정했다.
+        self.assertIn(ARBITRARY_FILE_READ_SAFE_PROBE_PATH, sent)
+        self.assertIn("%2fetc%2fos-release", sent)
+
+    def test_one_coordinate_yields_one_finding_not_one_per_form(self) -> None:
+        runtime = _QueryFileRuntime()
+        app, run = _pipeline_run(runtime)
+
+        # 같은 파일을 두 표기로 읽어도 발견은 하나다.
+        self.assertEqual(len(app.stores.findings.list_by_run(run.run_id)), 1)
+        observations = [
+            item for item in app.stores.evidence.list_by_run(run.run_id)
+            if item.observation.get("type") == ARBITRARY_FILE_READ_OBSERVATION
+        ]
+        self.assertEqual(len(observations), 1)
 
 
 class _AbsolutePathHandler(BaseHTTPRequestHandler):

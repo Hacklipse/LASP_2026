@@ -240,16 +240,37 @@ _FORBIDDEN_REQUEST_HEADERS = frozenset(
 )
 
 
-def is_path_traversal_safe_probe_value(value: str) -> bool:
-    """고정된 비민감 증명 파일 상대 경로와 정확히 같은지 확인한다."""
+# 같은 증명 파일을 가리키는 서로 다른 표기. 필터는 형태로 막는 경우가 많아, 한 형태가
+# 거부되는 것만 보고 "읽을 수 없다"고 결론 내면 실제 취약점을 놓친다.
+#
+# 집합이어도 안전 성질은 그대로다 — 모든 항목이 같은 비민감 파일 하나를 가리키므로,
+# Agent도 LLM도 "무엇을 읽을지"는 여전히 고를 수 없고 "어떤 표기로 시도할지"만 달라진다.
+# 새 표기를 늘리는 것은 여기서의 명시적 결정이 된다.
+#
+# 퍼센트 표기가 왜 다른 요청이 되는가 — 직렬화가 `%`를 다시 인코딩하므로, 값에 ``%2f``를
+# 두면 대상은 한 번 디코딩한 뒤 ``%2f``를 보게 된다. 경로 API에 그대로 넘기거나 한 번 더
+# 디코딩하는 구현에서만 `/`가 되어, 디코딩 전에 형태로 거르는 필터를 지난다.
+PATH_TRAVERSAL_SAFE_PROBE_VALUES = (
+    PATH_TRAVERSAL_SAFE_PROBE_PATH,
+    "../../etc/os-release",
+    "..%2f..%2f..%2fetc%2fos-release",
+)
+ARBITRARY_FILE_READ_SAFE_PROBE_VALUES = (
+    ARBITRARY_FILE_READ_SAFE_PROBE_PATH,
+    "%2fetc%2fos-release",
+)
 
-    return value == PATH_TRAVERSAL_SAFE_PROBE_PATH
+
+def is_path_traversal_safe_probe_value(value: str) -> bool:
+    """고정된 비민감 증명 파일을 가리키는 상대 표기 중 하나인지 확인한다."""
+
+    return value in PATH_TRAVERSAL_SAFE_PROBE_VALUES
 
 
 def is_arbitrary_file_read_safe_probe_value(value: str) -> bool:
-    """고정된 비민감 증명 파일 절대 경로와 정확히 같은지 확인한다."""
+    """고정된 비민감 증명 파일을 가리키는 절대 표기 중 하나인지 확인한다."""
 
-    return value == ARBITRARY_FILE_READ_SAFE_PROBE_PATH
+    return value in ARBITRARY_FILE_READ_SAFE_PROBE_VALUES
 
 
 def is_path_traversal_safe_form_probe_value(value: str) -> bool:

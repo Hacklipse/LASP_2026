@@ -41,6 +41,7 @@ from hacklipse.adapters.arbitrary_file_read import (
     build_directory_escape_requests,
     declared_root_of,
     ARBITRARY_FILE_READ_PROBE_PATH,
+    ARBITRARY_FILE_READ_SAFE_PROBE_VALUES,
     ARBITRARY_FILE_READ_PROOF_MARKERS,
     ARBITRARY_FILE_READ_TOOL,
     build_arbitrary_file_read_path_requests,
@@ -1067,13 +1068,15 @@ class ArbitraryFileReadPathAssignmentTests(unittest.TestCase):
             item for item in runtime.requests
             if item.request_kind is HttpRequestKind.ARBITRARY_FILE_READ_PROBE
         ]
-        # Analysis 1회 + 독립 Validation 1회.
-        self.assertEqual(len(probes), 2)
+        # 표기마다 하나씩, Analysis 1회 + 독립 Validation 1회.
+        self.assertEqual(len(probes), 2 * len(ARBITRARY_FILE_READ_SAFE_PROBE_VALUES))
         for probe in probes:
             self.assertEqual(probe.path_assignment_name, "file")
-            self.assertEqual(
-                probe.resolved_url, f"{_ORIGIN}/file={ARBITRARY_FILE_READ_PROBE_PATH}"
+            self.assertIn(
+                probe.path_assignment_value, ARBITRARY_FILE_READ_SAFE_PROBE_VALUES
             )
+            # 어느 표기든 값만 바뀌고 query 는 붙지 않는다.
+            self.assertTrue(probe.resolved_url.startswith(f"{_ORIGIN}/file="))
             self.assertNotIn("?", probe.resolved_url)
 
     def test_each_kind_is_bound_to_its_own_fixed_path(self) -> None:
