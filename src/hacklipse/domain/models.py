@@ -250,6 +250,9 @@ _FORBIDDEN_REQUEST_HEADERS = frozenset(
 # 퍼센트 표기가 왜 다른 요청이 되는가 — 직렬화가 `%`를 다시 인코딩하므로, 값에 ``%2f``를
 # 두면 대상은 한 번 디코딩한 뒤 ``%2f``를 보게 된다. 경로 API에 그대로 넘기거나 한 번 더
 # 디코딩하는 구현에서만 `/`가 되어, 디코딩 전에 형태로 거르는 필터를 지난다.
+# 바뀌지 않는 자리에 싣는 고정 marker. Adapter 들이 각자 문자열을 베끼지 않도록
+# 도메인에 한 번만 둔다.
+CONTROL_MARKER = "hacklipse-control"
 PATH_TRAVERSAL_SAFE_PROBE_VALUES = (
     PATH_TRAVERSAL_SAFE_PROBE_PATH,
     "../../etc/os-release",
@@ -713,6 +716,19 @@ class HttpRequestSpec:
                 HttpRequestKind.CONTROL, HttpRequestKind.ARBITRARY_FILE_READ_PROBE
             } or self.file_read_path_index < 1 or not self.file_read_path_value):
                 raise DomainInvariantError("invalid file-read path mutation")
+            # 값을 비어 있지 않은 문자열로만 묶으면 이 필드가 "경로 세그먼트 아무 데나
+            # 아무거나" 넣는 통로가 된다. 다른 좌표와 같은 규칙을 적용한다 — probe 는
+            # 고정 증명 표기 중 하나, control 은 고정 marker 하나뿐이다.
+            if self.request_kind is HttpRequestKind.ARBITRARY_FILE_READ_PROBE:
+                if not is_arbitrary_file_read_safe_probe_value(self.file_read_path_value):
+                    raise DomainInvariantError(
+                        "file-read segment probe may only use a fixed safe path: "
+                        f"{self.file_read_path_value!r}"
+                    )
+            elif self.file_read_path_value != CONTROL_MARKER:
+                raise DomainInvariantError(
+                    "file-read segment control may only use the fixed marker"
+                )
         if self.file_read_parameter is not None:
             if (
                 self.request_kind not in {

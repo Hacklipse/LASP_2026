@@ -38,6 +38,8 @@ class AnalyzerCapability:
     # 경로에 `이름=값`으로 실린 입력 좌표를 Surface가 실제로 들고 있어야 하는가.
     # 관측 Evidence만으로는 실행할 수 없다 — 교체할 범위는 Surface에만 있다.
     requires_path_assignment: bool = False
+    # 파라미터 없는 파일 제공 라우트의 마지막 세그먼트를 바꿀 수 있어야 하는가.
+    requires_file_serving_segment: bool = False
     observation_requirements: tuple[ObservationRequirement, ...] = ()
     exploration_parameter_source: ParameterSource = "none"
     supported_evidence_types: tuple[str, ...] = ()

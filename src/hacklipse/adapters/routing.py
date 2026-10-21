@@ -22,6 +22,7 @@ from .request_safety import (
     object_identifier_parameters,
 )
 from .open_redirect_analysis import REDIRECT_PARAMETER_HINTS
+from .arbitrary_file_read import file_serving_segment_index
 from .path_traversal_analysis import FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION
 from .cors_analysis import CORS_OBSERVATION, CORS_SEARCH_INPUT_NAMES
 from .graphql_introspection import INTROSPECTION_TYPE, INTROSPECTION_RECON_OBSERVATION
@@ -118,6 +119,21 @@ class IdentifierSurfaceRoutingRule:
             object_identifier_parameters(surface.parameters)
             or surface.path_identifier is not None
         )
+
+
+@dataclass(frozen=True, slots=True)
+class FileServingSegmentRoutingRule(SurfaceRoutingRule):
+    """마지막 세그먼트가 파일 이름인 파라미터 없는 라우트.
+
+    파라미터가 없으면 다른 탐색 규칙은 이 표면을 건너뛴다. 디렉터리 단서를 요구하는
+    이유는 요구하지 않으면 파라미터 없는 모든 GET 이 후보가 되기 때문이다 — 후보가
+    표면 수만큼 늘고, 라우팅 기대값을 고정한 기존 테스트가 깨진다.
+    """
+
+    requires_parameters: bool = False
+
+    def matches(self, surface: Surface) -> bool:
+        return file_serving_segment_index(surface) is not None
 
 
 # 첫 버전은 설명 가능하고 재현하기 쉬운 명시적 규칙으로 라우팅한다.
@@ -265,6 +281,9 @@ DEFAULT_SURFACE_RULES = (
     ),
     IdentifierSurfaceRoutingRule(
         "Access Control", "access_control_analyzer", priority=0.35
+    ),
+    FileServingSegmentRoutingRule(
+        "Arbitrary File Read", "arbitrary_file_read_analyzer", priority=0.21,
     ),
 )
 

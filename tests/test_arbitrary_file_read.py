@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from hacklipse.adapters.arbitrary_file_read import (
     ARBITRARY_FILE_READ_OBSERVATION,
@@ -25,6 +25,9 @@ from hacklipse.bootstrap import (
 )
 from hacklipse.domain import (
     ARBITRARY_FILE_READ_SAFE_PROBE_PATH,
+    CONTROL_MARKER,
+    DomainInvariantError,
+    HttpRequestSpec,
     ARBITRARY_FILE_READ_SAFE_PROBE_VALUES,
     Evidence,
     ExecutionRequest,
@@ -410,6 +413,113 @@ class ProbeFormCoverageTests(unittest.TestCase):
             if item.observation.get("type") == ARBITRARY_FILE_READ_OBSERVATION
         ]
         self.assertEqual(len(observations), 1)
+
+
+class _SegmentRuntime:
+    """query 가 없고 마지막 세그먼트가 파일 이름인 라우트."""
+
+    def __init__(self) -> None:
+        self.requests: list[ExecutionRequest] = []
+
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        self.requests.append(request)
+        path = urlsplit(request.resolved_url).path
+        if path in ("/", "/index.html"):
+            body, status = '<a href="/download/report.pdf">doc</a>', 200
+        elif path.startswith("/download/"):
+            value = unquote(path[len("/download/"):])
+            if value.endswith("os-release"):
+                body, status = "\n".join(ARBITRARY_FILE_READ_PROOF_MARKERS), 200
+            else:
+                body, status = "a report", 200
+        else:
+            body, status = '{"detail":"not found"}', 404
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            evidence_type="http_response",
+            observation={
+                "type": "http_response", "status": status, "body": body,
+                "requested_url": request.resolved_url,
+            },
+        )
+
+
+class PathSegmentCoordinateTests(unittest.TestCase):
+    """query 가 없어 다른 두 좌표로는 닿지 못하는 라우트."""
+
+    def test_parameterless_file_route_is_confirmed(self) -> None:
+        runtime = _SegmentRuntime()
+        app, run = _pipeline_run(runtime)
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertEqual(
+            [
+                item.vulnerability_type
+                for item in app.stores.findings.list_by_run(run.run_id)
+            ],
+            ["Arbitrary File Read"],
+        )
+        observation = next(
+            item for item in app.stores.evidence.list_by_run(run.run_id)
+            if item.observation.get("location") == "path_segment"
+        )
+        self.assertEqual(observation.observation["parameter"], "report.pdf")
+
+    def test_only_the_final_segment_changes(self) -> None:
+        runtime = _SegmentRuntime()
+        _pipeline_run(runtime)
+
+        probes = [
+            item for item in runtime.requests
+            if item.request_kind is HttpRequestKind.ARBITRARY_FILE_READ_PROBE
+        ]
+        self.assertTrue(probes)
+        for probe in probes:
+            # 앞 디렉터리는 관측된 그대로 남고 query 도 붙지 않는다.
+            self.assertTrue(urlsplit(probe.resolved_url).path.startswith("/download/"))
+            self.assertEqual(urlsplit(probe.resolved_url).query, "")
+            self.assertIn(
+                probe.file_read_path_value, ARBITRARY_FILE_READ_SAFE_PROBE_VALUES
+            )
+
+    def test_control_puts_the_fixed_marker_in_the_segment(self) -> None:
+        runtime = _SegmentRuntime()
+        _pipeline_run(runtime)
+
+        controls = [
+            item for item in runtime.requests
+            if item.tool == ARBITRARY_FILE_READ_TOOL
+            and item.request_kind is HttpRequestKind.CONTROL
+        ]
+        self.assertTrue(controls)
+        for control in controls:
+            # 정상 파일 응답을 증명으로 오인하지 않으려면 control 도 그 자리를 바꿔야 한다.
+            self.assertEqual(control.file_read_path_value, CONTROL_MARKER)
+
+    def test_segment_value_is_bounded_by_the_domain(self) -> None:
+        for bad in ("/etc/passwd", "../../secret", "anything"):
+            with self.subTest(value=bad), self.assertRaises(DomainInvariantError):
+                HttpRequestSpec(
+                    request_kind=HttpRequestKind.ARBITRARY_FILE_READ_PROBE,
+                    file_read_path_index=2, file_read_path_value=bad,
+                )
+
+    def test_routes_only_where_a_directory_cue_says_file_serving(self) -> None:
+        from hacklipse.adapters.arbitrary_file_read import file_serving_segment_index
+        from hacklipse.domain import Surface
+
+        cases = {
+            "http://t/download/report.pdf": 2,
+            "http://t/assets/js/app.js": 3,
+            "http://t/about/team.html": None,
+            "http://t/report.pdf": None,
+        }
+        for url, expected in cases.items():
+            with self.subTest(url=url):
+                surface = Surface(
+                    surface_id="s", run_id="r", url=url, method="GET",
+                )
+                self.assertEqual(file_serving_segment_index(surface), expected)
 
 
 class _AbsolutePathHandler(BaseHTTPRequestHandler):

@@ -21,7 +21,9 @@ from .sensitive_exposure import CONFIG_ROUTE_OBSERVATION
 from .public_login_credentials import PUBLIC_LOGIN_OBSERVATION, PUBLIC_LOGIN_TYPE
 from .arbitrary_file_read import (
     ARBITRARY_FILE_READ_PATH_CAPABILITY,
+    ARBITRARY_FILE_READ_SEGMENT_CAPABILITY,
     DIRECTORY_ESCAPE_CAPABILITY,
+    file_serving_segment_index,
 )
 from .open_redirect_analysis import REDIRECT_PARAMETER_HINTS
 from .path_traversal_analysis import (
@@ -354,6 +356,21 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         default_priority=0.23,
     ),
     AnalyzerCapability(
+        # query 가 없는 파일 제공 라우트. 바꿔 볼 파라미터가 없어 다른 두 좌표로는
+        # 닿지 못하고, 디렉터리 단서가 있을 때만 붙어 표면 전체로 번지지 않는다.
+        capability_id=ARBITRARY_FILE_READ_SEGMENT_CAPABILITY,
+        agent_type="arbitrary_file_read_analyzer",
+        vulnerability_type="Arbitrary File Read",
+        methods=("GET",),
+        surface_kind="server",
+        requires_parameters=False,
+        requires_file_serving_segment=True,
+        exploration_parameter_source="none",
+        supported_evidence_types=("control_response", "file_read_marker"),
+        strategy_ids=("probe_file_serving_segment",),
+        default_priority=0.21,
+    ),
+    AnalyzerCapability(
         capability_id="arbitrary_file_read.http.query",
         agent_type="arbitrary_file_read_analyzer",
         vulnerability_type="Arbitrary File Read",
@@ -498,6 +515,10 @@ def capability_missing_requirements(
         missing.append("object_identifier")
     if capability.requires_path_assignment and surface.path_assignment is None:
         missing.append("path_assignment")
+    if capability.requires_file_serving_segment and (
+        file_serving_segment_index(surface) is None
+    ):
+        missing.append("file_serving_segment")
     for requirement in capability.observation_requirements:
         if not any(
             item.run_id == surface.run_id

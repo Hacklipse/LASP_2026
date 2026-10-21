@@ -64,6 +64,7 @@ import re
 from hacklipse.domain import (
     ARBITRARY_FILE_READ_SAFE_PROBE_PATH,
     ARBITRARY_FILE_READ_SAFE_PROBE_VALUES,
+    CONTROL_MARKER,
     DIRECTORY_ESCAPE_ABSENT_FILE,
     DIRECTORY_ESCAPE_PROOF_FILE,
     AgentResult,
@@ -104,6 +105,8 @@ ARBITRARY_FILE_READ_PROOF_MARKERS = ("PRETTY_NAME=", "VERSION_ID=")
 # 경로에 실린 입력 자리를 절대 경로로 탐침하는 capability. Path Traversal 쪽과 좌표는
 # 같지만 싣는 값과 증명하는 사실이 다르므로 별도로 둔다.
 ARBITRARY_FILE_READ_PATH_CAPABILITY = "arbitrary_file_read.http.path_assignment"
+# 파라미터 없는 파일 제공 라우트의 마지막 세그먼트를 교체하는 좌표.
+ARBITRARY_FILE_READ_SEGMENT_CAPABILITY = "arbitrary_file_read.http.path_segment"
 # 선언된 하위 디렉터리를 벗어나 읽는 전략. 고정 절대 경로가 앱 루트 밖이라 영영 거부되는
 # 대상에서도 "읽어선 안 되는 자리를 연다"는 사실은 이쪽으로 증명된다. 증명하는 사실이
 # 달라 Observation과 proof type을 따로 둔다.
@@ -111,7 +114,7 @@ DIRECTORY_ESCAPE_CAPABILITY = "arbitrary_file_read.http.directory_escape"
 DIRECTORY_ESCAPE_OBSERVATION = "directory_escape"
 _ROOT_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # 탐침이 바뀌지 않은 파라미터에 싣는 값. Path Traversal control 과 같은 역할이다.
-CONTROL_VALUE = "hacklipse-control"
+CONTROL_VALUE = CONTROL_MARKER
 # Recon의 ``url_or_file_parameter`` 관측은 파일 이름과 URL 이름을 한 목록으로 묶는다
 # (``file``·``path``와 ``url``·``redirect``가 같이 들어 있다). 그래서 이 관측으로
 # 라우팅되는 분석기가 여럿이고, 표면 하나에서 후보가 여러 개 생긴다.
@@ -137,6 +140,38 @@ _FILE_PARAMETER_HINTS = (
 # 같은 이름 안에 URL 성격이 함께 드러나면 파일 자리로 보지 않는다. ``file_url`` 처럼
 # 양쪽 힌트를 모두 가진 이름은 외부 자원을 가리킬 가능성이 높다.
 _URL_PARAMETER_HINTS = ("url", "uri", "src", "link", "redirect", "dest", "target")
+
+
+# 마지막 세그먼트가 파일 이름인 라우트를 알아보는 디렉터리 단서. 파라미터 없는 URL
+# (``/download/report.pdf``)은 바꿔 볼 query 가 없어 기존 좌표로는 닿지 못한다.
+#
+# 단서를 요구하는 이유 — 요구하지 않으면 파라미터 없는 모든 GET 이 후보가 된다. 그러면
+# 후보 수가 표면 수만큼 늘고, 라우팅 기대값을 고정한 기존 테스트가 깨진다.
+_FILE_SERVING_DIRECTORY_CUES = frozenset({
+    "download", "downloads", "file", "files", "asset", "assets",
+    "attachment", "attachments", "document", "documents", "view",
+    "include", "template", "templates",
+})
+
+
+def file_serving_segment_index(surface: Surface) -> int | None:
+    """바꿔 볼 마지막 경로 세그먼트의 위치. 해당 없으면 ``None``.
+
+    index 는 ``urlsplit(url).path.split("/")`` 기준이므로 ``/download/report.pdf``의
+    ``report.pdf``는 2다. 실행기는 그 자리만 교체한다.
+    """
+
+    if surface.method.upper() != "GET" or surface.parameters:
+        return None
+    if urlsplit(surface.url).fragment or surface.path_assignment is not None:
+        return None
+    segments = urlsplit(surface.url).path.split("/")
+    if len(segments) < 3 or not segments[-1]:
+        return None
+    directories = {part.casefold() for part in segments[1:-1] if part}
+    if not directories & _FILE_SERVING_DIRECTORY_CUES:
+        return None
+    return len(segments) - 1
 
 
 def looks_like_file_parameter(name: str) -> bool:
@@ -176,6 +211,23 @@ def validate_arbitrary_file_read_request(request: ExecutionRequest) -> None:
             raise ValueError("path assignment replacement requires a probe kind")
         if request.query_parameters:
             raise ValueError("path assignment probe cannot add query parameters")
+        return
+
+    if request.file_read_path_index is not None:
+        # 마지막 세그먼트만 바꾸는 탐침. 도메인이 이미 "probe 는 고정 표기, control 은
+        # 고정 marker"를 강제했고, 여기서는 이 도구로 들어온 요청에도 같은 계약이
+        # 적용됐는지 독립적으로 다시 확인한다.
+        value = request.file_read_path_value or ""
+        if request.request_kind is HttpRequestKind.ARBITRARY_FILE_READ_PROBE:
+            if not is_arbitrary_file_read_safe_probe_value(value):
+                raise ValueError("segment probe may only use a fixed safe path")
+        elif request.request_kind is HttpRequestKind.CONTROL:
+            if value != CONTROL_VALUE:
+                raise ValueError("segment control may only use the fixed marker")
+        else:
+            raise ValueError("segment replacement requires a control or probe kind")
+        if request.query_parameters:
+            raise ValueError("segment probe cannot add query parameters")
         return
 
     if request.request_kind is HttpRequestKind.DIRECTORY_ESCAPE_PROBE:
@@ -321,6 +373,51 @@ def build_arbitrary_file_read_path_requests(
                     path_assignment_value_end=assignment.value_end,
                     path_assignment_value=form,
                 ),
+            )
+            for form in ARBITRARY_FILE_READ_SAFE_PROBE_VALUES
+        ),
+    )
+
+
+def build_arbitrary_file_read_segment_requests(
+    surface: Surface, *, purpose: str
+) -> tuple[EvidenceRequest, ...]:
+    """마지막 경로 세그먼트만 고정 증명 표기로 교체하는 control/probe 를 만든다.
+
+    query 가 없는 파일 제공 라우트(``/download/report.pdf``)는 바꿔 볼 파라미터가 없어
+    기존 두 좌표로는 닿지 못한다. control 은 그 자리에 고정 marker 를 실어, 정상 파일
+    응답을 증명으로 오인하지 않게 한다.
+    """
+
+    index = file_serving_segment_index(surface)
+    if index is None:
+        raise AgentContractError(
+            "segment probe requires a parameterless file-serving path"
+        )
+
+    def request(kind: HttpRequestKind, value: str, reason: str) -> EvidenceRequest:
+        return EvidenceRequest(
+            evidence_type="http_response",
+            surface_id=surface.surface_id,
+            reason=reason,
+            suggested_tool=ARBITRARY_FILE_READ_TOOL,
+            http_request=HttpRequestSpec(
+                method="GET",
+                request_kind=kind,
+                file_read_path_index=index,
+                file_read_path_value=value,
+            ),
+        )
+
+    return (
+        request(
+            HttpRequestKind.CONTROL, CONTROL_VALUE,
+            f"path segment control request for {purpose}",
+        ),
+        *(
+            request(
+                HttpRequestKind.ARBITRARY_FILE_READ_PROBE, form,
+                f"path segment probe ({_form_label(form)}) for {purpose}",
             )
             for form in ARBITRARY_FILE_READ_SAFE_PROBE_VALUES
         ),
@@ -608,6 +705,11 @@ class HeuristicArbitraryFileReadAnalyzer:
             capability_id=ARBITRARY_FILE_READ_PATH_CAPABILITY,
         ):
             return self._handle_path_assignment(task, candidate, surface, evidence)
+        if file_serving_segment_index(surface) is not None and (
+            candidate.routing_capability_id
+            in {"", ARBITRARY_FILE_READ_SEGMENT_CAPABILITY}
+        ):
+            return self._handle_path_segment(task, candidate, surface, evidence)
         if not selected:
             return AgentResult(
                 task_id=task.task_id,
@@ -651,6 +753,58 @@ class HeuristicArbitraryFileReadAnalyzer:
             evidence_store=self._evidence,
             created_by=HEURISTIC_ARBITRARY_FILE_READ_ANALYZER,
             id_factory=self._id_factory,
+        )
+        return AgentResult(
+            task_id=task.task_id,
+            status=AgentResultStatus.COMPLETED,
+            new_evidence_ids=tuple(new_ids),
+            candidate_ids=(candidate.candidate_id,),
+        )
+
+    def _handle_path_segment(
+        self,
+        task: TaskEnvelope,
+        candidate,
+        surface: Surface,
+        evidence: Sequence[Evidence],
+    ) -> AgentResult:
+        """파라미터 없는 파일 제공 라우트의 마지막 세그먼트를 교체해 비교한다."""
+
+        requests = build_arbitrary_file_read_segment_requests(
+            surface,
+            purpose=f"Arbitrary File Read candidate {candidate.candidate_id}",
+        )
+        collected = tuple(
+            matching_evidence(evidence, surface.url, request) for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "arbitrary file read segment probe lacks budget for its requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+                candidate_ids=(candidate.candidate_id,),
+            )
+        control, probes = collected[0], collected[1:]
+        if control is None or any(item is None for item in probes):
+            raise AgentContractError("segment probe evidence was not collected")
+        segments = urlsplit(surface.url).path.split("/")
+        new_ids = record_arbitrary_file_read_observations(
+            task=task,
+            selected=(segments[-1],),
+            control=control,
+            probes=probes,
+            evidence=evidence,
+            evidence_store=self._evidence,
+            created_by=HEURISTIC_ARBITRARY_FILE_READ_ANALYZER,
+            id_factory=self._id_factory,
+            extra={"location": "path_segment"},
         )
         return AgentResult(
             task_id=task.task_id,

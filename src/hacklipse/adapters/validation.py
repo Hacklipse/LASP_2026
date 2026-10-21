@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from urllib.parse import urlsplit
 
 from hacklipse.application.errors import AgentContractError
 from hacklipse.domain import (
@@ -68,8 +69,10 @@ from .arbitrary_file_read import (
     arbitrary_file_read_signal,
     build_arbitrary_file_read_path_requests,
     build_arbitrary_file_read_requests,
+    build_arbitrary_file_read_segment_requests,
     build_directory_escape_requests,
     declared_root_of,
+    file_serving_segment_index,
     directory_escape_signal,
     looks_like_file_parameter,
 )
@@ -1776,6 +1779,10 @@ class ValidationAgent:
             return self._validate_arbitrary_file_read_path(
                 task, candidate, surface, evidence, reproduction
             )
+        if file_serving_segment_index(surface) is not None:
+            return self._validate_arbitrary_file_read_segment(
+                task, candidate, surface, evidence, reproduction
+            )
         signaled = tuple(
             dict.fromkeys(
                 parameter
@@ -1863,6 +1870,98 @@ class ValidationAgent:
             evidence=reproduced,
             reason="independent probe did not reproduce the absolute-path read",
             reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+        )
+
+    def _validate_arbitrary_file_read_segment(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        surface,
+        evidence: Sequence[Evidence],
+        reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """마지막 경로 세그먼트 교체 읽기를 독립 세션에서 다시 만든다."""
+
+        segments = urlsplit(surface.url).path.split("/")
+        signaled = any(
+            item.surface_id == candidate.surface_id
+            and item.observation.get("type") == ARBITRARY_FILE_READ_OBSERVATION
+            and item.observation.get("location") == "path_segment"
+            for item in evidence
+        )
+        if not signaled:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no absolute-path read signal to reproduce",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        requests = build_arbitrary_file_read_segment_requests(
+            surface, purpose=f"Arbitrary File Read validation {task.validation_id}"
+        )
+        collected = tuple(
+            matching_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "Arbitrary File Read validation lacks budget for independent requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+        if any(item is None for item in collected):
+            raise AgentContractError("segment reproduction was not collected")
+        control, probes = collected[0], collected[1:]
+        if any(
+            item.observation.get("type") in {"http_error", "http_redirect"}
+            for item in collected
+        ):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=tuple(collected),
+                reason=(
+                    "independent absolute-path reproduction could not obtain "
+                    "comparable responses"
+                ),
+                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+            )
+        probe = next(
+            (item for item in probes if arbitrary_file_read_signal(control, item)),
+            None,
+        )
+        if probe is None:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=tuple(collected),
+                reason="independent probe did not reproduce the absolute-path read",
+                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+            )
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.CONFIRMED,
+            evidence=(control, probe),
+            reason=(
+                "independent control/probe comparison reproduced the absolute-path read"
+            ),
+            reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+            proof=ValidationProof(
+                proof_type=ValidationProofType.ARBITRARY_FILE_READ,
+                evidence_ids=(control.evidence_id, probe.evidence_id),
+                summary=(
+                    "independent fixed absolute-path probe reproduced a file read "
+                    f"by replacing the final path segment {segments[-1]!r}"
+                ),
+            ),
         )
 
     def _validate_arbitrary_file_read_path(
