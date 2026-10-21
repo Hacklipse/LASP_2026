@@ -55,7 +55,7 @@ POST 본문·GET+JSON 본문·multipart XXE라 위 "탐지하지 못하는 것"�
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from hacklipse.application.errors import AgentContractError
@@ -213,6 +213,16 @@ def validate_arbitrary_file_read_request(request: ExecutionRequest) -> None:
             raise ValueError("path assignment probe cannot add query parameters")
         return
 
+    if request.request_kind is HttpRequestKind.FILE_READ_PUBLIC_CHECK:
+        # 증명 파일을 정상 경로로 한 번 받아 보는 요청이다. 바꾸는 좌표가 없으므로
+        # 파라미터도 좌표 필드도 실리지 않아야 한다.
+        if (
+            request.query_parameters
+            or request.file_read_path_index is not None
+            or request.path_assignment_name is not None
+        ):
+            raise ValueError("public-file check cannot carry a probe coordinate")
+        return
     if request.file_read_path_index is not None:
         # 마지막 세그먼트만 바꾸는 탐침. 도메인이 이미 "probe 는 고정 표기, control 은
         # 고정 marker"를 강제했고, 여기서는 이 도구로 들어온 요청에도 같은 계약이
@@ -421,6 +431,45 @@ def build_arbitrary_file_read_segment_requests(
             )
             for form in ARBITRARY_FILE_READ_SAFE_PROBE_VALUES
         ),
+    )
+
+
+def build_public_file_check(surface: Surface, *, purpose: str) -> EvidenceRequest:
+    """증명 파일이 같은 origin 에서 원래 공개돼 있는지 직접 확인하는 요청.
+
+    앱이 정적 핸들러로 그 파일을 이미 내주고 있다면, 파라미터를 통해 읽힌 것은
+    취약점이 아니라 원래 공개된 자료다. 이 대조군이 없으면 그런 대상을 확정해 버린다.
+
+    같은 origin 의 경로 하나만 바꾸므로 Scope 검사는 그대로 적용된다. 요청 종류를
+    따로 둔 덕에 ``target_url_override`` 는 이 용도 밖에서는 쓰일 수 없다.
+    """
+
+    parsed = urlsplit(surface.url)
+    return EvidenceRequest(
+        evidence_type="http_response",
+        surface_id=surface.surface_id,
+        reason=f"direct public-file check for {purpose}",
+        suggested_tool=ARBITRARY_FILE_READ_TOOL,
+        target_url_override=urlunsplit(
+            (parsed.scheme, parsed.netloc, ARBITRARY_FILE_READ_PROOF_FILE, "", "")
+        ),
+        http_request=HttpRequestSpec(
+            method="GET", request_kind=HttpRequestKind.FILE_READ_PUBLIC_CHECK
+        ),
+    )
+
+
+def proof_file_is_public(check: Evidence | None) -> bool:
+    """직접 요청만으로 증명 파일 표식이 나오는지 확인한다."""
+
+    if check is None:
+        return False
+    status = check.observation.get("status")
+    body = response_body(check) or ""
+    return bool(
+        isinstance(status, int)
+        and 200 <= status < 300
+        and all(marker in body for marker in ARBITRARY_FILE_READ_PROOF_MARKERS)
     )
 
 

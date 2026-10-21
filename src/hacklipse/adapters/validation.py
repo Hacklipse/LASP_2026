@@ -71,9 +71,11 @@ from .arbitrary_file_read import (
     build_arbitrary_file_read_requests,
     build_arbitrary_file_read_segment_requests,
     build_directory_escape_requests,
+    build_public_file_check,
     declared_root_of,
-    file_serving_segment_index,
     directory_escape_signal,
+    file_serving_segment_index,
+    proof_file_is_public,
     looks_like_file_parameter,
 )
 from .ssti_analysis import (
@@ -1848,6 +1850,11 @@ class ValidationAgent:
             if not arbitrary_file_read_signal(control, probe):
                 continue
             proof_evidence = (control, probe)
+            public = self._public_proof_file_rejection(
+                task, surface, reproduction, evidence
+            )
+            if public is not None:
+                return public
             return self._validation_result(
                 task,
                 verdict=ValidationVerdict.CONFIRMED,
@@ -1870,6 +1877,46 @@ class ValidationAgent:
             evidence=reproduced,
             reason="independent probe did not reproduce the absolute-path read",
             reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+        )
+
+    def _public_proof_file_rejection(
+        self,
+        task: TaskEnvelope,
+        surface,
+        reproduction: Sequence[Evidence],
+        evidence: Sequence[Evidence],
+    ) -> AgentResult | None:
+        """증명 파일이 원래 공개돼 있으면 확정하지 않는다.
+
+        앱이 정적 핸들러로 이미 그 파일을 내주고 있다면, 파라미터로 읽힌 것은 취약점이
+        아니라 공개 자료다. 확정 직전에 확인하므로, 신호가 없는 대상에는 요청을 쓰지
+        않는다.
+        """
+
+        request = build_public_file_check(
+            surface, purpose=f"Arbitrary File Read validation {task.validation_id}"
+        )
+        check = matching_evidence(
+            reproduction, request.target_url_override or surface.url, request
+        )
+        if check is None:
+            if task.request_budget < 1:
+                raise BudgetExceeded(
+                    "Arbitrary File Read validation lacks budget for the public check"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=(request,),
+            )
+        if not proof_file_is_public(check):
+            return None
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.REJECTED,
+            evidence=(check,),
+            reason="the proof file is already served publicly on this origin",
+            reason_code=ValidationReasonCode.CONTROL_SIGNAL_PRESENT,
         )
 
     def _validate_arbitrary_file_read_segment(
@@ -1946,6 +1993,11 @@ class ValidationAgent:
                 reason="independent probe did not reproduce the absolute-path read",
                 reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
             )
+        public = self._public_proof_file_rejection(
+            task, surface, reproduction, evidence
+        )
+        if public is not None:
+            return public
         return self._validation_result(
             task,
             verdict=ValidationVerdict.CONFIRMED,
@@ -2045,6 +2097,11 @@ class ValidationAgent:
                 reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
             )
         if arbitrary_file_read_signal(control, probe):
+            public = self._public_proof_file_rejection(
+                task, surface, reproduction, evidence
+            )
+            if public is not None:
+                return public
             return self._validation_result(
                 task,
                 verdict=ValidationVerdict.CONFIRMED,

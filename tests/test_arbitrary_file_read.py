@@ -10,6 +10,7 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 from hacklipse.adapters.arbitrary_file_read import (
     ARBITRARY_FILE_READ_OBSERVATION,
     ARBITRARY_FILE_READ_PROBE_PATH,
+    ARBITRARY_FILE_READ_PROOF_FILE,
     ARBITRARY_FILE_READ_PROOF_MARKERS,
     ARBITRARY_FILE_READ_TOOL,
     arbitrary_file_read_signal,
@@ -25,6 +26,8 @@ from hacklipse.bootstrap import (
 )
 from hacklipse.domain import (
     ARBITRARY_FILE_READ_SAFE_PROBE_PATH,
+    CandidateStatus,
+    ValidationReasonCode,
     CONTROL_MARKER,
     DomainInvariantError,
     HttpRequestSpec,
@@ -520,6 +523,120 @@ class PathSegmentCoordinateTests(unittest.TestCase):
                     surface_id="s", run_id="r", url=url, method="GET",
                 )
                 self.assertEqual(file_serving_segment_index(surface), expected)
+
+
+class _PublicProofFileRuntime:
+    """증명 파일을 정적 핸들러로 이미 공개하는 앱.
+
+    파라미터로도 읽히지만, 원래 공개된 자료라 읽기 취약점이 아니다. 이 대조군이
+    없으면 그런 대상을 확정해 버린다.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[ExecutionRequest] = []
+
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        self.requests.append(request)
+        parsed = urlsplit(request.resolved_url)
+        values = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        markers = "\n".join(ARBITRARY_FILE_READ_PROOF_MARKERS)
+        if parsed.path in ("/", "/index.html"):
+            body = '<a href="/view?page=readme.txt">doc</a>'
+        elif parsed.path == ARBITRARY_FILE_READ_PROOF_FILE:
+            # 정적 핸들러가 그대로 내준다.
+            body = markers
+        elif values.get("page") in ARBITRARY_FILE_READ_SAFE_PROBE_VALUES:
+            body = markers
+        else:
+            body = "a readme"
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            evidence_type="http_response",
+            observation={
+                "type": "http_response", "status": 200, "body": body,
+                "requested_url": request.resolved_url,
+            },
+        )
+
+
+class PublicProofFileTests(unittest.TestCase):
+    """증명 파일이 원래 공개면 확정하지 않는다."""
+
+    def test_public_proof_file_is_not_a_finding(self) -> None:
+        runtime = _PublicProofFileRuntime()
+        app, run = _pipeline_run(runtime)
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        # 파라미터로 표식이 나왔지만 같은 파일이 정적 경로로도 공개돼 있다.
+        self.assertEqual(app.stores.findings.list_by_run(run.run_id), ())
+        candidate, = app.stores.candidates.list_by_run(run.run_id)
+        self.assertIs(candidate.status, CandidateStatus.REJECTED)
+        self.assertIs(
+            candidate.validation_reason_code,
+            ValidationReasonCode.CONTROL_SIGNAL_PRESENT,
+        )
+
+    def test_the_check_requests_the_proof_file_on_the_same_origin(self) -> None:
+        runtime = _PublicProofFileRuntime()
+        _pipeline_run(runtime)
+
+        checks = [
+            item for item in runtime.requests
+            if item.request_kind is HttpRequestKind.FILE_READ_PUBLIC_CHECK
+        ]
+        self.assertTrue(checks)
+        for check in checks:
+            parsed = urlsplit(check.resolved_url)
+            self.assertEqual(parsed.path, ARBITRARY_FILE_READ_PROOF_FILE)
+            self.assertEqual(parsed.netloc, "local.test")
+            # 좌표를 싣지 않는다 — 바꾸는 자리가 없는 평범한 GET 이다.
+            self.assertEqual(parsed.query, "")
+
+    def test_the_check_costs_nothing_when_no_signal_was_found(self) -> None:
+        # 신호가 없으면 확정 직전에 도달하지 않으므로 요청을 쓰지 않는다.
+        runtime = _QueryFileRuntime(blocked=True)
+        _pipeline_run(runtime)
+
+        self.assertEqual(
+            [
+                item for item in runtime.requests
+                if item.request_kind is HttpRequestKind.FILE_READ_PUBLIC_CHECK
+            ],
+            [],
+        )
+
+    def test_override_is_reserved_for_the_public_check(self) -> None:
+        from hacklipse.domain import EvidenceRequest
+
+        # 다른 종류가 target_url_override 를 쓰면 Task 생성에서 막힌다.
+        smuggled = EvidenceRequest(
+            evidence_type="http_response", surface_id="s", reason="r",
+            suggested_tool=ARBITRARY_FILE_READ_TOOL,
+            target_url_override="http://elsewhere.invalid/etc/os-release",
+            http_request=HttpRequestSpec(
+                method="GET",
+                request_kind=HttpRequestKind.ARBITRARY_FILE_READ_PROBE,
+                query_parameters=(("page", ARBITRARY_FILE_READ_SAFE_PROBE_PATH),),
+            ),
+        )
+        from hacklipse.application.task_factory import TaskFactory
+        from hacklipse.domain import Candidate, Run, RunScope
+
+        run = Run(
+            run_id="r", target_url="http://local.test/",
+            scope=RunScope(allowed_hosts=frozenset({"local.test"})),
+            policy_profile="safe", request_budget=10,
+        )
+        candidate = Candidate(
+            candidate_id="c", run_id="r", surface_id="s",
+            vulnerability_type="Arbitrary File Read", hypothesis="h",
+            assigned_agent="arbitrary_file_read_analyzer", evidence_ids=(),
+        )
+        with self.assertRaises(ValueError):
+            TaskFactory(id_factory=iter(("1",)).__next__).evidence_collection(
+                run, candidate, smuggled, target_url="http://local.test/view",
+                agent_type="evidence_collector", request_budget=5,
+            )
 
 
 class _AbsolutePathHandler(BaseHTTPRequestHandler):
