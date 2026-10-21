@@ -3,6 +3,13 @@
 자동 탐침은 임의 파일 경로를 받지 않는다. 일반적인 Linux 컨테이너에 기본 존재하는
 비민감 OS 식별 파일 ``/etc/os-release``만 고정 상대 경로로 요청하고, 응답의 두 표식이
 control에는 없고 probe에만 나타나는지 비교한다. Agent는 요청을 직접 실행하지 않는다.
+
+Arbitrary File Read 분석기와의 경계 — 이쪽은 "경로에 담긴 탈출 시퀀스를 서버가
+따라가는가"를, 저쪽은 "서버가 받은 경로를 그대로 열어 주는가"를 증명한다. 절대 경로
+읽기와 선언된 하위 디렉터리 탈출은 저쪽이 소유한다(``arbitrary_file_read`` 모듈의
+docstring에 세 전략이 정리돼 있다). 같은 관측(``url_or_file_parameter``,
+``file_like_path_assignment``)에서 두 분석기가 각각 라우팅되므로, 한쪽이 거부당해도
+다른 쪽이 증명할 기회가 남는다.
 """
 
 from __future__ import annotations
