@@ -27,3 +27,4 @@ AGENTS.md
 /artifacts/*.md
 /artifacts/*
 docs/
+SSRF_AGENT_DESIGN.md
