@@ -21,6 +21,7 @@ from hacklipse.domain import (
     HttpRequestKind,
     HttpRequestSpec,
     PATH_TRAVERSAL_BYPASS_SUFFIX,
+    PATH_TRAVERSAL_FILTER_BYPASS_PROBE_PATH,
     PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH,
     PATH_TRAVERSAL_SAFE_PROBE_PATH,
     ExecutionRequest,
@@ -46,6 +47,13 @@ PATH_TRAVERSAL_TOOL = "path_traversal_probe"
 HEURISTIC_PATH_TRAVERSAL_ANALYZER = "heuristic_path_traversal_analyzer"
 PATH_TRAVERSAL_OBSERVATION = "path_traversal_file_read"
 PATH_TRAVERSAL_PROBE_PATH = PATH_TRAVERSAL_SAFE_PROBE_PATH
+# 한 파라미터에 보내는 고정 표기들. 요청을 만드는 쪽과 결과를 파라미터에 귀속시키는 쪽이
+# 같은 목록을 보도록 한 곳에 둔다 — 길이가 어긋나면 어떤 표기의 성공이 다른 파라미터에
+# 붙는다.
+PATH_TRAVERSAL_PROBE_PAYLOADS = (
+    (PATH_TRAVERSAL_SAFE_PROBE_PATH, "safe-file probe"),
+    (PATH_TRAVERSAL_FILTER_BYPASS_PROBE_PATH, "filter-bypass probe"),
+)
 PATH_TRAVERSAL_FORM_PROBE_PATH = PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH
 PATH_TRAVERSAL_PROOF_FILE = "/etc/os-release"
 PATH_TRAVERSAL_PROOF_MARKERS = ("PRETTY_NAME=", "VERSION_ID=")
@@ -526,28 +534,28 @@ def build_path_traversal_requests(
             ),
         )
     ]
+    # 두 표기를 모두 보낸다. 같은 증명 파일을 가리키지만, 한 번만 훑는 제거 필터가
+    # 걸린 대상에서는 평문 표기가 통째로 지워져 "취약하지 않다"와 "필터에 지워졌다"를
+    # 구분할 수 없다. XBEN-079가 그 경우다 — XBEN-061과 같은 앱에 str_replace 한 줄만
+    # 추가돼 있고, 평문 표기는 필터 후 'etc/os-release'로 남아 트래버설이 사라진다.
     for parameter in selected_parameters:
-        requests.append(
-            EvidenceRequest(
-                evidence_type="http_response",
-                surface_id=surface.surface_id,
-                reason=f"safe-file probe for parameter {parameter} on {purpose}",
-                suggested_tool=PATH_TRAVERSAL_TOOL,
-                http_request=HttpRequestSpec(
-                    method="GET",
-                    query_parameters=tuple(
-                        (
-                            name,
-                            PATH_TRAVERSAL_PROBE_PATH
-                            if name == parameter
-                            else CONTROL_VALUE,
-                        )
-                        for name in all_parameters
+        for payload, label in PATH_TRAVERSAL_PROBE_PAYLOADS:
+            requests.append(
+                EvidenceRequest(
+                    evidence_type="http_response",
+                    surface_id=surface.surface_id,
+                    reason=f"{label} for parameter {parameter} on {purpose}",
+                    suggested_tool=PATH_TRAVERSAL_TOOL,
+                    http_request=HttpRequestSpec(
+                        method="GET",
+                        query_parameters=tuple(
+                            (name, payload if name == parameter else CONTROL_VALUE)
+                            for name in all_parameters
+                        ),
+                        request_kind=HttpRequestKind.PATH_TRAVERSAL_PROBE,
                     ),
-                    request_kind=HttpRequestKind.PATH_TRAVERSAL_PROBE,
-                ),
+                )
             )
-        )
     return tuple(requests)
 
 
@@ -637,10 +645,20 @@ def record_path_traversal_observations(
     """Python이 확인한 고정 safe-file 읽기만 공통 Observation으로 저장한다."""
 
     new_ids: list[str] = []
-    for parameter, probe in zip(selected, probes):
-        if probe is None:
+    width = len(PATH_TRAVERSAL_PROBE_PAYLOADS)
+    # 빌더와 같은 방식으로 중복을 제거한다. 한쪽만 제거하면 묶음 경계가 밀려 어떤
+    # 표기의 성공이 다른 좌표에 귀속된다.
+    for index, parameter in enumerate(dict.fromkeys(selected)):
+        group = list(probes[index * width : (index + 1) * width])
+        if not group or any(item is None for item in group):
             raise AgentContractError("path traversal probe evidence was not collected")
-        if not path_traversal_signal(control, probe):
+        # 표기 중 하나라도 고정 파일을 읽어냈으면 그 좌표의 노출이다. 필터가 걸린
+        # 대상에서는 평문 표기만 지워지고 다른 표기가 통과한다.
+        probe = next(
+            (item for item in group if item and path_traversal_signal(control, item)),
+            None,
+        )
+        if probe is None:
             continue
         if has_observation_record(
             evidence,

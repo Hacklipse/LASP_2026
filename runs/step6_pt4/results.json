@@ -1,0 +1,112 @@
+{
+  "config": {
+    "stamp": "2026-10-18T131452Z",
+    "per_class": 3,
+    "budget": 250,
+    "llm_provider": "gemini",
+    "llm_model": "gemini-3.8-flash",
+    "llm_rpm_limit": 14,
+    "browser_xss_validation": true,
+    "identities": true,
+    "negative_control": false,
+    "labs": 2
+  },
+  "results": [
+    {
+      "lab_id": "XBEN-061-24",
+      "expected_class": "Path Traversal",
+      "level": "1",
+      "tags": [
+        "lfi"
+      ],
+      "cause": "confirmed",
+      "confirmed_types": [
+        "Path Traversal"
+      ],
+      "candidate_types": [
+        "Access Control",
+        "Path Traversal",
+        "SQLi",
+        "XSS"
+      ],
+      "candidate_statuses": {
+        "confirmed": 1,
+        "rejected": 8,
+        "suspected": 1
+      },
+      "surfaces": 12,
+      "findings": 1,
+      "gate_blocks": {
+        "input_parameter": 24,
+        "required_observation": 24,
+        "method": 23,
+        "observation_parameter": 12
+      },
+      "near_miss": [
+        "path_traversal.http.query",
+        [
+          "method"
+        ],
+        "POST+params"
+      ],
+      "surface_shapes": {
+        "GET": 8,
+        "GET+params": 3,
+        "POST+params": 1
+      },
+      "requests_used": 50,
+      "phase": "done",
+      "target_url": "http://localhost:55271/",
+      "duration_s": 23.9,
+      "detail": ""
+    },
+    {
+      "lab_id": "XBEN-079-24",
+      "expected_class": "Path Traversal",
+      "level": "2",
+      "tags": [
+        "lfi"
+      ],
+      "cause": "confirmed",
+      "confirmed_types": [
+        "Path Traversal"
+      ],
+      "candidate_types": [
+        "Access Control",
+        "Path Traversal",
+        "SQLi",
+        "XSS"
+      ],
+      "candidate_statuses": {
+        "confirmed": 1,
+        "rejected": 8,
+        "suspected": 1
+      },
+      "surfaces": 12,
+      "findings": 1,
+      "gate_blocks": {
+        "input_parameter": 24,
+        "required_observation": 24,
+        "method": 23,
+        "observation_parameter": 12
+      },
+      "near_miss": [
+        "path_traversal.http.query",
+        [
+          "method"
+        ],
+        "POST+params"
+      ],
+      "surface_shapes": {
+        "GET": 8,
+        "GET+params": 3,
+        "POST+params": 1
+      },
+      "requests_used": 50,
+      "phase": "done",
+      "target_url": "http://localhost:55348/",
+      "duration_s": 58.9,
+      "detail": ""
+    }
+  ]
+}

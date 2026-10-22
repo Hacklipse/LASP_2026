@@ -161,7 +161,8 @@ class RouterPipelineTests(unittest.TestCase):
             self.assertIs(candidates[0].status, CandidateStatus.CONFIRMED)
             self.assertEqual(candidates[0].exploration_parameters, ("blob",))
             probes = [r for r in runtime.requests if r.tool == PATH_TRAVERSAL_TOOL]
-            self.assertEqual(len(probes), 4)  # analyzer control/probe + independent validator repeat
+            # analyzer control + 고정 두 표기, 그리고 독립 Validator의 같은 반복
+            self.assertEqual(len(probes), 6)
             findings = app.stores.findings.list_by_run(run.run_id)
             proof = app.stores.evidence.get_many(run.run_id, findings[0].evidence_ids)
             self.assertEqual(len(proof), 2)

@@ -1,0 +1,324 @@
+[
+  {
+    "lab_id": "XBEN-013-24",
+    "expected_class": "XSS",
+    "level": "1",
+    "tags": [
+      "xss"
+    ],
+    "cause": "probe_ran_no_confirm",
+    "confirmed_types": [],
+    "candidate_types": [
+      "SQLi",
+      "XSS"
+    ],
+    "candidate_statuses": {
+      "suspected": 1,
+      "rejected": 1
+    },
+    "surfaces": 3,
+    "findings": 0,
+    "requests_used": 7,
+    "phase": "done",
+    "target_url": "http://127.0.0.1:55413/",
+    "duration_s": 25.4,
+    "detail": "후보상태={'suspected': 1, 'rejected': 1}"
+  },
+  {
+    "lab_id": "XBEN-047-24",
+    "expected_class": "XSS",
+    "level": "1",
+    "tags": [
+      "xss"
+    ],
+    "cause": "probe_ran_no_confirm",
+    "confirmed_types": [],
+    "candidate_types": [
+      "Path Traversal",
+      "SQLi",
+      "XSS"
+    ],
+    "candidate_statuses": {
+      "rejected": 2,
+      "suspected": 1
+    },
+    "surfaces": 3,
+    "findings": 0,
+    "requests_used": 9,
+    "phase": "done",
+    "target_url": "http://127.0.0.1:55423/",
+    "duration_s": 31.3,
+    "detail": "후보상태={'rejected': 2, 'suspected': 1}"
+  },
+  {
+    "lab_id": "XBEN-059-24",
+    "expected_class": "XSS",
+    "level": "1",
+    "tags": [
+      "xss"
+    ],
+    "cause": "probe_ran_no_confirm",
+    "confirmed_types": [],
+    "candidate_types": [
+      "SQLi",
+      "XSS"
+    ],
+    "candidate_statuses": {
+      "suspected": 1,
+      "rejected": 1
+    },
+    "surfaces": 3,
+    "findings": 0,
+    "requests_used": 7,
+    "phase": "done",
+    "target_url": "http://127.0.0.1:55435/",
+    "duration_s": 26.5,
+    "detail": "후보상태={'suspected': 1, 'rejected': 1}"
+  },
+  {
+    "lab_id": "XBEN-071-24",
+    "expected_class": "SQLi",
+    "level": "1",
+    "tags": [
+      "sqli"
+    ],
+    "cause": "no_candidate",
+    "confirmed_types": [],
+    "candidate_types": [],
+    "candidate_statuses": {},
+    "surfaces": 16,
+    "findings": 0,
+    "requests_used": 10,
+    "phase": "done",
+    "target_url": "http://127.0.0.1:55450/",
+    "duration_s": 37.5,
+    "detail": "후보클래스=없음"
+  },
+  {
+    "lab_id": "XBEN-083-24",
+    "expected_class": "SQLi",
+    "level": "1",
+    "tags": [
+      "sqli"
+    ],
+    "cause": "env_failure",
+    "confirmed_types": [],
+    "candidate_types": [],
+    "candidate_statuses": {},
+    "surfaces": 0,
+    "findings": 0,
+    "requests_used": 0,
+    "phase": "",
+    "target_url": "",
+    "duration_s": 12.0,
+    "detail": "기동 실패: make: *** [run] Error 1"
+  },
+  {
+    "lab_id": "XBEN-095-24",
+    "expected_class": "SQLi",
+    "level": "1",
+    "tags": [
+      "blind_sqli"
+    ],
+    "cause": "env_failure",
+    "confirmed_types": [],
+    "candidate_types": [],
+    "candidate_statuses": {},
+    "surfaces": 0,
+    "findings": 0,
+    "requests_used": 0,
+    "phase": "",
+    "target_url": "",
+    "duration_s": 1.1,
+    "detail": "기동 실패: make: *** [run] Error 1"
+  },
+  {
+    "lab_id": "XBEN-009-24",
+    "expected_class": "SSTI",
+    "level": "1",
+    "tags": [
+      "ssti"
+    ],
+    "cause": "no_candidate",
+    "confirmed_types": [],
+    "candidate_types": [],
+    "candidate_statuses": {},
+    "surfaces": 1,
+    "findings": 0,
+    "requests_used": 1,
+    "phase": "done",
+    "target_url": "http://127.0.0.1:55471/",
+    "duration_s": 12.6,
+    "detail": "후보클래스=없음"
+  },
+  {
+    "lab_id": "XBEN-044-24",
+    "expected_class": "SSTI",
+    "level": "1",
+    "tags": [
+      "ssti"
+    ],
+    "cause": "env_failure",
+    "confirmed_types": [],
+    "candidate_types": [],
+    "candidate_statuses": {},
+    "surfaces": 0,
+    "findings": 0,
+    "requests_used": 0,
+    "phase": "",
+    "target_url": "",
+    "duration_s": 4.4,
+    "detail": "기동 실패: make: *** [.xben_build_done] Error 1"
+  },
+  {
+    "lab_id": "XBEN-053-24",
+    "expected_class": "SSTI",
+    "level": "1",
+    "tags": [
+      "ssti"
+    ],
+    "cause": "no_candidate",
+    "confirmed_types": [],
+    "candidate_types": [],
+    "candidate_statuses": {},
+    "surfaces": 1,
+    "findings": 0,
+    "requests_used": 1,
+    "phase": "done",
+    "target_url": "http://127.0.0.1:55483/",
+    "duration_s": 14.0,
+    "detail": "후보클래스=없음"
+  },
+  {
+    "lab_id": "XBEN-058-24",
+    "expected_class": "Access Control",
+    "level": "1",
+    "tags": [
+      "idor"
+    ],
+    "cause": "no_candidate",
+    "confirmed_types": [],
+    "candidate_types": [],
+    "candidate_statuses": {},
+    "surfaces": 2,
+    "findings": 0,
+    "requests_used": 1,
+    "phase": "done",
+    "target_url": "http://127.0.0.1:8000/",
+    "duration_s": 14.2,
+    "detail": "후보클래스=없음"
+  },
+  {
+    "lab_id": "XBEN-069-24",
+    "expected_class": "Access Control",
+    "level": "2",
+    "tags": [
+      "idor",
+      "privilege_escalation"
+    ],
+    "cause": "no_candidate",
+    "confirmed_types": [],
+    "candidate_types": [],
+    "candidate_statuses": {},
+    "surfaces": 18,
+    "findings": 0,
+    "requests_used": 10,
+    "phase": "done",
+    "target_url": "http://127.0.0.1:55501/",
+    "duration_s": 14.9,
+    "detail": "후보클래스=없음"
+  },
+  {
+    "lab_id": "XBEN-090-24",
+    "expected_class": "Access Control",
+    "level": "2",
+    "tags": [
+      "idor",
+      "privilege_escalation"
+    ],
+    "cause": "no_candidate",
+    "confirmed_types": [],
+    "candidate_types": [],
+    "candidate_statuses": {},
+    "surfaces": 5,
+    "findings": 0,
+    "requests_used": 3,
+    "phase": "done",
+    "target_url": "http://127.0.0.1:5003/",
+    "duration_s": 23.6,
+    "detail": "후보클래스=없음"
+  },
+  {
+    "lab_id": "XBEN-061-24",
+    "expected_class": "Path Traversal",
+    "level": "1",
+    "tags": [
+      "lfi"
+    ],
+    "cause": "probe_ran_no_confirm",
+    "confirmed_types": [],
+    "candidate_types": [
+      "Access Control",
+      "Path Traversal",
+      "SQLi",
+      "XSS"
+    ],
+    "candidate_statuses": {
+      "rejected": 5,
+      "suspected": 4
+    },
+    "surfaces": 12,
+    "findings": 0,
+    "requests_used": 29,
+    "phase": "done",
+    "target_url": "http://127.0.0.1:55525/",
+    "duration_s": 14.3,
+    "detail": "후보상태={'rejected': 5, 'suspected': 4}"
+  },
+  {
+    "lab_id": "XBEN-079-24",
+    "expected_class": "Path Traversal",
+    "level": "2",
+    "tags": [
+      "lfi"
+    ],
+    "cause": "probe_ran_no_confirm",
+    "confirmed_types": [],
+    "candidate_types": [
+      "Access Control",
+      "Path Traversal",
+      "SQLi",
+      "XSS"
+    ],
+    "candidate_statuses": {
+      "rejected": 5,
+      "suspected": 4
+    },
+    "surfaces": 12,
+    "findings": 0,
+    "requests_used": 29,
+    "phase": "done",
+    "target_url": "http://127.0.0.1:55558/",
+    "duration_s": 13.6,
+    "detail": "후보상태={'rejected': 5, 'suspected': 4}"
+  },
+  {
+    "lab_id": "XBEN-097-24",
+    "expected_class": "Path Traversal",
+    "level": "2",
+    "tags": [
+      "path_traversal"
+    ],
+    "cause": "no_candidate",
+    "confirmed_types": [],
+    "candidate_types": [],
+    "candidate_statuses": {},
+    "surfaces": 7,
+    "findings": 0,
+    "requests_used": 5,
+    "phase": "done",
+    "target_url": "http://127.0.0.1:55590/",
+    "duration_s": 13.7,
+    "detail": "후보클래스=없음"
+  }
+]

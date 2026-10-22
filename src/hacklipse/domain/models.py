@@ -99,6 +99,25 @@ class ValidationProofType(str, Enum):
     ERROR_DETAIL_EXPOSURE = "error_detail_exposure"
     OPEN_REDIRECT = "open_redirect"
     CORS_ORIGIN_REFLECTION = "cors_origin_reflection"
+    FILE_UPLOAD_RETRIEVAL = "file_upload_retrieval"
+
+
+# SQLi boolean 차등에 쓰는 고정 술어 쌍 (이름, 참, 거짓). 문자열 리터럴의 따옴표는
+# 대상마다 다르고(MySQL은 홑·쌍을 모두 받는다) 공백이나 `and`를 지우는 입력 필터도
+# 흔하다. 한 쌍만 두면 "취약하지 않다"와 "이 모양이 그 대상에서 성립하지 않는다"가
+# 구분되지 않는다. 목록이 도메인에 있는 이유는 요청을 만드는 쪽과 불변식이 같은 집합을
+# 봐야 하기 때문이다 — 두 곳으로 갈라지면 한쪽만 넓혀도 다른 쪽이 거부한다.
+SQLI_NUMERIC_PREDICATES = (
+    ("and_spaced", " AND 1=1", " AND 1=2"),
+    ("or_tight", "||1=1", "||1=2"),
+)
+SQLI_STRING_PREDICATES = (
+    ("single_and_spaced", "' AND '1'='1", "' AND '1'='2"),
+    ("double_and_spaced", '" AND "1"="1', '" AND "1"="2'),
+    ("double_or_tight", '"or"1"="1', '"or"1"="2'),
+    ("single_or_tight", "'or'1'='1", "'or'1'='2"),
+)
+SQLI_BOOLEAN_PREDICATES = (*SQLI_NUMERIC_PREDICATES, *SQLI_STRING_PREDICATES)
 
 
 class HttpRequestKind(str, Enum):
@@ -168,6 +187,14 @@ PATH_TRAVERSAL_SAFE_PROBE_PATH = "../../../../../etc/os-release"
 # 별도 저민감 파일. 패키지 메타데이터는 비밀 파일이 아니며 Juice Shop을 포함한
 # Node 애플리케이션 루트에 일반적으로 존재한다.
 PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH = "../package.json"
+# 같은 증명 파일을 가리키는 두 번째 고정 값. 한 번만 훑고 지나가는 필터
+# (``str_replace(['../','./','..\\','.\\'], '', $input)`` 같은 것)는 제거 후 남은
+# 조각이 다시 붙는 것을 막지 못한다. ``..\/``에서 ``..\``를 떼면 ``../``가 남으므로
+# 필터를 통과한 뒤 같은 경로가 복원된다. 가리키는 파일은 첫 값과 동일하고, 값 역시
+# 고정이라 Agent나 LLM이 다른 파일을 고를 수는 없다.
+PATH_TRAVERSAL_FILTER_BYPASS_PROBE_PATH = (
+    "....\\/....\\/....\\/....\\/....\\/etc/os-release"
+)
 # 확장자 필터를 우회해 서버가 직접 거부한 자기 파일을 읽게 하는 고정 접미사.
 # 이미 URL 인코딩된 문자열이므로 재인코딩하지 않고 경로 뒤에 그대로 붙인다.
 # Agent나 LLM은 "우회를 적용한다"만 지정할 수 있고 접미사 내용은 고를 수 없다.
@@ -192,9 +219,16 @@ _FORBIDDEN_REQUEST_HEADERS = frozenset(
 
 
 def is_path_traversal_safe_probe_value(value: str) -> bool:
-    """고정된 비민감 증명 파일 상대 경로와 정확히 같은지 확인한다."""
+    """고정된 비민감 증명 파일 상대 경로 중 하나와 정확히 같은지 확인한다.
 
-    return value == PATH_TRAVERSAL_SAFE_PROBE_PATH
+    두 값 모두 같은 파일을 가리킨다. 두 번째는 한 번만 훑는 제거 필터를 통과하기 위한
+    표기이며, 집합을 벗어난 값은 여전히 거부된다.
+    """
+
+    return value in {
+        PATH_TRAVERSAL_SAFE_PROBE_PATH,
+        PATH_TRAVERSAL_FILTER_BYPASS_PROBE_PATH,
+    }
 
 
 def is_path_traversal_safe_form_probe_value(value: str) -> bool:
@@ -495,6 +529,8 @@ class HttpRequestSpec:
     # 경로 끝에 그대로 붙는 도메인 고정 접미사. 값 형태를 도메인이 강제하므로
     # Agent가 임의 경로나 임의 인코딩을 여기로 실을 수 없다.
     path_suffix: str | None = None
+    # latin-1 preserves binary multipart bytes while keeping stored specs JSON-compatible.
+    body_encoding: str = "utf-8"
 
     def __post_init__(self) -> None:
         if not self.method or _HTTP_METHOD.fullmatch(self.method) is None:
@@ -503,6 +539,13 @@ class HttpRequestSpec:
             raise DomainInvariantError("HTTP request kind must be control or probe")
         if self.body is not None and not isinstance(self.body, str):
             raise DomainInvariantError("HTTP request body must be text")
+        if self.body_encoding not in {"utf-8", "latin-1"}:
+            raise DomainInvariantError("HTTP body encoding must be utf-8 or latin-1")
+        if self.body is not None:
+            try:
+                self.body.encode(self.body_encoding)
+            except UnicodeEncodeError as error:
+                raise DomainInvariantError("HTTP body cannot use the selected encoding") from error
         if self.body is not None and self.form_parameters:
             raise DomainInvariantError(
                 "HTTP request cannot carry raw body and structured form parameters"
@@ -560,20 +603,14 @@ class HttpRequestSpec:
             HttpRequestKind.SQLI_BOOLEAN_TRUE,
             HttpRequestKind.SQLI_BOOLEAN_FALSE,
         }:
-            expected_suffix = (
-                " AND 1=1"
-                if self.request_kind is HttpRequestKind.SQLI_BOOLEAN_TRUE
-                else " AND 1=2"
+            index = (
+                1 if self.request_kind is HttpRequestKind.SQLI_BOOLEAN_TRUE else 2
             )
-            string_suffix = (
-                "' AND '1'='1"
-                if self.request_kind is HttpRequestKind.SQLI_BOOLEAN_TRUE
-                else "' AND '1'='2"
-            )
+            suffixes = tuple(pair[index] for pair in SQLI_BOOLEAN_PREDICATES)
             mutations = [
                 value
                 for _, value in (*self.query_parameters, *self.form_parameters)
-                if value.endswith(expected_suffix) or value.endswith(string_suffix)
+                if value.endswith(suffixes)
             ]
             if len(mutations) != 1:
                 raise DomainInvariantError(
@@ -737,6 +774,7 @@ class EvidenceRequest:
         canonical = json.dumps(
             {
                 "body_present": request.body is not None,
+                **({"body_encoding": request.body_encoding} if request.body_encoding != "utf-8" else {}),
                 "form_names": [name for name, _ in request.form_parameters],
                 "approval_present": self.approval_ref is not None,
                 "evidence_type": self.evidence_type,
@@ -1261,6 +1299,7 @@ class ExecutionRequest:
     credential_ref: str | None = None
     approval_ref: str | None = None
     scope: RunScope | None = None
+    body_encoding: str = "utf-8"
 
     def __post_init__(self) -> None:
         # Runtime 직전 객체도 동일한 명세 검증을 통과시켜 직접 생성 경로의 우회를 막는다.
@@ -1270,6 +1309,7 @@ class ExecutionRequest:
             form_parameters=self.form_parameters,
             headers=self.headers,
             body=self.body,
+            body_encoding=self.body_encoding,
             request_kind=self.request_kind,
             identifier_parameter=self.identifier_parameter,
             identifier_location=self.identifier_location,

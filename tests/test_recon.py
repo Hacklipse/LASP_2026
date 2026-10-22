@@ -880,6 +880,79 @@ class ReconCrawlTests(unittest.TestCase):
         self.assertTrue(any(s.url == base + "/api/find" and s.parameters == ("q",)
                             for s in surfaces.list_by_run("script-priority")))
 
+    def test_an_upload_page_is_fetched_while_an_action_page_is_not(self) -> None:
+        # 업로드는 요청 본문이 있어야 성립하므로 /upload.php 를 GET으로 읽는 것은
+        # 동작이 아니다. 이 페이지를 받지 못하면 업로드 폼 자체를 관측할 수 없어
+        # 임의 파일 업로드가 영구히 보이지 않는다.
+        base = "http://localhost"
+        agent, collector, surfaces = _crawling_agent(
+            {
+                base + "/": ('<a href="/posts/upload-article.php">upload</a>'
+                             '<a href="/account/delete.php">delete</a>'),
+                base + "/posts/upload-article.php": (
+                    '<form method="post" enctype="multipart/form-data">'
+                    '<input type="file" name="articleFile"></form>'
+                ),
+                base + "/account/delete.php": "<p>gone</p>",
+            },
+            max_pages=5,
+        )
+        agent.handle(replace(_task("upload-reach", base + "/"), request_budget=40))
+
+        self.assertIn(base + "/posts/upload-article.php", collector.calls)
+        self.assertNotIn(base + "/account/delete.php", collector.calls)
+        # 가져오지 않은 것도 Surface로는 남아 "검사하지 않았다"가 결과에 드러난다.
+        urls = {item.url for item in surfaces.list_by_run("upload-reach")}
+        self.assertIn(base + "/account/delete.php", urls)
+
+    def test_a_menu_linked_page_outranks_alphabetically_earlier_content(self) -> None:
+        # XBEN-028 모양: /posts/ 아래 기사 여러 개와 사이드바의 업로드 폼 하나. 경로
+        # 알파벳순으로만 고르면 기사들이 상한을 다 먹고 폼 페이지는 끝까지 못 받는다.
+        base = "http://localhost"
+        articles = [f"/posts/Article-{letter}.php" for letter in "ABCDEFGH"]
+        menu = '<a href="/about.php">about</a><a href="/posts/upload-article.php">upload</a>'
+        pages = {base + "/": menu + "".join(f'<a href="{path}">a</a>' for path in articles),
+                 base + "/about.php": menu}
+        for path in articles:
+            pages[base + path] = "<p>content</p>"
+        pages[base + "/posts/upload-article.php"] = (
+            menu + '<form method="post" enctype="multipart/form-data">'
+            '<input type="file" name="articleFile"></form>'
+        )
+
+        agent, collector, surfaces = _crawling_agent(pages, max_pages=4)
+        agent.handle(replace(_task("menu-rank", base + "/"), request_budget=40))
+
+        self.assertIn(base + "/posts/upload-article.php", collector.calls)
+        self.assertLessEqual(
+            len([call for call in collector.calls if "/posts/Article-" in call]), 1
+        )
+
+    def test_a_relative_script_route_keeps_its_query_coordinate(self) -> None:
+        # XBEN-069의 IDOR 좌표는 인라인 JS의 상대 경로 리터럴에 실려 있다. 절대 경로만
+        # 받으면 그 Surface가 파라미터 없이 올라와 식별자 입력이 사라진다.
+        base = "http://localhost"
+        agent, collector, surfaces = _crawling_agent(
+            {
+                base + "/profile.php": (
+                    "<script>$.ajax({url: 'api/favorites.php?userId=3', type: 'GET'});"
+                    "var mime = 'application/json'; var cls = 'My.Widget';</script>"
+                ),
+                base + "/api/favorites.php": "{}",
+            },
+            max_pages=4,
+        )
+        agent.handle(replace(_task("relative-js", base + "/profile.php"), request_budget=20))
+
+        found = {
+            (item.url, item.parameters)
+            for item in surfaces.list_by_run("relative-js")
+        }
+        self.assertIn((base + "/api/favorites.php", ("userId",)), found)
+        # 질의가 없는 리터럴은 라우트로 보지 않는다. MIME 타입과 클래스 이름이
+        # 전부 Surface가 되면 frontier가 쓰레기로 찬다.
+        self.assertFalse(any("json" in url or "Widget" in url for url, _ in found))
+
     def test_does_not_parse_html_looking_strings_inside_json_as_surfaces(self) -> None:
         api_url = "http://localhost/api/items"
         agent, collector, surfaces = _crawling_agent(

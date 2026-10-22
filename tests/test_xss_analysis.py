@@ -12,7 +12,11 @@ from hacklipse.adapters import (
     RuleBasedVulnerabilityRouter,
     SurfaceRoutingRule,
 )
+from hacklipse.adapters.probing import PAYLOAD_CONTEXTS, payload_contexts
 from hacklipse.adapters.xss_analysis import secondary_dom_attribute_sinks
+from hacklipse.adapters.xss_execution import (
+    _execution_payload, context_execution_marker,
+)
 from hacklipse.application.errors import AgentContractError
 from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.bootstrap import build_local_application
@@ -41,14 +45,15 @@ _CANDIDATE_ID = "candidate-xss"
 class _ReflectionRuntime:
     """probe query 값을 응답에 반사하거나 제거하는 결정적 Runtime 대역."""
 
-    def __init__(self, *, reflect: bool) -> None:
+    def __init__(self, *, reflect: bool, template: str = "{}") -> None:
         self.reflect = reflect
+        self.template = template
         self.requests: list[ExecutionRequest] = []
 
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
         self.requests.append(request)
         values = " ".join(value for _, value in request.query_parameters)
-        body = values if self.reflect else "static response"
+        body = self.template.format(values) if self.reflect else "static response"
         return ExecutionResult(
             execution_id=request.execution_id,
             evidence_type="http_response",
@@ -164,7 +169,24 @@ class HeuristicXssAnalyzerTests(unittest.TestCase):
         self.assertEqual(len(observations), 1)
         self.assertEqual(observations[0].observation["type"], "reflection")
         self.assertEqual(observations[0].observation["parameter"], "name")
+        self.assertEqual(observations[0].observation["context_source"], "python")
         self.assertEqual(app.budget_manager.remaining(_RUN_ID), 8)
+
+    def test_reflection_records_the_context_python_computed(self) -> None:
+        agent, app, runtime, task = _task(parameters=("name",))
+        runtime.template = '<script> var name = "{}"; </script>'
+
+        requested = agent.handle(task)
+        agent.handle(_collect_requested(requested, app, task))
+
+        observation = next(
+            item.observation for item in app.stores.evidence.list_by_run(_RUN_ID)
+            if item.observation.get("type") == "reflection"
+        )
+        # 맥락은 LLM 주장이 아니라 Python이 본문에서 계산한 사실이어야 한다.
+        # Validation이 이 값으로 고정 payload를 고른다.
+        self.assertEqual(observation["payload_contexts"], ["js_string_double"])
+        self.assertEqual(observation["context_source"], "python")
 
     def test_non_reflected_marker_keeps_only_http_evidence(self) -> None:
         agent, app, runtime, task = _task(parameters=("name",))
@@ -252,6 +274,100 @@ class HeuristicXssAnalyzerTests(unittest.TestCase):
         with self.assertRaises(AgentContractError):
             agent.handle(task)
         self.assertEqual(runtime.requests, [])
+
+
+class PayloadContextTests(unittest.TestCase):
+    """반사 맥락은 Python이 본문에서 계산하는 사실이다. payload가 여기서 갈린다."""
+
+    MARKER = "hacklipse7331"
+
+    def _context(self, template: str) -> tuple[str, ...]:
+        return payload_contexts(template.replace("{m}", self.MARKER), self.MARKER)
+
+    def test_classifies_each_executable_context(self) -> None:
+        cases = (
+            ("<p>hello {m}</p>", ("html_text",)),
+            ('<div class="box">{m}</div>', ("html_text",)),
+            ('<input value="{m}">', ("attribute_double",)),
+            ("<input value='{m}'>", ("attribute_single",)),
+            ('<iframe src="{m}"></iframe>', ("uri_attribute",)),
+            ("<form action='{m}'>", ("uri_attribute",)),
+            ('<script> var name = "{m}"; </script>', ("js_string_double",)),
+            ("<script> var name = '{m}'; </script>", ("js_string_single",)),
+        )
+        for template, expected in cases:
+            with self.subTest(template=template):
+                self.assertEqual(self._context(template), expected)
+                for context in expected:
+                    self.assertIn(context, PAYLOAD_CONTEXTS)
+
+    def test_refuses_to_guess_a_context_it_cannot_break_out_of(self) -> None:
+        # 분류하지 못한 자리는 payload를 고를 근거가 없다. 추측해서 보내지 않는다.
+        for template in (
+            "<script> var total = {m}; </script>",   # 문자열 리터럴이 아니다
+            "<!-- {m} -->",                           # 주석 탈출은 지원하지 않는다
+        ):
+            with self.subTest(template=template):
+                self.assertEqual(self._context(template), ())
+
+    def test_script_quotes_do_not_leak_past_the_closing_tag(self) -> None:
+        # </script> 뒤의 반사는 JS 문자열이 아니라 그냥 HTML 본문이다.
+        self.assertEqual(
+            self._context('<script> var a = "x"; </script> var b = "{m}"'),
+            ("html_text",),
+        )
+
+    def test_reports_every_distinct_context_of_one_value(self) -> None:
+        self.assertEqual(
+            self._context('<input value="{m}"><p>{m}</p><iframe src="{m}">'),
+            ("attribute_double", "html_text", "uri_attribute"),
+        )
+
+    def test_a_missing_or_absent_marker_has_no_context(self) -> None:
+        self.assertEqual(payload_contexts(None, self.MARKER), ())
+        self.assertEqual(payload_contexts("<p>nothing here</p>", self.MARKER), ())
+
+
+class ContextPayloadTests(unittest.TestCase):
+    """맥락별 payload는 코드에 고정된 형태이며 marker 대입만 한다."""
+
+    CONTEXTS = (
+        "js_string_double", "js_string_single", "uri_attribute",
+        "attribute_double", "attribute_single",
+    )
+
+    def test_each_payload_only_assigns_the_marker(self) -> None:
+        for context in self.CONTEXTS:
+            with self.subTest(context=context):
+                marker = context_execution_marker("validation-1", context)
+                payload = _execution_payload(marker)
+                self.assertIn(f"=`{marker}`", payload)
+                # 외부 전송·임의 실행·DOM 변경 수단이 형태에 들어 있지 않다.
+                for forbidden in (
+                    "fetch", "XMLHttpRequest", "eval", "import", "document",
+                    "cookie", "localStorage", "//http", "src=",
+                ):
+                    self.assertNotIn(forbidden, payload)
+
+    def test_the_assignment_carries_no_dot_or_quote(self) -> None:
+        # "URL처럼 보이지 않는 점 포함 토큰을 지운다"거나 따옴표를 지우는 필터가 흔하다.
+        # 대입 자체가 그런 필터에 잘리면 맥락을 알아도 실행을 재현할 수 없다. 맥락을
+        # 벗어나는 따옴표는 탈출 자체이므로 대입 부분만 본다.
+        for context in self.CONTEXTS:
+            with self.subTest(context=context):
+                marker = context_execution_marker("validation-1", context)
+                payload = _execution_payload(marker)
+                start = payload.index("top[")
+                assignment = payload[start:payload.index(f"=`{marker}`", start) + len(marker) + 3]
+                self.assertNotIn(".", assignment)
+                self.assertNotIn('"', assignment)
+                self.assertNotIn("'", assignment)
+
+    def test_an_unclassified_context_cannot_bind_a_payload(self) -> None:
+        for context in ("unclassified", "html_text", "", "onerror"):
+            with self.subTest(context=context):
+                with self.assertRaises(ValueError):
+                    context_execution_marker("validation-1", context)
 
 
 class _SurfaceOnlyRecon:

@@ -50,6 +50,8 @@ PROOF_DESCRIPTIONS = MappingProxyType({
         "독립 GET 재요청에서 오류 응답의 내부 스택 프레임 확인",
     ValidationProofType.OPEN_REDIRECT:
         "독립 control/probe 비교에서 외부 origin 이동 대상 확인",
+    ValidationProofType.FILE_UPLOAD_RETRIEVAL:
+        "독립 업로드 재현에서 확장자가 보존된 무해 파일의 저장과 동일 바이트 회수 확인",
 })
 PROOF_UNAVAILABLE = "검증 상세를 사용할 수 없음"
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")

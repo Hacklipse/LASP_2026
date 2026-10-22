@@ -73,8 +73,11 @@ _PROOF_TYPE_BY_VULNERABILITY = {
     "Access Control": ValidationProofType.UNAUTHORIZED_OBJECT_ACCESS,
     "Path Traversal": ValidationProofType.PATH_TRAVERSAL_FILE_READ,
     "SSTI": ValidationProofType.SSTI_EXECUTION,
+    "File Upload": ValidationProofType.FILE_UPLOAD_RETRIEVAL,
 }
 
+# form login 한 번이 쓰는 요청 수 상한(CSRF 선행·전송·보호자원 확인).
+_AUTHENTICATION_REQUEST_COST = 3
 VALIDATION_ROUNDS_EXHAUSTED_REASON = "validation rounds exhausted"
 
 
@@ -659,18 +662,27 @@ class Orchestrator:
         reserve = 0
         for candidate_id in run.candidate_ids:
             candidate = self._candidates.get(run.run_id, candidate_id)
-            if not _pending_in(candidate, CandidateStatus.ANALYZED):
-                continue
-            browser_costs = [
-                min(32, 1 + count)
-                for evidence in self._evidence.get_many(run.run_id, candidate.evidence_ids)
-                if evidence.observation.get("type") == "browser_execution"
-                and evidence.observation.get("dom_reflected") is True
-                if type(count := evidence.observation.get("subrequest_count")) is int
-                and count >= 0
-            ]
-            reserve += 2 * max(browser_costs) if browser_costs else 2
+            if _pending_in(candidate, CandidateStatus.ANALYZED):
+                reserve += self._candidate_validation_floor(run, candidate)
         return reserve
+
+    def _candidate_validation_floor(self, run: Run, candidate: Candidate) -> int:
+        evidence = self._evidence.get_many(run.run_id, candidate.evidence_ids)
+        browser_costs = [
+            min(32, 1 + count)
+            for item in evidence
+            if item.observation.get("type") == "browser_execution"
+            and item.observation.get("dom_reflected") is True
+            if type(count := item.observation.get("subrequest_count")) is int and count >= 0
+        ]
+        # Upload forms with rotating tokens need refresh + POST + retrieval.
+        upload_floor = 3 if candidate.vulnerability_type == "File Upload" and any(
+            item.observation.get("type") == "file_upload_extension_result"
+            and item.observation.get("refresh_form") is True
+            and any(row.get("outcome") == "accepted" for row in item.observation.get("results", ()))
+            for item in evidence
+        ) else 2
+        return max(upload_floor, 2 * max(browser_costs) if browser_costs else 2)
 
     def _validation_floor(
         self, run: Run, candidate_id: str, remaining_ids: Sequence[str]
@@ -684,12 +696,19 @@ class Orchestrator:
         weights = dict(zip(run.budget_candidate_order, run.budget_candidate_weights))
         remaining = self._global_remaining(run.run_id)
         reserve = run.budget_validation_reserve
+        floors = {}
+        for item_id in pending:
+            candidate = self._candidates.get(run.run_id, item_id)
+            floors[item_id] = max(
+                reserve,
+                self._candidate_validation_floor(run, candidate) if candidate.vulnerability_type == "File Upload" else 0,
+            )
         total_weight = sum(weights[item] for item in pending)
         share = max(
-            reserve,
+            floors[candidate_id],
             (remaining * weights[candidate_id] + total_weight - 1) // total_weight,
         )
-        return max((len(pending) - 1) * reserve, remaining - share)
+        return max(sum(floor for item_id, floor in floors.items() if item_id != candidate_id), remaining - share)
 
     def _activate_budget_candidate(
         self, run: Run, candidate_id: str, phase: str, floor: int
@@ -984,6 +1003,40 @@ class Orchestrator:
                 finding_ids.append(finding_id)
         return current.with_updates(finding_ids=tuple(dict.fromkeys(finding_ids)))
 
+    def _authenticate_validation_session(self, run: Run, validation_id: str) -> Run:
+        """Validation 전용 세션에 역할별 로그인을 세운다.
+
+        자격증명이 없는 Run에서는 아무것도 하지 않는다. 한 주체만 인증되면 owner
+        control이 로그인 페이지를 받아 교차 주체 판정이 성립하지 않으므로, 등록된
+        참조 전부에 대해 실행한다.
+        """
+
+        current = run
+        references = tuple(_run_credentials(run))
+        if not references:
+            return current
+        # 로그인 하나가 CSRF 선행·전송·확인으로 최대 세 요청을 쓴다. 후보당 검증 예비는
+        # 그보다 작게 잡혀 있으므로, 예산이 모자라면 재인증을 시도하지 않고 넘어간다.
+        # 시도해서 BudgetExceeded로 끊기면 그 요청이 실패로 기록되고 남은 예산까지
+        # 흔들린다. 건너뛰면 재현이 미인증으로 돌아 "확정되지 않음"으로 남는다 — 그것이
+        # 예산이 부족했다는 사실에 대한 정직한 결과다.
+        needed = _AUTHENTICATION_REQUEST_COST * len(references)
+        if self._budget.remaining(run.run_id) < needed:
+            return current
+        for credential_ref in references:
+            task = self._task_factory.authentication(
+                current,
+                agent_type=self._config.authentication_agent_type,
+                request_budget=self._budget.remaining(run.run_id),
+                credential_ref=credential_ref,
+                validation_id=validation_id,
+            )
+            result = self._tasks.execute(task)
+            self._require_completed(result, "authentication")
+            current = self._merge_agent_result(current, result)
+            self._runs.save(current)
+        return current
+
     def _validate_candidate(
         self, run: Run, candidate: Candidate
     ) -> tuple[Run, str | None]:
@@ -992,6 +1045,12 @@ class Orchestrator:
         current = run
         validation = None
         validation_id = f"validation-{self._id_factory()}"
+        # 독립 재현은 세션을 일부러 분리한다(런타임 세션 키에 validation_id가 들어간다).
+        # 그 새 세션에는 정적 Cookie만 심기므로, form login을 쓰는 대상은 재현 요청이
+        # 미인증으로 나가 로그인 페이지를 받고 "노출 없음"으로 읽힌다. 분리는 유지하되
+        # 그 세션에 대해 중앙 인증 Worker를 다시 실행한다 — 로그인이 정책·예산·증적
+        # 경계를 그대로 지나가도록 런타임이 아니라 여기서 한다.
+        current = self._authenticate_validation_session(current, validation_id)
         surface = self._surfaces.get(run.run_id, candidate.surface_id)
         self._emit(
             run,

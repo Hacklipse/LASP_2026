@@ -77,7 +77,7 @@ class TaskFactory:
             allowed_tools = (_ACCESS_CONTROL_TOOL,)
         elif candidate.vulnerability_type == "SSTI":
             allowed_tools = (_SSTI_TOOL,)
-        elif candidate.vulnerability_type == _PUBLIC_LOGIN_CREDENTIAL_TYPE:
+        elif candidate.vulnerability_type in {_PUBLIC_LOGIN_CREDENTIAL_TYPE, "File Upload"}:
             allowed_tools = ("http_get", "http_post")
         elif candidate.vulnerability_type == "SQLi":
             allowed_tools = (
@@ -121,7 +121,7 @@ class TaskFactory:
             allowed_tools = (_ACCESS_CONTROL_TOOL,)
         elif candidate.vulnerability_type == "SSTI":
             allowed_tools = (_SSTI_TOOL,)
-        elif candidate.vulnerability_type == _PUBLIC_LOGIN_CREDENTIAL_TYPE:
+        elif candidate.vulnerability_type in {_PUBLIC_LOGIN_CREDENTIAL_TYPE, "File Upload"}:
             allowed_tools = ("http_get", "http_post")
         elif candidate.vulnerability_type == "SQLi":
             allowed_tools = (
@@ -191,11 +191,16 @@ class TaskFactory:
         agent_type: str,
         request_budget: int,
         credential_ref: str | None = None,
+        validation_id: str | None = None,
     ) -> TaskEnvelope:
         """비밀 원문 없이 credential_ref만 중앙 인증 Worker에 전달한다.
 
         Access Control처럼 주체가 둘 이상인 검사에서는 역할별로 각각 인증해야 하므로
         어떤 참조를 인증할지 호출자가 지정할 수 있다.
+
+        ``validation_id``가 주어지면 그 Validation 세션에 대해 인증한다. 독립 재현은
+        세션을 일부러 분리하므로(런타임의 세션 키에 validation_id가 들어간다) 분석
+        단계에서 세운 로그인이 그쪽으로 넘어가지 않는다.
         """
 
         selected = credential_ref or run.credential_ref
@@ -208,6 +213,7 @@ class TaskFactory:
             target_url=run.target_url,
             allowed_tools=("http_get", "http_post"),
             credential_ref=selected,
+            validation_id=validation_id,
         )
 
     def _base(

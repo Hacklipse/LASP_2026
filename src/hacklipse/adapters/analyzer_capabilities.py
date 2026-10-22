@@ -12,6 +12,7 @@ from hacklipse.ports import AnalyzerCapability, ObservationRequirement
 
 from .request_safety import has_state_changing_parameters, object_identifier_parameters
 from .cors_analysis import CORS_SEARCH_INPUT_NAMES
+from .ssti_analysis import SSTI_PARAMETER_HINTS
 from .graphql_introspection import INTROSPECTION_TYPE, INTROSPECTION_RECON_OBSERVATION
 from .graphql_suggestions import SUGGESTION_TYPE, SUGGESTION_PLAN
 from .error_disclosure import (
@@ -21,6 +22,7 @@ from .sensitive_exposure import CONFIG_ROUTE_OBSERVATION
 from .public_login_credentials import PUBLIC_LOGIN_OBSERVATION, PUBLIC_LOGIN_TYPE
 from .open_redirect_analysis import REDIRECT_PARAMETER_HINTS
 from .postmessage_plan import POSTMESSAGE_ANALYZER, POSTMESSAGE_CAPABILITY, POSTMESSAGE_PLAN
+from .file_upload_analysis import UPLOAD_TYPE, UPLOAD_ANALYZER, UPLOAD_FORM
 
 
 OPTIONAL_SOURCE_MAP_CAPABILITIES = (
@@ -38,6 +40,15 @@ OPTIONAL_SOURCE_MAP_CAPABILITIES = (
 
 
 DEFAULT_ANALYZER_CAPABILITIES = (
+    AnalyzerCapability(
+        capability_id="file_upload.multipart.extension_policy",
+        agent_type=UPLOAD_ANALYZER, vulnerability_type=UPLOAD_TYPE,
+        methods=("POST",), surface_kind="server",
+        observation_requirements=(ObservationRequirement(UPLOAD_FORM, "html_form"),),
+        exploration_parameter_source="observation",
+        supported_evidence_types=("http_response",),
+        strategy_ids=("compare_inert_file_extensions",), default_priority=0.25,
+    ),
     AnalyzerCapability(
         capability_id=POSTMESSAGE_CAPABILITY,
         agent_type=POSTMESSAGE_ANALYZER,
@@ -249,17 +260,41 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         default_priority=0.20,
     ),
     AnalyzerCapability(
-        capability_id="ssti.form.username",
+        capability_id="ssti.http.query",
         agent_type="ssti_analyzer",
         vulnerability_type="SSTI",
-        methods=("POST",),
+        methods=("GET",),
         surface_kind="server",
-        parameter_hints=("username",),
+        # username 힌트를 걸지 않는다. 템플릿에 렌더링되는 좌표의 이름은 대상마다 달라
+        # name·message·template 등으로 나타나며, heuristic_ssti_parameters가 이미
+        # SSTI_PARAMETER_HINTS로 한 번 좁힌다. 여기서 또 좁히면 선언과 분석기의
+        # 좁힘 기준이 두 곳으로 갈라진다.
         exploration_parameter_source="surface",
         supported_evidence_types=(
             "control_response",
             "template_execution_marker",
         ),
+        strategy_ids=("compare_query_template_expressions",),
+        default_priority=0.25,
+    ),
+    AnalyzerCapability(
+        capability_id="ssti.http.form",
+        agent_type="ssti_analyzer",
+        vulnerability_type="SSTI",
+        methods=("POST",),
+        surface_kind="server",
+        # username 하나로 좁히면 템플릿에 렌더링되는 POST 좌표가 name·message·template
+        # 으로 불리는 대상에서는 후보가 서지 않는다. 좁힘 기준은 분석기가 쓰는 집합
+        # 하나여야 한다 — 선언과 분석기가 서로 다른 목록을 들고 있으면 한쪽만 넓혀도
+        # 다른 쪽이 조용히 떨어뜨린다.
+        parameter_hints=tuple(sorted(SSTI_PARAMETER_HINTS)),
+        exploration_parameter_source="surface",
+        supported_evidence_types=(
+            "control_response",
+            "template_execution_marker",
+        ),
+        # username이면 저장되는 /profile 계약을, 아니면 응답에만 렌더링되는 폼 경로를
+        # 쓴다. 두 경로 모두 고정 산술 control/probe 비교이므로 전략은 하나로 센다.
         strategy_ids=("compare_template_expressions",),
         default_priority=0.20,
     ),

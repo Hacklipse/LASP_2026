@@ -23,7 +23,7 @@ import hashlib
 import json
 import re
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit
 from uuid import uuid4
@@ -49,6 +49,8 @@ from .llm_iterative_recon import (
     find_stored_recon_action,
     recon_action_status_detail,
 )
+from .hidden_parameter_planner import safe_hidden_name
+from .request_safety import has_state_changing_get
 from .llm_parameter_names import alias_parameter_names
 from .browser_recon import PlaywrightRecon
 from .discovery_links import json_links_from_observation
@@ -82,6 +84,7 @@ from .error_disclosure import (
     ERROR_ROUTE_OBSERVATION, ERROR_GRAPHQL_OBSERVATION, error_route_candidate,
 )
 from .request_safety import has_state_changing_get
+from .file_upload_analysis import UPLOAD_FORM, upload_form_plans
 
 # HttpExecutionRuntime이 GET 실행에 사용하는 도구 이름과 맞춘다(tests/test_http_runtime.py).
 RECON_TOOL = "http_get"
@@ -105,6 +108,13 @@ _JS_PATH = re.compile(
 # URL의 일부이므로 제외한다 — 이 필터가 없으면 소셜 공유 링크가 전부 섞여 들어온다.
 _JS_PATH_PARAM = re.compile(
     r"""(?<![/A-Za-z0-9._~-])(/[A-Za-z0-9][A-Za-z0-9._~/-]{0,100})\?([A-Za-z0-9_]{1,40})="""
+)
+# `url: 'api/items.php?userId=3'` 처럼 **상대** 경로로 쓰인 라우트. 흔한 모양이지만
+# 리터럴이 전부 라우트는 아니므로 `?name=` 를 요구한다 — 질의가 붙은 리터럴은 요청
+# URL이라는 뜻이고, 그 질의 이름이 바로 찾고 있는 입력 좌표다. 상대 경로는 문서
+# URL 기준으로만 해석하며, 기준이 없으면 쓰지 않는다.
+_JS_RELATIVE_PATH_PARAM = re.compile(
+    r"""["'`](?:\./)?([A-Za-z0-9][A-Za-z0-9._~/-]{0,100})\?([A-Za-z0-9_]{1,40})="""
 )
 # Bundlers often build a path from adjacent constant fragments, for example
 # "/api/" + "items?term=". Only literal-to-literal addition is interpreted;
@@ -164,6 +174,16 @@ _JS_DATA_VALUE = re.compile(
 # 결정적 Recon 단계에서 실제 요청 없이도 판단할 수 있는 유일한 신호: 파라미터 "이름"이
 # 파일·경로·URL을 가리키는 것처럼 보이는가. Router.DEFAULT_RULES의 "url_or_file_parameter"
 # 규칙과 맞아야 ROUTE 단계가 Candidate를 만들 수 있다.
+# 값이 파일로 보이는지 판정할 때 쓰는 종류 목록. 파라미터 이름과 달리 이것은 파일
+# 형식에 대한 것이어서 대상이 바뀌어도 유효하다.
+_FILE_VALUE_EXTENSIONS = frozenset(
+    {
+        "php", "phtml", "html", "htm", "asp", "aspx", "jsp", "cgi", "pl",
+        "js", "css", "txt", "md", "json", "xml", "yml", "yaml", "csv",
+        "log", "ini", "conf", "cfg", "env", "bak", "tpl", "twig",
+        "pdf", "png", "jpg", "jpeg", "gif", "svg", "zip", "tar", "gz",
+    }
+)
 _FILE_OR_URL_PARAM_HINTS = (
     "file",
     "page",
@@ -223,6 +243,26 @@ _RESTRICTED_FILE_EXTENSIONS = (
 # 능동 POST는 Analysis의 승인·고정 safe-file 경계 뒤에서만 일어난다.
 _UNLINKED_RENDER_PARAMETERS = ("layout",)
 
+# 링크도 폼도 선언하지 않는 GET 쿼리 좌표의 후보 이름. 추측을 Surface로 바꾸지 않고,
+# 마커를 실어 보낸 응답이 무파라미터 기준선과 달라졌을 때만 기록한다. 그래야 "이름을
+# 찍어봤다"가 아니라 "그 좌표가 응답을 바꾼다"는 관측이 된다.
+# 길이를 짧게 유지하는 이유는 비용이다. 한 이름이 요청 하나이고, 문서 페이지마다
+# 반복되므로 전체 예산을 정찰이 다 먹으면 분석 단계가 굶는다.
+_INFERRED_QUERY_PARAMETERS = (
+    "name",
+    "username",
+    "q",
+    "search",
+    "message",
+    "template",
+    "page",
+    "view",
+)
+_INFERENCE_MARKER = "hacklipse-probe-7193"
+# 추론에 쓸 문서 페이지 수와 페이지당 이름 수의 상한.
+_MAX_INFERENCE_PAGES = 2
+_MAX_INFERENCE_NAMES = 8
+
 _MAX_SCRIPT_BYTES = 4 * 1024 * 1024
 _MAX_INLINE_SCRIPT_BYTES = 256 * 1024
 _MAX_INLINE_SCRIPT_PATHS = 100
@@ -241,6 +281,15 @@ _MAX_AGENTIC_CONTEXT = 2
 _MAX_AGENTIC_OBSERVATIONS = _MAX_AGENTIC_SELECTABLE + _MAX_AGENTIC_CONTEXT
 _PATH_OBJECT_ID = re.compile(r"^[0-9]{1,10}$")
 _PATH_RESOURCE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
+# 숫자 세그먼트를 뒤에 달지만 객체 컬렉션이 아닌 좌표. 형제가 여럿이어도 식별자로
+# 보지 않는다 — 페이지네이션과 API 버전이 바로 이 모양이다.
+_NON_OBJECT_PATH_RESOURCES = frozenset(
+    {
+        "api", "page", "pages", "p", "offset", "limit", "size", "per_page",
+        "step", "part", "index", "v", "version", "ver", "rev",
+        "year", "month", "day", "week", "hour", "minute",
+    }
+)
 _SINGULAR_OBJECT_RESOURCES = frozenset(
     {
         "account",
@@ -348,12 +397,26 @@ def _json_links_from_response(evidence: Evidence, base_url: str) -> tuple[str, .
     return json_links_from_observation(evidence.observation, base_url)
 
 
-def _script_paths_from_body(body: str, origin) -> list[tuple[str, tuple[str, ...], bool, bool]]:
+def _script_paths_from_body(
+    body: str, origin, base_url: str | None = None
+) -> list[tuple[str, tuple[str, ...], bool, bool]]:
     """Derive same-origin route candidates from a bounded script body."""
 
     parameters: dict[str, set[str]] = {}
     for match in _JS_PATH_PARAM.finditer(body):
         parameters.setdefault(match.group(1), set()).add(match.group(2))
+    if base_url:
+        for match in _JS_RELATIVE_PATH_PARAM.finditer(body):
+            try:
+                resolved = urlsplit(urljoin(base_url, match.group(1)))
+            except ValueError:
+                continue
+            if (
+                resolved.netloc.casefold() == origin.netloc.casefold()
+                and resolved.path.startswith("/")
+                and ".." not in resolved.path.split("/")
+            ):
+                parameters.setdefault(resolved.path, set()).add(match.group(2))
     for path, names in _literal_js_query_paths(body).items():
         parameters.setdefault(path, set()).update(names)
     for path, names in _constant_js_paths(body).items():
@@ -583,6 +646,27 @@ def _openapi_item_links(
             if found and found[-1].startswith(base + template.split("{", 1)[0]):
                 break
     return tuple(found[:2])
+def _looks_like_file_value(value: str) -> bool:
+    """관측된 **값**이 파일명이나 경로처럼 보이는지 판정한다.
+
+    이름만 보면 좌표를 놓친다. XBEN-061은 ``post.php?id=`` 하나로 파일을 고르는데
+    (``"posts/" . $id``), ``id``는 어느 대상에서도 파일 힌트가 아니고 넣어서도 안 된다.
+    반면 그 좌표의 관측값은 ``EternalBlue.php``처럼 분명한 파일명이다.
+
+    확장자는 열어 두지 않고 문서·스크립트 종류로 제한한다. 알파벳 확장자를 모두 받으면
+    ``example.com``이 파일로 읽히고, 숫자를 받으면 ``3.14``가 걸린다. 종류 목록은 파일
+    형식에 대한 것이므로 대상이 달라도 그대로 쓰인다.
+    """
+
+    candidate = value.strip()
+    if not candidate or len(candidate) > 128:
+        return False
+    if "@" in candidate or "://" in candidate:
+        return False
+    if "/" in candidate or "\\" in candidate:
+        return True
+    _stem, _, extension = candidate.rpartition(".")
+    return bool(_stem) and extension.lower() in _FILE_VALUE_EXTENSIONS
 
 
 def _client_routes(body: str) -> dict[str, tuple[str, ...]]:
@@ -639,21 +723,28 @@ def _script_priority(url: str) -> int:
 
 
 def _deterministic_pending(
-    urls: Sequence[str], protected: Sequence[str] | set[str] = ()
+    urls: Sequence[str],
+    protected: Sequence[str] | set[str] = (),
+    inbound: Mapping[str, set[str]] | None = None,
 ) -> list[str]:
-    """보호 URL을 먼저, 나머지를 정규 URL 순서로 고정한다."""
+    """보호 URL을 먼저, 그 안에서는 여러 문서가 가리킨 URL부터 고정한다.
+
+    고정된 frontier 상한 아래에서 순수 경로 알파벳순은 콘텐츠 페이지가 기능 페이지를
+    밀어낸다. 메뉴·사이드바에 실린 폼 페이지는 여러 문서에서 가리켜지고 기사 하나는
+    보통 한 번만 가리켜지므로, 서로 다른 몇 개의 문서가 이 URL을 가리켰는지를 알파벳
+    순서보다 먼저 본다. 같은 수면 URL 키로 끊어 재현성은 그대로다.
+    """
 
     unique = tuple(dict.fromkeys(urls))
     protected_set = set(protected)
+    counts = inbound or {}
+
+    def rank(url: str) -> tuple:
+        return (-len(counts.get(url, ())), _deterministic_url_key(url))
+
     return [
-        *sorted(
-            (url for url in unique if url in protected_set),
-            key=_deterministic_url_key,
-        ),
-        *sorted(
-            (url for url in unique if url not in protected_set),
-            key=_deterministic_url_key,
-        ),
+        *sorted((url for url in unique if url in protected_set), key=rank),
+        *sorted((url for url in unique if url not in protected_set), key=rank),
     ]
 
 
@@ -671,6 +762,7 @@ class ReconAgent:
         surface_collection_mode: str = "adaptive",
         seed_urls: Sequence[str] = (),
         infer_unlinked_render_parameters: bool = True,
+        infer_unlinked_query_parameters: bool = False,
         id_factory: Callable[[], str] | None = None,
         planner: ReconPlanner | None = None,
         iterative_planner: IterativeReconPlanner | None = None,
@@ -691,6 +783,10 @@ class ReconAgent:
         self._surface_collection_mode = surface_collection_mode
         self._seed_urls = tuple(dict.fromkeys(seed_urls))
         self._infer_unlinked_render_parameters = infer_unlinked_render_parameters
+        # 기본값을 끈 이유는 비용이다. 이름 하나가 요청 하나이므로 켜면 정찰이
+        # 쓰는 요청 수가 늘고, 그만큼 분석 단계 몫이 줄어든다. 켤 쪽이 그 교환을
+        # 알고 켜야 한다.
+        self._infer_unlinked_query_parameters = infer_unlinked_query_parameters
         self._id_factory = id_factory or (lambda: str(uuid4()))
         # None이면(휴리스틱 프로필) 아래 두 번째 crawl() 직전 분기 자체가 실행되지
         # 않아 기존 결정적 동작과 한 줄도 다르지 않다.
@@ -740,6 +836,9 @@ class ReconAgent:
             url: {"seed"} for url in pending
         }
         fetched: set[str] = set()
+        # URL -> 그 URL을 가리킨 서로 다른 문서들. 한 페이지에 같은 링크가 여러 번
+        # 있어도 한 번으로 센다.
+        inbound_documents: dict[str, set[str]] = {}
         responded: set[str] = set()
         successful: set[str] = set()
         parsed: set[str] = set()
@@ -773,9 +872,15 @@ class ReconAgent:
         deferred_inline_urls: list[str] = []
         inline_seen_shapes: set[tuple[str, tuple[str, ...]]] = set()
         inline_path_count = 0
+        # 리소스명 -> 관측된 숫자 세그먼트 값. 목록 페이지가 항목 링크를 형제로 함께
+        # 내보내므로, 저장 전에 같은 배치 안에서 형제 수를 셀 수 있다.
+        numeric_siblings: dict[str, set[str]] = {}
         document_pages: set[str] = set()
         browser_document_seeds: dict[str, int] = {}
         unparameterized_search_pages: dict[str, str] = {}
+        # 쿼리 좌표 추론을 적용한 문서 페이지 수. 페이지마다 이름 목록을 다시 찍으면
+        # 정찰이 예산을 다 쓰고 분석 단계가 굶는다.
+        inference_pages = 0
         if targeted:
             # A second pass only visits this selected document. Preserve the
             # document-page form signal normally set during first-pass script discovery.
@@ -824,7 +929,7 @@ class ReconAgent:
             discovery_types: Sequence[str] = (),
         ) -> str:
             clean_url = url.split("?", 1)[0]
-            path_identifier = _path_identifier(clean_url)
+            path_identifier = _path_identifier(clean_url, numeric_siblings)
             key_url = _canonical_surface_url(clean_url, path_identifier)
             key = (key_url, method, names)
             def record_error_route(surface_id: str) -> None:
@@ -894,7 +999,7 @@ class ReconAgent:
             record_credential_route(surface_id)
             evidence_ids.extend(
                 self._flag_suspect_parameters(
-                    task.run_id, surface_id, names, clean_url, method
+                    task.run_id, surface_id, names, clean_url, method, observed
                 )
             )
             if _looks_like_restricted_file(clean_url):
@@ -1094,6 +1199,7 @@ class ReconAgent:
             max_visits: int | None = None,
         ) -> int:
             nonlocal deadline_exhausted, api_schema_found, inline_path_count
+            nonlocal inference_pages
             visited = 0
             while pending and len(fetched) < page_budget:
                 if remaining_work() < 1.0:
@@ -1102,7 +1208,16 @@ class ReconAgent:
                 if max_visits is not None and visited >= max_visits:
                     break
                 if self._surface_collection_mode == "deterministic":
-                    pending[:] = _deterministic_pending(pending, protected)
+                    pending[:] = _deterministic_pending(pending, protected, inbound_documents)
+                else:
+                    # 메뉴·사이드바에 실린 기능 페이지는 여러 문서가 가리키고, 기사 하나는
+                    # 보통 한 번만 가리켜진다. 문서에 나온 순서는 유지하되(안정 정렬) 가리킨
+                    # 문서가 많은 쪽을 먼저 본다. 고정된 페이지 상한에서 콘텐츠 목록이 폼
+                    # 페이지를 끝까지 밀어내는 것을 막는다.
+                    pending.sort(key=lambda candidate: (
+                        candidate not in protected,
+                        -len(inbound_documents.get(candidate, ())),
+                    ))
                 url = pending.pop(0)
                 if url in fetched:
                     continue
@@ -1117,6 +1232,16 @@ class ReconAgent:
                     tuple(sorted(pending_discovery_types.get(url, {"discovered"}))),
                 )
                 pending_surface_ids[url] = surface_id
+                if has_state_changing_get(url):
+                    # 상태를 바꾸는 GET은 가져오지 않는다. Surface로는 보존해 "검사하지
+                    # 않았다"가 결과에 남는다.
+                    #
+                    # 정책 게이트가 승인 없는 이런 요청을 거부하므로, 시도하면
+                    # ApprovalRequired가 recon 단계에서 Run 전체를 끝낸다. 인증을 세운
+                    # 뒤에 특히 문제가 된다 — 로그아웃 링크는 로그인한 페이지에만
+                    # 나타나므로, 크롤이 방금 만든 세션을 스스로 끊으려 하고 그 거부로
+                    # 측정이 통째로 날아간다.
+                    continue
                 evidence_id, evidence = self._fetch(
                     task, url, surface_id, timeout_seconds=remaining_work()
                 )
@@ -1233,6 +1358,23 @@ class ReconAgent:
                             observed=fields,
                             discovery_types=("javascript_request",),
                         )
+                for upload_plan in upload_form_plans(body, url):
+                    upload_surface_id = remember(
+                        upload_plan.url, "POST",
+                        tuple(dict.fromkeys((upload_plan.parameter, *(name for name, _ in upload_plan.fields)))),
+                        discovery_types=("html_form",),
+                    )
+                    upload_evidence_id = f"evi-{self._id_factory()}"
+                    self._evidence.append(Evidence(
+                        evidence_id=upload_evidence_id, run_id=task.run_id,
+                        surface_id=upload_surface_id, created_by="recon",
+                        evidence_type="observation",
+                        observation={"type": UPLOAD_FORM, "source": "html_form",
+                                     "parameter": upload_plan.parameter, "accept": upload_plan.accept,
+                                     "source_surface_id": surface_id,
+                                     "refresh_form": bool(upload_plan.fields)},
+                    ))
+                    evidence_ids.append(upload_evidence_id)
                 for form_url, method, names, content_type in forms:
                     form_surface_id = remember(
                         form_url, method, names, discovery_types=("html_form",)
@@ -1257,6 +1399,34 @@ class ReconAgent:
                                 task.run_id, form_surface_id
                             )
                         )
+                if (
+                    self._infer_unlinked_query_parameters
+                    and not _query_names(url)
+                    and inference_pages < _MAX_INFERENCE_PAGES
+                    and page_budget > len(fetched)
+                ):
+                    inference_pages += 1
+                    inferred, inferred_ids, spent = self._infer_query_parameters(
+                        task, url, evidence, page_budget - len(fetched)
+                    )
+                    visited += spent
+                    evidence_ids.extend(inferred_ids)
+                    for name, observed in inferred:
+                        remember(
+                            url,
+                            "GET",
+                            (name,),
+                            observed,
+                            discovery_types=("inferred_query_parameter",),
+                        )
+
+                # 링크를 Surface로 만들기 전에 숫자 형제를 먼저 센다. remember가
+                # 저장 시점에 식별자를 확정하고, 저장된 Surface는 덮어쓸 수 없다.
+                for link in links:
+                    if not _same_origin(link, origin):
+                        continue
+                    _record_numeric_sibling(link, numeric_siblings)
+
                 for link in links:
                     if not _same_origin(link, origin):
                         continue
@@ -1269,6 +1439,7 @@ class ReconAgent:
                         discovery_types=("html_link",),
                     )
                     pending_discovery_types.setdefault(link, set()).add("html_link")
+                    inbound_documents.setdefault(link, set()).add(url)
                     if link not in fetched and link not in pending:
                         pending.append(link)
                 for source in sources:
@@ -1301,7 +1472,7 @@ class ReconAgent:
                     if inline_path_count >= _MAX_INLINE_SCRIPT_PATHS:
                         break
                     for script_url, names, should_crawl, is_navigation in _script_paths_from_body(
-                        inline_body, origin
+                        inline_body, origin, url
                     ):
                         if inline_path_count >= _MAX_INLINE_SCRIPT_PATHS:
                             break
@@ -1578,7 +1749,7 @@ class ReconAgent:
                         if browser_llm_reserve else "fallback:llm_call_limit"
                     )
                 if self._surface_collection_mode == "deterministic" or provider_fallback_status:
-                    pending[:] = _deterministic_pending(pending, navigation_pages)
+                    pending[:] = _deterministic_pending(pending, navigation_pages, inbound_documents)
                 remaining_budget = max(page_budget - len(fetched), 0)
                 candidates = self._recon_candidates(
                     task.run_id, pending, pending_surface_ids
@@ -1645,7 +1816,7 @@ class ReconAgent:
                 if self._surface_collection_mode == "deterministic":
                     # Planner 호출·결과는 감사를 위해 남기되 방문 집합은
                     # LLM 순서·stop에 좌우되지 않게 고정한다.
-                    pending[:] = _deterministic_pending(pending, navigation_pages)
+                    pending[:] = _deterministic_pending(pending, navigation_pages, inbound_documents)
                 else:
                     pending[:] = self._apply_plan(
                         plan, pending, pending_surface_ids, navigation_pages
@@ -1892,7 +2063,9 @@ class ReconAgent:
                             record_script_request_shape(
                                 url, method, names, "browser_script_request_shape"
                             )
-                        for url, names, _, _ in _script_paths_from_body(body, origin):
+                        for url, names, _, _ in _script_paths_from_body(
+                            body, origin, script_url,
+                        ):
                             if _same_origin(url, origin):
                                 remember(url, "GET", names,
                                          discovery_types=("browser_script_literal",))
@@ -2064,7 +2237,7 @@ class ReconAgent:
             return [], [], evidence, False
 
         return (
-            _script_paths_from_body(body, origin),
+            _script_paths_from_body(body, origin, source),
             _javascript_requests(body, source, javascript_globals or {}),
             evidence,
             True,
@@ -2118,17 +2291,37 @@ class ReconAgent:
         return evidence_id
 
     def _flag_suspect_parameters(
-        self, run_id: str, surface_id: str, params: tuple[str, ...],
-        url: str, method: str,
+        self,
+        run_id: str,
+        surface_id: str,
+        params: tuple[str, ...],
+        url: str,
+        method: str,
+        observed: tuple[tuple[str, str], ...] = (),
     ) -> list[str]:
-        """Record named file inputs and weaker filename inputs on file-serving GETs."""
+        """파일·URL로 보이는 파라미터만 Observation으로 남긴다.
 
+        세 가지 근거를 쓴다. 이름이 파일 힌트인 경우, 파일을 내보내는 GET 경로에서
+        filename류 이름이 나온 경우, 그리고 이름은 힌트가 아니지만 **관측된 값**이
+        파일명이나 경로인 경우다. 마지막 근거가 없으면 ``post.php?id=EternalBlue.php``
+        처럼 이름만으로는 알 수 없는 좌표를 놓친다.
+        """
+
+        values: dict[str, list[str]] = {}
+        for name, value in observed:
+            values.setdefault(name, []).append(value)
         evidence_ids: list[str] = []
         for name in params:
             if _looks_like_file_or_url_parameter(name):
                 observation_type = "url_or_file_parameter"
+                basis = "name"
             elif method.upper() == "GET" and _looks_like_file_serving_parameter(url, name):
                 observation_type = "file_serving_parameter"
+                basis = "file_serving_route"
+            elif any(_looks_like_file_value(value) for value in values.get(name, ())):
+                # 이름으로는 알 수 없고 관측된 값이 파일명인 좌표.
+                observation_type = "url_or_file_parameter"
+                basis = "observed_value"
             else:
                 continue
             evidence_id = f"evi-{self._id_factory()}"
@@ -2139,7 +2332,11 @@ class ReconAgent:
                     surface_id=surface_id,
                     created_by="recon",
                     evidence_type="observation",
-                    observation={"type": observation_type, "parameter": name},
+                    observation={
+                        "type": observation_type,
+                        "parameter": name,
+                        "basis": basis,
+                    },
                 )
             )
             evidence_ids.append(evidence_id)
@@ -2168,6 +2365,51 @@ class ReconAgent:
             )
         )
         return evidence_id
+
+    def _infer_query_parameters(
+        self,
+        task: TaskEnvelope,
+        url: str,
+        baseline: Evidence,
+        remaining: int,
+    ) -> tuple[list[tuple[str, tuple[tuple[str, str], ...]]], list[str], int]:
+        """마커를 실어 보내 응답을 바꾸는 GET 쿼리 좌표만 찾아낸다.
+
+        링크나 폼이 이름을 선언해 주지 않는 좌표가 있다. XBEN-053은 ``/``에서
+        ``username``을 읽지만 어디에도 그 이름이 적혀 있지 않아 정찰이 파라미터 없는
+        Surface 하나만 남기고, 그러면 입력을 요구하는 모든 capability가
+        input_parameter에서 떨어진다.
+
+        이름을 찍어 Surface를 만들지는 않는다. 기준선과 비교해 마커가 응답에
+        나타나거나 상태 코드가 달라진 경우만 기록한다. 둘 다 아니면 애플리케이션이
+        그 좌표를 쓰지 않는다는 뜻이므로 버린다.
+        """
+
+        found: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+        evidence_ids: list[str] = []
+        base_status = baseline.observation.get("status")
+        base_body = baseline.observation.get("body")
+        base_body = base_body if isinstance(base_body, str) else ""
+        if _INFERENCE_MARKER in base_body:
+            # 기준선에 이미 마커가 있으면 차등 비교가 성립하지 않는다.
+            return found, evidence_ids, 0
+        spent = 0
+        for name in _INFERRED_QUERY_PARAMETERS[:_MAX_INFERENCE_NAMES]:
+            if spent >= remaining:
+                break
+            if not safe_hidden_name(name, ()):
+                continue
+            probe_url = f"{url}{'&' if '?' in url else '?'}{urlencode(((name, _INFERENCE_MARKER),))}"
+            evidence_id, probe = self._fetch(task, probe_url, None)
+            evidence_ids.append(evidence_id)
+            spent += 1
+            probe_body = probe.observation.get("body")
+            probe_body = probe_body if isinstance(probe_body, str) else ""
+            reflected = _INFERENCE_MARKER in probe_body
+            status_changed = probe.observation.get("status") != base_status
+            if reflected or status_changed:
+                found.append((name, ((name, _INFERENCE_MARKER),)))
+        return found, evidence_ids, spent
 
     def _flag_unlinked_render_parameters(
         self, run_id: str, surface_id: str
@@ -2624,8 +2866,12 @@ def _parse_page(
         names = tuple(
             dict.fromkeys(
                 field["name"]
+                # 이름 있는 <button>도 폼 필드다. 브라우저는 누른 버튼의 name=value를
+                # 함께 보내고, 그 값이 있어야 비로소 실행되는 분기가 흔하다 —
+                # XBEN-071의 send.php는 isset($_POST['submit'])로 전체를 감싸므로
+                # 버튼을 빼면 주입 지점에 닿는 요청을 만들 수 없다.
                 for field in form.find_all(
-                    ["input", "select", "textarea"], attrs={"name": True}
+                    ["input", "select", "textarea", "button"], attrs={"name": True}
                 )
                 if field["name"]
             )
@@ -2687,11 +2933,33 @@ def _query_pairs(url: str) -> tuple[tuple[str, str], ...]:
     return tuple(pairs.items())
 
 
-def _path_identifier(url: str) -> tuple[str, int, str] | None:
+def _record_numeric_sibling(url: str, siblings: dict[str, set[str]]) -> None:
+    """`/<리소스>/<숫자>` 형태에서 리소스별 숫자 값을 모은다."""
+
+    segments = urlsplit(url).path.split("/")
+    for index in range(len(segments) - 1, 1, -1):
+        value = segments[index]
+        resource = segments[index - 1]
+        if _PATH_OBJECT_ID.fullmatch(value) is None:
+            continue
+        if _PATH_RESOURCE.fullmatch(resource) is None:
+            continue
+        siblings.setdefault(resource.casefold(), set()).add(value)
+
+
+def _path_identifier(
+    url: str, numeric_siblings: Mapping[str, set[str]] | None = None
+) -> tuple[str, int, str] | None:
     """`/users/17` 형태에서 논리 식별자명·세그먼트 위치·관측값을 얻는다.
 
-    모든 숫자 경로를 객체로 보면 버전(`/v1/`)이나 연도까지 후보가 된다. 따라서 숫자
-    바로 앞이 복수형 리소스명인 경우만 결정적으로 인정한다.
+    모든 숫자 경로를 객체로 보면 버전(`/v1/`)이나 연도까지 후보가 된다. 그래서 숫자
+    바로 앞이 복수형 리소스명이거나 알려진 단수 객체명인 경우를 결정적으로 인정한다.
+
+    그 둘에 해당하지 않아도, **같은 리소스 아래 서로 다른 숫자 값이 둘 이상** 관측됐고
+    리소스가 페이지네이션·버전 이름이 아니면 객체 컬렉션으로 본다. 목록 페이지는 항목
+    링크를 형제로 함께 내보내므로(`/edit_draft/2`와 `/edit_draft/3`) 이 구조는 리소스
+    이름을 몰라도 판별된다. 이름 목록을 늘리는 방식은 대상마다 다른 이름을 계속
+    추가해야 하고, 그렇게 맞춘 목록은 그 대상에서만 동작한다.
     """
 
     segments = urlsplit(url).path.split("/")
@@ -2706,6 +2974,12 @@ def _path_identifier(url: str) -> tuple[str, int, str] | None:
         if lowered.endswith("s") and len(resource) > 1:
             singular = resource[:-1]
         elif lowered in _SINGULAR_OBJECT_RESOURCES:
+            singular = resource
+        elif (
+            numeric_siblings is not None
+            and lowered not in _NON_OBJECT_PATH_RESOURCES
+            and len(numeric_siblings.get(lowered, ())) >= 2
+        ):
             singular = resource
         else:
             continue

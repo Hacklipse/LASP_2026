@@ -22,6 +22,7 @@ from .probing import (
     has_observation_record,
     marker_reflected,
     matching_evidence,
+    payload_contexts,
     resolve_analysis_task,
     response_body,
 )
@@ -136,8 +137,9 @@ class HeuristicXssAnalyzer:
         for parameter, probe in zip(parameters, collected[1:]):
             if probe is None:  # missing 분기 이후에는 도달하지 않는 방어선.
                 raise AgentContractError("xss baseline probe evidence was not collected")
+            probe_body = response_body(probe)
             if marker_reflected(
-                control_body, response_body(probe), _REFLECTION_MARKER
+                control_body, probe_body, _REFLECTION_MARKER
             ) and not has_observation_record(
                 evidence,
                 HEURISTIC_XSS_ANALYZER,
@@ -159,6 +161,13 @@ class HeuristicXssAnalyzer:
                             "parameter": parameter,
                             "control_evidence_id": control.evidence_id,
                             "probe_evidence_id": probe.evidence_id,
+                            # 어떤 구문 맥락에 떨어졌는지는 Python이 본문에서 직접
+                            # 계산한 사실이다. Validation이 이 값으로 고정 payload를
+                            # 고르므로 LLM 주장이 payload 선택에 끼어들 수 없다.
+                            "payload_contexts": list(
+                                payload_contexts(probe_body, _REFLECTION_MARKER)
+                            ),
+                            "context_source": "python",
                         },
                     )
                 )

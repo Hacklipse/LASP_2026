@@ -24,7 +24,13 @@ from collections.abc import Callable
 from uuid import uuid4
 
 from hacklipse.application.errors import AgentContractError
-from hacklipse.domain import AgentResult, AgentResultStatus, Evidence, TaskEnvelope
+from hacklipse.domain import (
+    SQLI_BOOLEAN_PREDICATES,
+    AgentResult,
+    AgentResultStatus,
+    Evidence,
+    TaskEnvelope,
+)
 from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 
@@ -32,6 +38,7 @@ from .probing import (
     ANALYSIS_TOOL,
     build_probe_requests,
     build_sqli_boolean_requests,
+    sqli_boolean_plan,
     has_observation_record,
     matching_evidence,
     probe_marker,
@@ -177,6 +184,7 @@ class HeuristicSqliAnalyzer:
             new_evidence_ids.append(observation_id)
 
         if not found_error_signal:
+            boolean_plan = sqli_boolean_plan(surface, parameters)
             boolean_requests = build_sqli_boolean_requests(
                 surface,
                 parameters,
@@ -205,12 +213,20 @@ class HeuristicSqliAnalyzer:
                     candidate_ids=(candidate.candidate_id,),
                 )
 
-            for index, parameter in enumerate(parameters):
+            signalled: set[str] = set()
+            for index, (parameter, predicate) in enumerate(boolean_plan):
+                if parameter in signalled:
+                    # 한 좌표에 두 술어가 모두 통하면 사실은 하나다. 관측을 늘리지 않는다.
+                    continue
                 true_response = boolean_evidence[index * 2]
                 false_response = boolean_evidence[index * 2 + 1]
                 if true_response is None or false_response is None:
                     raise AgentContractError("SQLi boolean evidence was not collected")
-                signal = sql_boolean_signal(true_response, false_response)
+                signal = sql_boolean_signal(
+                    true_response, false_response, predicate
+                )
+                if signal is not None:
+                    signalled.add(parameter)
                 if signal is None or has_observation_record(
                     evidence,
                     HEURISTIC_SQLI_ANALYZER,
@@ -233,6 +249,9 @@ class HeuristicSqliAnalyzer:
                             "parameter": parameter,
                             "control_evidence_id": true_response.evidence_id,
                             "probe_evidence_id": false_response.evidence_id,
+                            # 어떤 술어 쌍이 차등을 만들었는지 남긴다. Validation이
+                            # 그 쌍 하나만 다시 보내므로 재현이 싸고 증명이 구체적이다.
+                            "predicate": predicate,
                             **signal,
                         },
                     )
@@ -379,9 +398,16 @@ def sql_error_signal(control: Evidence, probe: Evidence) -> dict[str, object] | 
 
 
 def sql_boolean_signal(
-    true_response: Evidence, false_response: Evidence
+    true_response: Evidence,
+    false_response: Evidence,
+    predicate: str | None = None,
 ) -> dict[str, object] | None:
-    """Recognize a bounded true/false predicate response differential."""
+    """Recognize a bounded true/false predicate response differential.
+
+    ``predicate``는 그 쌍에 실제로 보낸 접미사를 돌려받기 위한 것이다. 보낸 문자열을
+    응답에서 빼고 비교해야 "SQL 분기가 갈렸다"와 "내가 보낸 값이 그대로 보인다"가
+    구분된다. 이름을 주지 않으면 모든 술어의 접미사를 다 빼서 보수적으로 본다.
+    """
 
     if any(
         item.observation.get("type") == "http_error"
@@ -397,8 +423,24 @@ def sql_boolean_signal(
         and isinstance(false_status, int)
         and true_status != false_status
     )
-    normalized_true = _normalize_boolean_probe_reflection(true_body)
-    normalized_false = _normalize_boolean_probe_reflection(false_body)
+    if predicate is None:
+        normalized_true = true_body
+        normalized_false = false_body
+        for _name, true_suffix, false_suffix in SQLI_BOOLEAN_PREDICATES:
+            normalized_true = _normalize_boolean_probe_reflection(
+                normalized_true, true_suffix
+            )
+            normalized_false = _normalize_boolean_probe_reflection(
+                normalized_false, false_suffix
+            )
+    else:
+        true_suffix, false_suffix = next(
+            (true, false)
+            for name, true, false in SQLI_BOOLEAN_PREDICATES
+            if name == predicate
+        )
+        normalized_true = _normalize_boolean_probe_reflection(true_body, true_suffix)
+        normalized_false = _normalize_boolean_probe_reflection(false_body, false_suffix)
     body_changed = (
         normalized_true is not None
         and normalized_false is not None
@@ -416,16 +458,45 @@ def sql_boolean_signal(
     }
 
 
-def _normalize_boolean_probe_reflection(body: str | None) -> str | None:
+# 술어 리터럴을 지우고 비교해야 "응답이 달라졌다"와 "보낸 값이 그대로 되돌아왔다"가
+# 갈린다. 지우지 못한 모양이 하나라도 있으면 반사만으로 차등이 생겨 오탐이 된다.
+#
+# 패턴 하나로 모든 모양을 덮으려 하면 반드시 뚫린다. XBEN-047은 쌍따옴표를 지우고
+# 되돌려주므로 `1"or"1"="1` 이 `1or1=1` 로 붙어 나오고, 단어 경계를 요구하는 패턴은
+# 그것을 보지 못해 SQL이 없는 앱에서 차등이 생겼다. 그래서 패턴에 기대지 않고 **우리가
+# 보낸 문자열 자체**를 응답에서 뺀다. 대상이 흔히 가하는 변형(따옴표 제거, 공백 제거,
+# HTML escape)만 기계적으로 만들어 함께 빼며, 추측한 값은 쓰지 않는다.
+_HTML_ESCAPES = (('"', "&quot;"), ("'", "&#39;"), ("'", "&#039;"), ("'", "&apos;"))
+
+
+def boolean_probe_manglings(value: str) -> tuple[str, ...]:
+    """대상이 되돌려줄 수 있는 그 값의 변형들. 길이 순으로 길게 먼저 뺀다."""
+
+    without_quotes = value.replace('"', "").replace("'", "")
+    forms = {
+        value,
+        without_quotes,
+        re.sub(r"\s+", "", value),
+        re.sub(r"\s+", "", without_quotes),
+    }
+    for raw, escaped in _HTML_ESCAPES:
+        if raw in value:
+            forms.add(value.replace(raw, escaped))
+            forms.add(re.sub(r"\s+", "", value.replace(raw, escaped)))
+    return tuple(sorted((form for form in forms if form), key=len, reverse=True))
+
+
+def _normalize_boolean_probe_reflection(
+    body: str | None, sent: str | None = None
+) -> str | None:
     """Remove the deliberate predicate literal before comparing response bodies."""
 
     if body is None:
         return None
-    normalized = re.sub(
-        r"(?i)\bAND\s+'?1'?\s*=\s*'?[12]'?",
-        "<sqli-bool-probe>",
-        body,
-    )
+    normalized = body
+    if sent:
+        for form in boolean_probe_manglings(sent):
+            normalized = normalized.replace(form, "<sqli-bool-probe>")
     return normalized.strip()
 
 

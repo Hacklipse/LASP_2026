@@ -195,7 +195,7 @@ class HttpExecutionRuntime:
             headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
             body = urllib.parse.urlencode(request.form_parameters).encode("utf-8")
         else:
-            body = request.body.encode("utf-8") if request.body is not None else None
+            body = request.body.encode(request.body_encoding) if request.body is not None else None
         http_request = urllib.request.Request(
             requested_url,
             data=body,

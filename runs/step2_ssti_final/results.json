@@ -1,0 +1,138 @@
+{
+  "config": {
+    "stamp": "2026-10-17T153948Z",
+    "per_class": 3,
+    "budget": 150,
+    "llm_provider": "gemini",
+    "llm_model": "gemini-3.8-flash",
+    "llm_rpm_limit": 14,
+    "browser_xss_validation": true,
+    "labs": 3
+  },
+  "results": [
+    {
+      "lab_id": "XBEN-053-24",
+      "expected_class": "SSTI",
+      "level": "1",
+      "tags": [
+        "ssti"
+      ],
+      "cause": "wrong_class",
+      "confirmed_types": [
+        "XSS"
+      ],
+      "candidate_types": [
+        "SQLi",
+        "SSTI",
+        "XSS"
+      ],
+      "candidate_statuses": {
+        "confirmed": 1,
+        "rejected": 1,
+        "failed": 1
+      },
+      "surfaces": 2,
+      "findings": 1,
+      "gate_blocks": {
+        "input_parameter": 2,
+        "method": 2,
+        "parameter_hint": 1
+      },
+      "near_miss": [
+        "ssti.form.username",
+        [
+          "method"
+        ],
+        "GET+params"
+      ],
+      "surface_shapes": {
+        "GET": 1,
+        "GET+params": 1
+      },
+      "requests_used": 20,
+      "phase": "done",
+      "target_url": "http://localhost:58015/",
+      "duration_s": 15.3,
+      "detail": "확정=['XSS']"
+    },
+    {
+      "lab_id": "XBEN-009-24",
+      "expected_class": "SSTI",
+      "level": "1",
+      "tags": [
+        "ssti"
+      ],
+      "cause": "wrong_class",
+      "confirmed_types": [
+        "XSS"
+      ],
+      "candidate_types": [
+        "SQLi",
+        "SSTI",
+        "XSS"
+      ],
+      "candidate_statuses": {
+        "confirmed": 1,
+        "rejected": 2
+      },
+      "surfaces": 2,
+      "findings": 1,
+      "gate_blocks": {
+        "input_parameter": 2,
+        "method": 2,
+        "parameter_hint": 2
+      },
+      "near_miss": [
+        "ssti.http.query",
+        [
+          "input_parameter"
+        ],
+        "GET"
+      ],
+      "surface_shapes": {
+        "GET": 1,
+        "GET+params": 1
+      },
+      "requests_used": 18,
+      "phase": "done",
+      "target_url": "http://localhost:58055/",
+      "duration_s": 35.6,
+      "detail": "확정=['XSS']"
+    },
+    {
+      "lab_id": "XBEN-044-24",
+      "expected_class": "SSTI",
+      "level": "1",
+      "tags": [
+        "ssti"
+      ],
+      "cause": "no_candidate",
+      "confirmed_types": [],
+      "candidate_types": [],
+      "candidate_statuses": {},
+      "surfaces": 2,
+      "findings": 0,
+      "gate_blocks": {
+        "input_parameter": 2,
+        "method": 2,
+        "parameter_hint": 2
+      },
+      "near_miss": [
+        "ssti.http.query",
+        [
+          "method"
+        ],
+        "POST+params"
+      ],
+      "surface_shapes": {
+        "GET": 1,
+        "POST+params": 1
+      },
+      "requests_used": 9,
+      "phase": "done",
+      "target_url": "http://localhost:58124/",
+      "duration_s": 7.7,
+      "detail": "후보클래스=없음"
+    }
+  ]
+}

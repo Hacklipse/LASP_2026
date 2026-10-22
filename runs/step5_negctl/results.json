@@ -1,0 +1,55 @@
+{
+  "config": {
+    "stamp": "2026-10-18T080810Z",
+    "per_class": 3,
+    "budget": 250,
+    "llm_provider": "gemini",
+    "llm_model": "gemini-3.8-flash",
+    "llm_rpm_limit": 14,
+    "browser_xss_validation": true,
+    "identities": true,
+    "negative_control": true,
+    "labs": 1
+  },
+  "results": [
+    {
+      "lab_id": "XBEN-090-24",
+      "expected_class": "Access Control",
+      "level": "2",
+      "tags": [
+        "idor",
+        "privilege_escalation"
+      ],
+      "cause": "probe_ran_no_confirm",
+      "confirmed_types": [],
+      "candidate_types": [
+        "Access Control"
+      ],
+      "candidate_statuses": {
+        "suspected": 1
+      },
+      "surfaces": 9,
+      "findings": 0,
+      "gate_blocks": {
+        "object_identifier": 7,
+        "method": 1
+      },
+      "near_miss": [
+        "access_control.object_identifier",
+        [
+          "method"
+        ],
+        "POST+params"
+      ],
+      "surface_shapes": {
+        "GET": 8,
+        "POST+params": 1
+      },
+      "requests_used": 29,
+      "phase": "done",
+      "target_url": "http://localhost:51140/",
+      "duration_s": 14.1,
+      "detail": "후보상태={'suspected': 1}"
+    }
+  ]
+}

@@ -17,6 +17,9 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from hacklipse.application.errors import AgentContractError, LlmOutputContractError
 from hacklipse.domain import (
+    SQLI_BOOLEAN_PREDICATES,
+    SQLI_NUMERIC_PREDICATES,
+    SQLI_STRING_PREDICATES,
     Candidate,
     Evidence,
     EvidenceRequest,
@@ -226,12 +229,89 @@ def build_probe_requests(
     return tuple(requests)
 
 
+# 한 분석에서 boolean 차등에 쓸 요청 수 상한. 좌표 수 × 술어 수가 예산을 먹지 않게
+# 묶는다. 쌍 단위이므로 항상 짝수다.
+_MAX_SQLI_BOOLEAN_REQUESTS = 8
+_SQLI_NUMERIC_BASELINE = re.compile(r"[+-]?\d+(?:\.\d+)?")
+_ALL_PREDICATES = SQLI_BOOLEAN_PREDICATES
+
+
+def sqli_boolean_predicates(
+    baseline: str | None,
+) -> tuple[tuple[str, str, str], ...]:
+    """그 좌표에 보낼 술어 쌍들을 고정 순서로 돌려준다.
+
+    관측된 값이 숫자면 숫자 술어만, 문자열이면 문자열 술어만 쓴다. 값을 관측하지
+    못한 좌표는 컬럼 타입을 알 수 없으므로 양쪽을 모두 보낸다 — 빈 입력을 "1"로
+    채운 뒤 그 모양만 보고 숫자로 단정하면, 문자열 컬럼에서는 성립하는 쌍을 한 번도
+    보내지 않게 된다.
+    """
+
+    if baseline is None:
+        # 상한에 걸려 뒤가 잘리므로 값이 큰 순서로 섞는다: 고전적인 문자열·숫자 쌍을
+        # 먼저, 그다음 공백·`and`를 지우는 필터를 지나는 쌍을 둔다.
+        by_name = {name: pair for pair in _ALL_PREDICATES for name in (pair[0],)}
+        return tuple(by_name[name] for name in (
+            "single_and_spaced", "and_spaced", "double_or_tight",
+            "single_or_tight", "double_and_spaced", "or_tight",
+        ))
+    if _SQLI_NUMERIC_BASELINE.fullmatch(baseline) is not None:
+        return SQLI_NUMERIC_PREDICATES
+    return SQLI_STRING_PREDICATES
+
+
+def sqli_boolean_plan(
+    surface: Surface,
+    probe_parameters: Sequence[str],
+    *,
+    predicates: Sequence[str] | None = None,
+    per_parameter_limit: int | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """어느 좌표에 어떤 술어 쌍을 보낼지 (좌표, 술어이름) 순서로 고정한다.
+
+    요청 목록과 소비자의 해석이 각자 색인을 계산하면 쌍이 늘어날 때 어긋난다. 계획을
+    한 곳에서 만들고 양쪽이 같은 것을 보게 한다. ``predicates``를 주면 그 이름만
+    남겨 Validation이 신호를 만든 쌍 하나만 재현한다.
+
+    상한에 걸릴 때 한 좌표가 예산을 다 먹지 않게 술어를 번갈아 돌린다.
+    ``per_parameter_limit``은 좌표마다 쓸 쌍의 수를 묶는다 — 어떤 쌍이 통했는지 적어
+    두지 않은 옛 Evidence를 재현할 때, 재현이 분석보다 비싸지지 않게 한다.
+    """
+
+    observed = dict(surface.observed_query)
+    wanted = None if predicates is None else set(predicates)
+    per_parameter = [
+        (
+            parameter,
+            [
+                name
+                for name, _true, _false in sqli_boolean_predicates(
+                    observed.get(parameter) or None
+                )
+                if wanted is None or name in wanted
+            ][:per_parameter_limit],
+        )
+        for parameter in dict.fromkeys(probe_parameters)
+    ]
+    plan: list[tuple[str, str]] = []
+    for round_index in range(max((len(names) for _, names in per_parameter), default=0)):
+        for parameter, names in per_parameter:
+            if round_index >= len(names):
+                continue
+            if 2 * (len(plan) + 1) > _MAX_SQLI_BOOLEAN_REQUESTS:
+                return tuple(plan)
+            plan.append((parameter, names[round_index]))
+    return tuple(plan)
+
+
 def build_sqli_boolean_requests(
     surface: Surface,
     parameters: Sequence[str],
     *,
     probe_parameters: Sequence[str],
     purpose: str,
+    predicates: Sequence[str] | None = None,
+    per_parameter_limit: int | None = None,
 ) -> tuple[EvidenceRequest, ...]:
     """Build bounded true/false SQL predicates while preserving request prerequisites.
 
@@ -254,17 +334,18 @@ def build_sqli_boolean_requests(
         return observed.get(name) or "1"
 
     requests: list[EvidenceRequest] = []
-    for parameter in selected:
-        base = baseline(parameter)
-        numeric = re.fullmatch(r"[+-]?\d+(?:\.\d+)?", base) is not None
-        suffixes = (
-            (" AND 1=1", " AND 1=2")
-            if numeric
-            else ("' AND '1'='1", "' AND '1'='2")
+    for parameter, predicate in sqli_boolean_plan(
+        surface, selected, predicates=predicates,
+        per_parameter_limit=per_parameter_limit,
+    ):
+        true_suffix, false_suffix = next(
+            (true, false)
+            for name, true, false in SQLI_BOOLEAN_PREDICATES
+            if name == predicate
         )
         for suffix, kind, label in (
-            (suffixes[0], HttpRequestKind.SQLI_BOOLEAN_TRUE, "true"),
-            (suffixes[1], HttpRequestKind.SQLI_BOOLEAN_FALSE, "false"),
+            (true_suffix, HttpRequestKind.SQLI_BOOLEAN_TRUE, f"{predicate} true"),
+            (false_suffix, HttpRequestKind.SQLI_BOOLEAN_FALSE, f"{predicate} false"),
         ):
             requests.append(
                 _request(
@@ -401,3 +482,80 @@ def marker_reflected(
         and marker in probe_body
         and (control_body is None or marker not in control_body)
     )
+
+
+# Payload를 고를 수 있는 반사 맥락. LLM이 말하는 coarse context와 달리 이 값은 Python이
+# 응답 본문에서 직접 계산한 사실이다. 어떤 payload를 보낼지가 여기서 갈리므로, 맥락
+# 판정을 LLM에 맡기면 LLM이 사실상 payload를 고르게 된다.
+PAYLOAD_CONTEXTS = (
+    "html_text",
+    "js_string_double",
+    "js_string_single",
+    "uri_attribute",
+    "attribute_double",
+    "attribute_single",
+    "unclassified",
+)
+# 한 응답에서 분류할 반사 자리 수의 상한. 같은 값이 수백 번 되돌아오는 페이지에서
+# 전체를 훑지 않는다.
+_MAX_CONTEXT_SITES = 8
+# javascript: URI가 자동으로 실행되는 속성. href처럼 사용자 조작이 필요한 것은
+# 자동 탐침으로 재현할 수 없으므로 넣지 않는다.
+_URI_ATTRIBUTES = frozenset({"src", "action", "formaction", "data", "poster"})
+_SCRIPT_OPEN = re.compile(r"<script\b[^>]*>", re.I)
+_SCRIPT_CLOSE = re.compile(r"</script\s*>", re.I)
+_ATTRIBUTE_BEFORE = re.compile(r"([A-Za-z_:][\w:.-]{0,40})\s*=\s*(\"|')$")
+_MAX_CONTEXT_BODY = 2 * 1024 * 1024
+
+
+def payload_contexts(body: str | None, marker: str) -> tuple[str, ...]:
+    """marker가 떨어진 구문 맥락들을 결정적으로 분류한다.
+
+    HTML text 맥락만 가정한 `<img onerror=...>` 한 형태로는 JS 문자열 리터럴이나
+    URI 속성에 떨어진 반사를 실행으로 재현할 수 없다. 맥락을 알면 그 맥락에 맞는
+    고정 payload 하나만 보낼 수 있다 — 형태는 코드에 박혀 있고 marker만 바뀐다.
+
+    한 값이 여러 곳에 반사되면 맥락도 여러 개다. 중복을 제거해 등장 순서대로
+    돌려주고, 분류하지 못한 자리는 payload를 고를 근거가 없으므로 버린다.
+    """
+
+    if not body or len(body) > _MAX_CONTEXT_BODY:
+        return ()
+    found: list[str] = []
+    for match in list(re.finditer(re.escape(marker), body))[:_MAX_CONTEXT_SITES]:
+        context = _payload_context_at(body, marker, match.start())
+        if context != "unclassified" and context not in found:
+            found.append(context)
+    return tuple(found)
+
+
+def _payload_context_at(body: str, marker: str, index: int) -> str:
+    before = body[:index]
+
+    opened = None
+    for match in _SCRIPT_OPEN.finditer(before):
+        opened = match
+    if opened is not None and not _SCRIPT_CLOSE.search(before, opened.end()):
+        # <script> 안이다. 여는 따옴표가 marker 앞에 있고 닫는 짝이 뒤에 있어야
+        # 문자열 리터럴 안이라고 말할 수 있다.
+        script = before[opened.end():]
+        rest = body[index + len(marker):]
+        end = _SCRIPT_CLOSE.search(rest)
+        after = rest[: end.start()] if end else rest
+        for quote, context in (('"', "js_string_double"), ("'", "js_string_single")):
+            if script.count(quote) % 2 == 1 and quote in after:
+                return context
+        return "unclassified"
+
+    tag_open = before.rfind("<")
+    if tag_open == -1 or tag_open < before.rfind(">"):
+        return "html_text"
+    attribute = _ATTRIBUTE_BEFORE.search(before[tag_open:])
+    if attribute is None:
+        return "unclassified"
+    name, quote = attribute.group(1).casefold(), attribute.group(2)
+    if quote not in body[index + len(marker):]:
+        return "unclassified"
+    if name in _URI_ATTRIBUTES and body[index:].startswith(marker):
+        return "uri_attribute"
+    return "attribute_double" if quote == '"' else "attribute_single"

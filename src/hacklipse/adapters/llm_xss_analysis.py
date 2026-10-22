@@ -34,6 +34,7 @@ from hacklipse.ports import CandidateStore, EvidenceStore, LlmClient, SurfaceSto
 from hacklipse.ports.llm import LlmMessage, LlmRequest
 
 from .probing import (
+    payload_contexts,
     CONTROL_VALUE,
     build_probe_requests,
     has_observation_record,
@@ -298,14 +299,20 @@ class LlmXssAnalyzer:
                 probe.evidence_id,
             ):
                 continue
-            confirmed.append((parameter, probe, _excerpt(probe_body or "", marker)))
+            confirmed.append((
+                parameter, probe, _excerpt(probe_body or "", marker),
+                payload_contexts(probe_body, marker),
+            ))
 
         if not confirmed:
             return []
 
-        classifications = self._classify(marker, confirmed, task.timeout_seconds)
+        classifications = self._classify(
+            marker, tuple((name, probe, excerpt) for name, probe, excerpt, _ in confirmed),
+            task.timeout_seconds,
+        )
         new_ids: list[str] = []
-        for parameter, probe, _ in confirmed:
+        for parameter, probe, _, contexts in confirmed:
             classification = classifications.get(
                 parameter, {"context": "unclassified", "encoded": False, "note": ""}
             )
@@ -327,8 +334,11 @@ class LlmXssAnalyzer:
                         "context": classification["context"],
                         "encoded": classification["encoded"],
                         "note": classification["note"],
-                        # 사실은 Python이, 맥락은 LLM이 만들었다는 것을 관측에 남긴다.
+                        # 사실은 Python이, 설명은 LLM이 만들었다는 것을 관측에 남긴다.
                         "context_source": "llm",
+                        # payload를 고르는 맥락은 LLM의 coarse context와 별개로 Python이
+                        # 본문에서 직접 계산한다. 그래야 LLM이 payload를 고르지 못한다.
+                        "payload_contexts": list(contexts),
                     },
                 )
             )

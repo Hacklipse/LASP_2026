@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from hacklipse.application.errors import AgentContractError
 from hacklipse.domain import (
@@ -24,6 +24,7 @@ from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 from .probing import (
     build_probe_requests,
     build_sqli_boolean_requests,
+    sqli_boolean_plan,
     matching_evidence,
     probe_marker,
 )
@@ -37,6 +38,7 @@ from .path_traversal_analysis import (
     is_restricted_file_surface,
     path_parameter_candidates,
     path_traversal_bypass_signal,
+    PATH_TRAVERSAL_PROBE_PAYLOADS,
     path_traversal_signal,
 )
 from .access_control_analysis import (
@@ -58,14 +60,20 @@ from .graphql_suggestions import (
     suggestion_request, suggested_field,
 )
 from .ssti_analysis import (
+    build_ssti_form_requests,
     SSTI_OBSERVATION,
     SSTI_TOOL,
+    build_ssti_query_requests,
     build_ssti_requests,
     matching_ssti_evidence,
     ssti_execution_signal,
+    ssti_query_execution_signal,
 )
 from .xss_execution import (
-    BROWSER_XSS_TOOL, XSS_EXECUTION_MARKER_PREFIX, attribute_execution_marker,
+    BROWSER_XSS_TOOL,
+    XSS_EXECUTION_MARKER_PREFIX,
+    attribute_execution_marker,
+    context_execution_marker,
 )
 from .postmessage_plan import POSTMESSAGE_ANALYZER
 from .postmessage_xss_analysis import message_request
@@ -89,6 +97,10 @@ from .open_redirect_analysis import (
 from .cors_analysis import (
     CORS_TYPE, CORS_OBSERVATION, CORS_VALIDATION_ORIGIN,
     build_cors_requests, cors_reflection_signal, cors_probe_shape,
+)
+from .file_upload_analysis import (
+    UPLOAD_TYPE, UPLOAD_ANALYZER, UPLOAD_RESULT, UPLOAD_RISK_EXTENSIONS,
+    check_upload_extensions,
 )
 
 # Router가 Candidate를 만들 때 쓴 것과 같은 taxonomy. Candidate가 알려진 취약점
@@ -194,6 +206,8 @@ class ValidationAgent:
             if _is_reproduction_evidence(item, task.validation_id)
         ]
 
+        if candidate.vulnerability_type == UPLOAD_TYPE:
+            return self._validate_file_upload(task, candidate, evidence)
         if candidate.vulnerability_type == "SQLi":
             return self._validate_sqli(task, candidate, evidence, reproduction)
         if candidate.vulnerability_type == EXPOSURE_TYPE:
@@ -233,6 +247,92 @@ class ValidationAgent:
         if not reproduction:
             return self._needs_evidence(task, candidate.surface_id, EXPOSURE_TYPE)
         return self._decide(task, reproduction)
+
+    def _validate_file_upload(
+        self, task: TaskEnvelope, candidate: Candidate, evidence: Sequence[Evidence],
+    ) -> AgentResult:
+        analysis = next((item.observation for item in reversed(evidence)
+                         if item.surface_id == candidate.surface_id
+                         and item.created_by == UPLOAD_ANALYZER
+                         and item.observation.get("type") == UPLOAD_RESULT), None)
+        rows = analysis.get("results", ()) if analysis else ()
+        accepted = tuple(row for row in rows
+                         if row.get("outcome") == "accepted"
+                         and row.get("extension") in UPLOAD_RISK_EXTENSIONS
+                         and row.get("stored_extension", row["extension"]).casefold()
+                         in {extension.casefold() for extension in UPLOAD_RISK_EXTENSIONS})
+        if not accepted:
+            rejected = bool(rows) and all(row.get("outcome") == "rejected" for row in rows)
+            if rejected:
+                return self._validation_result(
+                    task, verdict=ValidationVerdict.REJECTED, evidence=(),
+                    reason="all tested uploads rejected; this does not establish the server extension policy",
+                    reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+                )
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED,
+                evidence=(), reason="no risky extension acceptance verified; consult per-extension observations",
+                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+            )
+        if self._collector is None:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="independent upload collector unavailable",
+                reason_code=ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR,
+            )
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        form_page = (self._surfaces.get(task.run_id, analysis["source_surface_id"])
+                     if analysis.get("refresh_form") else None)
+        reproduced, ids = check_upload_extensions(
+            self._collector, task, surface, analysis["parameter"],
+            form_page=form_page, probes=((accepted[0]["extension"], accepted[0].get("profile", "text_octet")),),
+        )
+        # outcome="accepted"는 업로드 응답만으로 서지 않는다. 저장된 파일을 되읽어
+        # 바이트가 일치했을 때만 붙는다. 여기에 확장자 보존까지 겹치면 "서버가 임의
+        # 타입 파일을 그 타입 그대로 보관하고 되돌려준다"는 재현된 사실이므로 CONFIRMED로
+        # 본다. 스크립트 실행은 별개이고 주장하지 않는다.
+        risky = {extension.casefold() for extension in UPLOAD_RISK_EXTENSIONS}
+        stored = next((row for row in reproduced
+                       if row["outcome"] == "accepted"
+                       and row.get("stored_extension", "").casefold() in risky), None)
+        if stored is not None:
+            proof_evidence = self._evidence.get_many(
+                task.run_id, tuple(stored.get("evidence_ids") or ids),
+            )
+            if proof_evidence:
+                served = stored.get("served_content_type") or "an unclassified type"
+                return self._validation_result(
+                    task, verdict=ValidationVerdict.CONFIRMED, evidence=proof_evidence,
+                    reason=(
+                        f"independent upload stored an inert {stored['stored_extension']} file "
+                        f"with its extension intact and served it back byte-identical as {served}"
+                    ),
+                    reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+                    proof=ValidationProof(
+                        proof_type=ValidationProofType.FILE_UPLOAD_RETRIEVAL,
+                        evidence_ids=tuple(item.evidence_id for item in proof_evidence),
+                        summary=(
+                            f"independent session uploaded an inert file to {analysis['parameter']} "
+                            f"and retrieved it byte-identical at a stored {stored['stored_extension']} "
+                            f"path served as {served}; the server keeps an arbitrary file type, "
+                            "which is not by itself proof of script execution"
+                        ),
+                    ),
+                )
+        # 되읽기는 됐지만 서버가 확장자를 정규화했다면 임의 타입 보관이 아니다.
+        if any(row["outcome"] == "accepted" for row in reproduced):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED,
+                evidence=self._evidence.get_many(task.run_id, ids),
+                reason="inert upload independently stored, but the server normalized the extension it is served under",
+                reason_code=ValidationReasonCode.GENERIC_NO_PROOF,
+            )
+        return self._validation_result(
+            task, verdict=ValidationVerdict.BLOCKED,
+            evidence=self._evidence.get_many(task.run_id, ids),
+            reason="independent upload acceptance could not be verified",
+            reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+        )
 
     def _validate_public_login(
         self, task: TaskEnvelope, candidate: Candidate, evidence: Sequence[Evidence],
@@ -816,11 +916,25 @@ class ValidationAgent:
             and item.observation.get("type") == "dom_secondary_attribute_sink"
             and isinstance((attribute := item.observation.get("attribute")), str)
         ))[:2]
+        # Analysis가 응답 본문에서 계산한 반사 맥락. HTML text 맥락을 가정한 기본
+        # payload는 JS 문자열 리터럴이나 URI 속성에서는 실행되지 않으므로, 맥락마다
+        # 그 맥락에서만 발화하는 고정 payload를 따로 재현한다.
+        signaled_contexts = tuple(dict.fromkeys(
+            context
+            for item in evidence
+            if item.surface_id == candidate.surface_id
+            and item.observation.get("type") == "reflection"
+            for context in (item.observation.get("payload_contexts") or ())
+            if isinstance(context, str) and context != "html_text"
+        ))[:2]
         secondary_plans = []
-        for attribute in secondary_attributes:
+        for seed, builder in (
+            *((attribute, attribute_execution_marker) for attribute in secondary_attributes),
+            *((context, context_execution_marker) for context in signaled_contexts),
+        ):
             try:
-                secondary_marker = attribute_execution_marker(
-                    f"{task.validation_id}{candidate.candidate_id}", attribute
+                secondary_marker = builder(
+                    f"{task.validation_id}{candidate.candidate_id}", seed
                 )
             except ValueError:
                 continue
@@ -989,9 +1103,12 @@ class ValidationAgent:
             return self._validate_graphql_sqli(
                 task, candidate, evidence, reproduction, surface, graphql_plans
             )
-        boolean_parameters = tuple(
+        # Analysis가 차등을 만든 술어 쌍까지 적어 둔다. 그 쌍 하나만 다시 보내면
+        # 재현이 싸고, 증명이 "어떤 모양으로 성립했는지"까지 가리킨다. 옛 Evidence에는
+        # 그 이름이 없으므로 없으면 전체 쌍으로 되돌아간다.
+        boolean_signals = tuple(
             dict.fromkeys(
-                parameter
+                (parameter, item.observation.get("predicate"))
                 for item in evidence
                 if item.surface_id == candidate.surface_id
                 and item.observation.get("type") == "sqli_differential"
@@ -999,6 +1116,17 @@ class ValidationAgent:
                 and parameter in surface.parameters
             )
         )
+        boolean_parameters = tuple(dict.fromkeys(name for name, _ in boolean_signals))
+        boolean_predicates = tuple(
+            dict.fromkeys(
+                predicate for _, predicate in boolean_signals
+                if isinstance(predicate, str)
+            )
+        )
+        # 술어 이름을 적지 않던 Evidence는 어떤 쌍이 통했는지 알려주지 않는다. 전체
+        # 쌍으로 넓히면 재현이 분석보다 비싸지므로 좌표마다 첫 쌍 하나만 다시 보낸다.
+        boolean_limit = None if boolean_predicates else 1
+        boolean_predicates = boolean_predicates or None
         signaled_parameters = tuple(
             dict.fromkeys(
                 parameter
@@ -1015,6 +1143,12 @@ class ValidationAgent:
                 surface.parameters,
                 probe_parameters=boolean_parameters,
                 purpose=f"SQLi validation {task.validation_id}",
+                predicates=boolean_predicates,
+                per_parameter_limit=boolean_limit,
+            )
+            boolean_plan = sqli_boolean_plan(
+                surface, boolean_parameters, predicates=boolean_predicates,
+                per_parameter_limit=boolean_limit,
             )
             collected = tuple(
                 matching_evidence(reproduction, surface.url, request)
@@ -1035,12 +1169,14 @@ class ValidationAgent:
                 )
 
             reproduced = tuple(item for item in collected if item is not None)
-            for index, parameter in enumerate(boolean_parameters):
+            for index, (parameter, _predicate) in enumerate(boolean_plan):
                 true_response = collected[index * 2]
                 false_response = collected[index * 2 + 1]
                 if true_response is None or false_response is None:
                     continue
-                if sql_boolean_signal(true_response, false_response) is None:
+                if sql_boolean_signal(
+                    true_response, false_response, _predicate
+                ) is None:
                     continue
                 proof_evidence = (true_response, false_response)
                 proof = ValidationProof(
@@ -1469,8 +1605,16 @@ class ValidationAgent:
             )
 
         control = reproduced[0]
-        for parameter, probe in zip(signaled_parameters, reproduced[1:]):
-            if not path_traversal_signal(control, probe):
+        # 한 파라미터에 고정 표기 여러 개를 보내므로 묶음으로 짝짓는다. 인덱스를 1:1로
+        # 가정하면 어떤 표기의 성공이 다른 파라미터에 귀속된다.
+        width = len(PATH_TRAVERSAL_PROBE_PAYLOADS)
+        rest = reproduced[1:]
+        for index, parameter in enumerate(signaled_parameters):
+            group = rest[index * width : (index + 1) * width]
+            probe = next(
+                (item for item in group if path_traversal_signal(control, item)), None
+            )
+            if probe is None:
                 continue
             proof_evidence = (control, probe)
             proof = ValidationProof(
@@ -1607,6 +1751,89 @@ class ValidationAgent:
             proof=proof,
         )
 
+    def _validate_ssti_stateless(
+        self,
+        task: TaskEnvelope,
+        surface: Surface,
+        signaled_parameters: Sequence[str],
+        reproduction: Sequence[Evidence],
+        build: Callable[..., tuple[EvidenceRequest, ...]],
+    ) -> AgentResult:
+        """상태를 남기지 않는 좌표의 평가를 Validation 세션에서 다시 확인한다.
+
+        /profile 경로의 정리(cleanup) 검사를 쓰지 않는다. 이 경로는 상태를 남기지
+        않으므로 복원할 것이 없고, 마지막 요청의 302/303을 요구하면 정상 응답(200)을
+        실패로 읽는다. 요청 모양만 build가 결정한다.
+        """
+
+        if not signaled_parameters:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no fixed-arithmetic SSTI signal to reproduce",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        parameter = signaled_parameters[0]
+        requests = build(
+            surface,
+            parameter,
+            purpose=f"SSTI validation {task.validation_id}",
+        )
+        collected = tuple(
+            matching_ssti_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "SSTI stateless validation lacks budget for its independent request set"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+
+        reproduced = tuple(item for item in collected if item is not None)
+        if any(item.observation.get("type") == "http_error" for item in reproduced):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=reproduced,
+                reason="independent SSTI query sequence encountered an HTTP execution error",
+                reason_code=ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR,
+            )
+        dialect = ssti_query_execution_signal(collected)
+        if not dialect:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=reproduced,
+                reason="independent fixed arithmetic probe was not evaluated by the template",
+                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+            )
+
+        proof = ValidationProof(
+            proof_type=ValidationProofType.SSTI_EXECUTION,
+            evidence_ids=tuple(item.evidence_id for item in reproduced),
+            summary=(
+                "independent control/probe query comparison reproduced fixed server-side "
+                f"arithmetic evaluation through the {dialect} template dialect"
+            ),
+        )
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.CONFIRMED,
+            evidence=reproduced,
+            reason="independent control/probe comparison reproduced the SSTI effect",
+            reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+            proof=proof,
+        )
+
     def _validate_ssti(
         self,
         task: TaskEnvelope,
@@ -1627,13 +1854,17 @@ class ValidationAgent:
                 and parameter in surface.parameters
             )
         )
+        if surface.method.upper() == "GET":
+            return self._validate_ssti_stateless(
+                task, surface, signaled_parameters, reproduction,
+                build_ssti_query_requests,
+            )
+
         if "username" not in signaled_parameters:
-            return self._validation_result(
-                task,
-                verdict=ValidationVerdict.REJECTED,
-                evidence=(),
-                reason="analysis produced no fixed-arithmetic SSTI signal to reproduce",
-                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            # /profile 저장 계약이 아닌 좌표는 응답에만 렌더링되는 폼 경로로 재현한다.
+            return self._validate_ssti_stateless(
+                task, surface, signaled_parameters, reproduction,
+                build_ssti_form_requests,
             )
 
         requests = build_ssti_requests(
