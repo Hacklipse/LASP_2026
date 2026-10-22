@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -71,6 +72,34 @@ def _executor(task_store, agent: _RecordingAgent, *, progress=None) -> TaskExecu
 
 
 class TaskExecutorSsrfSecretTests(unittest.TestCase):
+    def test_json_post_probe_body_is_redacted_in_task_store(self) -> None:
+        secret_endpoint = "https://callback.example/session/json-secret"
+        task = TaskEnvelope(
+            task_id="task-json", run_id="run-ssrf-secret", agent_type="worker",
+            surface_id="surface-fetch",
+            evidence_request=EvidenceRequest(
+                evidence_type="http_response", surface_id="surface-fetch",
+                reason="bounded JSON SSRF verification", suggested_tool="http_post",
+                http_request=HttpRequestSpec(
+                    method="POST", headers=(("Content-Type", "application/json"),),
+                    body=json.dumps({"url": secret_endpoint}),
+                    request_kind=HttpRequestKind.SSRF_PROBE,
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.sqlite3"
+            with SQLiteStoreBundle(path) as stores:
+                agent = _RecordingAgent()
+                _executor(stores.tasks, agent).execute(task)
+                with sqlite3.connect(path) as connection:
+                    serialized = connection.execute(
+                        "SELECT data FROM tasks WHERE task_id = ?", (task.task_id,)
+                    ).fetchone()[0]
+                self.assertNotIn(secret_endpoint, serialized)
+                self.assertIn("protected-ssrf-endpoint.invalid", serialized)
+                self.assertIn(secret_endpoint, agent.tasks[0].evidence_request.http_request.body)
+
     def test_memory_store_and_progress_hide_callback_but_worker_receives_it(self) -> None:
         secret_endpoint = "https://callback.example/session/analysis-secret"
         task = _ssrf_task(

@@ -24,9 +24,13 @@ from .postmessage_plan import POSTMESSAGE_ANALYZER, POSTMESSAGE_CAPABILITY, POST
 from .ssrf_analysis import (
     SSRF_ANALYZER,
     SSRF_CALLBACK_CAPABILITY, SSRF_CALLBACK_DECLARED_CAPABILITY,
+    SSRF_CALLBACK_JSON_CAPABILITY, SSRF_CALLBACK_EDITOR_CAPABILITY,
     SSRF_CANARY_CAPABILITY, SSRF_CANARY_DECLARED_CAPABILITY,
+    SSRF_CANARY_EDITOR_CAPABILITY,
     SSRF_OWNED_RECEIVER_CAPABILITY, SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY,
-    SSRF_PARAMETER_HINTS, SSRF_TYPE,
+    SSRF_OWNED_RECEIVER_JSON_CAPABILITY, SSRF_OWNED_RECEIVER_EDITOR_CAPABILITY,
+    SSRF_EDITOR_CATCHER_STRUCTURE,
+    SSRF_JSON_PARAMETER_HINTS, SSRF_PARAMETER_HINTS, SSRF_TYPE,
 )
 
 
@@ -63,9 +67,39 @@ OPTIONAL_SSRF_CALLBACK_CAPABILITIES = (
         supported_evidence_types=("ssrf_callback_http",),
         strategy_ids=("declared_url_callback_probe",), default_priority=0.28,
     ),
+    AnalyzerCapability(
+        capability_id=SSRF_CALLBACK_JSON_CAPABILITY, agent_type=SSRF_ANALYZER,
+        vulnerability_type=SSRF_TYPE, methods=("POST",), surface_kind="server",
+        parameter_hints=tuple(sorted(SSRF_JSON_PARAMETER_HINTS)),
+        observation_requirements=(ObservationRequirement("javascript_json_request_structure"),),
+        exploration_parameter_source="observation",
+        observation_parameter_field="body_parameter_names",
+        supported_evidence_types=("ssrf_callback_http",),
+        strategy_ids=("declared_json_callback_probe",), default_priority=0.28,
+    ),
+    AnalyzerCapability(
+        capability_id=SSRF_CALLBACK_EDITOR_CAPABILITY, agent_type=SSRF_ANALYZER,
+        vulnerability_type=SSRF_TYPE, methods=("GET",), surface_kind="server",
+        parameter_hints=(),
+        observation_requirements=(ObservationRequirement(SSRF_EDITOR_CATCHER_STRUCTURE),),
+        exploration_parameter_source="observation",
+        observation_parameter_field="query_parameter_names",
+        supported_evidence_types=("ssrf_callback_http",),
+        strategy_ids=("declared_url_callback_probe",), default_priority=0.28,
+    ),
 )
 
 OPTIONAL_SSRF_CANARY_CAPABILITIES = (
+    AnalyzerCapability(
+        capability_id=SSRF_CANARY_EDITOR_CAPABILITY, agent_type=SSRF_ANALYZER,
+        vulnerability_type=SSRF_TYPE, methods=("GET",), surface_kind="server",
+        parameter_hints=(),
+        observation_requirements=(ObservationRequirement(SSRF_EDITOR_CATCHER_STRUCTURE),),
+        exploration_parameter_source="observation",
+        observation_parameter_field="query_parameter_names",
+        supported_evidence_types=("http_response",),
+        strategy_ids=("declared_url_internal_canary_probe",), default_priority=0.29,
+    ),
     AnalyzerCapability(
         capability_id=SSRF_CANARY_CAPABILITY, agent_type=SSRF_ANALYZER,
         vulnerability_type=SSRF_TYPE, methods=("GET",), surface_kind="server",
@@ -88,6 +122,17 @@ OPTIONAL_SSRF_CANARY_CAPABILITIES = (
 )
 
 OPTIONAL_SSRF_OWNED_RECEIVER_CAPABILITIES = (
+    AnalyzerCapability(
+        capability_id=SSRF_OWNED_RECEIVER_EDITOR_CAPABILITY,
+        agent_type=SSRF_ANALYZER, vulnerability_type=SSRF_TYPE,
+        methods=("GET",), surface_kind="server", parameter_hints=(),
+        observation_requirements=(ObservationRequirement(SSRF_EDITOR_CATCHER_STRUCTURE),),
+        exploration_parameter_source="observation",
+        observation_parameter_field="query_parameter_names",
+        supported_evidence_types=("ssrf_server_request_observation",),
+        strategy_ids=("declared_url_internal_request_log_probe",),
+        default_priority=0.30,
+    ),
     AnalyzerCapability(
         capability_id=SSRF_OWNED_RECEIVER_CAPABILITY,
         agent_type=SSRF_ANALYZER,
@@ -113,6 +158,18 @@ OPTIONAL_SSRF_OWNED_RECEIVER_CAPABILITIES = (
         observation_parameter_field="query_parameter_names",
         supported_evidence_types=("ssrf_server_request_observation",),
         strategy_ids=("declared_url_internal_request_log_probe",),
+        default_priority=0.30,
+    ),
+    AnalyzerCapability(
+        capability_id=SSRF_OWNED_RECEIVER_JSON_CAPABILITY,
+        agent_type=SSRF_ANALYZER, vulnerability_type=SSRF_TYPE,
+        methods=("POST",), surface_kind="server",
+        parameter_hints=tuple(sorted(SSRF_JSON_PARAMETER_HINTS)),
+        observation_requirements=(ObservationRequirement("javascript_json_request_structure"),),
+        exploration_parameter_source="observation",
+        observation_parameter_field="body_parameter_names",
+        supported_evidence_types=("ssrf_server_request_observation",),
+        strategy_ids=("declared_json_internal_request_log_probe",),
         default_priority=0.30,
     ),
 )

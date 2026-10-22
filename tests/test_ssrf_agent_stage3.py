@@ -299,6 +299,24 @@ class SsrfStage3Tests(unittest.TestCase):
             OPTIONAL_SSRF_CAPABILITIES[0], surface,
         ))
 
+    def test_untrusted_legacy_workflow_label_cannot_route_probe(self) -> None:
+        surface = Surface(
+            surface_id="legacy-flow", run_id=self.run.run_id,
+            url="https://target.example/operations/execute", method="POST",
+            parameters=("url",),
+        )
+        claimed = Evidence(
+            evidence_id="claimed-flow", run_id=self.run.run_id,
+            surface_id=surface.surface_id, created_by="recon",
+            evidence_type="observation",
+            observation={"type": "javascript_model_download_workflow",
+                         "method": "POST", "body_parameter_names": ["url"]},
+        )
+        decisions = standard_router(
+            ("SSRF",), ssrf_owned_receiver_enabled=True,
+        ).route(self.run, (surface,), (claimed,))
+        self.assertEqual(decisions, ())
+
     def test_declared_get_query_routes_and_reproduces_without_claiming_proof(self) -> None:
         surface = Surface(
             surface_id="schema-only", run_id=self.run.run_id,
@@ -319,7 +337,11 @@ class SsrfStage3Tests(unittest.TestCase):
         router = standard_router(("SSRF",), ssrf_callback_service=self.service)
         decisions = router.route(self.run, (surface,), (shape,))
         self.assertEqual(len(decisions), 1)
-        self.assertEqual(router.last_analyzer_coverage[-1].status, "routable")
+        self.assertEqual(
+            next(item.status for item in router.last_analyzer_coverage
+                 if item.capability_id == "ssrf.callback_declared_url_query"),
+            "routable",
+        )
         self.surface = surface
         self.candidate = decisions[0].candidate
         self.stores.candidates.add(self.candidate)
@@ -691,6 +713,30 @@ class SsrfStage3Tests(unittest.TestCase):
             for item in app.runtime.requests
         ))
         self.assertTrue(llm.calls)
+
+    def test_heuristic_tries_second_observed_input_and_validates_it(self) -> None:
+        service = _Service()
+        runtime = _TwoFieldRuntime(service)
+        app = build_local_application(
+            {}, runtime=runtime, ssrf_callback_service=service,
+            router=standard_router(("SSRF",), ssrf_callback_service=service),
+        )
+        register_standard_agents(app, recon_max_pages=4)
+        run = app.orchestrator.start(RunRequest(
+            target_url="https://target.example/",
+            scope=RunScope(allowed_hosts=frozenset({"target.example"})),
+            request_budget=20,
+        ))
+        self.assertEqual(run.phase, RunPhase.DONE)
+        candidate = app.stores.candidates.list_by_run(run.run_id)[0]
+        self.assertEqual(candidate.status, CandidateStatus.SUSPECTED)
+        probes = [item for item in runtime.requests
+                  if item.request_kind is HttpRequestKind.SSRF_PROBE]
+        self.assertEqual([
+            next(name for name, value in probe.query_parameters
+                 if value.startswith(service.origin)) for probe in probes
+        ], ["url", "image_url", "image_url"])
+        self.assertEqual(run.finding_ids, ())
 
     def test_llm_tool_loop_tries_second_observed_input_and_validates_it(self) -> None:
         service = _Service()

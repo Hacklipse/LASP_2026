@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from urllib.parse import urljoin, urlsplit
 
@@ -11,6 +12,10 @@ _MAX_NODES = 300
 _MAX_LINKS = 32
 _LINK_KEYS = frozenset({"href", "url", "path", "route", "link", "endpoint"})
 _LINK_LIST_KEYS = frozenset({"links", "navigation", "routes"})
+_REMOTE_RESOURCE_SCRIPT = re.compile(
+    r"(?:^|[/_.-])(?:url|fetch|request|proxy|download|model|image|import|"
+    r"webhook|callback|remote|install)(?:[/_.-]|$)", re.I,
+)
 
 
 def json_links_from_observation(observation: Mapping[str, object],
@@ -37,7 +42,24 @@ def json_links_from_observation(observation: Mapping[str, object],
     origin = urlsplit(base_url)
     links: list[str] = []
     seen: set[str] = set()
-    pending: list[tuple[object, int, bool]] = [(document, 0, False)]
+    # A top-level array of same-origin paths is a common extension/module
+    # manifest. Treat only that specific shape as links; nested arbitrary
+    # string arrays still need an explicit link-shaped key.
+    root_path_list = (
+        isinstance(document, list) and bool(document)
+        and all(isinstance(item, str) and item.startswith("/")
+                and not item.startswith("//") for item in document[:100])
+    )
+    if root_path_list:
+        document = sorted(
+            document[:100],
+            key=lambda path: (
+                not (path.endswith((".js", ".mjs"))
+                     and _REMOTE_RESOURCE_SCRIPT.search(path)),
+                path,
+            ),
+        )
+    pending: list[tuple[object, int, bool]] = [(document, 0, root_path_list)]
     visited_nodes = 0
     while pending and visited_nodes < _MAX_NODES and len(links) < _MAX_LINKS:
         value, depth, link_list = pending.pop()

@@ -86,7 +86,7 @@ from hacklipse.adapters.routing_audit import AuditedVulnerabilityRouter, Routing
 from hacklipse.adapters.paired_routing import PairedVulnerabilityRouter
 from hacklipse.adapters.llm_iterative_recon import LlmIterativeReconPlanner
 from hacklipse.adapters.llm_recon_planner import LlmReconPlanner, ReconPlanner
-from hacklipse.adapters.recon import DEFAULT_MAX_PAGES
+from hacklipse.adapters.recon import DEFAULT_MAX_PAGES, DEFAULT_MAX_SCRIPTS
 from hacklipse.application import (
     KnowledgeContextProvider,
     Orchestrator,
@@ -389,6 +389,7 @@ def build_local_application(
             allowed_tools=(
                 "http_get",
                 "http_post",
+                "http_delete",
                 "browser_xss",
                 "path_traversal_probe",
                 "access_control_probe",
@@ -756,9 +757,11 @@ def register_standard_agents(
     llm_client: LlmClient | None = None,
     recon_planner: ReconPlanner | IterativeReconPlanner | None = None,
     recon_max_pages: int = DEFAULT_MAX_PAGES,
+    recon_max_scripts: int = DEFAULT_MAX_SCRIPTS,
     recon_surface_collection_mode: str = "adaptive",
     recon_seed_urls: tuple[str, ...] = (),
     recon_infer_unlinked_render_parameters: bool = True,
+    recon_ssrf_navigation: bool = False,
     recon_browser_enabled: bool = False,
     recon_browser_executable_path: str | None = None,
     actor_object_id: str | None = None,
@@ -785,9 +788,11 @@ def register_standard_agents(
             evidence_store=app.stores.evidence,
             surface_store=app.stores.surfaces,
             max_pages=recon_max_pages,
+            max_scripts=recon_max_scripts,
             surface_collection_mode=recon_surface_collection_mode,
             seed_urls=recon_seed_urls,
             infer_unlinked_render_parameters=recon_infer_unlinked_render_parameters,
+            ssrf_navigation=recon_ssrf_navigation,
             browser_recon=(PlaywrightRecon(
                 collector=app.collector, run_store=app.stores.runs,
                 session_cookies=getattr(app.runtime, "session_cookies", None),
@@ -1080,7 +1085,7 @@ def register_standard_agents(
             SSRF_ANALYZER,
             (LlmSsrfAnalyzer(llm_client=analysis_llm_client, **ssrf_kwargs)
              if llm_client is not None else SsrfAnalyzer(**ssrf_kwargs)),
-            allowed_tools=("http_get", *SSRF_ANALYSIS_TOOLS),
+            allowed_tools=("http_get", "http_post", "http_delete", *SSRF_ANALYSIS_TOOLS),
         )
     # Validation verdict와 proof는 어느 구성에서나 결정적 Validator가 만든다.
     # validation_review는 그 위에 LLM 분류 Claim을 덧붙일 뿐이고, 기본값이 off인
@@ -1105,6 +1110,7 @@ def register_standard_agents(
         allowed_tools=(
             "http_get",
             "http_post",
+            "http_delete",
             "browser_xss",
             "path_traversal_probe",
             "access_control_probe",

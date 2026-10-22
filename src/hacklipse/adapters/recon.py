@@ -46,6 +46,7 @@ from hacklipse.domain import (
 from hacklipse.domain.url_redaction import ssrf_destination_reference_parts
 from hacklipse.ports import EvidenceStore, SurfaceStore
 from hacklipse.ports import IterativeReconPlanner, ReconAction, ReconObservation
+from hacklipse.ports.errors import ApprovalRequired, BudgetExceeded, PolicyViolation
 
 from .llm_iterative_recon import (
     AGENTIC_RECON_PLANNER,
@@ -88,7 +89,9 @@ from .error_disclosure import (
 from .request_safety import has_state_changing_get
 from .security import redacted_internal_url_path
 from .ssrf_analysis import (
+    SSRF_EDITOR_CATCHER_STRUCTURE,
     SSRF_DESTINATION_HINT_TYPE,
+    SSRF_JSON_PARAMETER_HINTS,
     SSRF_URL_FETCH_REVIEW_TYPE,
     ssrf_parameter_sources,
 )
@@ -145,10 +148,26 @@ _JS_LITERAL_JOIN = re.compile(r"\s*\+\s*\Z")
 _JS_PATH_FRAGMENT = re.compile(r"[A-Za-z0-9._~/?=&-]{1,80}\Z")
 _JS_PARAMETER_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,39}\Z")
 _JS_FETCH_MUTATION = re.compile(
-    r"\bfetch\s*\(\s*(?P<quote>[\"'`])(?P<path>/[A-Za-z0-9][A-Za-z0-9._~/?=&-]{0,160})"
+    r"\b(?:fetch|fetchApi)\s*\(\s*(?P<quote>[\"'`])(?P<path>/[A-Za-z0-9][A-Za-z0-9._~/?=&-]{0,160})"
     r"(?P=quote)\s*,\s*\{[^{}]{0,240}?\bmethod\s*:\s*[\"'`]"
     r"(?P<method>POST|PUT|PATCH|DELETE)[\"'`]",
     re.I,
+)
+_JS_FETCH_JSON = re.compile(
+    r"\bfetch\s*\(\s*([\"'`])(?P<path>/[A-Za-z0-9][A-Za-z0-9._~/?=&-]{0,160})\1"
+    r"\s*,\s*\{(?P<options>[^;]{0,1024})",
+    re.I,
+)
+_JS_JSON_GET = re.compile(
+    r"\b(?:fetch|fetchApi)\s*\(\s*([\"'`])"
+    r"(?P<path>/[A-Za-z0-9][A-Za-z0-9._~/?=&-]{0,160})\1"
+    r"[^;\r\n]{0,180}?\)\s*\)\s*\.json\s*\(",
+    re.I,
+)
+_JS_SINGLE_JSON_FIELD = re.compile(
+    r"\bJSON\.stringify\s*\(\s*\{\s*"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]{0,63})\s*:\s*[^,{}]{1,160}"
+    r"\}\s*\)", re.I,
 )
 _JS_AXIOS_MUTATION = re.compile(
     r"\baxios\s*\.\s*(?P<method>post|put|patch|delete)\s*\(\s*"
@@ -390,6 +409,7 @@ def _script_paths_from_body(body: str, origin) -> list[tuple[str, tuple[str, ...
     for path, names in _constant_js_paths(body).items():
         parameters.setdefault(path, set()).update(names)
     document_paths = {match.group(1) for match in _JS_DOCUMENT_NAVIGATION.finditer(body)}
+    json_get_paths = {match.group("path") for match in _JS_JSON_GET.finditer(body)}
     paths = {match.group(1) for match in _JS_PATH.finditer(body)}
     paths.update(parameters)
     paths.update(match.group(1) for match in _JS_DIRECTORY.finditer(body))
@@ -405,12 +425,17 @@ def _script_paths_from_body(body: str, origin) -> list[tuple[str, tuple[str, ...
     # useful than static asset paths. Keep explicit document navigation first.
     ordered_paths = (
         *sorted(document_paths),
-        *sorted(path for path in paths - document_paths if parameters.get(path)),
-        *sorted(path for path in paths - document_paths if not parameters.get(path)),
+        *sorted(path for path in paths - document_paths if path in json_get_paths),
+        *sorted(path for path in paths - document_paths - json_get_paths
+                if parameters.get(path)),
+        *sorted(path for path in paths - document_paths - json_get_paths
+                if not parameters.get(path)),
     )
     found = [
         (f"{base}{path}", tuple(sorted(parameters.get(path, ()))),
-         path in document_paths or path.endswith("/"), path in document_paths)
+         path in document_paths or path in json_get_paths or path.endswith("/")
+         or path.endswith(("/api-docs", "/openapi.json", "/swagger.json")),
+         path in document_paths)
         for path in ordered_paths
     ]
     found.extend(
@@ -438,6 +463,30 @@ def _script_mutation_shapes(body: str, origin) -> tuple[tuple[str, str, tuple[st
             shapes.add((base + path, match.group("method").upper(), names))
             if len(shapes) >= 128:
                 return tuple(sorted(shapes))
+    return tuple(sorted(shapes))
+
+
+def _script_ssrf_json_shapes(body: str, origin) -> tuple[tuple[str, str], ...]:
+    """Read literal POST JSON URL-field shapes; never infer a request body value."""
+
+    base = f"{origin.scheme}://{origin.netloc}"
+    shapes: set[tuple[str, str]] = set()
+    for match in _JS_FETCH_JSON.finditer(body[:_MAX_SCRIPT_BYTES]):
+        options = match.group("options")
+        if (
+            re.search(r"\bmethod\s*:\s*['\"]POST['\"]", options, re.I) is None
+            or re.search(r"['\"]Content-Type['\"]\s*:\s*['\"]application/json['\"]", options, re.I) is None
+        ):
+            continue
+        field = _JS_SINGLE_JSON_FIELD.search(options)
+        if field is None or field.group("name").casefold() not in SSRF_JSON_PARAMETER_HINTS:
+            continue
+        path = match.group("path").split("?", 1)[0]
+        if path.startswith("//") or ".." in path.split("/"):
+            continue
+        shapes.add((base + path, field.group("name")))
+        if len(shapes) >= 32:
+            break
     return tuple(sorted(shapes))
 
 
@@ -471,6 +520,38 @@ def _openapi_document(evidence: Evidence) -> dict | None:
     if not isinstance(paths, dict):
         return None
     return document
+
+
+def _ueditor_catcher_shape(evidence: Evidence) -> tuple[str, str] | None:
+    """Accept only a successful UEditor config declaring a remote-image catcher."""
+
+    observation = evidence.observation
+    media = observation.get("content_type")
+    body = observation.get("body")
+    if (
+        evidence.evidence_type != "http_response"
+        or observation.get("status") != 200
+        or observation.get("truncated")
+        or not isinstance(media, str)
+        or media.split(";", 1)[0].strip().casefold() != "application/json"
+        or not isinstance(body, str) or len(body) > 64_000
+    ):
+        return None
+    try:
+        config = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(config, dict):
+        return None
+    action = config.get("catcherActionName")
+    field = config.get("catcherFieldName")
+    if (
+        not isinstance(action, str) or not isinstance(field, str)
+        or re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", action) is None
+        or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", field) is None
+    ):
+        return None
+    return action, field + "[]"
 
 
 def _internal_destination_kind(hostname: str) -> str | None:
@@ -693,6 +774,37 @@ def _openapi_literal_surfaces(
     return found
 
 
+def _openapi_html_document_urls(evidence: Evidence, origin) -> tuple[str, ...]:
+    """Sample only literal, input-free GET documents declared to return HTML."""
+
+    document = _openapi_document(evidence)
+    if document is None:
+        return ()
+    base = f"{origin.scheme}://{origin.netloc}"
+    urls: list[str] = []
+    for path, operations in sorted(document["paths"].items()):
+        if (
+            len(urls) >= _MAX_SCHEMA_GET_SAMPLES
+            or not isinstance(path, str) or not _API_PATH.fullmatch(path)
+            or path.startswith("//") or ".." in path.split("/")
+            or not isinstance(operations, dict)
+        ):
+            continue
+        get = operations.get("get")
+        responses = get.get("responses") if isinstance(get, dict) else None
+        response = responses.get("200") if isinstance(responses, dict) else None
+        content = response.get("content", {}) if isinstance(response, dict) else None
+        if (
+            isinstance(content, dict)
+            and any(isinstance(media, str) and media.casefold().startswith("text/html")
+                    for media in content)
+            and not operations.get("parameters")
+            and not get.get("parameters")
+        ):
+            urls.append(base + path)
+    return tuple(urls)
+
+
 def _openapi_collection_templates(
     evidence: Evidence, origin
 ) -> tuple[tuple[str, str, str], ...]:
@@ -864,6 +976,7 @@ class ReconAgent:
         surface_collection_mode: str = "adaptive",
         seed_urls: Sequence[str] = (),
         infer_unlinked_render_parameters: bool = True,
+        ssrf_navigation: bool = False,
         id_factory: Callable[[], str] | None = None,
         planner: ReconPlanner | None = None,
         iterative_planner: IterativeReconPlanner | None = None,
@@ -884,6 +997,7 @@ class ReconAgent:
         self._surface_collection_mode = surface_collection_mode
         self._seed_urls = tuple(dict.fromkeys(seed_urls))
         self._infer_unlinked_render_parameters = infer_unlinked_render_parameters
+        self._ssrf_navigation = ssrf_navigation
         self._id_factory = id_factory or (lambda: str(uuid4()))
         # None이면(휴리스틱 프로필) 아래 두 번째 crawl() 직전 분기 자체가 실행되지
         # 않아 기존 결정적 동작과 한 줄도 다르지 않다.
@@ -985,6 +1099,7 @@ class ReconAgent:
         deferred_inline_urls: list[str] = []
         inline_seen_shapes: set[tuple[str, tuple[str, ...]]] = set()
         inline_path_count = 0
+        ssrf_inline_docs_queued = 0
         document_pages: set[str] = set()
         browser_document_seeds: dict[str, int] = {}
         unparameterized_search_pages: dict[str, str] = {}
@@ -1230,6 +1345,25 @@ class ReconAgent:
                 if collection_url not in fetched and collection_url not in pending:
                     pending.append(collection_url)
 
+            if not targeted:
+                source_evidence = self._evidence.get(task.run_id, source_evidence_id)
+                for html_url in _openapi_html_document_urls(source_evidence, origin):
+                    if (
+                        schema_get_samples_queued >= _MAX_SCHEMA_GET_SAMPLES
+                        or len(fetched) + len(pending) >= page_budget - 2
+                    ):
+                        break
+                    if html_url in fetched or html_url in pending or has_state_changing_get(html_url):
+                        continue
+                    pending_surface_ids[html_url] = remember(
+                        html_url, "GET", (), discovery_types=("openapi_html_document",),
+                    )
+                    pending_discovery_types.setdefault(html_url, set()).add(
+                        "openapi_html_document"
+                    )
+                    pending.append(html_url)
+                    schema_get_samples_queued += 1
+
             # A schema declaration alone has no response evidence. Sample a
             # few literal, input-free GET routes so ordinary JSON links and
             # credential fields can enter Recon. Leave two crawl slots for
@@ -1351,12 +1485,38 @@ class ReconAgent:
             ))
             evidence_ids.append(evidence_id)
 
+        def record_ssrf_json_shapes(script_body: str, source: str) -> None:
+            for url, field in _script_ssrf_json_shapes(script_body, origin):
+                surface_id = remember(
+                    url, "POST", (field,), discovery_types=(source,),
+                )
+                if any(
+                    item.surface_id == surface_id
+                    and item.observation.get("type") == "javascript_json_request_structure"
+                    for item in self._evidence.list_by_run(task.run_id)
+                ):
+                    continue
+                evidence_id = f"evi-{self._id_factory()}"
+                self._evidence.append(Evidence(
+                    evidence_id=evidence_id, run_id=task.run_id,
+                    surface_id=surface_id, created_by="recon",
+                    evidence_type="observation", source_task_id=task.task_id,
+                    observation={
+                        "type": "javascript_json_request_structure",
+                        "method": "POST", "content_type": "application/json",
+                        "body_parameter_names": [field],
+                        "request_template_available": False,
+                    },
+                ))
+                evidence_ids.append(evidence_id)
+
         def crawl(
             *,
             protected: Sequence[str] | set[str] = (),
             max_visits: int | None = None,
         ) -> int:
             nonlocal deadline_exhausted, api_schema_found, inline_path_count
+            nonlocal ssrf_inline_docs_queued
             visited = 0
             while pending and len(fetched) < page_budget:
                 if remaining_work() < 1.0:
@@ -1380,6 +1540,10 @@ class ReconAgent:
                     tuple(sorted(pending_discovery_types.get(url, {"discovered"}))),
                 )
                 pending_surface_ids[url] = surface_id
+                # HTML navigation can expose logout or other mutating GET links.
+                # Keep their coordinates, but never fetch them during Recon.
+                if has_state_changing_get(url):
+                    continue
                 evidence_id, evidence = self._fetch(
                     task, url, surface_id, timeout_seconds=remaining_work()
                 )
@@ -1421,6 +1585,26 @@ class ReconAgent:
                     # JSON/API 응답 안의 escaped HTML 조각을 실제 링크나 폼으로 오인하면
                     # `/api/\"https:/...` 같은 실행 불가능한 Surface가 생긴다. API 본문은
                     # status/content-type 관찰로 남기되 HTML parser에는 넣지 않는다.
+                    if (
+                        (_javascript_response(evidence) or (
+                            urlsplit(url).path.casefold().endswith((".js", ".mjs"))
+                            and "javascript" in str(
+                                evidence.observation.get("content_type", "")
+                            ).casefold()
+                        ))
+                        and len(body) <= _MAX_SCRIPT_BYTES
+                    ):
+                        parsed.add(url)
+                        for mutation_url, method, names in _script_mutation_shapes(body, origin):
+                            record_script_request_shape(
+                                mutation_url, method, names, "javascript_link_request_shape"
+                            )
+                        record_ssrf_json_shapes(body, "javascript_link_json_request")
+                        for literal_url, names, _, _ in _script_paths_from_body(body, origin):
+                            if _same_origin(literal_url, origin):
+                                remember(literal_url, "GET", names,
+                                         discovery_types=("javascript_link_literal",))
+                        continue
                     schema_surfaces = _openapi_literal_surfaces(evidence, origin)
                     record_sensitive_exposure(
                         surface_id, exposed_json_field_paths(evidence.observation)
@@ -1487,6 +1671,7 @@ class ReconAgent:
                 )
                 for inline_body in inline_scripts:
                     javascript_globals.update(_javascript_globals(inline_body))
+                    record_ssrf_json_shapes(inline_body, "inline_javascript_json_request")
                 for inline_body in inline_scripts:
                     for request_url, method, fields in _javascript_requests(
                         inline_body, url, javascript_globals
@@ -1538,6 +1723,19 @@ class ReconAgent:
                     pending_discovery_types.setdefault(link, set()).add("html_link")
                     if link not in fetched and link not in pending:
                         pending.append(link)
+                if self._ssrf_navigation:
+                    for link in reversed(_data_navigation_links(body, url)):
+                        if not _same_origin(link, origin):
+                            continue
+                        pending_surface_ids[link] = remember(
+                            link, "GET", _query_names(link), _query_pairs(link),
+                            discovery_types=("html_data_navigation",),
+                        )
+                        pending_discovery_types.setdefault(link, set()).add(
+                            "html_data_navigation"
+                        )
+                        if link not in fetched and link not in pending:
+                            pending.insert(0, link)
                 for source in sources:
                     if source not in scripts and _same_origin(source, origin):
                         scripts.append(source)
@@ -1584,10 +1782,16 @@ class ReconAgent:
                         pending_discovery_types.setdefault(script_url, set()).add(
                             "inline_script_literal"
                         )
-                        if should_crawl:
+                        ssrf_document = (
+                            self._ssrf_navigation
+                            and ssrf_inline_docs_queued < 8
+                            and urlsplit(script_url).path.casefold().endswith(".html")
+                        )
+                        if should_crawl or ssrf_document:
                             document_pages.add(script_url)
                             if script_url not in fetched and script_url not in deferred_inline_urls:
                                 deferred_inline_urls.append(script_url)
+                                ssrf_inline_docs_queued += int(ssrf_document)
                         if is_navigation:
                             navigation_pages.add(script_url)
             return visited
@@ -1658,6 +1862,7 @@ class ReconAgent:
                         record_script_request_shape(
                             url, method, names, "script_request_shape"
                         )
+                    record_ssrf_json_shapes(script_body, "javascript_json_request")
             for url, names, should_crawl, is_navigation in script_paths:
                 discovery_type = (
                     "browser_navigation" if is_navigation else "script_literal"
@@ -2053,6 +2258,57 @@ class ReconAgent:
 
         probe_search_pages()
 
+        # An observed upload endpoint may expose UEditor's read-only config.
+        # Its declared catcher action and field are useful coordinates, but
+        # the config request still passes through the central PolicyGate.
+        if not targeted and remaining_work() >= 1.0:
+            editor_paths = sorted({
+                url for url, method, _ in surfaces
+                if method == "GET"
+                and "upload" in urlsplit(url).path.casefold().split("/")
+                and _same_origin(url, origin)
+            })
+            for editor_path in editor_paths[:1]:
+                config_url = editor_path + "?" + urlencode({
+                    "from": "ueditor", "action": "config",
+                })
+                if config_url in fetched:
+                    continue
+                try:
+                    config_id, config_evidence = self._fetch(
+                        task, config_url, None,
+                        timeout_seconds=remaining_work(),
+                    )
+                except (ApprovalRequired, PolicyViolation, BudgetExceeded):
+                    break
+                fetched.add(config_url)
+                evidence_ids.append(config_id)
+                record_response(config_url, config_evidence)
+                shape = _ueditor_catcher_shape(config_evidence)
+                if shape is None:
+                    break
+                action, field = shape
+                surface_id = remember(
+                    editor_path, "GET", ("from", "action", field),
+                    (("from", "ueditor"), ("action", action)),
+                    ("ueditor_catcher_declaration",),
+                )
+                shape_id = f"evi-{self._id_factory()}"
+                self._evidence.append(Evidence(
+                    evidence_id=shape_id, run_id=task.run_id,
+                    surface_id=surface_id, created_by="recon",
+                    evidence_type="observation", source_task_id=task.task_id,
+                    observation={
+                        "type": SSRF_EDITOR_CATCHER_STRUCTURE,
+                        "source_evidence_id": config_id,
+                        "method": "GET",
+                        "query_parameter_names": [field],
+                        "request_template_available": False,
+                    },
+                ))
+                evidence_ids.append(shape_id)
+                break
+
         if self._browser_recon is not None and not targeted:
             browser_budget = max(0, int(task.request_budget * _RECON_BUDGET_SHARE) - len(fetched))
             if browser_budget and remaining_work() > 1.0:
@@ -2196,6 +2452,7 @@ class ReconAgent:
                             record_script_request_shape(
                                 url, method, names, "browser_script_request_shape"
                             )
+                        record_ssrf_json_shapes(body, "browser_javascript_json_request")
                         for url, names, _, _ in _script_paths_from_body(body, origin):
                             if _same_origin(url, origin):
                                 remember(url, "GET", names,
@@ -2344,7 +2601,7 @@ class ReconAgent:
                     "type": SSRF_URL_FETCH_REVIEW_TYPE,
                     "status": "REVIEW_REQUIRED",
                     "reason_code": "ssrf_manual_review_required",
-                    "method": "GET",
+                    "method": surface.method.upper(),
                     "parameter_names": [name for name, _ in coordinates],
                     "parameter_sources": [
                         {"name": name, "source": source}
@@ -2951,6 +3208,36 @@ def _javascript_requests(
             )
         requests.append((resolved.split("#", 1)[0], method, fields))
     return list(dict.fromkeys(requests))
+
+
+def _data_navigation_links(body: str, base_url: str) -> tuple[str, ...]:
+    """Read bounded, same-origin GET navigation declared by HTML data attributes."""
+
+    if len(body) > 256_000:
+        return ()
+    origin = urlsplit(base_url)
+    found: list[str] = []
+    soup = BeautifulSoup(body, "lxml")
+    for element in soup.select("[data-url], [data-href]")[:100]:
+        if str(element.get("data-method", "GET")).upper() != "GET":
+            continue
+        raw = element.get("data-url") or element.get("data-href")
+        if not isinstance(raw, str) or not raw.startswith(("/", "./", "../")):
+            continue
+        if raw.startswith("//") or len(raw) > 2048:
+            continue
+        resolved = urljoin(base_url, raw).split("#", 1)[0]
+        parsed = urlsplit(resolved)
+        if (
+            parsed.scheme in {"http", "https"}
+            and parsed.netloc == origin.netloc
+            and not has_state_changing_get(resolved)
+            and resolved not in found
+        ):
+            found.append(resolved)
+        if len(found) >= 24:
+            break
+    return tuple(found)
 
 
 def _parse_page(

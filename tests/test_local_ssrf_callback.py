@@ -20,6 +20,17 @@ from hacklipse.ports.errors import PolicyViolation
 
 
 class LocalSsrfCallbackTests(unittest.TestCase):
+    def test_explicit_bridge_binding_rejects_wildcard_and_public_addresses(self) -> None:
+        for address in ("0.0.0.0", "8.8.8.8", "not-an-ip"):
+            with self.subTest(address=address), self.assertRaises(ValueError):
+                LocalSsrfCallbackService(
+                    advertised_host="host.docker.internal", bind_host=address,
+                )
+        with self.assertRaises(ValueError):
+            LocalSsrfCallbackService(
+                advertised_host="127.0.0.1", bind_host="172.24.0.1",
+            )
+
     def test_docker_host_origin_keeps_listener_on_loopback(self) -> None:
         with LocalSsrfCallbackService(advertised_host="host.docker.internal") as service:
             self.assertFalse(service.public_oast)

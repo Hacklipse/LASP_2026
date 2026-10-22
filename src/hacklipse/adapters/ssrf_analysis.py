@@ -1,8 +1,9 @@
-"""관측/명세 출처를 구분하는 GET SSRF control/probe와 결정적 Analyzer."""
+"""출처가 확인된 GET query와 단일 JSON POST SSRF probe용 Analyzer."""
 
 from __future__ import annotations
 
 import hashlib
+import json
 from urllib.parse import parse_qsl, urlsplit
 
 from hacklipse.application.execution import (
@@ -23,18 +24,25 @@ SSRF_TYPE = "SSRF"
 SSRF_ANALYZER = "ssrf_analyzer"
 SSRF_CALLBACK_CAPABILITY = "ssrf.callback_observed_url_query"
 SSRF_CALLBACK_DECLARED_CAPABILITY = "ssrf.callback_declared_url_query"
+SSRF_CALLBACK_JSON_CAPABILITY = "ssrf.callback_declared_url_json"
+SSRF_CALLBACK_EDITOR_CAPABILITY = "ssrf.callback_editor_catcher_query"
 SSRF_CANARY_CAPABILITY = "ssrf.internal_canary_observed_url_query"
 SSRF_CANARY_DECLARED_CAPABILITY = "ssrf.internal_canary_declared_url_query"
+SSRF_CANARY_EDITOR_CAPABILITY = "ssrf.internal_canary_editor_catcher_query"
 SSRF_OWNED_RECEIVER_CAPABILITY = "ssrf.internal_request_log_observed_url_query"
 SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY = (
     "ssrf.internal_request_log_declared_url_query"
 )
+SSRF_OWNED_RECEIVER_JSON_CAPABILITY = "ssrf.internal_request_log_declared_url_json"
+SSRF_OWNED_RECEIVER_EDITOR_CAPABILITY = "ssrf.internal_request_log_editor_catcher_query"
+SSRF_EDITOR_CATCHER_STRUCTURE = "editor_catcher_request_structure"
 # Backwards-compatible public names. Existing callers mean the callback
 # strategy when they ask for the original SSRF capability.
 SSRF_CAPABILITY = SSRF_CALLBACK_CAPABILITY
 SSRF_DECLARED_CAPABILITY = SSRF_CALLBACK_DECLARED_CAPABILITY
 SSRF_CALLBACK_STRATEGIES = frozenset({
     "observed_url_callback_probe", "declared_url_callback_probe",
+    "declared_json_callback_probe",
 })
 SSRF_CANARY_STRATEGIES = frozenset({
     "observed_url_internal_canary_probe",
@@ -43,10 +51,14 @@ SSRF_CANARY_STRATEGIES = frozenset({
 SSRF_OWNED_RECEIVER_STRATEGIES = frozenset({
     "observed_url_internal_request_log_probe",
     "declared_url_internal_request_log_probe",
+    "declared_json_internal_request_log_probe",
 })
 SSRF_PARAMETER_HINTS = frozenset({
     "url", "uri", "link", "image", "image_url", "feed", "feed_url",
     "webhook", "callback", "target", "destination", "source", "resource",
+})
+SSRF_JSON_PARAMETER_HINTS = frozenset({
+    "url", "uri", "link", "image_url", "feed_url", "webhook", "callback",
 })
 _CONTROL_VALUE = "hacklipse-control"
 SSRF_CONTEXT_TOOL = "get_surface_context"
@@ -56,6 +68,46 @@ SSRF_ANALYSIS_TOOLS = (SSRF_CONTEXT_TOOL, SSRF_PROBE_TOOL, SSRF_RESULT_TOOL)
 SSRF_RESULT_TYPE = "ssrf_probe_result"
 SSRF_DESTINATION_HINT_TYPE = "ssrf_destination_hint"
 SSRF_URL_FETCH_REVIEW_TYPE = "ssrf_url_fetch_review"
+
+
+def observed_url_parameter_names(surface: Surface) -> frozenset[str]:
+    """Find actual HTTP URL values without retaining or reusing their contents."""
+
+    names: set[str] = set()
+    for name, value in (*surface.observed_query, *parse_qsl(
+        urlsplit(surface.url).query, keep_blank_values=True,
+    )):
+        try:
+            parsed = urlsplit(value)
+            if (
+                parsed.scheme.casefold() in {"http", "https"}
+                and parsed.hostname
+                and parsed.username is None
+                and parsed.password is None
+            ):
+                names.add(name)
+        except ValueError:
+            continue
+    return frozenset(names)
+
+
+def _ssrf_http_spec(
+    surface: Surface, parameter: str, value: str, kind: HttpRequestKind,
+    *, query: tuple[tuple[str, str], ...] = (),
+) -> HttpRequestSpec:
+    if surface.method.upper() == "POST":
+        return HttpRequestSpec(
+            method="POST", headers=(("Content-Type", "application/json"),),
+            body=json.dumps({parameter: value}, separators=(",", ":")),
+            request_kind=kind,
+        )
+    return HttpRequestSpec(
+        method="GET", query_parameters=query, request_kind=kind,
+    )
+
+
+def _ssrf_tool(surface: Surface) -> str:
+    return "http_post" if surface.method.upper() == "POST" else "http_get"
 
 def is_ssrf_canary_candidate(candidate) -> bool:
     """Return whether a Candidate is explicitly bound to internal canary work."""
@@ -102,14 +154,36 @@ def ssrf_local_validation_reserve(task: TaskEnvelope) -> int:
 def ssrf_parameter_sources(
     surface: Surface, evidence: tuple[Evidence, ...] = (),
 ) -> tuple[tuple[str, str], ...]:
-    """Separate replayable inputs from OpenAPI-declared GET query names."""
+    """Return bounded URL coordinates with their GET or JSON provenance."""
 
-    if surface.method.upper() != "GET" or urlsplit(surface.url).fragment:
+    method = surface.method.upper()
+    if method not in {"GET", "POST"} or urlsplit(surface.url).fragment:
         return ()
+    if method == "POST":
+        declared = {
+            name
+            for item in evidence
+            if item.run_id == surface.run_id
+            and item.surface_id == surface.surface_id
+            and item.created_by == "recon"
+            and item.evidence_type == "observation"
+            and item.observation.get("method") == "POST"
+            and item.observation.get("content_type") == "application/json"
+            and item.observation.get("type") == "javascript_json_request_structure"
+            and isinstance(item.observation.get("body_parameter_names"), (list, tuple))
+            for name in item.observation["body_parameter_names"]
+            if isinstance(name, str) and name.casefold() in SSRF_JSON_PARAMETER_HINTS
+        }
+        return tuple(
+            (name, "declared_json_body")
+            for name in surface.parameters
+            if name in declared
+        )
     observed_names = {name for name, _ in surface.observed_query}
     observed_names.update(name for name, _ in parse_qsl(
         urlsplit(surface.url).query, keep_blank_values=True,
     ))
+    observed_url_names = observed_url_parameter_names(surface)
     declared_names = {
         name
         for item in evidence
@@ -121,11 +195,24 @@ def ssrf_parameter_sources(
         for name in item.observation["query_parameter_names"]
         if isinstance(name, str)
     }
+    editor_names = {
+        name
+        for item in evidence
+        if item.run_id == surface.run_id and item.surface_id == surface.surface_id
+        and item.created_by == "recon" and item.evidence_type == "observation"
+        and item.observation.get("type") == SSRF_EDITOR_CATCHER_STRUCTURE
+        and item.observation.get("method") == "GET"
+        and isinstance(item.observation.get("query_parameter_names"), (list, tuple))
+        for name in item.observation["query_parameter_names"]
+        if isinstance(name, str)
+    }
     coordinates = tuple(
-        (name, "observed_query" if name in observed_names else "openapi_declaration")
+        (name, "observed_query" if name in observed_names else
+         "editor_catcher_declaration" if name in editor_names else "openapi_declaration")
         for name in dict.fromkeys(surface.parameters)
-        if name.casefold() in SSRF_PARAMETER_HINTS
-        and (name in observed_names or name in declared_names)
+        if (name.casefold() in SSRF_PARAMETER_HINTS or name in observed_url_names
+            or name in editor_names)
+        and (name in observed_names or name in declared_names or name in editor_names)
     )
     return tuple(sorted(coordinates, key=lambda item: item[1] != "observed_query"))
 
@@ -140,10 +227,10 @@ def build_ssrf_requests(
     surface: Surface, parameter: str, callback_url: str,
     evidence: tuple[Evidence, ...] = (),
 ) -> tuple[EvidenceRequest, EvidenceRequest]:
-    """같은 GET Surface에서 한 필드만 callback URL로 바꾸는 두 요청을 만든다."""
+    """같은 Surface에서 한 필드만 callback URL로 바꾸는 두 요청을 만든다."""
 
     if parameter not in ssrf_parameters(surface, evidence):
-        raise ValueError("SSRF probe requires an observed or declared URL-like GET parameter")
+        raise ValueError("SSRF probe requires an observed or declared URL input")
     parsed = urlsplit(callback_url)
     if (
         (parsed.scheme != "https" and not (
@@ -156,30 +243,33 @@ def build_ssrf_requests(
         raise ValueError("SSRF callback must be an HTTPS or loopback-test URL without credentials")
     observed = dict(surface.observed_query)
     observed.update(parse_qsl(urlsplit(surface.url).query, keep_blank_values=True))
+    observed_url_names = observed_url_parameter_names(surface)
     # shortcut: preserve only bounded non-URL companion values; richer request
     # templates need a provenance-aware runtime contract before expansion.
     names = tuple(dict.fromkeys((*observed, *surface.parameters)))
     control = tuple((name, _CONTROL_VALUE if name == parameter or
-                     name.casefold() in SSRF_PARAMETER_HINTS else observed[name])
+                     name.casefold() in SSRF_PARAMETER_HINTS or
+                     name in observed_url_names else observed[name])
                     for name in names if name == parameter or name in observed)
     probe = tuple((name, callback_url if name == parameter else
-                   _CONTROL_VALUE if name.casefold() in SSRF_PARAMETER_HINTS else observed[name])
+                   _CONTROL_VALUE if name.casefold() in SSRF_PARAMETER_HINTS or
+                   name in observed_url_names else observed[name])
                   for name in names if name == parameter or name in observed)
     return (
         EvidenceRequest(
             evidence_type="http_response", surface_id=surface.surface_id,
-            reason=f"SSRF control for {parameter}", suggested_tool="http_get",
-            http_request=HttpRequestSpec(
-                method="GET", query_parameters=control,
-                request_kind=HttpRequestKind.SSRF_CONTROL,
+            reason=f"SSRF control for {parameter}", suggested_tool=_ssrf_tool(surface),
+            http_request=_ssrf_http_spec(
+                surface, parameter, _CONTROL_VALUE, HttpRequestKind.SSRF_CONTROL,
+                query=control,
             ),
         ),
         EvidenceRequest(
             evidence_type="http_response", surface_id=surface.surface_id,
-            reason=f"SSRF callback probe for {parameter}", suggested_tool="http_get",
-            http_request=HttpRequestSpec(
-                method="GET", query_parameters=probe,
-                request_kind=HttpRequestKind.SSRF_PROBE,
+            reason=f"SSRF callback probe for {parameter}", suggested_tool=_ssrf_tool(surface),
+            http_request=_ssrf_http_spec(
+                surface, parameter, callback_url, HttpRequestKind.SSRF_PROBE,
+                query=probe,
             ),
         ),
     )
@@ -195,10 +285,12 @@ def build_ssrf_canary_request(
         raise ValueError("SSRF canary requires an observed or declared URL-like GET parameter")
     observed = dict(surface.observed_query)
     observed.update(parse_qsl(urlsplit(surface.url).query, keep_blank_values=True))
+    observed_url_names = observed_url_parameter_names(surface)
     names = tuple(dict.fromkeys((*observed, *surface.parameters)))
     query = tuple(
         (name, canary_url if name == parameter else
-         _CONTROL_VALUE if name.casefold() in SSRF_PARAMETER_HINTS else observed[name])
+         _CONTROL_VALUE if name.casefold() in SSRF_PARAMETER_HINTS or
+         name in observed_url_names else observed[name])
         for name in names if name == parameter or name in observed
     )
     return EvidenceRequest(
@@ -243,14 +335,16 @@ def build_ssrf_owned_receiver_requests(
 
     if parameter not in ssrf_parameters(surface, evidence):
         raise ValueError(
-            "SSRF owned receiver requires an observed or declared URL-like GET parameter"
+            "SSRF owned receiver requires an observed or declared URL input"
         )
     observed = dict(surface.observed_query)
     observed.update(parse_qsl(urlsplit(surface.url).query, keep_blank_values=True))
+    observed_url_names = observed_url_parameter_names(surface)
     names = tuple(dict.fromkeys((*observed, *surface.parameters)))
     probe_query = tuple(
         (name, receiver_url if name == parameter else
-         _CONTROL_VALUE if name.casefold() in SSRF_PARAMETER_HINTS else observed[name])
+         _CONTROL_VALUE if name.casefold() in SSRF_PARAMETER_HINTS or
+         name in observed_url_names else observed[name])
         for name in names if name == parameter or name in observed
     )
     control_query = tuple(
@@ -261,19 +355,19 @@ def build_ssrf_owned_receiver_requests(
         EvidenceRequest(
             evidence_type="http_response", surface_id=surface.surface_id,
             reason=f"SSRF owned receiver control for {parameter}",
-            suggested_tool="http_get",
-            http_request=HttpRequestSpec(
-                method="GET", query_parameters=control_query,
-                request_kind=HttpRequestKind.SSRF_CONTROL,
+            suggested_tool=_ssrf_tool(surface),
+            http_request=_ssrf_http_spec(
+                surface, parameter, _CONTROL_VALUE, HttpRequestKind.SSRF_CONTROL,
+                query=control_query,
             ),
         ),
         EvidenceRequest(
             evidence_type="http_response", surface_id=surface.surface_id,
             reason=f"SSRF owned receiver probe for {parameter}",
-            suggested_tool="http_get",
-            http_request=HttpRequestSpec(
-                method="GET", query_parameters=probe_query,
-                request_kind=HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE,
+            suggested_tool=_ssrf_tool(surface),
+            http_request=_ssrf_http_spec(
+                surface, parameter, receiver_url,
+                HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE, query=probe_query,
             ),
         ),
     )
@@ -403,6 +497,7 @@ class SsrfAnalyzer:
         candidate, surface, _ = resolve_analysis_task(
             task, vulnerability_type=SSRF_TYPE,
             candidate_store=self._candidates, surface_store=self._surfaces,
+            required_tool=None, allowed_methods=("GET", "POST"),
         )
         strategy = ssrf_candidate_verification_strategy(candidate)
         registration = self._collector.ssrf_review_for_surface(
@@ -456,53 +551,84 @@ class SsrfAnalyzer:
                 task_id=task.task_id, status=AgentResultStatus.COMPLETED,
                 candidate_ids=(candidate.candidate_id,),
             )
-        # shortcut: one eligible URL field per Surface; expand only with a
-        # ticket key that includes the field and budget reserved per probe.
-        try:
-            ticket = self._collector.issue_ssrf_ticket(
-                task.run_id, candidate.candidate_id, parameters[0]
-            )
-        except (OSError, TimeoutError):
-            outcome = record_ssrf_result(
-                self._evidence, task, parameters[0], "", (), "provider_error",
-                sources[parameters[0]], candidate.analysis_strategy_id,
-            )
-            return AgentResult(
-                task_id=task.task_id, status=AgentResultStatus.COMPLETED,
-                new_evidence_ids=(outcome.evidence_id,),
-                candidate_ids=(candidate.candidate_id,),
-            )
-        requests = build_ssrf_requests(surface, parameters[0], ticket.url, surface_evidence)
+        # A Surface can expose several URL inputs. Try at most three observed
+        # coordinates, one control/probe pair at a time, while preserving the
+        # independent Validation request reserve. Persist each result so a
+        # resumed task never repeats a completed probe.
+        new_ids: list[str] = []
         evidence = self._evidence.get_many(task.run_id, task.evidence_ids)
-        collected = tuple(matching_evidence(evidence, surface.url, request) for request in requests)
-        missing = tuple(request for request, item in zip(requests, collected) if item is None)
-        if missing:
-            required = len(missing) + ssrf_local_validation_reserve(task)
-            if task.request_budget < required:
-                raise BudgetExceeded(
-                    "SSRF analysis must reserve independent validation requests",
-                    required_requests=required,
+        for parameter in parameters[:3]:
+            previous = next((
+                item for item in self._evidence.list_by_run(task.run_id)
+                if item.created_by == SSRF_ANALYZER
+                and item.validation_id is None
+                and item.observation.get("type") == SSRF_RESULT_TYPE
+                and item.observation.get("candidate_id") == candidate.candidate_id
+                and item.observation.get("parameter") == parameter
+            ), None)
+            if previous is not None:
+                if previous.observation.get("status") in {"http", "provider_error"}:
+                    return AgentResult(
+                        task_id=task.task_id, status=AgentResultStatus.COMPLETED,
+                        new_evidence_ids=tuple(new_ids),
+                        candidate_ids=(candidate.candidate_id,),
+                    )
+                continue
+            try:
+                ticket = self._collector.issue_ssrf_ticket(
+                    task.run_id, candidate.candidate_id, parameter,
                 )
-            return AgentResult(
-                task_id=task.task_id, status=AgentResultStatus.NEEDS_EVIDENCE,
-                evidence_requests=missing, candidate_ids=(candidate.candidate_id,),
+            except (OSError, TimeoutError):
+                outcome = record_ssrf_result(
+                    self._evidence, task, parameter, "", (), "provider_error",
+                    sources[parameter], candidate.analysis_strategy_id,
+                )
+                new_ids.append(outcome.evidence_id)
+                break
+            requests = build_ssrf_requests(surface, parameter, ticket.url, surface_evidence)
+            collected = tuple(
+                matching_evidence(evidence, surface.url, request) for request in requests
             )
-        probe = collected[1]
-        assert probe is not None
-        try:
-            callback_ids = poll_ssrf_callbacks(
-                self._collector, self._evidence, task, surface, requests[1], probe.evidence_id,
+            missing = tuple(
+                request for request, item in zip(requests, collected) if item is None
             )
-            status = ssrf_result_status(self._evidence, task.run_id, callback_ids, probe.evidence_id)
-        except (OSError, TimeoutError):
-            callback_ids, status = (), "provider_error"
-        outcome = record_ssrf_result(
-            self._evidence, task, parameters[0], probe.evidence_id, callback_ids, status,
-            sources[parameters[0]], candidate.analysis_strategy_id,
-        )
+            if missing:
+                required = len(missing) + ssrf_local_validation_reserve(task)
+                if task.request_budget < required:
+                    if new_ids:
+                        break
+                    raise BudgetExceeded(
+                        "SSRF analysis must reserve independent validation requests",
+                        required_requests=required,
+                    )
+                return AgentResult(
+                    task_id=task.task_id, status=AgentResultStatus.NEEDS_EVIDENCE,
+                    new_evidence_ids=tuple(new_ids),
+                    evidence_requests=missing,
+                    candidate_ids=(candidate.candidate_id,),
+                )
+            probe = collected[1]
+            assert probe is not None
+            try:
+                callback_ids = poll_ssrf_callbacks(
+                    self._collector, self._evidence, task, surface,
+                    requests[1], probe.evidence_id,
+                )
+                status = ssrf_result_status(
+                    self._evidence, task.run_id, callback_ids, probe.evidence_id,
+                )
+            except (OSError, TimeoutError):
+                callback_ids, status = (), "provider_error"
+            outcome = record_ssrf_result(
+                self._evidence, task, parameter, probe.evidence_id, callback_ids,
+                status, sources[parameter], candidate.analysis_strategy_id,
+            )
+            new_ids.extend((*callback_ids, outcome.evidence_id))
+            if status in {"http", "provider_error"}:
+                break
         return AgentResult(
             task_id=task.task_id, status=AgentResultStatus.COMPLETED,
-            new_evidence_ids=callback_ids + (outcome.evidence_id,),
+            new_evidence_ids=tuple(new_ids),
             candidate_ids=(candidate.candidate_id,),
         )
 
@@ -550,7 +676,9 @@ class SsrfAnalyzer:
             if item.validation_id is None
         )
         collected = tuple(
-            matching_evidence(evidence, surface.url, request)
+            matching_evidence(
+                evidence, request.request_target_url or surface.url, request,
+            )
             for request in requests
         )
         missing = tuple(
@@ -571,7 +699,8 @@ class SsrfAnalyzer:
         assert probe is not None
         try:
             observation_ids = self._collector.collect_ssrf_owned_receiver_observations(
-                task.run_id, candidate.candidate_id, surface.url, requests[1],
+                task.run_id, candidate.candidate_id, surface.url,
+                requests[1],
                 probe.evidence_id, task_id=task.task_id,
             )
             status = (

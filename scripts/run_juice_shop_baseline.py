@@ -1595,7 +1595,11 @@ def main(
     parser.add_argument(
         "--ssrf-local-callback-host",
         choices=("127.0.0.1", "host.docker.internal"), default="127.0.0.1",
-        help="Docker Desktop 대상에는 host.docker.internal을 광고한다(수신기는 loopback 유지)",
+        help="Docker 대상에는 host.docker.internal을 광고한다(기본 수신 주소는 loopback)",
+    )
+    parser.add_argument(
+        "--ssrf-local-callback-bind-host", default="127.0.0.1",
+        help="로컬 Docker bridge 실험에서만 수신기를 결합할 사설 IPv4 주소",
     )
     parser.add_argument(
         "--ssrf-oast", choices=("off", "public_interactsh", "private_interactsh"),
@@ -1707,6 +1711,15 @@ def main(
         and not (args.ssrf_local_callback or args.ssrf_owned_local_receiver)
     ):
         print("거부: Docker callback 주소에는 명시적인 로컬 SSRF 수신기가 필요합니다.")
+        return 2
+    if (
+        args.ssrf_local_callback_bind_host != "127.0.0.1"
+        and (
+            args.ssrf_local_callback_host != "host.docker.internal"
+            or not (args.ssrf_local_callback or args.ssrf_owned_local_receiver)
+        )
+    ):
+        print("거부: Docker bridge 수신 주소에는 host.docker.internal 수신기가 필요합니다.")
         return 2
     if args.ssrf_oast != "off" and args.vuln not in {"auto", "all"}:
         print("거부: Interactsh SSRF는 auto/all 통합 검사에서만 사용합니다.")
@@ -2027,6 +2040,7 @@ def main(
         if args.ssrf_local_callback:
             ssrf_callback = LocalSsrfCallbackService(
                 advertised_host=args.ssrf_local_callback_host,
+                bind_host=args.ssrf_local_callback_bind_host,
             )
         elif args.ssrf_oast != "off":
             ssrf_callback = InteractshCliCallbackService(
@@ -2050,6 +2064,7 @@ def main(
             # Public callback Provider와 신뢰 경계를 공유하지 않는 별도 인스턴스다.
             ssrf_owned_receiver = LocalSsrfCallbackService(
                 advertised_host=args.ssrf_local_callback_host,
+                bind_host=args.ssrf_local_callback_bind_host,
             )
     except (OSError, TimeoutError, ValueError) as error:
         close_ssrf_services(ssrf_owned_receiver)

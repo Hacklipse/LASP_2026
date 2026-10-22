@@ -8,12 +8,14 @@ import threading
 import unittest
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 from hacklipse.adapters import HttpExecutionRuntime
 from hacklipse.adapters.browser_recon import BrowserReconResult
 from hacklipse.adapters.memory import InMemoryEvidenceStore, InMemorySurfaceStore
 from hacklipse.adapters.recon import (
-    ReconAgent, _json_links_from_response, _parse_page,
+    ReconAgent, _data_navigation_links, _json_links_from_response, _parse_page,
+    _openapi_html_document_urls, _script_ssrf_json_shapes,
     sanitize_url_reference, ssrf_destination_hints,
 )
 from hacklipse.adapters.routing import RuleBasedVulnerabilityRouter
@@ -42,6 +44,53 @@ _SAMPLE_HTML = """
 <a href="/about.php">about</a>
 </body></html>
 """
+
+
+class SsrfJsonShapeTests(unittest.TestCase):
+    def test_data_navigation_accepts_only_local_nonmutating_get(self) -> None:
+        body = (
+            '<button data-url="/articles/new">New</button>'
+            '<button data-url="/articles/delete/1">Delete</button>'
+            '<button data-url="https://elsewhere.example/collect">Elsewhere</button>'
+            '<button data-url="/articles/edit" data-method="POST">Post</button>'
+        )
+        self.assertEqual(
+            _data_navigation_links(body, "https://target.example/articles"),
+            ("https://target.example/articles/new",),
+        )
+
+    def test_inline_fetch_shape_keeps_only_single_url_field(self) -> None:
+        script = (
+            "fetch('/api/preview',{method:'POST',headers:{'Content-Type':'application/json'},"
+            "body:JSON.stringify({url:u})});"
+            "fetch('/api/ping',{method:'POST',headers:{'Content-Type':'application/json'},"
+            "body:JSON.stringify({target:h})});"
+        )
+        self.assertEqual(
+            _script_ssrf_json_shapes(script, urlsplit("http://localhost/")),
+            (("http://localhost/api/preview", "url"),),
+        )
+
+    def test_openapi_html_sampling_ignores_mutations_and_malformed_entries(self) -> None:
+        document = {"openapi": "3.0.0", "paths": {
+            "/console": {"get": {"responses": {
+                "200": {"content": {"text/html": {}}},
+            }}},
+            "/write": {"post": {"responses": {
+                "200": {"content": {"text/html": {}}},
+            }}},
+            "/broken": {"get": {"responses": ["bad"]}},
+        }}
+        evidence = Evidence(
+            evidence_id="schema", run_id="run-1", surface_id=None,
+            created_by="recon", evidence_type="http_response",
+            observation={"status": 200, "content_type": "application/json",
+                         "body": json.dumps(document)},
+        )
+        self.assertEqual(
+            _openapi_html_document_urls(evidence, urlsplit("http://localhost/")),
+            ("http://localhost/console",),
+        )
 
 
 class _FakeCollector:
@@ -716,6 +765,7 @@ class _RoutingCollector:
                 observation={
                     "type": "http_response",
                     "status": 200,
+                    "requested_url": target_url,
                     "body": self._bodies.get(target_url, "<html></html>"),
                     **(
                         {"content_type": self._content_types[target_url]}
@@ -745,6 +795,131 @@ def _crawling_agent(bodies: dict[str, str], **kwargs):
 
 
 class ReconCrawlTests(unittest.TestCase):
+    def test_authenticated_form_does_not_create_unobserved_csv_workflow(self) -> None:
+        base = "http://localhost"
+        page = base + "/admin-dev/index.php?controller=AdminImport"
+        form = (
+            '<html><body>AdminImport Categories'
+            '<input name="file"><input name="csv"><select name="entity"></select>'
+        )
+        route = (
+            '/admin-dev/index.php/configure/advanced/import/file/upload'
+            '?_token=opaque'
+        )
+        for include_route in (False, True):
+            body = form + (f'<a href="{route}">Upload</a>' if include_route else "")
+            agent, collector, surfaces = _crawling_agent(
+                {page: body + "</body></html>"}, max_pages=1,
+            )
+            run_id = f"presta-csv-{include_route}"
+            agent.handle(replace(
+                _task(run_id, page, credential_ref="presta-admin"),
+                request_budget=10,
+            ))
+            workflow = [
+                item for item in collector._evidence.list_by_run(run_id)
+                if item.observation.get("type") == "admin_csv_image_import_workflow"
+            ]
+            self.assertEqual(workflow, [])
+
+    def test_script_does_not_invent_model_download_workflow(self) -> None:
+        base = "http://localhost"
+        list_url = base + "/externalmodel/getlist?mode=cache"
+        model_script = (
+            "const data = item.originalData;"
+            "fetchApi('/manager/queue/install_model',"
+            "{method:'POST',body:JSON.stringify(data)});"
+            "fetchApi('/manager/queue/start');"
+            "fetchData(`/externalmodel/getlist?mode=${mode}`);"
+        )
+        agent, collector, surfaces = _crawling_agent(
+            {
+                base + "/": (
+                    '<script src="/model-manager.js"></script>'
+                    '<script src="/main.js"></script>'
+                ),
+                base + "/model-manager.js": model_script,
+                base + "/main.js": "const option = {value:'cache'};",
+                list_url: json.dumps({"models": [{
+                    "filename": "sample.safetensors", "type": "clip",
+                    "base": "clip", "save_path": "default",
+                }]}),
+            },
+            content_types={
+                base + "/model-manager.js": "application/javascript",
+                base + "/main.js": "application/javascript",
+                list_url: "application/json",
+            },
+            max_pages=6, max_scripts=3,
+        )
+        agent.handle(replace(_task("model-flow", base + "/"), request_budget=30))
+        self.assertNotIn(list_url, collector.calls)
+        evidence = collector._evidence.list_by_run("model-flow")
+        workflow = [
+            item for item in evidence
+            if item.observation.get("type") == "javascript_model_download_workflow"
+        ]
+        self.assertEqual(workflow, [])
+
+    def test_observed_ueditor_config_declares_ssrf_coordinate(self) -> None:
+        base = "http://localhost"
+        upload = base + "/admin/upload/index.html"
+        config_url = upload + "?from=ueditor&action=config"
+        agent, collector, surfaces = _crawling_agent(
+            {
+                base + "/": f'<a href="{upload}">Upload</a>',
+                upload: "<html></html>",
+                config_url: json.dumps({
+                    "catcherActionName": "catch_image",
+                    "catcherFieldName": "remote_image",
+                }),
+            },
+            content_types={config_url: "application/json"},
+            max_pages=3,
+        )
+        agent.handle(replace(_task("ueditor", base + "/"), request_budget=20))
+        self.assertIn(config_url, collector.calls)
+        found = surfaces.list_by_run("ueditor")
+        editor = next(item for item in found if "remote_image[]" in item.parameters)
+        self.assertEqual(editor.observed_query, (
+            ("from", "ueditor"), ("action", "catch_image"),
+        ))
+        evidence = collector._evidence.list_by_run("ueditor")
+        self.assertTrue(any(
+            item.surface_id == editor.surface_id
+            and item.observation.get("type") == "editor_catcher_request_structure"
+            for item in evidence
+        ))
+        run = Run(
+            run_id="ueditor", target_url=base + "/",
+            scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+            policy_profile="safe", request_budget=20,
+        )
+        decisions = standard_router(
+            ("SSRF",), ssrf_owned_receiver_enabled=True,
+        ).route(run, found, evidence)
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].candidate.surface_id, editor.surface_id)
+
+    def test_unrelated_upload_response_does_not_declare_catcher(self) -> None:
+        base = "http://localhost"
+        upload = base + "/admin/upload/index.html"
+        config_url = upload + "?from=ueditor&action=config"
+        agent, collector, surfaces = _crawling_agent(
+            {
+                base + "/": f'<a href="{upload}">Upload</a>',
+                config_url: json.dumps({"catcherFieldName": "file"}),
+            },
+            content_types={config_url: "application/json"},
+            max_pages=2,
+        )
+        agent.handle(replace(_task("not-ueditor", base + "/"), request_budget=20))
+        self.assertIn(config_url, collector.calls)
+        self.assertFalse(any(
+            "file[]" in item.parameters
+            for item in surfaces.list_by_run("not-ueditor")
+        ))
+
     def test_search_query_surface_requires_observed_echo(self) -> None:
         base = "http://localhost"
         marker = "hacklipse-search-control"
@@ -989,6 +1164,21 @@ class ReconCrawlTests(unittest.TestCase):
         self.assertTrue(any(
             item.url == base + "/api/linked" and item.parameters == ("term",)
             for item in surfaces.list_by_run("schema-get-sample")
+        ))
+
+    def test_html_navigation_records_but_does_not_fetch_mutating_get(self) -> None:
+        base = "http://localhost"
+        agent, collector, surfaces = _crawling_agent({
+            base + "/": '<a href="/admin/logout">Exit</a>'
+                        '<a href="/admin/dashboard">Dashboard</a>',
+            base + "/admin/dashboard": "<html>Dashboard</html>",
+        })
+        agent.handle(replace(_task("admin-navigation", base + "/"), request_budget=10))
+        self.assertNotIn(base + "/admin/logout", collector.calls)
+        self.assertIn(base + "/admin/dashboard", collector.calls)
+        self.assertTrue(any(
+            item.url == base + "/admin/logout"
+            for item in surfaces.list_by_run("admin-navigation")
         ))
 
     def test_template_only_openapi_is_recorded_without_guessing_another_schema_url(self) -> None:
@@ -1435,6 +1625,39 @@ class ReconCrawlTests(unittest.TestCase):
         self.assertFalse(any("evil.example" in surface.url for surface in found.values()))
         self.assertFalse(any("dynamicPath" in surface.url for surface in found.values()))
         self.assertFalse(any(url.endswith("/api/messages") for url in collector.calls))
+
+    def test_json_module_manifest_reveals_fetchapi_post_shape(self) -> None:
+        base = "http://localhost"
+        main = (
+            'async function modules() { return await(await '
+            'api.fetchApi("/extensions", {cache:"no-store"})).json() }'
+        )
+        extension = (
+            'await api.fetchApi("/api/install", {'
+            'method: "POST", body: JSON.stringify(item)});'
+        )
+        agent, collector, surfaces = _crawling_agent(
+            {
+                base + "/": '<script src="/main.js"></script>',
+                base + "/main.js": main,
+                base + "/extensions": json.dumps(["/extensions/model.js"]),
+                base + "/extensions/model.js": extension,
+            },
+            content_types={
+                base + "/main.js": "application/javascript",
+                base + "/extensions": "application/json",
+                base + "/extensions/model.js": "application/javascript",
+            },
+            max_pages=8,
+        )
+        agent.handle(replace(
+            _task("json-module-manifest", base + "/"), request_budget=40
+        ))
+        found = {(item.url, item.method): item
+                 for item in surfaces.list_by_run("json-module-manifest")}
+        self.assertIn((base + "/api/install", "POST"), found)
+        self.assertIn(base + "/extensions/model.js", collector.calls)
+        self.assertNotIn(base + "/api/install", collector.calls)
 
     def test_discovers_post_ajax_shape_and_localized_runtime_values(self) -> None:
         html = """

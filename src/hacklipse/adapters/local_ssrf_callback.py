@@ -1,4 +1,4 @@
-"""Loopback-only callback receiver for explicitly authorized local SSRF tests."""
+"""Local callback receiver for explicitly authorized SSRF tests."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import IPv4Address, ip_address
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -18,11 +19,19 @@ class LocalSsrfCallbackService:
 
     def __init__(
         self, *, port: int = 0, ticket_ttl_seconds: int = 300,
-        advertised_host: str = "127.0.0.1",
+        advertised_host: str = "127.0.0.1", bind_host: str = "127.0.0.1",
     ) -> None:
+        try:
+            bind_address = ip_address(bind_host)
+        except ValueError as error:
+            raise ValueError("local SSRF listener bind host must be an IPv4 address") from error
         if (
             not 0 <= port <= 65535 or not 1 <= ticket_ttl_seconds <= 3600
             or advertised_host not in {"127.0.0.1", "host.docker.internal"}
+            or not isinstance(bind_address, IPv4Address)
+            or bind_address.is_unspecified
+            or not (bind_address.is_loopback or bind_address.is_private)
+            or (advertised_host == "127.0.0.1" and bind_host != "127.0.0.1")
         ):
             raise ValueError("invalid local SSRF callback listener settings")
         self._condition = threading.Condition()
@@ -48,9 +57,9 @@ class LocalSsrfCallbackService:
             def log_message(self, format: str, *args: object) -> None:
                 pass
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        self._server = ThreadingHTTPServer((bind_host, port), Handler)
         self._server.daemon_threads = True
-        # Docker Desktop forwards host.docker.internal to this loopback listener.
+        # Docker Desktop can forward to loopback; Linux can bind a bridge address.
         self.origin = f"http://{advertised_host}:{self._server.server_port}"
         self._thread = threading.Thread(
             target=self._server.serve_forever, name="ssrf-callback", daemon=True,

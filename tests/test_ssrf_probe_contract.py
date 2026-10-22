@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import json
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl, urlsplit
 
@@ -10,6 +11,7 @@ from hacklipse.adapters.policy import AllowlistPolicyGate
 from hacklipse.adapters.ssrf_analysis import (
     build_ssrf_requests, ssrf_parameter_sources, ssrf_parameters,
 )
+from hacklipse.adapters.routing import SsrfSurfaceRoutingRule
 from hacklipse.domain import (
     DestinationPolicy, Evidence, ExecutionRequest, HttpRequestKind, HttpRequestSpec,
     Run, RunScope, SsrfCanaryProofTarget, SsrfDestinationRule,
@@ -77,6 +79,38 @@ class SsrfProbeContractTests(unittest.TestCase):
                 self.surface, "url", "https://callback.example/a?redirect=/admin",
             )
 
+    def test_observed_http_url_can_identify_nonstandard_field(self) -> None:
+        surface = Surface(
+            surface_id="remote-image", run_id="run-1",
+            url="https://target.example/fetch?file%5B%5D=https%3A%2F%2Fimages.example%2Fa"
+                "&other=https%3A%2F%2Fimages.example%2Fb&mode=small",
+            method="GET", parameters=("file[]", "other", "mode"),
+        )
+        self.assertEqual(
+            ssrf_parameter_sources(surface),
+            (("file[]", "observed_query"), ("other", "observed_query")),
+        )
+        rule = SsrfSurfaceRoutingRule(
+            "SSRF", "ssrf_analyzer", parameter_hints=("url",),
+            requires_observed_query=True,
+        )
+        self.assertTrue(rule.matches(surface))
+        control, probe = build_ssrf_requests(
+            surface, "file[]", "https://callback.example/ssrf/proof",
+        )
+        self.assertEqual(dict(control.http_request.query_parameters), {
+            "file[]": "hacklipse-control", "other": "hacklipse-control",
+            "mode": "small",
+        })
+        self.assertEqual(dict(probe.http_request.query_parameters)["other"],
+                         "hacklipse-control")
+        non_url = Surface(
+            surface_id="non-url", run_id="run-1",
+            url="https://target.example/fetch?file%5B%5D=sample",
+            method="GET", parameters=("file[]",),
+        )
+        self.assertFalse(rule.matches(non_url))
+
     def test_control_and_probe_change_one_field_only(self) -> None:
         control, probe = build_ssrf_requests(
             self.surface, "url", "https://callback.example/token-a",
@@ -99,6 +133,79 @@ class SsrfProbeContractTests(unittest.TestCase):
         for request in (control, probe):
             resolved = self._execution(request.http_request).resolved_url
             self.assertEqual(len(parse_qsl(urlsplit(resolved).query)), 2)
+
+    def test_declared_single_json_url_field_uses_scoped_post(self) -> None:
+        surface = Surface(
+            surface_id="json-preview", run_id="run-1",
+            url="https://target.example/api/preview", method="POST",
+            parameters=("url",),
+        )
+        shape = Evidence(
+            evidence_id="evi-json", run_id="run-1", surface_id=surface.surface_id,
+            created_by="recon", evidence_type="observation",
+            observation={
+                "type": "javascript_json_request_structure", "method": "POST",
+                "content_type": "application/json", "body_parameter_names": ["url"],
+            },
+        )
+        self.assertEqual(ssrf_parameter_sources(surface, (shape,)),
+                         (("url", "declared_json_body"),))
+        control, probe = build_ssrf_requests(
+            surface, "url", "https://callback.example/one", (shape,),
+        )
+        self.assertEqual((control.suggested_tool, probe.suggested_tool),
+                         ("http_post", "http_post"))
+        self.assertEqual(json.loads(control.http_request.body),
+                         {"url": "hacklipse-control"})
+        self.assertEqual(json.loads(probe.http_request.body),
+                         {"url": "https://callback.example/one"})
+        self.assertEqual(probe.http_request.query_parameters, ())
+        self.assertEqual(probe.http_request.headers,
+                         (("Content-Type", "application/json"),))
+        class PermitPost:
+            def is_approved(self, run, request):
+                return True
+
+        def execution(spec):
+            return ExecutionRequest(
+                execution_id="json-exec", run_id=self.run.run_id,
+                task_id="json-task", tool="http_post", target_url=surface.url,
+                surface_id=surface.surface_id, purpose="JSON SSRF proof",
+                method=spec.method, headers=spec.headers, body=spec.body,
+                request_kind=spec.request_kind, scope=self.run.scope,
+            )
+
+        AllowlistPolicyGate(
+            approval_gate=PermitPost(),
+            ssrf_callback_origin="https://callback.example",
+        ).validate_execution(self.run, execution(probe.http_request))
+        with self.assertRaises(PolicyViolation):
+            AllowlistPolicyGate(
+                approval_gate=PermitPost(),
+                ssrf_callback_origin="https://other.example",
+            ).validate_execution(self.run, execution(probe.http_request))
+        for body, headers in (
+            ('{"url":"https://callback.example/one","other":"x"}',
+             (("Content-Type", "application/json"),)),
+            ('{"url":"https://callback.example/one","url":"https://other.example/"}',
+             (("Content-Type", "application/json"),)),
+            ('{"url":"https://callback.example/one"}',
+             (("Content-Type", "text/plain"),)),
+        ):
+            with self.assertRaises(DomainInvariantError):
+                HttpRequestSpec(
+                    method="POST", body=body, headers=headers,
+                    request_kind=HttpRequestKind.SSRF_PROBE,
+                )
+        schema_only = Evidence(
+            evidence_id="evi-schema", run_id="run-1", surface_id=surface.surface_id,
+            created_by="recon", evidence_type="observation",
+            observation={
+                "type": "openapi_request_structure", "method": "POST",
+                "content_type": "application/json", "body_parameter_names": ["url"],
+            },
+        )
+        self.assertEqual(ssrf_parameter_sources(surface, (schema_only,)), ())
 
     def test_canary_requires_operator_rule_and_exact_runtime_url(self) -> None:
         with self.assertRaises(DomainInvariantError):

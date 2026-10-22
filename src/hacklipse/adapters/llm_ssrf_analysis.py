@@ -88,6 +88,7 @@ class LlmSsrfAnalyzer(SsrfAnalyzer):
         candidate, surface, _ = resolve_analysis_task(
             task, vulnerability_type=SSRF_TYPE,
             candidate_store=self._candidates, surface_store=self._surfaces,
+            required_tool=None, allowed_methods=("GET", "POST"),
         )
         strategy = ssrf_candidate_verification_strategy(candidate)
         if strategy in {
@@ -369,7 +370,8 @@ class LlmSsrfAnalyzer(SsrfAnalyzer):
 
     def _probe(self, task: TaskEnvelope, candidate_id: str, surface, parameter: str,
                attempt: int, source: str, new_ids: list[str]) -> AgentResult:
-        if SSRF_PROBE_TOOL not in task.allowed_tools or "http_get" not in task.allowed_tools:
+        http_tool = "http_post" if surface.method.upper() == "POST" else "http_get"
+        if SSRF_PROBE_TOOL not in task.allowed_tools or http_tool not in task.allowed_tools:
             return self._complete(task, candidate_id, new_ids)
         surface_evidence = tuple(item for item in self._evidence.list_by_run(task.run_id)
                                  if item.surface_id == surface.surface_id)

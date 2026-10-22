@@ -34,9 +34,14 @@ from .public_login_credentials import PUBLIC_LOGIN_OBSERVATION, PUBLIC_LOGIN_TYP
 from .ssrf_analysis import (
     SSRF_ANALYZER,
     SSRF_CALLBACK_CAPABILITY, SSRF_CALLBACK_DECLARED_CAPABILITY,
+    SSRF_CALLBACK_JSON_CAPABILITY, SSRF_CALLBACK_EDITOR_CAPABILITY,
     SSRF_CANARY_CAPABILITY, SSRF_CANARY_DECLARED_CAPABILITY,
+    SSRF_CANARY_EDITOR_CAPABILITY,
     SSRF_OWNED_RECEIVER_CAPABILITY, SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY,
-    SSRF_PARAMETER_HINTS, SSRF_TYPE,
+    SSRF_OWNED_RECEIVER_JSON_CAPABILITY, SSRF_OWNED_RECEIVER_EDITOR_CAPABILITY,
+    SSRF_EDITOR_CATCHER_STRUCTURE,
+    SSRF_JSON_PARAMETER_HINTS, SSRF_PARAMETER_HINTS, SSRF_TYPE,
+    observed_url_parameter_names,
 )
 
 
@@ -115,6 +120,19 @@ class DiscoveredSurfaceRoutingRule(SurfaceRoutingRule):
 
     def matches(self, surface: Surface) -> bool:
         return bool(surface.discovery_types) and super().matches(surface)
+
+
+class SsrfSurfaceRoutingRule(SurfaceRoutingRule):
+    """Also route an observed URL value under a nonstandard field name."""
+
+    def matches(self, surface: Surface) -> bool:
+        if super().matches(surface):
+            return True
+        return (
+            surface.method.upper() == "GET"
+            and not urlsplit(surface.url).fragment
+            and bool(set(surface.parameters) & observed_url_parameter_names(surface))
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,7 +282,7 @@ DEFAULT_SURFACE_RULES = (
 )
 
 OPTIONAL_SSRF_SURFACE_RULES = (
-    SurfaceRoutingRule(
+    SsrfSurfaceRoutingRule(
         SSRF_TYPE, SSRF_ANALYZER,
         parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
         requires_observed_query=True, priority=0.30,
@@ -275,6 +293,14 @@ OPTIONAL_SSRF_SURFACE_RULES = (
 
 OPTIONAL_SSRF_OBSERVATION_RULES = (
     RoutingRule(
+        SSRF_EDITOR_CATCHER_STRUCTURE, SSRF_TYPE, SSRF_ANALYZER,
+        0.28, methods=("GET",),
+        observation_parameter_field="query_parameter_names",
+        parameter_hints=(),
+        capability_id=SSRF_CALLBACK_EDITOR_CAPABILITY,
+        analysis_strategy_id="declared_url_callback_probe",
+    ),
+    RoutingRule(
         "openapi_request_structure", SSRF_TYPE, SSRF_ANALYZER,
         0.28, methods=("GET",),
         observation_parameter_field="query_parameter_names",
@@ -282,10 +308,18 @@ OPTIONAL_SSRF_OBSERVATION_RULES = (
         capability_id=SSRF_CALLBACK_DECLARED_CAPABILITY,
         analysis_strategy_id="declared_url_callback_probe",
     ),
+    RoutingRule(
+        "javascript_json_request_structure", SSRF_TYPE, SSRF_ANALYZER,
+        0.28, methods=("POST",),
+        observation_parameter_field="body_parameter_names",
+        parameter_hints=tuple(sorted(SSRF_JSON_PARAMETER_HINTS)),
+        capability_id=SSRF_CALLBACK_JSON_CAPABILITY,
+        analysis_strategy_id="declared_json_callback_probe",
+    ),
 )
 
 OPTIONAL_SSRF_CANARY_SURFACE_RULES = (
-    SurfaceRoutingRule(
+    SsrfSurfaceRoutingRule(
         SSRF_TYPE, SSRF_ANALYZER,
         parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
         requires_observed_query=True, priority=0.31,
@@ -295,6 +329,14 @@ OPTIONAL_SSRF_CANARY_SURFACE_RULES = (
 )
 
 OPTIONAL_SSRF_CANARY_OBSERVATION_RULES = (
+    RoutingRule(
+        SSRF_EDITOR_CATCHER_STRUCTURE, SSRF_TYPE, SSRF_ANALYZER,
+        0.29, methods=("GET",),
+        observation_parameter_field="query_parameter_names",
+        parameter_hints=(),
+        capability_id=SSRF_CANARY_EDITOR_CAPABILITY,
+        analysis_strategy_id="declared_url_internal_canary_probe",
+    ),
     RoutingRule(
         "openapi_request_structure", SSRF_TYPE, SSRF_ANALYZER,
         0.29, methods=("GET",),
@@ -306,7 +348,7 @@ OPTIONAL_SSRF_CANARY_OBSERVATION_RULES = (
 )
 
 OPTIONAL_SSRF_OWNED_RECEIVER_SURFACE_RULES = (
-    SurfaceRoutingRule(
+    SsrfSurfaceRoutingRule(
         SSRF_TYPE, SSRF_ANALYZER,
         parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
         requires_observed_query=True, priority=0.32,
@@ -317,6 +359,14 @@ OPTIONAL_SSRF_OWNED_RECEIVER_SURFACE_RULES = (
 
 OPTIONAL_SSRF_OWNED_RECEIVER_OBSERVATION_RULES = (
     RoutingRule(
+        SSRF_EDITOR_CATCHER_STRUCTURE, SSRF_TYPE, SSRF_ANALYZER,
+        0.30, methods=("GET",),
+        observation_parameter_field="query_parameter_names",
+        parameter_hints=(),
+        capability_id=SSRF_OWNED_RECEIVER_EDITOR_CAPABILITY,
+        analysis_strategy_id="declared_url_internal_request_log_probe",
+    ),
+    RoutingRule(
         "openapi_request_structure", SSRF_TYPE, SSRF_ANALYZER,
         0.30, methods=("GET",),
         observation_parameter_field="query_parameter_names",
@@ -324,12 +374,20 @@ OPTIONAL_SSRF_OWNED_RECEIVER_OBSERVATION_RULES = (
         capability_id=SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY,
         analysis_strategy_id="declared_url_internal_request_log_probe",
     ),
+    RoutingRule(
+        "javascript_json_request_structure", SSRF_TYPE, SSRF_ANALYZER,
+        0.30, methods=("POST",),
+        observation_parameter_field="body_parameter_names",
+        parameter_hints=tuple(sorted(SSRF_JSON_PARAMETER_HINTS)),
+        capability_id=SSRF_OWNED_RECEIVER_JSON_CAPABILITY,
+        analysis_strategy_id="declared_json_internal_request_log_probe",
+    ),
 )
 
 # A registered passive review still needs an exact coordinate Candidate, but it
 # is deliberately not labelled as callback or canary execution.
 OPTIONAL_SSRF_REVIEW_SURFACE_RULES = (
-    SurfaceRoutingRule(
+    SsrfSurfaceRoutingRule(
         SSRF_TYPE, SSRF_ANALYZER,
         parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
         requires_observed_query=True, priority=0.30,
@@ -337,6 +395,12 @@ OPTIONAL_SSRF_REVIEW_SURFACE_RULES = (
 )
 
 OPTIONAL_SSRF_REVIEW_OBSERVATION_RULES = (
+    RoutingRule(
+        SSRF_EDITOR_CATCHER_STRUCTURE, SSRF_TYPE, SSRF_ANALYZER,
+        0.28, methods=("GET",),
+        observation_parameter_field="query_parameter_names",
+        parameter_hints=(),
+    ),
     RoutingRule(
         "openapi_request_structure", SSRF_TYPE, SSRF_ANALYZER,
         0.28, methods=("GET",),
@@ -353,15 +417,19 @@ def _decision_key(
 
     if capability_id in {
         SSRF_CALLBACK_CAPABILITY, SSRF_CALLBACK_DECLARED_CAPABILITY,
+        SSRF_CALLBACK_JSON_CAPABILITY, SSRF_CALLBACK_EDITOR_CAPABILITY,
     }:
         return surface_id, "ssrf.callback"
     if capability_id in {
         SSRF_CANARY_CAPABILITY, SSRF_CANARY_DECLARED_CAPABILITY,
+        SSRF_CANARY_EDITOR_CAPABILITY,
     }:
         return surface_id, "ssrf.internal_canary"
     if capability_id in {
         SSRF_OWNED_RECEIVER_CAPABILITY,
         SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY,
+        SSRF_OWNED_RECEIVER_JSON_CAPABILITY,
+        SSRF_OWNED_RECEIVER_EDITOR_CAPABILITY,
     }:
         return surface_id, "ssrf.internal_request_log"
     return surface_id, capability_id or vulnerability_type
@@ -626,7 +694,13 @@ class RuleBasedVulnerabilityRouter:
                 names = (value,) if isinstance(value, str) else value if isinstance(value, (list, tuple)) else ()
                 offered = {name.casefold() for name in names
                            if isinstance(name, str) and name in surface.parameters}
-                if not offered.intersection(hint.casefold() for hint in rule.parameter_hints):
+                if rule.parameter_hints and not offered.intersection(
+                    hint.casefold() for hint in rule.parameter_hints
+                ):
+                    continue
+                if not rule.parameter_hints and (
+                    rule.vulnerability_type != SSRF_TYPE or not offered
+                ):
                     continue
             key = _decision_key(
                 item.surface_id, rule.vulnerability_type, rule.capability_id,

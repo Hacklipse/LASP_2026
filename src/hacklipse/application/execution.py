@@ -42,6 +42,7 @@ from hacklipse.domain import (
     TaskEnvelope,
 )
 from hacklipse.domain.url_redaction import ssrf_destination_reference_parts
+from hacklipse.domain.models import ssrf_csv_upload_parameter, ssrf_request_parameters
 from hacklipse.ports import (
     BudgetManager,
     EvidenceSanitizer,
@@ -80,10 +81,15 @@ _SSRF_SECRET_REDACTION = "<redacted-ssrf-verification>"
 _SSRF_CAPABILITY_STRATEGIES = {
     "ssrf.callback_observed_url_query": SsrfVerificationStrategy.CALLBACK,
     "ssrf.callback_declared_url_query": SsrfVerificationStrategy.CALLBACK,
+    "ssrf.callback_declared_url_json": SsrfVerificationStrategy.CALLBACK,
+    "ssrf.callback_editor_catcher_query": SsrfVerificationStrategy.CALLBACK,
     "ssrf.internal_canary_observed_url_query": (
         SsrfVerificationStrategy.INTERNAL_CANARY
     ),
     "ssrf.internal_canary_declared_url_query": (
+        SsrfVerificationStrategy.INTERNAL_CANARY
+    ),
+    "ssrf.internal_canary_editor_catcher_query": (
         SsrfVerificationStrategy.INTERNAL_CANARY
     ),
     "ssrf.internal_request_log_observed_url_query": (
@@ -92,10 +98,26 @@ _SSRF_CAPABILITY_STRATEGIES = {
     "ssrf.internal_request_log_declared_url_query": (
         SsrfVerificationStrategy.OWNED_RECEIVER
     ),
+    "ssrf.internal_request_log_declared_url_json": (
+        SsrfVerificationStrategy.OWNED_RECEIVER
+    ),
+    "ssrf.internal_request_log_editor_catcher_query": (
+        SsrfVerificationStrategy.OWNED_RECEIVER
+    ),
+    "ssrf.internal_request_log_model_download_workflow": (
+        SsrfVerificationStrategy.OWNED_RECEIVER
+    ),
+    "ssrf.internal_request_log_webhook_send_workflow": (
+        SsrfVerificationStrategy.OWNED_RECEIVER
+    ),
+    "ssrf.internal_request_log_category_csv_workflow": (
+        SsrfVerificationStrategy.OWNED_RECEIVER
+    ),
 }
 _SSRF_ANALYSIS_STRATEGIES = {
     "observed_url_callback_probe": SsrfVerificationStrategy.CALLBACK,
     "declared_url_callback_probe": SsrfVerificationStrategy.CALLBACK,
+    "declared_json_callback_probe": SsrfVerificationStrategy.CALLBACK,
     "observed_url_internal_canary_probe": (
         SsrfVerificationStrategy.INTERNAL_CANARY
     ),
@@ -106,6 +128,18 @@ _SSRF_ANALYSIS_STRATEGIES = {
         SsrfVerificationStrategy.OWNED_RECEIVER
     ),
     "declared_url_internal_request_log_probe": (
+        SsrfVerificationStrategy.OWNED_RECEIVER
+    ),
+    "declared_json_internal_request_log_probe": (
+        SsrfVerificationStrategy.OWNED_RECEIVER
+    ),
+    "declared_json_workflow_internal_request_log_probe": (
+        SsrfVerificationStrategy.OWNED_RECEIVER
+    ),
+    "declared_json_webhook_internal_request_log_probe": (
+        SsrfVerificationStrategy.OWNED_RECEIVER
+    ),
+    "declared_csv_image_internal_request_log_probe": (
         SsrfVerificationStrategy.OWNED_RECEIVER
     ),
 }
@@ -1094,11 +1128,17 @@ class RuntimeEvidenceCollector:
                 probe_started_at = probe.observation.get("execution_started_at")
                 if (
                     probe.surface_id != surface_id
-                    or probe.created_by != "execution_runtime:http_get"
+                    or probe.created_by not in {
+                        "execution_runtime:http_get", "execution_runtime:http_post",
+                    }
                     or probe.source_task_id is None
                     or probe.validation_id != item.validation_id
                     or probe.observation.get("request_kind")
-                    != HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE.value
+                    not in {
+                        HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE.value,
+                        HttpRequestKind.SSRF_WORKFLOW_OWNED_PROBE.value,
+                        HttpRequestKind.SSRF_CSV_UPLOAD_PROBE.value,
+                    }
                     or not isinstance(probe_started_at, str)
                     or datetime.fromisoformat(probe_started_at) > observation.observed_at
                 ):
@@ -1222,8 +1262,9 @@ class RuntimeEvidenceCollector:
         """Run/Candidate/입력 좌표/Validation에 묶인 일회성 URL을 발급한다."""
 
         run = self._runs.get(run_id)
-        if not parameter or len(parameter) > 128 or not parameter.isascii() or not all(
-            char.isalnum() or char in "_-" for char in parameter
+        base_parameter = parameter[:-2] if parameter.endswith("[]") else parameter
+        if not base_parameter or len(parameter) > 128 or not parameter.isascii() or not all(
+            char.isalnum() or char in "_-" for char in base_parameter
         ):
             raise AgentContractError("SSRF ticket requires a safe observed parameter name")
         service = self._ssrf_callback
@@ -1377,15 +1418,36 @@ class RuntimeEvidenceCollector:
         spec = probe_request.http_request
         if (
             spec is None
-            or spec.request_kind is not HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE
-            or probe_request.suggested_tool != "http_get"
+            or spec.request_kind not in {
+                HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE,
+                HttpRequestKind.SSRF_WORKFLOW_OWNED_PROBE,
+                HttpRequestKind.SSRF_CSV_UPLOAD_PROBE,
+            }
+            or probe_request.suggested_tool != (
+                "http_post" if spec.method.upper() == "POST" else "http_get"
+            )
         ):
             raise AgentContractError("SSRF owned receiver lookup is not a bound probe")
-        receiver_pairs = tuple(
-            (name, value)
-            for name, value in spec.query_parameters
-            if callback_url_matches_origin(value, receiver.origin)
-        )
+        if spec.request_kind is HttpRequestKind.SSRF_CSV_UPLOAD_PROBE:
+            csv_pair = ssrf_csv_upload_parameter(
+                spec.method, spec.headers, spec.body,
+            )
+            receiver_pairs = (
+                (csv_pair,) if csv_pair is not None
+                and callback_url_matches_origin(csv_pair[1], receiver.origin)
+                else ()
+            )
+        else:
+            receiver_pairs = tuple(
+                (name, value)
+                for name, value in ssrf_request_parameters(
+                    spec.method, spec.query_parameters, spec.headers, spec.body,
+                    allow_companions=(
+                        spec.request_kind is HttpRequestKind.SSRF_WORKFLOW_OWNED_PROBE
+                    ),
+                )
+                if callback_url_matches_origin(value, receiver.origin)
+            )
         if len(receiver_pairs) != 1:
             raise AgentContractError("SSRF owned receiver lookup needs one coordinate")
         parameter, _ = receiver_pairs[0]
@@ -1396,17 +1458,17 @@ class RuntimeEvidenceCollector:
             parameter,
             validation_id=validation_id,
         )
-        if sum(value == ticket.url for _, value in spec.query_parameters) != 1:
+        if len(receiver_pairs) != 1 or receiver_pairs[0][1] != ticket.url:
             raise AgentContractError("SSRF owned receiver URL was not issued for this probe")
         probe = self._evidence.get(run_id, probe_evidence_id)
         probe_started_at = probe.observation.get("execution_started_at")
         if (
             probe.surface_id != probe_request.surface_id
             or probe.validation_id != validation_id
-            or probe.created_by != "execution_runtime:http_get"
+            or probe.created_by != f"execution_runtime:{probe_request.suggested_tool}"
             or probe.source_task_id is None
             or probe.observation.get("request_kind")
-            != HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE.value
+            != spec.request_kind.value
             or probe.observation.get("request_fingerprint")
             != probe_request.request_fingerprint(target_url)
             or not isinstance(probe_started_at, str)
@@ -1508,7 +1570,9 @@ class RuntimeEvidenceCollector:
             raise ValueError("SSRF callback poll timeout exceeds the provider limit")
         spec = probe_request.http_request
         callback_pairs = (
-            tuple((name, value) for name, value in spec.query_parameters
+            tuple((name, value) for name, value in ssrf_request_parameters(
+                spec.method, spec.query_parameters, spec.headers, spec.body,
+            )
                   if value.startswith((
                       "https://", "http://127.0.0.1:",
                       "http://host.docker.internal:",
@@ -1522,8 +1586,12 @@ class RuntimeEvidenceCollector:
         )
         if (
             spec is None or spec.request_kind is not HttpRequestKind.SSRF_PROBE
-            or probe_request.suggested_tool != "http_get"
-            or sum(value == ticket.url for _, value in spec.query_parameters) != 1
+            or probe_request.suggested_tool != (
+                "http_post" if spec.method.upper() == "POST" else "http_get"
+            )
+            or sum(value == ticket.url for _, value in ssrf_request_parameters(
+                spec.method, spec.query_parameters, spec.headers, spec.body,
+            )) != 1
         ):
             raise AgentContractError("SSRF callback lookup is not bound to its probe")
         probe = self._evidence.get(run_id, probe_evidence_id)
@@ -1531,7 +1599,7 @@ class RuntimeEvidenceCollector:
         if (
             probe.surface_id != probe_request.surface_id
             or probe.validation_id != validation_id
-            or probe.created_by != "execution_runtime:http_get"
+            or probe.created_by != f"execution_runtime:{probe_request.suggested_tool}"
             or probe.source_task_id is None
             or probe.observation.get("request_kind") != HttpRequestKind.SSRF_PROBE.value
             or probe.observation.get("request_fingerprint")
@@ -1673,7 +1741,9 @@ class RuntimeEvidenceCollector:
             if candidate_id is None:
                 raise AgentContractError("SSRF probe is missing its candidate")
             callback_pairs = tuple(
-                (name, value) for name, value in request.query_parameters
+                (name, value) for name, value in ssrf_request_parameters(
+                    request.method, request.query_parameters, request.headers, request.body,
+                )
                 if value.startswith((
                     "https://", "http://127.0.0.1:",
                     "http://host.docker.internal:",
@@ -1686,19 +1756,41 @@ class RuntimeEvidenceCollector:
                 run_id, candidate_id, parameter, validation_id=validation_id,
             )
             callback_ticket = ticket
-            if sum(value == ticket.url for _, value in request.query_parameters) != 1:
+            if sum(value == ticket.url for _, value in ssrf_request_parameters(
+                request.method, request.query_parameters, request.headers, request.body,
+            )) != 1:
                 raise AgentContractError("SSRF probe URL was not issued for this candidate")
-        if request.request_kind is HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE:
+        if request.request_kind in {
+            HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE,
+            HttpRequestKind.SSRF_WORKFLOW_OWNED_PROBE,
+            HttpRequestKind.SSRF_CSV_UPLOAD_PROBE,
+        }:
             if candidate_id is None:
                 raise AgentContractError("SSRF owned receiver probe is missing its candidate")
             receiver = self._ssrf_owned_receiver
             if receiver is None:
                 raise ExternalExecutionDisabled("SSRF owned receiver is not configured")
-            receiver_pairs = tuple(
-                (name, value)
-                for name, value in request.query_parameters
-                if callback_url_matches_origin(value, receiver.origin)
-            )
+            if request.request_kind is HttpRequestKind.SSRF_CSV_UPLOAD_PROBE:
+                csv_pair = ssrf_csv_upload_parameter(
+                    request.method, request.headers, request.body,
+                )
+                receiver_pairs = (
+                    (csv_pair,) if csv_pair is not None
+                    and callback_url_matches_origin(csv_pair[1], receiver.origin)
+                    else ()
+                )
+            else:
+                receiver_pairs = tuple(
+                    (name, value)
+                    for name, value in ssrf_request_parameters(
+                        request.method, request.query_parameters,
+                        request.headers, request.body,
+                        allow_companions=(
+                            request.request_kind is HttpRequestKind.SSRF_WORKFLOW_OWNED_PROBE
+                        ),
+                    )
+                    if callback_url_matches_origin(value, receiver.origin)
+                )
             if len(receiver_pairs) != 1:
                 raise AgentContractError(
                     "SSRF owned receiver probe needs one issued coordinate"
@@ -1712,7 +1804,7 @@ class RuntimeEvidenceCollector:
                 validation_id=validation_id,
             )
             callback_ticket = ticket
-            if sum(value == ticket.url for _, value in request.query_parameters) != 1:
+            if receiver_pairs[0][1] != ticket.url:
                 raise AgentContractError(
                     "SSRF owned receiver URL was not issued for this candidate"
                 )
@@ -1797,6 +1889,11 @@ class RuntimeEvidenceCollector:
                 HttpRequestKind.SSRF_PROBE,
                 HttpRequestKind.SSRF_CANARY_PROBE,
                 HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE,
+                HttpRequestKind.SSRF_WORKFLOW_OWNED_PROBE,
+                HttpRequestKind.SSRF_CSV_UPLOAD_CONTROL,
+                HttpRequestKind.SSRF_CSV_UPLOAD_PROBE,
+                HttpRequestKind.SSRF_CSV_IMPORT_CONTROL,
+                HttpRequestKind.SSRF_CSV_IMPORT_PROBE,
             }:
                 observation["requested_url"] = _redacted_ssrf_request_url(
                     request.resolved_url,
@@ -1824,6 +1921,15 @@ class RuntimeEvidenceCollector:
                             HttpRequestKind.SSRF_PROBE,
                             HttpRequestKind.SSRF_CANARY_PROBE,
                             HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE,
+                            HttpRequestKind.SSRF_WORKFLOW_CONTROL,
+                            HttpRequestKind.SSRF_WORKFLOW_OWNED_PROBE,
+                            HttpRequestKind.SSRF_WORKFLOW_SETUP,
+                            HttpRequestKind.SSRF_WORKFLOW_TRIGGER,
+                            HttpRequestKind.SSRF_WORKFLOW_CLEANUP,
+                            HttpRequestKind.SSRF_CSV_UPLOAD_CONTROL,
+                            HttpRequestKind.SSRF_CSV_UPLOAD_PROBE,
+                            HttpRequestKind.SSRF_CSV_IMPORT_CONTROL,
+                            HttpRequestKind.SSRF_CSV_IMPORT_PROBE,
                         }
                         else stored_result.content_hash
                     ),

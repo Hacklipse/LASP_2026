@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import signal
 import threading
 import time
@@ -124,6 +126,8 @@ def _protected_observable_envelope(envelope: TaskEnvelope) -> TaskEnvelope:
         HttpRequestKind.SSRF_PROBE,
         HttpRequestKind.SSRF_CANARY_PROBE,
         HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE,
+        HttpRequestKind.SSRF_WORKFLOW_OWNED_PROBE,
+        HttpRequestKind.SSRF_CSV_UPLOAD_PROBE,
     }:
         return envelope
 
@@ -134,16 +138,45 @@ def _protected_observable_envelope(envelope: TaskEnvelope) -> TaskEnvelope:
             else _PROTECTED_SSRF_VALUE
         )
 
+    protected_body = _PROTECTED_SSRF_VALUE if request.body is not None else None
+    if request.request_kind is HttpRequestKind.SSRF_CSV_UPLOAD_PROBE:
+        assert request.body is not None
+        prefix, separator, remainder = request.body.partition("\r\n\r\n")
+        row, newline, trailer = remainder.partition("\n")
+        category, delimiter, _ = row.partition(";")
+        if not (separator and newline and delimiter):
+            raise AgentContractError("CSV probe body is malformed")
+        protected_body = (
+            prefix + separator + category + delimiter
+            + "http://%31%32%37%2e%30%2e%30%2e%31:9/redacted"
+            + newline + trailer
+        )
+    elif request.method.upper() == "POST" and request.body is not None:
+        # Keep only field names in observable tasks. The execution worker uses
+        # its original envelope, which remains bound to the issued URL ticket.
+        def protect_json(value):
+            if isinstance(value, dict):
+                return {name: protect_json(item) for name, item in value.items()}
+            if isinstance(value, str):
+                return protected(value)
+            return _PROTECTED_SSRF_VALUE
+        protected_body = json.dumps(protect_json(json.loads(request.body)))
+
     protected_request = replace(
         request,
-        query_parameters=tuple(
-            (name, protected(value)) for name, value in request.query_parameters
+        query_parameters=(
+            request.query_parameters
+            if request.request_kind is HttpRequestKind.SSRF_CSV_UPLOAD_PROBE
+            else tuple((name, protected(value)) for name, value in request.query_parameters)
         ),
         form_parameters=tuple(
             (name, protected(value)) for name, value in request.form_parameters
         ),
-        headers=tuple((name, _PROTECTED_SSRF_VALUE) for name, _ in request.headers),
-        body=_PROTECTED_SSRF_VALUE if request.body is not None else None,
+        headers=(
+            request.headers if request.method.upper() == "POST"
+            else tuple((name, _PROTECTED_SSRF_VALUE) for name, _ in request.headers)
+        ),
+        body=protected_body,
     )
     return replace(
         envelope,

@@ -9,6 +9,7 @@ from hacklipse.domain import (
     ExecutionRequest, HttpRequestKind, Run, RunRequest, RunScope,
     SsrfCanaryProofTarget,
 )
+from hacklipse.domain.models import ssrf_csv_upload_parameter, ssrf_request_parameters
 from hacklipse.ports import ApprovalGate
 from hacklipse.ports.errors import ApprovalRequired, PolicyViolation
 from hacklipse.ports.ssrf_callback import callback_url_matches_origin
@@ -144,16 +145,29 @@ class AllowlistPolicyGate:
 
         if request.run_id != run.run_id:
             raise PolicyViolation("execution request belongs to another run")
+        if (
+            request.tool == "http_delete"
+            and request.request_kind is not HttpRequestKind.SSRF_WORKFLOW_CLEANUP
+        ) or (
+            request.request_kind is HttpRequestKind.SSRF_WORKFLOW_CLEANUP
+            and request.tool != "http_delete"
+        ):
+            raise PolicyViolation("HTTP DELETE is reserved for SSRF workflow cleanup")
         if request.request_kind is HttpRequestKind.SSRF_PROBE:
+            ssrf_pairs = ssrf_request_parameters(
+                request.method, request.query_parameters, request.headers, request.body,
+            )
             callbacks = [
-                value for _, value in request.query_parameters
+                value for _, value in ssrf_pairs
                 if value.startswith((
                     "https://", "http://127.0.0.1:",
                     "http://host.docker.internal:",
                 ))
             ]
             if (
-                request.tool != "http_get" or request.method.upper() != "GET"
+                request.tool != (
+                    "http_post" if request.method.upper() == "POST" else "http_get"
+                ) or request.method.upper() not in {"GET", "POST"}
                 or self._ssrf_callback_origin is None or len(callbacks) != 1
                 or not callback_url_matches_origin(callbacks[0], self._ssrf_callback_origin)
             ):
@@ -176,27 +190,54 @@ class AllowlistPolicyGate:
                        for _, value in request.query_parameters)
             ):
                 raise PolicyViolation("SSRF canary probe requires the approved exact URL")
-        if request.request_kind is HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE:
+        if request.request_kind in {
+            HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE,
+            HttpRequestKind.SSRF_WORKFLOW_OWNED_PROBE,
+        }:
             receiver_values = [
-                (name, value) for name, value in request.query_parameters
+                (name, value) for name, value in ssrf_request_parameters(
+                    request.method, request.query_parameters, request.headers, request.body,
+                    allow_companions=(
+                        request.request_kind is HttpRequestKind.SSRF_WORKFLOW_OWNED_PROBE
+                    ),
+                )
                 if value.startswith(("http://", "https://"))
             ]
             tickets = self._ssrf_owned_receiver_tickets.get(run.run_id, {})
             if (
-                request.tool != "http_get"
-                or request.method.upper() != "GET"
+                request.tool != (
+                    "http_post" if request.method.upper() == "POST" else "http_get"
+                )
+                or request.method.upper() not in {"GET", "POST"}
                 or len(receiver_values) != 1
                 or tickets.get(receiver_values[0][1])
                 != (request.surface_id, receiver_values[0][0])
                 or any(
                     value.startswith(("http://", "https://"))
                     and value != receiver_values[0][1]
-                    for _, value in request.query_parameters
+                    for _, value in ssrf_request_parameters(
+                        request.method, request.query_parameters,
+                        request.headers, request.body,
+                        allow_companions=(
+                            request.request_kind is HttpRequestKind.SSRF_WORKFLOW_OWNED_PROBE
+                        ),
+                    )
                 )
             ):
                 raise PolicyViolation(
                     "SSRF owned-receiver probe requires its exact issued ticket"
                 )
+        if request.request_kind is HttpRequestKind.SSRF_CSV_UPLOAD_PROBE:
+            coordinate = ssrf_csv_upload_parameter(
+                request.method, request.headers, request.body,
+            )
+            tickets = self._ssrf_owned_receiver_tickets.get(run.run_id, {})
+            if (
+                request.tool != "http_post" or coordinate is None
+                or tickets.get(coordinate[1])
+                != (request.surface_id, coordinate[0])
+            ):
+                raise PolicyViolation("SSRF CSV upload requires its exact issued ticket")
         if request.tool == BROWSER_XSS_TOOL:
             if request.scope != run.scope:
                 raise PolicyViolation("browser execution scope does not match its run")
@@ -221,6 +262,21 @@ class AllowlistPolicyGate:
                 raise PolicyViolation(str(error)) from error
         # 구조화 query까지 결합된 실제 전송 URL을 기준으로 Scope를 검사한다.
         self._validate_url(request.resolved_url, run.scope)
+        if (
+            request.request_kind in {
+                HttpRequestKind.SSRF_WORKFLOW_SETUP,
+                HttpRequestKind.SSRF_WORKFLOW_TRIGGER,
+                HttpRequestKind.SSRF_WORKFLOW_CLEANUP,
+                HttpRequestKind.SSRF_CSV_UPLOAD_CONTROL,
+                HttpRequestKind.SSRF_CSV_UPLOAD_PROBE,
+                HttpRequestKind.SSRF_CSV_IMPORT_CONTROL,
+                HttpRequestKind.SSRF_CSV_IMPORT_PROBE,
+            }
+            and not self._approval.is_approved(run, request)
+        ):
+            raise ApprovalRequired(
+                "SSRF workflow trigger requires an explicit approved action reference"
+            )
         if (
             run.policy_profile == "safe"
             and (

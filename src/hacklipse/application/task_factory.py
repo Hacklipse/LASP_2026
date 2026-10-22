@@ -82,7 +82,15 @@ class TaskFactory:
         elif candidate.vulnerability_type == "SSTI":
             allowed_tools = (_SSTI_TOOL,)
         elif candidate.vulnerability_type == "SSRF":
-            allowed_tools = ("http_get", *_SSRF_TOOLS)
+            if candidate.analysis_strategy_id == "declared_json_webhook_internal_request_log_probe":
+                allowed_tools = ("http_post", "http_delete", *_SSRF_TOOLS)
+            elif candidate.analysis_strategy_id == "declared_json_workflow_internal_request_log_probe":
+                allowed_tools = ("http_get", "http_post", *_SSRF_TOOLS)
+            else:
+                allowed_tools = (
+                    "http_post" if surface_method.upper() == "POST" else "http_get",
+                    *_SSRF_TOOLS,
+                )
         elif candidate.vulnerability_type == _PUBLIC_LOGIN_CREDENTIAL_TYPE:
             allowed_tools = ("http_get", "http_post")
         elif candidate.vulnerability_type == "SQLi":
@@ -134,6 +142,15 @@ class TaskFactory:
             allowed_tools = (
                 "http_post" if surface_method.upper() == "POST" else "http_get",
             )
+        elif candidate.vulnerability_type == "SSRF":
+            if candidate.analysis_strategy_id == "declared_json_webhook_internal_request_log_probe":
+                allowed_tools = ("http_post", "http_delete")
+            elif candidate.analysis_strategy_id == "declared_json_workflow_internal_request_log_probe":
+                allowed_tools = ("http_get", "http_post")
+            else:
+                allowed_tools = (
+                    "http_post" if surface_method.upper() == "POST" else "http_get",
+                )
         else:
             allowed_tools = ("http_get",)
         return self._base(

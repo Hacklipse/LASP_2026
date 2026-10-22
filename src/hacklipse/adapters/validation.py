@@ -180,7 +180,7 @@ class ValidationAgent:
             candidate.vulnerability_type == "SSTI" and SSTI_TOOL in task.allowed_tools
         )
         specialized_login_validation = candidate.vulnerability_type == PUBLIC_LOGIN_TYPE
-        if candidate.vulnerability_type == "SQLi":
+        if candidate.vulnerability_type in {"SQLi", SSRF_TYPE}:
             surface = self._surfaces.get(task.run_id, candidate.surface_id)
             required_tool = (
                 "http_post" if surface.method.upper() == "POST" else _REPRODUCTION_TOOL
@@ -563,7 +563,9 @@ class ValidationAgent:
             item for item in evidence if item.validation_id == task.validation_id
         )
         collected = tuple(
-            matching_evidence(session_evidence, surface.url, request)
+            matching_evidence(
+                session_evidence, request.request_target_url or surface.url, request,
+            )
             for request in requests
         )
         missing = tuple(

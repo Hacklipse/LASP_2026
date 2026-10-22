@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Mapping
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
 from .errors import DomainInvariantError
 
@@ -234,6 +234,15 @@ class HttpRequestKind(str, Enum):
     SSRF_PROBE = "ssrf_probe"
     SSRF_CANARY_PROBE = "ssrf_canary_probe"
     SSRF_OWNED_RECEIVER_PROBE = "ssrf_owned_receiver_probe"
+    SSRF_WORKFLOW_CONTROL = "ssrf_workflow_control"
+    SSRF_WORKFLOW_OWNED_PROBE = "ssrf_workflow_owned_probe"
+    SSRF_WORKFLOW_SETUP = "ssrf_workflow_setup"
+    SSRF_WORKFLOW_TRIGGER = "ssrf_workflow_trigger"
+    SSRF_WORKFLOW_CLEANUP = "ssrf_workflow_cleanup"
+    SSRF_CSV_UPLOAD_CONTROL = "ssrf_csv_upload_control"
+    SSRF_CSV_UPLOAD_PROBE = "ssrf_csv_upload_probe"
+    SSRF_CSV_IMPORT_CONTROL = "ssrf_csv_import_control"
+    SSRF_CSV_IMPORT_PROBE = "ssrf_csv_import_probe"
     CORS_PROBE = "cors_probe"
     SQLI_BOOLEAN_TRUE = "sqli_boolean_true"
     SQLI_BOOLEAN_FALSE = "sqli_boolean_false"
@@ -348,7 +357,132 @@ class RunScope:
 
 _SSRF_REFERENCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/#-]{0,199}\Z")
 _SSRF_SURFACE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z")
-_SSRF_PARAMETER = re.compile(r"[A-Za-z_][A-Za-z0-9_.:-]{0,63}\Z")
+_SSRF_PARAMETER = re.compile(r"[A-Za-z_][A-Za-z0-9_.:-]{0,63}(?:\[\])?\Z")
+
+
+def ssrf_request_parameters(
+    method: str, query_parameters: tuple[tuple[str, str], ...],
+    headers: tuple[tuple[str, str], ...], body: str | None,
+    *, allow_companions: bool = False,
+) -> tuple[tuple[str, str], ...]:
+    """Read one SSRF input, optionally with a bounded flat JSON workflow body."""
+
+    if method.upper() == "GET":
+        if body is not None or headers:
+            return ()
+        return query_parameters
+    if (
+        method.upper() != "POST" or query_parameters
+        or body is None or len(body) > 4096
+    ):
+        return ()
+    if (
+        len(headers) != 1
+        or tuple((name.casefold(), value.casefold()) for name, value in headers)
+        != (("content-type", "application/json"),)
+    ):
+        return ()
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        if len(pairs) != len({name for name, _ in pairs}):
+            raise ValueError("duplicate JSON input field")
+        return dict(pairs)
+
+    try:
+        parsed = json.loads(body, object_pairs_hook=unique_object)
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(parsed, dict):
+        return ()
+    if allow_companions:
+        flattened: list[tuple[str, str]] = []
+        def visit(value: object, prefix: str, depth: int) -> bool:
+            if depth > 3 or not isinstance(value, dict):
+                return False
+            for name, item in value.items():
+                if not isinstance(name, str) or _SSRF_PARAMETER.fullmatch(name) is None:
+                    return False
+                coordinate = f"{prefix}.{name}" if prefix else name
+                if isinstance(item, dict):
+                    if not visit(item, coordinate, depth + 1):
+                        return False
+                elif isinstance(item, str):
+                    if len(item) > (
+                        2048 if item.startswith(("http://", "https://")) else 128
+                    ):
+                        return False
+                    flattened.append((coordinate, item))
+                else:
+                    return False
+                if len(flattened) > 12:
+                    return False
+            return True
+        if not visit(parsed, "", 1) or not flattened:
+            return ()
+        return tuple(flattened)
+    if (
+        len(parsed) != 1
+        or any(not isinstance(name, str) or _SSRF_PARAMETER.fullmatch(name) is None
+               or not isinstance(value, str) for name, value in parsed.items())
+    ):
+        return ()
+    return tuple(parsed.items())
+
+
+def ssrf_csv_upload_parameter(
+    method: str, headers: tuple[tuple[str, str], ...], body: str | None,
+) -> tuple[str, str] | None:
+    """Read one URL coordinate from the bounded category-image CSV upload."""
+
+    if method.upper() != "POST" or body is None or len(body) > 4096 or len(headers) != 1:
+        return None
+    header_name, header_value = headers[0]
+    if header_name.casefold() != "content-type":
+        return None
+    match = re.fullmatch(
+        r"multipart/form-data; boundary=(hacklipse[0-9a-f]{12}(?:control|probe))",
+        header_value,
+    )
+    if match is None:
+        return None
+    boundary = match.group(1)
+    suffix = boundary.removeprefix("hacklipse")
+    filename = "hacklipse-" + suffix + ".csv"
+    prefix = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        "Content-Type: text/csv\r\n\r\n"
+    )
+    trailer = f"\r\n--{boundary}--\r\n"
+    if not body.startswith(prefix) or not body.endswith(trailer):
+        return None
+    csv_line = body[len(prefix):-len(trailer)]
+    if csv_line.count("\n") != 1 or not csv_line.endswith("\n") or ";" not in csv_line:
+        return None
+    category, _, raw_url = csv_line[:-1].partition(";")
+    if category != "hacklipse" + suffix or not raw_url or "\r" in raw_url:
+        return None
+    decoded = unquote(raw_url)
+    if decoded != "hacklipse-control":
+        try:
+            parsed = urlsplit(decoded)
+            encoded = urlsplit(raw_url)
+            encoded_hostname = encoded.hostname
+        except ValueError:
+            return None
+        if (
+            parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment
+            or encoded_hostname is None
+            or encoded_hostname.casefold() != "".join(
+                f"%{ord(char):02x}" for char in parsed.hostname
+            )
+            or len(decoded) > 2048
+        ):
+            return None
+    return "csv.image", decoded
+
+
 _SSRF_REFERENCE_JWT = re.compile(
     r"(?:^|[:/#._-])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\."
     r"[A-Za-z0-9_-]{8,}(?:$|[:/#._-])"
@@ -1338,17 +1472,19 @@ class HttpRequestSpec:
         ):
             raise DomainInvariantError("open redirect probe must be a bounded GET request")
         if self.request_kind in {HttpRequestKind.SSRF_CONTROL, HttpRequestKind.SSRF_PROBE}:
+            ssrf_pairs = ssrf_request_parameters(
+                self.method, self.query_parameters, self.headers, self.body,
+            )
             callback_values = [
-                value for _, value in self.query_parameters
+                value for _, value in ssrf_pairs
                 if value.startswith((
                     "https://", "http://127.0.0.1:",
                     "http://host.docker.internal:",
                 ))
             ]
             if (
-                self.method.upper() != "GET" or self.body is not None
-                or self.form_parameters or self.headers
-                or not self.query_parameters
+                self.method.upper() not in {"GET", "POST"}
+                or self.form_parameters or not ssrf_pairs
                 or len(callback_values) != (
                     1 if self.request_kind is HttpRequestKind.SSRF_PROBE else 0
                 )
@@ -1356,11 +1492,11 @@ class HttpRequestSpec:
                     value != "hacklipse-control"
                     and value not in callback_values
                     and re.fullmatch(r"[A-Za-z0-9._~-]{0,128}", value) is None
-                    for _, value in self.query_parameters
+                    for _, value in ssrf_pairs
                 )
             ):
                 raise DomainInvariantError(
-                    "SSRF request must be a bounded GET with one registered callback"
+                    "SSRF request must have one bounded registered callback"
                 )
         if self.request_kind is HttpRequestKind.SSRF_CANARY_PROBE:
             urls = [value for _, value in self.query_parameters
@@ -1374,18 +1510,137 @@ class HttpRequestSpec:
             ):
                 raise DomainInvariantError("SSRF canary probe must be a bounded GET")
         if self.request_kind is HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE:
-            urls = [value for _, value in self.query_parameters
+            ssrf_pairs = ssrf_request_parameters(
+                self.method, self.query_parameters, self.headers, self.body,
+            )
+            urls = [value for _, value in ssrf_pairs
                     if value.startswith(("http://", "https://"))]
             if (
-                self.method.upper() != "GET" or self.body is not None
-                or self.form_parameters or self.headers or len(urls) != 1
+                self.method.upper() not in {"GET", "POST"}
+                or self.form_parameters or len(urls) != 1
                 or any(value not in urls and
                        re.fullmatch(r"[A-Za-z0-9._~-]{0,128}", value) is None
-                       for _, value in self.query_parameters)
+                       for _, value in ssrf_pairs)
             ):
                 raise DomainInvariantError(
-                    "SSRF owned-receiver probe must be a bounded GET"
+                    "SSRF owned-receiver probe must have one bounded URL"
                 )
+        if self.request_kind in {
+            HttpRequestKind.SSRF_WORKFLOW_CONTROL,
+            HttpRequestKind.SSRF_WORKFLOW_OWNED_PROBE,
+        }:
+            pairs = ssrf_request_parameters(
+                self.method, self.query_parameters, self.headers, self.body,
+                allow_companions=True,
+            )
+            url_fields = [
+                (name, value) for name, value in pairs
+                if name.casefold().rsplit(".", 1)[-1] in {
+                    "url", "uri", "link", "image_url", "feed_url", "webhook", "callback",
+                }
+            ]
+            receiver_urls = [
+                value for _, value in pairs
+                if value.startswith(("http://", "https://"))
+            ]
+            expected_url_count = (
+                1 if self.request_kind is HttpRequestKind.SSRF_WORKFLOW_OWNED_PROBE
+                else 0
+            )
+            if (
+                self.method.upper() != "POST" or self.form_parameters
+                or len(url_fields) != 1
+                or len(receiver_urls) != expected_url_count
+                or (expected_url_count == 1
+                    and receiver_urls[0] != url_fields[0][1])
+                or (self.request_kind is HttpRequestKind.SSRF_WORKFLOW_CONTROL
+                    and url_fields[0][1] != "hacklipse-control")
+                or any(
+                    value not in receiver_urls
+                    and re.fullmatch(r"[A-Za-z0-9._~-]{0,128}", value) is None
+                    for _, value in pairs
+                )
+            ):
+                raise DomainInvariantError("SSRF workflow POST must bind one URL field")
+        if self.request_kind is HttpRequestKind.SSRF_WORKFLOW_TRIGGER and (
+            self.method.upper() != "GET" or self.body is not None
+            or self.headers or self.query_parameters or self.form_parameters
+        ):
+            raise DomainInvariantError("SSRF workflow trigger must be a plain GET")
+        if self.request_kind is HttpRequestKind.SSRF_WORKFLOW_SETUP:
+            try:
+                setup = json.loads(self.body or "")
+            except ValueError:
+                setup = None
+            if (
+                self.method.upper() != "POST"
+                or self.headers != (("Content-Type", "application/json"),)
+                or self.query_parameters or self.form_parameters
+                or not isinstance(setup, dict)
+                or set(setup) != {"id", "name", "type", "provider", "configuration"}
+                or not isinstance(setup.get("id"), str)
+                or re.fullmatch(r"hacklipse[0-9a-f]{12}", setup["id"]) is None
+                or setup.get("name") != setup["id"]
+                or setup.get("type") != "webhook"
+                or setup.get("provider") != "http"
+                or setup.get("configuration") != {"url": "http://127.0.0.1:9/seed"}
+            ):
+                raise DomainInvariantError("SSRF workflow setup must be a bounded webhook config")
+        if self.request_kind is HttpRequestKind.SSRF_WORKFLOW_CLEANUP and (
+            self.method.upper() != "DELETE" or self.body is not None
+            or self.headers or self.query_parameters or self.form_parameters
+        ):
+            raise DomainInvariantError("SSRF workflow cleanup must be a plain DELETE")
+        if self.request_kind in {
+            HttpRequestKind.SSRF_CSV_UPLOAD_CONTROL,
+            HttpRequestKind.SSRF_CSV_UPLOAD_PROBE,
+        }:
+            coordinate = ssrf_csv_upload_parameter(
+                self.method, self.headers, self.body,
+            )
+            if (
+                self.method.upper() != "POST" or self.form_parameters
+                or self.query_parameters != (
+                    ("ajax", "1"), ("token", "hacklipse-credential-token"),
+                    ("_token", "hacklipse-credential-_token"),
+                )
+                or coordinate is None
+                or (self.request_kind is HttpRequestKind.SSRF_CSV_UPLOAD_CONTROL
+                    and coordinate[1] != "hacklipse-control")
+                or (self.request_kind is HttpRequestKind.SSRF_CSV_UPLOAD_PROBE
+                    and coordinate[1] == "hacklipse-control")
+            ):
+                raise DomainInvariantError("SSRF CSV upload must carry one bounded image URL")
+        if self.request_kind in {
+            HttpRequestKind.SSRF_CSV_IMPORT_CONTROL,
+            HttpRequestKind.SSRF_CSV_IMPORT_PROBE,
+        }:
+            form = dict(self.form_parameters)
+            expected_form = {
+                "entity": "0", "iso_lang": "en", "truncate": "0",
+                "forceIDs": "0", "regenerate": "0", "sendemail": "0",
+                "separator": ";", "multiple_value_separator": ",",
+                "skip": "0", "type_value[0]": "name",
+                "type_value[1]": "image", "crossStepsVars": "{}",
+            }
+            filename = form.pop("csv", None)
+            if (
+                self.method.upper() != "POST" or self.body is not None or self.headers
+                or self.query_parameters != (
+                    ("ajax", "1"), ("action", "import"),
+                    ("tab", "AdminImport"), ("offset", "0"),
+                    ("limit", "5"),
+                    ("token", "hacklipse-credential-token"),
+                )
+                or len(self.form_parameters) != len(expected_form) + 1
+                or form != expected_form
+                or not isinstance(filename, str)
+                or re.fullmatch(
+                    r"[0-9]{14}-hacklipse-[0-9a-f]{12}(?:control|probe)\.csv",
+                    filename,
+                ) is None
+            ):
+                raise DomainInvariantError("SSRF CSV import must use a bounded category mapping")
         if self.request_kind is HttpRequestKind.CORS_PROBE and (
             self.method.upper() != "GET" or self.body is not None
             or (
@@ -1494,6 +1749,9 @@ class EvidenceRequest:
     # 상태 변경 요청의 승인 참조는 비밀이 아니라 사용자가 부여한 권한의 식별자다.
     # 실제 허용 여부는 Agent가 아니라 중앙 ApprovalGate가 판단한다.
     approval_ref: str | None = None
+    # An SSRF workflow can use a separately observed, same-origin GET step.
+    # The Orchestrator verifies that this URL is an existing read surface.
+    request_target_url: str | None = None
 
     def __post_init__(self) -> None:
         if self.principal_role is not None and not isinstance(
@@ -1504,6 +1762,31 @@ class EvidenceRequest:
             raise DomainInvariantError("anonymous request cannot select a principal role")
         if self.approval_ref is not None and not self.approval_ref.strip():
             raise DomainInvariantError("evidence request approval reference cannot be blank")
+        if self.request_target_url is not None:
+            parsed = urlsplit(self.request_target_url)
+            if (
+                parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.query or parsed.fragment
+                or self.http_request is None
+                or self.http_request.request_kind not in {
+                    HttpRequestKind.SSRF_WORKFLOW_SETUP,
+                    HttpRequestKind.SSRF_WORKFLOW_TRIGGER,
+                    HttpRequestKind.SSRF_WORKFLOW_CLEANUP,
+                    HttpRequestKind.SSRF_CSV_UPLOAD_CONTROL,
+                    HttpRequestKind.SSRF_CSV_UPLOAD_PROBE,
+                }
+            ):
+                raise DomainInvariantError("workflow target must be a plain HTTP URL")
+        elif (
+            self.http_request is not None
+            and self.http_request.request_kind in {
+                HttpRequestKind.SSRF_WORKFLOW_SETUP,
+                HttpRequestKind.SSRF_WORKFLOW_TRIGGER,
+                HttpRequestKind.SSRF_WORKFLOW_CLEANUP,
+            }
+        ):
+            raise DomainInvariantError("SSRF workflow step requires an observed target")
 
     def request_fingerprint(self, target_url: str) -> str:
         """비밀값 없이 동일 EvidenceRequest를 재연결하는 결정적 식별자.

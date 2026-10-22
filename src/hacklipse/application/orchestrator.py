@@ -18,6 +18,7 @@ from hacklipse.domain import (
     AgentResultStatus,
     Candidate,
     Finding,
+    HttpRequestKind,
     KnowledgeCase,
     KnowledgeHint,
     ReportArtifact,
@@ -81,6 +82,47 @@ _PROOF_TYPE_BY_VULNERABILITY = {
 }
 
 VALIDATION_ROUNDS_EXHAUSTED_REASON = "validation rounds exhausted"
+
+
+def _ssrf_evidence_target(run, candidate, surface, request, surface_store) -> str:
+    """Allow workflow steps only at declared same-origin surfaces."""
+
+    target = request.request_target_url
+    if target is None:
+        return surface.url
+    spec = request.http_request
+    origin = urlsplit(surface.url)
+    selected = urlsplit(target)
+    if (
+        candidate.vulnerability_type != "SSRF" or spec is None
+        or spec.request_kind not in {
+            HttpRequestKind.SSRF_WORKFLOW_SETUP,
+            HttpRequestKind.SSRF_WORKFLOW_TRIGGER,
+            HttpRequestKind.SSRF_WORKFLOW_CLEANUP,
+            HttpRequestKind.SSRF_CSV_UPLOAD_CONTROL,
+            HttpRequestKind.SSRF_CSV_UPLOAD_PROBE,
+        }
+        or (spec.request_kind not in {
+                HttpRequestKind.SSRF_WORKFLOW_SETUP,
+                HttpRequestKind.SSRF_CSV_UPLOAD_CONTROL,
+                HttpRequestKind.SSRF_CSV_UPLOAD_PROBE,
+            }
+            and (spec.body is not None or spec.headers
+                 or spec.query_parameters or spec.form_parameters))
+        or (spec.request_kind in {
+                HttpRequestKind.SSRF_CSV_UPLOAD_CONTROL,
+                HttpRequestKind.SSRF_CSV_UPLOAD_PROBE,
+            } and selected.path !=
+            "/admin-dev/index.php/configure/advanced/import/file/upload")
+        or (selected.scheme, selected.netloc) != (origin.scheme, origin.netloc)
+        or not any(
+            known.url == target and known.method.upper() == spec.method.upper()
+            and not known.parameters
+            for known in surface_store.list_by_run(run.run_id)
+        )
+    ):
+        raise AgentContractError("SSRF workflow target is not a declared same-origin step")
+    return target
 
 
 @dataclass(frozen=True, slots=True)
@@ -1098,7 +1140,9 @@ class Orchestrator:
                     current,
                     candidate,
                     request,
-                    target_url=surface.url,
+                    target_url=_ssrf_evidence_target(
+                        run, candidate, surface, request, self._surfaces,
+                    ),
                     agent_type=self._config.evidence_collector_agent_type,
                     request_budget=self._budget.remaining(run.run_id),
                 )
@@ -1308,7 +1352,9 @@ class Orchestrator:
                     current,
                     candidate,
                     request,
-                    target_url=surface.url,
+                    target_url=_ssrf_evidence_target(
+                        run, candidate, surface, request, self._surfaces,
+                    ),
                     agent_type=self._config.evidence_collector_agent_type,
                     request_budget=self._budget.remaining(run.run_id),
                     validation_id=validation_id,
