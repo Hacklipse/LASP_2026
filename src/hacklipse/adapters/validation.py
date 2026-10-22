@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from urllib.parse import urlsplit
 
 from hacklipse.application.errors import AgentContractError
 from hacklipse.domain import (
@@ -33,13 +34,17 @@ from .path_traversal_analysis import (
     PATH_TRAVERSAL_BYPASS_OBSERVATION,
     PATH_TRAVERSAL_OBSERVATION,
     PATH_TRAVERSAL_TOOL,
+    build_path_assignment_requests,
     build_path_traversal_bypass_requests,
     build_path_traversal_requests,
+    has_file_like_path_assignment,
     is_restricted_file_surface,
     path_parameter_candidates,
+    path_parameters_from_evidence,
     path_traversal_bypass_signal,
     PATH_TRAVERSAL_PROBE_PAYLOADS,
     path_traversal_signal,
+    prefers_path_assignment,
 )
 from .access_control_analysis import (
     ACCESS_CONTROL_TOOL,
@@ -58,6 +63,22 @@ from .graphql_introspection import (
 from .graphql_suggestions import (
     SUGGESTION_TYPE, SUGGESTION_OBSERVATION,
     suggestion_request, suggested_field,
+)
+from .arbitrary_file_read import (
+    ARBITRARY_FILE_READ_OBSERVATION,
+    ARBITRARY_FILE_READ_PATH_CAPABILITY,
+    ARBITRARY_FILE_READ_TOOL,
+    arbitrary_file_read_signal,
+    build_arbitrary_file_read_path_requests,
+    build_arbitrary_file_read_requests,
+    build_arbitrary_file_read_segment_requests,
+    build_directory_escape_requests,
+    build_public_file_check,
+    declared_root_of,
+    directory_escape_signal,
+    file_serving_segment_index,
+    proof_file_is_public,
+    looks_like_file_parameter,
 )
 from .ssti_analysis import (
     build_ssti_form_requests,
@@ -174,6 +195,10 @@ class ValidationAgent:
             candidate.vulnerability_type == "Access Control"
             and ACCESS_CONTROL_TOOL in task.allowed_tools
         )
+        specialized_file_read_validation = (
+            candidate.vulnerability_type == "Arbitrary File Read"
+            and ARBITRARY_FILE_READ_TOOL in task.allowed_tools
+        )
         specialized_ssti_validation = (
             candidate.vulnerability_type == "SSTI" and SSTI_TOOL in task.allowed_tools
         )
@@ -189,6 +214,8 @@ class ValidationAgent:
             required_tool = ACCESS_CONTROL_TOOL
         elif specialized_ssti_validation:
             required_tool = SSTI_TOOL
+        elif specialized_file_read_validation:
+            required_tool = ARBITRARY_FILE_READ_TOOL
         elif specialized_login_validation:
             required_tool = "http_post"
         else:
@@ -234,6 +261,10 @@ class ValidationAgent:
             return self._validate_access_control(task, candidate, evidence)
         if specialized_ssti_validation:
             return self._validate_ssti(task, candidate, evidence, reproduction)
+        if specialized_file_read_validation:
+            return self._validate_arbitrary_file_read(
+                task, candidate, evidence, reproduction
+            )
         if (
             candidate.vulnerability_type == "XSS"
             and BROWSER_XSS_TOOL in task.allowed_tools
@@ -1546,6 +1577,19 @@ class ValidationAgent:
             return self._validate_path_traversal_bypass(
                 task, candidate, surface, evidence, reproduction
             )
+        # Analysis 가 고른 것과 같은 좌표를 재현해야 한다. 분기 입력도 Analyzer 와
+        # 똑같이 계산해, 한쪽은 query 를 보고 다른 쪽은 경로를 보는 일이 없게 한다.
+        if prefers_path_assignment(
+            candidate,
+            surface,
+            evidence,
+            path_parameters_from_evidence(
+                evidence, surface, tuple(dict.fromkeys(surface.parameters))
+            ),
+        ):
+            return self._validate_path_assignment(
+                task, candidate, surface, evidence, reproduction
+            )
         signaled_parameters = tuple(
             dict.fromkeys(
                 parameter
@@ -1638,6 +1682,110 @@ class ValidationAgent:
             task,
             verdict=ValidationVerdict.REJECTED,
             evidence=reproduced,
+            reason="independent probe did not reproduce the safe-file read",
+            reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+        )
+
+    def _validate_path_assignment(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        surface,
+        evidence: Sequence[Evidence],
+        reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """경로에 실린 입력 자리의 파일 읽기를 독립 세션에서 다시 만든다.
+
+        Analysis 의 증적을 그대로 쓰지 않는다. 좌표(어느 표면의 어느 자리인가)만
+        가져오고 control 과 probe 를 이 Validation 세션에서 새로 보낸다. 판정 근거는
+        고정 증명 파일의 표식이 probe 에만 나타났는지 하나뿐이다 — 상태 코드 차이나
+        서버 오류 화면은 확정 근거가 아니다.
+        """
+
+        assignment = surface.path_assignment
+        if assignment is None or not has_file_like_path_assignment(evidence, surface):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=(),
+                reason="observed path assignment coordinate is unavailable for replay",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        signaled = any(
+            item.surface_id == candidate.surface_id
+            and item.observation.get("type") == PATH_TRAVERSAL_OBSERVATION
+            and item.observation.get("location") == "path_assignment"
+            and item.observation.get("parameter") == assignment.name
+            for item in evidence
+        )
+        if not signaled:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no safe-file read signal to reproduce",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+
+        requests = build_path_assignment_requests(
+            surface, purpose=f"Path Traversal validation {task.validation_id}"
+        )
+        collected = tuple(
+            matching_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "Path Traversal validation lacks budget for independent requests",
+                    required_requests=len(missing),
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+        control, probe = collected
+        if any(
+            item.observation.get("type") in {"http_error", "http_redirect"}
+            for item in collected
+        ):
+            # 정상 control 을 못 만들었으면 비교 자체가 성립하지 않는다. 확정도
+            # 기각도 아닌 상태로 남기고 이유를 표시한다.
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=tuple(collected),
+                reason=(
+                    "independent safe-file reproduction could not obtain comparable responses"
+                ),
+                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+            )
+        if path_traversal_signal(control, probe):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence=(control, probe),
+                reason=(
+                    "independent control/probe comparison reproduced the safe-file read"
+                ),
+                reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+                proof=ValidationProof(
+                    proof_type=ValidationProofType.PATH_TRAVERSAL_FILE_READ,
+                    evidence_ids=(control.evidence_id, probe.evidence_id),
+                    summary=(
+                        "independent fixed safe-file probe reproduced an out-of-directory "
+                        f"file read through the observed path assignment {assignment.name}"
+                    ),
+                ),
+            )
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.REJECTED,
+            evidence=tuple(collected),
             reason="independent probe did not reproduce the safe-file read",
             reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
         )
@@ -1832,6 +1980,428 @@ class ValidationAgent:
             reason="independent control/probe comparison reproduced the SSTI effect",
             reason_code=ValidationReasonCode.CONFIRMED_PROOF,
             proof=proof,
+        )
+
+    def _validate_arbitrary_file_read(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        evidence,
+        reproduction,
+    ) -> AgentResult:
+        """Analysis가 남긴 신호를 독립 요청으로 다시 만들어야 확정한다."""
+
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        # Analysis 가 고른 것과 같은 좌표를 재현한다. 경로 좌표 Candidate 는 query 를
+        # 건드리지 않고, query Candidate 는 경로를 건드리지 않는다.
+        if prefers_path_assignment(
+            candidate,
+            surface,
+            evidence,
+            tuple(
+                name
+                for name in dict.fromkeys(surface.parameters)
+                if looks_like_file_parameter(name)
+            ),
+            capability_id=ARBITRARY_FILE_READ_PATH_CAPABILITY,
+        ):
+            return self._validate_arbitrary_file_read_path(
+                task, candidate, surface, evidence, reproduction
+            )
+        if file_serving_segment_index(surface) is not None:
+            return self._validate_arbitrary_file_read_segment(
+                task, candidate, surface, evidence, reproduction
+            )
+        signaled = tuple(
+            dict.fromkeys(
+                parameter
+                for item in evidence
+                if item.surface_id == candidate.surface_id
+                and item.observation.get("type") == ARBITRARY_FILE_READ_OBSERVATION
+                and isinstance((parameter := item.observation.get("parameter")), str)
+                and parameter in surface.parameters
+            )
+        )
+        if not signaled:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no absolute-path read signal to reproduce",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+
+        requests = build_arbitrary_file_read_requests(
+            surface,
+            surface.parameters,
+            signaled,
+            purpose=f"Arbitrary File Read validation {task.validation_id}",
+        )
+        collected = tuple(
+            matching_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "Arbitrary File Read validation lacks budget for independent requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+
+        reproduced = tuple(item for item in collected if item is not None)
+        if any(
+            item.observation.get("type") in {"http_error", "http_redirect"}
+            for item in reproduced
+        ):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=reproduced,
+                reason="independent absolute-path reproduction could not obtain comparable responses",
+                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+            )
+
+        control = reproduced[0]
+        # 좌표마다 표기가 여러 개 재현되므로 1:1 로 짝지으면 첫 표기만 보고 기각한다.
+        # 형태로 막는 대상에서는 그 첫 표기가 거부되는 쪽이라 특히 문제가 된다.
+        forms = max(1, len(reproduced[1:]) // max(1, len(signaled)))
+        for index, probe in enumerate(reproduced[1:]):
+            parameter = signaled[min(index // forms, len(signaled) - 1)]
+            if not arbitrary_file_read_signal(control, probe):
+                continue
+            proof_evidence = (control, probe)
+            public = self._public_proof_file_rejection(
+                task, surface, reproduction, evidence
+            )
+            if public is not None:
+                return public
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence=proof_evidence,
+                reason="independent control/probe comparison reproduced the absolute-path read",
+                reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+                proof=ValidationProof(
+                    proof_type=ValidationProofType.ARBITRARY_FILE_READ,
+                    evidence_ids=tuple(item.evidence_id for item in proof_evidence),
+                    summary=(
+                        "independent fixed absolute-path probe reproduced a file read "
+                        f"for parameter {parameter}"
+                    ),
+                ),
+            )
+
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.REJECTED,
+            evidence=reproduced,
+            reason="independent probe did not reproduce the absolute-path read",
+            reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+        )
+
+    def _public_proof_file_rejection(
+        self,
+        task: TaskEnvelope,
+        surface,
+        reproduction: Sequence[Evidence],
+        evidence: Sequence[Evidence],
+    ) -> AgentResult | None:
+        """증명 파일이 원래 공개돼 있으면 확정하지 않는다.
+
+        앱이 정적 핸들러로 이미 그 파일을 내주고 있다면, 파라미터로 읽힌 것은 취약점이
+        아니라 공개 자료다. 확정 직전에 확인하므로, 신호가 없는 대상에는 요청을 쓰지
+        않는다.
+        """
+
+        request = build_public_file_check(
+            surface, purpose=f"Arbitrary File Read validation {task.validation_id}"
+        )
+        check = matching_evidence(
+            reproduction, request.target_url_override or surface.url, request
+        )
+        if check is None:
+            if task.request_budget < 1:
+                raise BudgetExceeded(
+                    "Arbitrary File Read validation lacks budget for the public check"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=(request,),
+            )
+        if not proof_file_is_public(check):
+            return None
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.REJECTED,
+            evidence=(check,),
+            reason="the proof file is already served publicly on this origin",
+            reason_code=ValidationReasonCode.CONTROL_SIGNAL_PRESENT,
+        )
+
+    def _validate_arbitrary_file_read_segment(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        surface,
+        evidence: Sequence[Evidence],
+        reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """마지막 경로 세그먼트 교체 읽기를 독립 세션에서 다시 만든다."""
+
+        segments = urlsplit(surface.url).path.split("/")
+        signaled = any(
+            item.surface_id == candidate.surface_id
+            and item.observation.get("type") == ARBITRARY_FILE_READ_OBSERVATION
+            and item.observation.get("location") == "path_segment"
+            for item in evidence
+        )
+        if not signaled:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no absolute-path read signal to reproduce",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        requests = build_arbitrary_file_read_segment_requests(
+            surface, purpose=f"Arbitrary File Read validation {task.validation_id}"
+        )
+        collected = tuple(
+            matching_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "Arbitrary File Read validation lacks budget for independent requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+        if any(item is None for item in collected):
+            raise AgentContractError("segment reproduction was not collected")
+        control, probes = collected[0], collected[1:]
+        if any(
+            item.observation.get("type") in {"http_error", "http_redirect"}
+            for item in collected
+        ):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=tuple(collected),
+                reason=(
+                    "independent absolute-path reproduction could not obtain "
+                    "comparable responses"
+                ),
+                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+            )
+        probe = next(
+            (item for item in probes if arbitrary_file_read_signal(control, item)),
+            None,
+        )
+        if probe is None:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=tuple(collected),
+                reason="independent probe did not reproduce the absolute-path read",
+                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+            )
+        public = self._public_proof_file_rejection(
+            task, surface, reproduction, evidence
+        )
+        if public is not None:
+            return public
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.CONFIRMED,
+            evidence=(control, probe),
+            reason=(
+                "independent control/probe comparison reproduced the absolute-path read"
+            ),
+            reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+            proof=ValidationProof(
+                proof_type=ValidationProofType.ARBITRARY_FILE_READ,
+                evidence_ids=(control.evidence_id, probe.evidence_id),
+                summary=(
+                    "independent fixed absolute-path probe reproduced a file read "
+                    f"by replacing the final path segment {segments[-1]!r}"
+                ),
+            ),
+        )
+
+    def _validate_arbitrary_file_read_path(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        surface,
+        evidence: Sequence[Evidence],
+        reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """경로에 실린 입력 자리의 절대 경로 읽기를 독립 세션에서 다시 만든다."""
+
+        assignment = surface.path_assignment
+        if assignment is None or not has_file_like_path_assignment(evidence, surface):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=(),
+                reason="observed path assignment coordinate is unavailable for replay",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        signaled = any(
+            item.surface_id == candidate.surface_id
+            and item.observation.get("type") == ARBITRARY_FILE_READ_OBSERVATION
+            and item.observation.get("location") == "path_assignment"
+            and item.observation.get("parameter") == assignment.name
+            for item in evidence
+        )
+        if not signaled:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no absolute-path read signal to reproduce",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+
+        purpose = f"Arbitrary File Read validation {task.validation_id}"
+        requests = build_arbitrary_file_read_path_requests(surface, purpose=purpose)
+        collected = tuple(
+            matching_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "Arbitrary File Read validation lacks budget for independent requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+
+        control, probes = collected[0], collected[1:]
+        if control is None or any(item is None for item in probes):
+            raise AgentContractError(
+                "arbitrary file read path reproduction was not collected"
+            )
+        # 표기 중 하나라도 재현되면 확정이다. 같은 파일을 다른 표기로 읽은 것이므로
+        # 발견이 여럿이 되는 것은 아니다.
+        probe = next(
+            (item for item in probes if arbitrary_file_read_signal(control, item)),
+            probes[0],
+        )
+        if any(
+            item.observation.get("type") in {"http_error", "http_redirect"}
+            for item in (control, probe)
+        ):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=(control, probe),
+                reason=(
+                    "independent absolute-path reproduction could not obtain "
+                    "comparable responses"
+                ),
+                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+            )
+        if arbitrary_file_read_signal(control, probe):
+            public = self._public_proof_file_rejection(
+                task, surface, reproduction, evidence
+            )
+            if public is not None:
+                return public
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence=(control, probe),
+                reason=(
+                    "independent control/probe comparison reproduced the absolute-path read"
+                ),
+                reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+                proof=ValidationProof(
+                    proof_type=ValidationProofType.ARBITRARY_FILE_READ,
+                    evidence_ids=(control.evidence_id, probe.evidence_id),
+                    summary=(
+                        "independent fixed absolute-path probe reproduced a file read "
+                        f"through the observed path assignment {assignment.name}"
+                    ),
+                ),
+            )
+        # 절대 경로가 막혔어도 선언된 디렉터리 밖으로는 나갈 수 있다. Analysis 와 같은
+        # 순서로 escalate 해, 재현 요청 수도 같게 유지한다.
+        if declared_root_of(surface.path_assignment) is None:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(control, probe),
+                reason="independent probe did not reproduce the absolute-path read",
+                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+            )
+        escalated = build_directory_escape_requests(surface, purpose=purpose)
+        collected = tuple(
+            matching_evidence(reproduction, surface.url, request)
+            for request in escalated
+        )
+        missing = tuple(
+            request for request, item in zip(escalated, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "Arbitrary File Read validation lacks budget for independent requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+        if any(item is None for item in collected):
+            raise AgentContractError(
+                "directory escape reproduction was not collected"
+            )
+        escape_control, absent, escape = collected
+        if not directory_escape_signal(escape_control, absent, escape):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(escape_control, absent, escape),
+                reason="independent probe did not reproduce a read outside the directory",
+                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+            )
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.CONFIRMED,
+            evidence=(escape_control, absent, escape),
+            reason="independent probe reproduced a read outside the declared directory",
+            reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+            proof=ValidationProof(
+                proof_type=ValidationProofType.DIRECTORY_ESCAPE_FILE_READ,
+                evidence_ids=(escape_control.evidence_id, escape.evidence_id),
+                summary=(
+                    "independent probe read a file outside the declared directory "
+                    f"{declared_root_of(surface.path_assignment)!r} through the "
+                    f"observed path assignment {assignment.name}"
+                ),
+            ),
         )
 
     def _validate_ssti(

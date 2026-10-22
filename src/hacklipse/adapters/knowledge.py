@@ -20,6 +20,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from threading import RLock
+from types import MappingProxyType
 from hacklipse.domain import (
     Candidate,
     Evidence,
@@ -31,6 +32,14 @@ from hacklipse.domain import (
     generalize_surface_path,
 )
 from hacklipse.ports.errors import DuplicateRecord
+
+# Observation type 상수는 Analyzer 에서 직접 가져온다. 문자열을 베껴 두면 Analyzer 가
+# 바꿨을 때 조용히 매칭이 끊긴다 — 실제로 그렇게 끊겨 있었다.
+from .access_control_analysis import OBSERVATION_TYPE as ACCESS_CONTROL_OBSERVATION
+from .arbitrary_file_read import ARBITRARY_FILE_READ_OBSERVATION
+from .open_redirect_analysis import REDIRECT_OBSERVATION
+from .path_traversal_analysis import PATH_TRAVERSAL_OBSERVATION
+from .ssti_analysis import SSTI_OBSERVATION
 
 
 _CATEGORY_LIMIT = 80
@@ -65,13 +74,34 @@ _ALLOWED_METADATA_KEYS = frozenset(
 )
 _ENRICHMENT_METADATA_KEYS = frozenset({"signal_parameter_names"})
 
-_PROOF_TYPE_BY_VULNERABILITY = {
-    "XSS": "xss_execution",
-    "SQLi": "sqli_effect",
-    "Access Control": "unauthorized_object_access",
-    "Path Traversal": "path_traversal_file_read",
-    "SSTI": "ssti_execution",
-}
+# 어느 Observation 이 그 취약점의 probe 신호를 만든 좌표를 들고 있는가.
+#
+# 값은 Analyzer 가 실제로 기록하는 Observation type 이어야 한다. 이전 판은 여기에
+# ValidationProofType 문자열("xss_execution" 등)을 넣어 두었는데, 두 어휘가 우연히
+# 일치하는 Path Traversal 하나만 맞고 나머지는 아무 Observation 과도 매칭되지 않아
+# signal_parameter_names 가 조용히 비어 있었다. 그래서 상수를 직접 가져온다 —
+# Analyzer 가 type 을 바꾸면 import 가 깨져 드러난다.
+#
+# 좌표가 없는 유형은 ``()`` 로 명시한다. 라우트 자체가 노출인 유형은 바꿔 볼 파라미터가
+# 없어 비어 있는 것이 정상이며, 빠뜨린 것과 구분되어야 한다.
+_SIGNAL_OBSERVATIONS_BY_VULNERABILITY: Mapping[str, tuple[str, ...]] = MappingProxyType({
+    "XSS": ("reflection",),
+    "SQLi": ("sql_error", "sqli_differential"),
+    "SSTI": (SSTI_OBSERVATION,),
+    "Path Traversal": (PATH_TRAVERSAL_OBSERVATION,),
+    "Arbitrary File Read": (ARBITRARY_FILE_READ_OBSERVATION,),
+    "Open Redirect": (REDIRECT_OBSERVATION,),
+    "Access Control": (ACCESS_CONTROL_OBSERVATION,),
+    "CORS": (),
+    "Sensitive Data Exposure": (),
+    "Exposed Working Credentials": (),
+    "GraphQL Introspection Exposure": (),
+    "GraphQL Field Suggestion Exposure": (),
+    "Source Map Exposure": (),
+    "Error Detail Exposure": (),
+})
+# Access Control 은 좌표를 ``parameter`` 가 아니라 ``identifier_parameter`` 에 적는다.
+_SIGNAL_PARAMETER_FIELDS = ("parameter", "identifier_parameter")
 
 
 def knowledge_case_id(
@@ -117,11 +147,14 @@ class KnowledgeCaseFactory:
         """
 
         _validate_source_relationships(finding, candidate, surface)
-        proof_type = _PROOF_TYPE_BY_VULNERABILITY.get(finding.vulnerability_type)
-        if proof_type is None:
+        # 확정 Finding 은 자기를 확정시킨 proof type 을 이미 들고 있다. 취약점 유형으로
+        # 다시 조회하면 사본을 하나 더 두는 셈이고, 한 Agent 가 전략을 여럿 가지면
+        # 어느 쪽으로 확정됐는지도 잃는다.
+        if finding.proof_type is None:
             raise ValueError(
-                "knowledge publication requires a supported vulnerability proof type"
+                "knowledge publication requires a confirmed vulnerability proof"
             )
+        proof_type = finding.proof_type.value
 
         method = surface.method.upper()
         surface_kind = _surface_kind(surface)
@@ -428,8 +461,10 @@ def _confirmed_signal_parameters(
 ) -> tuple[str, ...]:
     """확정 Candidate에서 구조화된 probe 신호를 만든 안전한 좌표만 추출한다."""
 
-    signal_type = _PROOF_TYPE_BY_VULNERABILITY.get(finding.vulnerability_type)
-    if signal_type is None:
+    signal_types = _SIGNAL_OBSERVATIONS_BY_VULNERABILITY.get(
+        finding.vulnerability_type
+    )
+    if not signal_types:
         return ()
     allowed_ids = set(candidate.evidence_ids)
     selected: list[str] = []
@@ -438,11 +473,18 @@ def _confirmed_signal_parameters(
             item.evidence_id not in allowed_ids
             or item.run_id != finding.run_id
             or item.surface_id != surface.surface_id
-            or item.observation.get("type") != signal_type
+            or item.observation.get("type") not in signal_types
         ):
             continue
-        parameter = item.observation.get("parameter")
-        if not isinstance(parameter, str):
+        parameter = next(
+            (
+                value
+                for field in _SIGNAL_PARAMETER_FIELDS
+                if isinstance((value := item.observation.get(field)), str)
+            ),
+            None,
+        )
+        if parameter is None:
             continue
         generalized = generalize_parameter_names((parameter,))[0]
         if generalized == "{parameter}":

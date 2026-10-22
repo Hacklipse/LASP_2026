@@ -31,8 +31,26 @@ _CWE = {
     ValidationProofType.XSS_EXECUTION: "CWE-79",
     ValidationProofType.SQLI_EFFECT: "CWE-89",
     ValidationProofType.PATH_TRAVERSAL_FILE_READ: "CWE-22",
+    # 탈출 시퀀스 없이 절대 경로를 그대로 여는 쪽은 CWE-22 의 하위인 CWE-36 이다.
+    # 이 분석기가 따로 있는 이유 자체가 ``..`` 를 거르는 필터가 절대 경로는 막지
+    # 못한다는 것이므로, 부모로 뭉개지 않고 정확한 쪽을 쓴다.
+    ValidationProofType.ARBITRARY_FILE_READ: "CWE-36",
+    # 탈출 탐침 값은 상대 경로에 탈출 시퀀스를 담으므로 CWE-23 이다. 절대 경로(CWE-36)와
+    # 같은 Agent 가 내보내지만 증명한 사실이 다르므로 같은 값으로 뭉개지 않는다.
+    ValidationProofType.DIRECTORY_ESCAPE_FILE_READ: "CWE-23",
+    # 사용자가 바꿀 수 있는 객체 식별자로 남의 객체를 읽는 IDOR.
+    ValidationProofType.UNAUTHORIZED_OBJECT_ACCESS: "CWE-639",
     ValidationProofType.SSTI_EXECUTION: "CWE-1336",
 }
+# 새 proof type 이 매핑 없이 추가되면 CWE 필드가 조용히 빠진 채로 내보내진다. 스코어러는
+# 그 finding 을 분류하지 못하는데 수출 쪽은 성공한 것처럼 보이므로, 여기서 먼저 막는다.
+_UNMAPPED_PROOF_TYPES = tuple(
+    item.name for item in ValidationProofType if item not in _CWE
+)
+if _UNMAPPED_PROOF_TYPES:
+    raise RuntimeError(
+        "scoring export is missing a CWE for: " + ", ".join(_UNMAPPED_PROOF_TYPES)
+    )
 _SEVERITIES = frozenset({"info", "low", "medium", "high", "critical"})
 
 

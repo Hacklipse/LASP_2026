@@ -72,6 +72,12 @@ _PROOF_TYPE_BY_VULNERABILITY = {
     "SQLi": ValidationProofType.SQLI_EFFECT,
     "Access Control": ValidationProofType.UNAUTHORIZED_OBJECT_ACCESS,
     "Path Traversal": ValidationProofType.PATH_TRAVERSAL_FILE_READ,
+    # 한 Agent가 여러 전략을 가지면 확정 근거도 여럿이다. 절대 경로를 그대로 여는 것과
+    # 선언된 디렉터리를 벗어나는 것은 증명하는 사실이 달라 proof type을 나눠 두었다.
+    "Arbitrary File Read": (
+        ValidationProofType.ARBITRARY_FILE_READ,
+        ValidationProofType.DIRECTORY_ESCAPE_FILE_READ,
+    ),
     "SSTI": ValidationProofType.SSTI_EXECUTION,
     "File Upload": ValidationProofType.FILE_UPLOAD_RETRIEVAL,
 }
@@ -1391,14 +1397,13 @@ class Orchestrator:
                     raise AgentContractError("related proof surface is outside the candidate origin")
 
         if validation.verdict is ValidationVerdict.CONFIRMED:
-            expected_proof = _PROOF_TYPE_BY_VULNERABILITY.get(
-                candidate.vulnerability_type
-            )
-            if expected_proof is None or validation.proof is None:
+            expected = _PROOF_TYPE_BY_VULNERABILITY.get(candidate.vulnerability_type)
+            if expected is None or validation.proof is None:
                 raise AgentContractError(
                     "confirmed validation has no supported vulnerability proof"
                 )
-            if validation.proof.proof_type is not expected_proof:
+            accepted = expected if isinstance(expected, tuple) else (expected,)
+            if validation.proof.proof_type not in accepted:
                 raise AgentContractError(
                     "validation proof type does not match the candidate vulnerability"
                 )

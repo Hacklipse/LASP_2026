@@ -20,7 +20,19 @@ from .error_disclosure import (
 )
 from .sensitive_exposure import CONFIG_ROUTE_OBSERVATION
 from .public_login_credentials import PUBLIC_LOGIN_OBSERVATION, PUBLIC_LOGIN_TYPE
+from .arbitrary_file_read import (
+    ARBITRARY_FILE_READ_PATH_CAPABILITY,
+    ARBITRARY_FILE_READ_SEGMENT_CAPABILITY,
+    DIRECTORY_ESCAPE_CAPABILITY,
+    file_serving_segment_index,
+)
 from .open_redirect_analysis import REDIRECT_PARAMETER_HINTS
+from .path_traversal_analysis import (
+    FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION,
+    PATH_ASSIGNMENT_CAPABILITY,
+    PATH_ASSIGNMENT_OBSERVATION,
+    PATH_ASSIGNMENT_SOURCE,
+)
 from .postmessage_plan import POSTMESSAGE_ANALYZER, POSTMESSAGE_CAPABILITY, POSTMESSAGE_PLAN
 from .file_upload_analysis import UPLOAD_TYPE, UPLOAD_ANALYZER, UPLOAD_FORM
 
@@ -224,6 +236,31 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         default_priority=0.25,
     ),
     AnalyzerCapability(
+        # 관측된 경로 내장 입력 전용 좌표. path_traversal.http.query 와 합치지 않는다.
+        # 그쪽은 query를 덧붙여 탐침하므로, 경로가 입력을 나르는 표면에 쓰면 대상이
+        # 가진 적 없는 `?file=` URL을 만든다.
+        capability_id=PATH_ASSIGNMENT_CAPABILITY,
+        agent_type="path_traversal_analyzer",
+        vulnerability_type="Path Traversal",
+        methods=("GET",),
+        surface_kind="server",
+        requires_parameters=False,
+        requires_path_assignment=True,
+        observation_requirements=(
+            # 위치(어디에 입력이 있는가)와 의미 가설(그 이름이 파일형인가)을 모두
+            # 요구한다. 위치만으로 파일 탐침을 보내면 `url`·`redirect` 같은 자리에도
+            # 요청이 나간다.
+            ObservationRequirement(PATH_ASSIGNMENT_OBSERVATION, PATH_ASSIGNMENT_SOURCE),
+            ObservationRequirement(
+                FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION, PATH_ASSIGNMENT_SOURCE
+            ),
+        ),
+        exploration_parameter_source="none",
+        supported_evidence_types=("control_response", "file_read_marker"),
+        strategy_ids=("probe_observed_path_assignment",),
+        default_priority=0.26,
+    ),
+    AnalyzerCapability(
         capability_id="path_traversal.bounded_render_form",
         agent_type="path_traversal_analyzer",
         vulnerability_type="Path Traversal",
@@ -311,7 +348,76 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         strategy_ids=("compare_object_ownership",),
         default_priority=0.35,
     ),
+    AnalyzerCapability(
+        # 같은 경로 좌표를 Path Traversal 과 다른 값으로 탐침한다. `..`를 거르는 필터가
+        # 절대 경로는 막지 못하는 경우가 있어 둘 다 시도할 값이 있다.
+        capability_id=ARBITRARY_FILE_READ_PATH_CAPABILITY,
+        agent_type="arbitrary_file_read_analyzer",
+        vulnerability_type="Arbitrary File Read",
+        methods=("GET",),
+        surface_kind="server",
+        requires_parameters=False,
+        requires_path_assignment=True,
+        observation_requirements=(
+            ObservationRequirement(PATH_ASSIGNMENT_OBSERVATION, PATH_ASSIGNMENT_SOURCE),
+            ObservationRequirement(
+                FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION, PATH_ASSIGNMENT_SOURCE
+            ),
+        ),
+        exploration_parameter_source="none",
+        supported_evidence_types=("control_response", "file_read_marker"),
+        strategy_ids=("probe_observed_path_assignment_absolute",),
+        default_priority=0.24,
+    ),
+    AnalyzerCapability(
+        # 같은 경로 좌표의 세 번째 전략. 고정 절대 경로가 앱 루트 밖이라 영영 거부되는
+        # 대상에서도, 선언된 하위 디렉터리 제한이 강제되지 않는다는 사실은 증명된다.
+        capability_id=DIRECTORY_ESCAPE_CAPABILITY,
+        agent_type="arbitrary_file_read_analyzer",
+        vulnerability_type="Arbitrary File Read",
+        methods=("GET",),
+        surface_kind="server",
+        requires_parameters=False,
+        requires_path_assignment=True,
+        observation_requirements=(
+            ObservationRequirement(PATH_ASSIGNMENT_OBSERVATION, PATH_ASSIGNMENT_SOURCE),
+            ObservationRequirement(
+                FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION, PATH_ASSIGNMENT_SOURCE
+            ),
+        ),
+        exploration_parameter_source="none",
+        supported_evidence_types=("control_response", "file_read_marker"),
+        strategy_ids=("probe_directory_escape",),
+        default_priority=0.23,
+    ),
+    AnalyzerCapability(
+        # query 가 없는 파일 제공 라우트. 바꿔 볼 파라미터가 없어 다른 두 좌표로는
+        # 닿지 못하고, 디렉터리 단서가 있을 때만 붙어 표면 전체로 번지지 않는다.
+        capability_id=ARBITRARY_FILE_READ_SEGMENT_CAPABILITY,
+        agent_type="arbitrary_file_read_analyzer",
+        vulnerability_type="Arbitrary File Read",
+        methods=("GET",),
+        surface_kind="server",
+        requires_parameters=False,
+        requires_file_serving_segment=True,
+        exploration_parameter_source="none",
+        supported_evidence_types=("control_response", "file_read_marker"),
+        strategy_ids=("probe_file_serving_segment",),
+        default_priority=0.21,
+    ),
+    AnalyzerCapability(
+        capability_id="arbitrary_file_read.http.query",
+        agent_type="arbitrary_file_read_analyzer",
+        vulnerability_type="Arbitrary File Read",
+        methods=("GET",),
+        surface_kind="server",
+        exploration_parameter_source="surface",
+        supported_evidence_types=("control_response", "file_read_marker"),
+        strategy_ids=("probe_absolute_file_path",),
+        default_priority=0.22,
+    ),
 )
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,6 +548,12 @@ def capability_missing_requirements(
         or surface.path_identifier is not None
     ):
         missing.append("object_identifier")
+    if capability.requires_path_assignment and surface.path_assignment is None:
+        missing.append("path_assignment")
+    if capability.requires_file_serving_segment and (
+        file_serving_segment_index(surface) is None
+    ):
+        missing.append("file_serving_segment")
     for requirement in capability.observation_requirements:
         if not any(
             item.run_id == surface.run_id

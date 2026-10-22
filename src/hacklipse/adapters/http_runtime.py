@@ -35,6 +35,10 @@ _HTTP_TOOLS = frozenset(
         "http_get",
         "http_post",
         "path_traversal_probe",
+        # 이 도구가 빠져 있던 동안 Arbitrary File Read는 Analyzer와 Validation이
+        # 모두 구현돼 있어도 실제 대상에서 한 건도 실행되지 못했다. 테스트가 Evidence를
+        # 직접 만들어 넣는 대역을 써서 드러나지 않았다.
+        "arbitrary_file_read_probe",
         "access_control_probe",
         "ssti_probe",
     }
@@ -331,7 +335,14 @@ class HttpExecutionRuntime:
         }
 
         # 텍스트만 디코딩한다. 바이너리는 강제 문자열화하지 않고 크기·해시만 남긴다.
-        if method != "HEAD" and _is_textual(content_type):
+        # 읽어 낸 파일은 application/octet-stream 으로 오는 경우가 많다.
+        # 텍스트만 디코딩하면 본문이 비어 표식을 볼 수 없다.
+        if method != "HEAD" and (
+            _is_textual(content_type)
+            # 도구 이름은 _HTTP_TOOLS 와 같이 리터럴로 둔다 — 이 저수준 Runtime 이
+            # Analyzer 모듈을 import 하면 순환이 생긴다.
+            or request.tool == "arbitrary_file_read_probe"
+        ):
             body_text = raw.decode(_charset(content_type), errors="replace")
             if self._redirect_origin_aliases:
                 request_origin = urllib.parse.urlsplit(requested_url)

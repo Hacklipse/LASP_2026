@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from urllib.parse import urlsplit
 
-from hacklipse.domain import ExecutionRequest, Run, RunRequest, RunScope
-from hacklipse.ports import ApprovalGate
-from hacklipse.ports.errors import ApprovalRequired, PolicyViolation
+from hacklipse.domain import ExecutionRequest, HttpRequestKind, Run, RunRequest, RunScope
+from hacklipse.ports import ApprovalGate, SurfaceStore
+from hacklipse.ports.errors import ApprovalRequired, PolicyViolation, RecordNotFound
 
 from .request_safety import has_state_changing_get
 from .security import DenyAllApprovalGate
@@ -17,6 +17,10 @@ from .path_traversal_analysis import (
 from .access_control_analysis import (
     ACCESS_CONTROL_TOOL,
     validate_access_control_request,
+)
+from .arbitrary_file_read import (
+    ARBITRARY_FILE_READ_TOOL,
+    validate_arbitrary_file_read_request,
 )
 from .ssti_analysis import SSTI_TOOL, validate_ssti_request
 from .xss_execution import BROWSER_XSS_TOOL, validate_browser_xss_request
@@ -30,6 +34,7 @@ class AllowlistPolicyGate:
 
     def __init__(self, approval_gate: ApprovalGate | None = None) -> None:
         self._approval = approval_gate or DenyAllApprovalGate()
+
 
     def validate_run(self, request: RunRequest) -> None:
         """Run 시작 대상이 선언된 Scope 안에 있는지 검사한다."""
@@ -56,6 +61,11 @@ class AllowlistPolicyGate:
         if request.tool == PATH_TRAVERSAL_TOOL:
             try:
                 validate_path_traversal_request(request)
+            except ValueError as error:
+                raise PolicyViolation(str(error)) from error
+        if request.tool == ARBITRARY_FILE_READ_TOOL:
+            try:
+                validate_arbitrary_file_read_request(request)
             except ValueError as error:
                 raise PolicyViolation(str(error)) from error
         if request.tool == SSTI_TOOL:

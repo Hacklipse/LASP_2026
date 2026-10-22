@@ -37,6 +37,7 @@ from hacklipse.domain import (
     AgentResultStatus,
     Evidence,
     EvidenceRequest,
+    PathAssignment,
     Surface,
     TaskEnvelope,
 )
@@ -69,7 +70,12 @@ from .llm_recon_planner import (
     find_stored_recon_plan,
     recon_plan_status_detail,
 )
+from .arbitrary_file_read import looks_like_file_parameter
 from .path_traversal_analysis import (
+    FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION,
+    PATH_ASSIGNMENT_OBSERVATION,
+    PATH_ASSIGNMENT_SKIPPED_OBSERVATION,
+    PATH_ASSIGNMENT_SOURCE,
     RESTRICTED_FILE_OBSERVATION,
     UNLINKED_RENDER_PARAMETER_OBSERVATION,
 )
@@ -280,6 +286,9 @@ _MAX_AGENTIC_SELECTABLE = 32
 _MAX_AGENTIC_CONTEXT = 2
 _MAX_AGENTIC_OBSERVATIONS = _MAX_AGENTIC_SELECTABLE + _MAX_AGENTIC_CONTEXT
 _PATH_OBJECT_ID = re.compile(r"^[0-9]{1,10}$")
+# 경로에 실린 입력 이름으로 인정할 형태. 도메인의 PathAssignment 불변식과 같은 모양을
+# 쓴다 — 여기서 먼저 거르는 것은 거부당할 좌표로 Evidence를 만들지 않기 위해서다.
+_PATH_ASSIGNMENT_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,31}")
 _PATH_RESOURCE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
 # 숫자 세그먼트를 뒤에 달지만 객체 컬렉션이 아닌 좌표. 형제가 여럿이어도 식별자로
 # 보지 않는다 — 페이지네이션과 API 버전이 바로 이 모양이다.
@@ -865,6 +874,16 @@ class ReconAgent:
             and item.observation.get("type") == CONFIG_ROUTE_OBSERVATION
             and item.surface_id is not None
         }
+        # 파일형 경로 입력 가설은 이름 단위로 한 번만 세운다. `/file=a.js`와 `/file=b.js`는
+        # 서로 다른 Surface지만 같은 서버 처리기를 가리키므로, 둘 다 라우팅하면 같은
+        # 자리를 두 번 탐침하며 예산만 쓴다.
+        path_assignment_names_seen: set[str] = {
+            name for item in self._evidence.list_by_run(task.run_id)
+            if item.created_by == "recon"
+            and item.observation.get("type") == FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION
+            and isinstance((name := item.observation.get("parameter")), str)
+        }
+        path_assignment_skips_seen: set[str] = set()
         api_schema_found = False
         schema_get_samples_queued = 0
         schema_collections: dict[str, list[tuple[str, str]]] = {}
@@ -930,6 +949,13 @@ class ReconAgent:
         ) -> str:
             clean_url = url.split("?", 1)[0]
             path_identifier = _path_identifier(clean_url, numeric_siblings)
+            assignment, skip_reason = _path_assignment(
+                clean_url, source=PATH_ASSIGNMENT_SOURCE
+            )
+            if assignment is not None and assignment.name in names:
+                # 같은 이름이 query에도 있으면 어느 자리를 관측한 것인지 단정할 수 없다.
+                # 좌표를 섞지 않는다는 계약이 깨지므로 경로 쪽을 인정하지 않는다.
+                assignment, skip_reason = None, "name_collides_with_query_parameter"
             key_url = _canonical_surface_url(clean_url, path_identifier)
             key = (key_url, method, names)
             def record_error_route(surface_id: str) -> None:
@@ -993,6 +1019,7 @@ class ReconAgent:
                 names,
                 observed=observed,
                 path_identifier=path_identifier,
+                path_assignment=assignment,
                 discovery_types=tuple(dict.fromkeys(discovery_types)),
             )
             record_error_route(surface_id)
@@ -1000,6 +1027,17 @@ class ReconAgent:
             evidence_ids.extend(
                 self._flag_suspect_parameters(
                     task.run_id, surface_id, names, clean_url, method, observed
+                )
+            )
+            evidence_ids.extend(
+                self._flag_path_assignment(
+                    task.run_id,
+                    surface_id,
+                    assignment,
+                    skip_reason,
+                    method,
+                    names_seen=path_assignment_names_seen,
+                    skips_seen=path_assignment_skips_seen,
                 )
             )
             if _looks_like_restricted_file(clean_url):
@@ -2253,6 +2291,7 @@ class ReconAgent:
         *,
         observed: tuple[tuple[str, str], ...] = (),
         path_identifier: tuple[str, int, str] | None = None,
+        path_assignment: PathAssignment | None = None,
         discovery_types: tuple[str, ...] = (),
     ) -> None:
         path_name, path_index, path_value = path_identifier or (None, None, None)
@@ -2267,6 +2306,7 @@ class ReconAgent:
                 path_identifier=path_name,
                 path_identifier_index=path_index,
                 observed_path_identifier=path_value,
+                path_assignment=path_assignment,
                 discovery_types=discovery_types,
             )
         )
@@ -2341,6 +2381,101 @@ class ReconAgent:
             )
             evidence_ids.append(evidence_id)
         return evidence_ids
+
+    def _flag_path_assignment(
+        self,
+        run_id: str,
+        surface_id: str,
+        assignment: PathAssignment | None,
+        skip_reason: str | None,
+        method: str,
+        *,
+        names_seen: set[str],
+        skips_seen: set[str],
+    ) -> list[str]:
+        """경로에 실린 입력의 위치와, 그 이름이 파일형이라는 가설을 따로 남긴다.
+
+        두 관측을 나누는 이유는 둘이 다른 주장이기 때문이다. 위치 관측은 "URL 경로에
+        ``이름=값``이 있었다"는 구문 사실이고, 파일형 가설은 "그 이름이 서버의 파일을
+        여는 자리로 보인다"는 해석이다. 어느 쪽도 "서버가 이를 입력으로 처리한다"는
+        뜻이 아니며, 그 판정은 control/probe를 비교한 뒤에만 나온다.
+
+        ``=``가 있었지만 좌표로 인정하지 않은 경우에는 사유만 남긴다. 추측해서 요청을
+        만들지 않되, 무엇을 건너뛰었는지는 감사할 수 있어야 한다.
+        """
+
+        evidence_ids: list[str] = []
+        if assignment is None:
+            if skip_reason is None or skip_reason in skips_seen or len(skips_seen) >= 8:
+                return evidence_ids
+            skips_seen.add(skip_reason)
+            evidence_ids.append(
+                self._append_observation(
+                    run_id,
+                    surface_id,
+                    {
+                        "type": PATH_ASSIGNMENT_SKIPPED_OBSERVATION,
+                        "reason": skip_reason,
+                        "source": PATH_ASSIGNMENT_SOURCE,
+                    },
+                )
+            )
+            return evidence_ids
+
+        evidence_ids.append(
+            self._append_observation(
+                run_id,
+                surface_id,
+                {
+                    "type": PATH_ASSIGNMENT_OBSERVATION,
+                    "parameter": assignment.name,
+                    "location": "path_assignment",
+                    "source": assignment.source,
+                    # 구문 관측일 뿐이라는 것을 Evidence 자체에 남긴다. 이후 단계가
+                    # 이 관측을 "검증된 서버 입력"으로 오해하지 않게 한다.
+                    "interpretation": "syntactic_only",
+                    "server_input_confirmed": False,
+                },
+            )
+        )
+        if (
+            method.upper() != "GET"
+            or not looks_like_file_parameter(assignment.name)
+            or assignment.name in names_seen
+            or len(names_seen) >= 4
+        ):
+            return evidence_ids
+        names_seen.add(assignment.name)
+        evidence_ids.append(
+            self._append_observation(
+                run_id,
+                surface_id,
+                {
+                    "type": FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION,
+                    "parameter": assignment.name,
+                    "location": "path_assignment",
+                    "source": PATH_ASSIGNMENT_SOURCE,
+                    "server_input_confirmed": False,
+                },
+            )
+        )
+        return evidence_ids
+
+    def _append_observation(
+        self, run_id: str, surface_id: str, observation: dict[str, object]
+    ) -> str:
+        evidence_id = f"evi-{self._id_factory()}"
+        self._evidence.append(
+            Evidence(
+                evidence_id=evidence_id,
+                run_id=run_id,
+                surface_id=surface_id,
+                created_by="recon",
+                evidence_type="observation",
+                observation=observation,
+            )
+        )
+        return evidence_id
 
     def _flag_post_form_structure(
         self, run_id: str, surface_id: str, names: tuple[str, ...]
@@ -2918,6 +3053,61 @@ def _parse_page(
         if len(inline_scripts) >= 16:
             break
     return links, forms, sources, inline_scripts
+
+
+# 경로 안에서 `=`로 입력을 싣는 표면을 찾을 때 의존하는 두 구분자의 인코딩 형태.
+# 경로에 이것들이 있으면 어디까지가 이름이고 값인지 단정할 수 없다.
+_ENCODED_PATH_DELIMITERS = ("%3d", "%2f")
+
+
+def _path_assignment(url: str, *, source: str) -> tuple[PathAssignment | None, str | None]:
+    """경로에 ``이름=값``으로 실린 입력 좌표를 보수적으로 식별한다.
+
+    query가 아니라 경로가 입력을 나르는 프레임워크가 있다(``/file=web_assets/app.js``).
+    그 자리를 query parameter로 기록하면 Analyzer가 ``?file=``을 덧붙인, 대상이 제공한
+    적 없는 URL을 만든다. 그래서 값이 경로에서 차지하는 범위를 그대로 보존한다.
+
+    모호하면 좌표를 만들지 않고 사유를 돌려준다. 여기서 추측하면 관측하지 않은 자리에
+    요청을 보내게 되고, 그것은 이 도구가 하지 않기로 한 일이다. 반환값의 두 번째 항목은
+    "``=``가 있었지만 인정하지 않은" 경우의 사유이며, ``=``가 아예 없으면 ``None``이다.
+
+    값은 첫 ``=`` 뒤부터 경로 끝까지다. 파일 경로는 ``/``를 포함하는 것이 정상이라
+    다음 세그먼트에서 자르면 값이 잘린다.
+    """
+
+    path = urlsplit(url).path
+    marker = path.find("=")
+    if marker < 0:
+        return None, None
+    lowered = path.casefold()
+    if any(token in lowered for token in _ENCODED_PATH_DELIMITERS):
+        # 인코딩된 `=`나 `/`가 섞이면 이름과 값의 경계를 단정할 수 없다.
+        return None, "encoded_delimiter"
+    if path.count("=") > 1:
+        # `/file=a=b`는 값이 `a=b`인지 좌표가 둘인지 구분할 근거가 없다.
+        return None, "ambiguous_multiple_assignments"
+    name = path[path.rfind("/", 0, marker) + 1 : marker]
+    if not name:
+        return None, "empty_name"
+    if _PATH_ASSIGNMENT_NAME.fullmatch(name) is None:
+        # base64 꼬리(`/aGVsbG8=`)처럼 `=`를 포함한 경로를 입력으로 오인하지 않는다.
+        return None, "name_not_identifier"
+    value = path[marker + 1 :]
+    if not value:
+        return None, "empty_value"
+    if value.startswith("/"):
+        # `=/`는 세그먼트 끝의 padding으로 보이며 값의 시작 위치가 분명하지 않다.
+        return None, "value_starts_with_separator"
+    return (
+        PathAssignment(
+            name=name,
+            value_start=marker + 1,
+            value_end=len(path),
+            observed_value=value,
+            source=source,
+        ),
+        None,
+    )
 
 
 def _query_names(url: str) -> tuple[str, ...]:

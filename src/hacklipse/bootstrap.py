@@ -18,6 +18,7 @@ from hacklipse.adapters import (
     HeuristicAccessControlAnalyzer,
     HeuristicSqliAnalyzer,
     HeuristicSstiAnalyzer,
+    HeuristicArbitraryFileReadAnalyzer,
     HeuristicPathTraversalAnalyzer,
     HeuristicXssAnalyzer,
     InMemoryBudgetManager,
@@ -224,6 +225,7 @@ def build_local_application(
     selected_budget = ReservedBudgetManager(
         budget_manager if budget_manager is not None else InMemoryBudgetManager()
     )
+
     policy = AllowlistPolicyGate(approval_gate=approval_gate)
     # 명시적인 Runtime 주입이 없으면 외부 실행을 전부 거부하는 구현을 선택한다.
     selected_runtime = runtime or DisabledExecutionRuntime()
@@ -290,6 +292,7 @@ def build_local_application(
                 "http_post",
                 "browser_xss",
                 "path_traversal_probe",
+                "arbitrary_file_read_probe",
                 "access_control_probe",
                 "ssti_probe",
             ),
@@ -383,8 +386,10 @@ IMPLEMENTED_ANALYZERS = (
     "postmessage_xss_analyzer",
     "sqli_analyzer",
     "path_traversal_analyzer",
+    "arbitrary_file_read_analyzer",
     "ssti_analyzer",
 )
+
 
 def standard_router(
     vulnerability_types: Collection[str] | None = None,
@@ -898,6 +903,17 @@ def register_standard_agents(
         access_control_analyzer,
         allowed_tools=("access_control_probe",),
     )
+    # LLM 변형이 없는 분석기이므로 프로필 분기 밖에서 한 번만 만든다.
+    arbitrary_file_read_analyzer: Agent = HeuristicArbitraryFileReadAnalyzer(
+        candidate_store=app.stores.candidates,
+        surface_store=app.stores.surfaces,
+        evidence_store=app.stores.evidence,
+    )
+    app.dispatcher.register(
+        "arbitrary_file_read_analyzer",
+        arbitrary_file_read_analyzer,
+        allowed_tools=("arbitrary_file_read_probe",),
+    )
     app.dispatcher.register(
         "ssti_analyzer",
         ssti_analyzer,
@@ -928,6 +944,7 @@ def register_standard_agents(
             "http_post",
             "browser_xss",
             "path_traversal_probe",
+            "arbitrary_file_read_probe",
             "access_control_probe",
             "ssti_probe",
         ),

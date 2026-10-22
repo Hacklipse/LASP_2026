@@ -24,6 +24,7 @@ from .llm_browser_xss_analysis import (
 from .llm_xss_analysis import LlmXssAnalyzer
 from .memory import CallbackProgressLog, InMemoryProgressLog, MemoryStoreBundle
 from .policy import AllowlistPolicyGate
+from .arbitrary_file_read import HeuristicArbitraryFileReadAnalyzer
 from .path_traversal_analysis import HeuristicPathTraversalAnalyzer
 from .access_control_analysis import HeuristicAccessControlAnalyzer
 from .llm_access_control_analysis import LlmAccessControlAnalyzer

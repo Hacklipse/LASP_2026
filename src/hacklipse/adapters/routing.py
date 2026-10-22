@@ -22,6 +22,8 @@ from .request_safety import (
     object_identifier_parameters,
 )
 from .open_redirect_analysis import REDIRECT_PARAMETER_HINTS
+from .arbitrary_file_read import file_serving_segment_index
+from .path_traversal_analysis import FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION
 from .cors_analysis import CORS_OBSERVATION, CORS_SEARCH_INPUT_NAMES
 from .graphql_introspection import INTROSPECTION_TYPE, INTROSPECTION_RECON_OBSERVATION
 from .graphql_suggestions import SUGGESTION_TYPE, SUGGESTION_PLAN
@@ -121,6 +123,21 @@ class IdentifierSurfaceRoutingRule:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class FileServingSegmentRoutingRule(SurfaceRoutingRule):
+    """마지막 세그먼트가 파일 이름인 파라미터 없는 라우트.
+
+    파라미터가 없으면 다른 탐색 규칙은 이 표면을 건너뛴다. 디렉터리 단서를 요구하는
+    이유는 요구하지 않으면 파라미터 없는 모든 GET 이 후보가 되기 때문이다 — 후보가
+    표면 수만큼 늘고, 라우팅 기대값을 고정한 기존 테스트가 깨진다.
+    """
+
+    requires_parameters: bool = False
+
+    def matches(self, surface: Surface) -> bool:
+        return file_serving_segment_index(surface) is not None
+
+
 # 첫 버전은 설명 가능하고 재현하기 쉬운 명시적 규칙으로 라우팅한다.
 DEFAULT_RULES = (
     RoutingRule(UPLOAD_FORM, UPLOAD_TYPE, UPLOAD_ANALYZER, 0.25, methods=("POST",)),
@@ -168,6 +185,24 @@ DEFAULT_RULES = (
         methods=("GET",),
     ),
     RoutingRule(
+        # 경로에 실린 파일형 입력. 이름만 보고 세우는 query 가설과 달리 값이 실제로
+        # 관측된 좌표라 우선순위를 조금 높게 둔다.
+        FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION,
+        "Path Traversal",
+        "path_traversal_analyzer",
+        0.62,
+        methods=("GET",),
+    ),
+    RoutingRule(
+        # 같은 관측에서 절대 경로 읽기도 올라온다. query 표면에서 url_or_file_parameter가
+        # 두 분석기로 가는 것과 같은 구조다.
+        FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION,
+        "Arbitrary File Read",
+        "arbitrary_file_read_analyzer",
+        0.57,
+        methods=("GET",),
+    ),
+    RoutingRule(
         "file_serving_parameter",
         "Path Traversal",
         "path_traversal_analyzer",
@@ -183,6 +218,15 @@ DEFAULT_RULES = (
     ),
     RoutingRule("template_error", "SSTI", "ssti_analyzer", 0.7),
     RoutingRule("template_execution", "SSTI", "ssti_analyzer", 0.9),
+    # 파일 파라미터를 가리키는 같은 관측에서 상대 탈출과 함께 올라온다. ``..``를
+    # 거르는 필터가 절대 경로는 막지 못하는 경우가 있어 둘 다 시도할 값이 있다.
+    RoutingRule(
+        "url_or_file_parameter",
+        "Arbitrary File Read",
+        "arbitrary_file_read_analyzer",
+        0.55,
+        methods=("GET",),
+    ),
 )
 
 # Public source maps can be deliberately published for debugging or open
@@ -254,7 +298,11 @@ DEFAULT_SURFACE_RULES = (
     IdentifierSurfaceRoutingRule(
         "Access Control", "access_control_analyzer", priority=0.35
     ),
+    FileServingSegmentRoutingRule(
+        "Arbitrary File Read", "arbitrary_file_read_analyzer", priority=0.21,
+    ),
 )
+
 
 
 # 규칙이 만든 어떤 Candidate보다도 낮다(현재 규칙 최저값은 SSTI 탐색의 0.20).
@@ -422,7 +470,14 @@ class RuleBasedVulnerabilityRouter:
             raise ValueError("review policy must be weak or ambiguous")
         if advisor_mode not in _ADVISOR_MODES:
             raise ValueError("advisor mode must be supplemental or primary")
-        self._rules = {rule.observation_type: rule for rule in rules}
+        # 관측 하나가 여러 분석기로 갈 수 있다. 파일형 파라미터 관측은 상대 탈출과
+        # 절대 경로 읽기를 모두 정당화하며, 둘은 서로 다른 것을 증명한다. dict 하나에
+        # 덮어쓰면 나중에 선언된 규칙만 남아 다른 쪽이 조용히 사라진다.
+        self._rules: dict[str, tuple[RoutingRule, ...]] = {}
+        for rule in rules:
+            self._rules[rule.observation_type] = (
+                *self._rules.get(rule.observation_type, ()), rule,
+            )
         self._surface_rules = tuple(surface_rules)
         self._id_factory = id_factory or (lambda: str(uuid4()))
         self._advisor = advisor
@@ -478,8 +533,8 @@ class RuleBasedVulnerabilityRouter:
         decisions: dict[tuple[str, str], RouteDecision] = {}
         for item in evidence:
             observation_type = str(item.observation.get("type", ""))
-            rule = self._rules.get(observation_type)
-            if rule is None or item.surface_id is None:
+            matched = self._rules.get(observation_type, ())
+            if not matched or item.surface_id is None:
                 continue
             surface = next(
                 (
@@ -496,22 +551,30 @@ class RuleBasedVulnerabilityRouter:
                 run.execution_profile.state_changing_approved
             ):
                 continue
-            if rule.methods is not None and surface.method.upper() not in rule.methods:
-                continue
-            key = (item.surface_id, rule.vulnerability_type)
-            # 동일 Surface와 취약점 유형 조합은 하나의 Candidate만 생성한다.
-            if key in decisions:
-                continue
-            candidate = Candidate(
-                candidate_id=f"candidate-{self._id_factory()}",
-                run_id=run.run_id,
-                surface_id=item.surface_id,
-                vulnerability_type=rule.vulnerability_type,
-                hypothesis=f"{rule.vulnerability_type} candidate from {observation_type}",
-                assigned_agent=rule.agent_type,
-                evidence_ids=(item.evidence_id,),
-            )
-            decisions[key] = RouteDecision(candidate=candidate, priority=rule.priority)
+            for rule in matched:
+                if (
+                    rule.methods is not None
+                    and surface.method.upper() not in rule.methods
+                ):
+                    continue
+                key = (item.surface_id, rule.vulnerability_type)
+                # 동일 Surface와 취약점 유형 조합은 하나의 Candidate만 생성한다.
+                if key in decisions:
+                    continue
+                candidate = Candidate(
+                    candidate_id=f"candidate-{self._id_factory()}",
+                    run_id=run.run_id,
+                    surface_id=item.surface_id,
+                    vulnerability_type=rule.vulnerability_type,
+                    hypothesis=(
+                        f"{rule.vulnerability_type} candidate from {observation_type}"
+                    ),
+                    assigned_agent=rule.agent_type,
+                    evidence_ids=(item.evidence_id,),
+                )
+                decisions[key] = RouteDecision(
+                    candidate=candidate, priority=rule.priority
+                )
 
         # Some checks describe a server-wide setting. Sample a bounded number
         # of actual read surfaces per origin so these candidates cannot exhaust

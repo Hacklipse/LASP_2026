@@ -47,6 +47,7 @@ class RuntimeEvidenceCollector:
         audit_log: ExecutionAuditLog | None = None,
         id_factory: Callable[[], str] | None = None,
         default_approval_ref: str | None = None,
+        evidence_projection: Callable[[ExecutionRequest, ExecutionResult], ExecutionResult] | None = None,
     ) -> None:
         self._runs = run_store
         self._evidence = evidence_store
@@ -57,6 +58,7 @@ class RuntimeEvidenceCollector:
         self._audit = audit_log
         self._id_factory = id_factory or (lambda: str(uuid4()))
         self._default_approval_ref = default_approval_ref
+        self._evidence_projection = evidence_projection
 
     def collect(
         self,
@@ -122,6 +124,13 @@ class RuntimeEvidenceCollector:
             path_identifier_index=http_request.path_identifier_index,
             path_identifier_value=http_request.path_identifier_value,
             path_suffix=http_request.path_suffix,
+            path_assignment_name=http_request.path_assignment_name,
+            path_assignment_value_start=http_request.path_assignment_value_start,
+            path_assignment_value_end=http_request.path_assignment_value_end,
+            path_assignment_value=http_request.path_assignment_value,
+            file_read_path_index=http_request.file_read_path_index,
+            file_read_path_value=http_request.file_read_path_value,
+            file_read_parameter=http_request.file_read_parameter,
             validation_id=validation_id,
             timeout_seconds=min(timeout_seconds, run.timeout_seconds),
             credential_ref=_credential_for(
@@ -151,10 +160,15 @@ class RuntimeEvidenceCollector:
             raise error
 
         try:
-            stored_result = (
-                self._sanitizer.sanitize(request, result)
-                if self._sanitizer is not None
+            projected_result = (
+                self._evidence_projection(request, result)
+                if self._evidence_projection is not None
                 else result
+            )
+            stored_result = (
+                self._sanitizer.sanitize(request, projected_result)
+                if self._sanitizer is not None
+                else projected_result
             )
             # Runtime 결과는 메시지로 중계하지 않고 Evidence Store에 먼저 기록한다.
             evidence_id = f"evi-{self._id_factory()}"

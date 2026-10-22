@@ -181,3 +181,47 @@ fact preservation, offered-set citation containment, status representation, and
 narrator cost. Neither establishes semantic accuracy: the fixed-fixture human
 blind review that the measurement contract also requires is not part of this
 tool. Keep the target and its state fixed when collecting the runs.
+
+# Arbitrary File Read detector
+
+The `Arbitrary File Read` agent proves that a server opens a path it was not
+meant to serve. The `Path Traversal` agent stays separate and proves a different
+fact — that the server follows an escape sequence it was handed.
+
+It works three ways, all on observed GET coordinates:
+
+- an observed query input, carrying the fixed absolute proof path;
+- a path that carries its input as `name=value` (`/file=web_assets/app.js`),
+  replacing only the span the value occupies, never appending a query;
+- when the absolute path is refused, a read that leaves the directory the
+  observed values live in. That one escalation is why a target which rejects
+  both the escape sequence and the absolute path can still be proven.
+
+The file to read is fixed per probe kind in the domain, so neither an agent nor
+a model can choose another one, and only a marker seen in the probe and absent
+from the control confirms. Validation repeats the pair independently. Analyzer
+and module docstrings carry the probe contract and the cases it cannot reach;
+bodies of any kind are the main one.
+
+Run the common pipeline against an authorized local application:
+
+```bash
+python scripts/run_baseline.py 'http://127.0.0.1:8000/download?file=sample' 80
+```
+
+Three coordinates, then. A query input, a value carried in the path as
+`name=value`, and the final segment of a parameterless file route such as
+`/download/report.pdf` — the last one asks for a directory cue before it
+offers a candidate, so it does not attach to every GET without a query.
+
+Each coordinate is tried in every spelling the domain fixes for its probe
+kind, because filters reject a shape rather than a file: a target that refuses
+`/etc/os-release` may still serve it when the separator arrives encoded. Every
+spelling resolves to the same file, so what gets read is still not a choice.
+Reading it two ways is one finding, not two.
+
+Before confirming, the proof file is fetched directly on the same origin. If
+the app already publishes it, the read proves nothing and the candidate is
+rejected.
+
+Merged in from `feat/arbitrary-file-read-detection-plan`.

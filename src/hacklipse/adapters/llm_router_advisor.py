@@ -1333,6 +1333,9 @@ def surface_routing_summary(
         "parameter_names": list(alias_parameter_names(surface.parameters).prompt_names),
         "requires_auth": surface.requires_auth,
         "has_path_identifier": surface.path_identifier is not None,
+        # 경로에 입력이 실려 있다는 구조 사실만 알린다. 관측값은 넣지 않으며, 모델은
+        # 이 좌표를 새로 만들 수 없고 이미 관측된 것의 우선순위만 고를 수 있다.
+        "has_path_assignment": surface.path_assignment is not None,
         "observation_types": sorted(
             {
                 kind

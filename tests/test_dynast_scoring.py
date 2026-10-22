@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+import dynast_scoring
 from dynast_scoring import build_dynast_documents
 from hacklipse.adapters.memory import MemoryStoreBundle
 from hacklipse.domain import (
@@ -167,6 +168,36 @@ class DynastScoringTests(unittest.TestCase):
         self.assertIn({"kind": "graphql", "graphql_kind": "query", "op": "posts"},
                       endpoints["endpoints"])
         self.assertFalse(any(item.get("op") == "secretField" for item in endpoints["endpoints"]))
+
+
+class DynastCweMappingTests(unittest.TestCase):
+    """모든 proof type 이 CWE 를 갖는지 고정한다.
+
+    매핑이 빠지면 finding 은 그대로 내보내지면서 ``cwe`` 필드만 사라진다. 수출은
+    성공한 것처럼 보이고 스코어러는 그 finding 을 분류하지 못하므로, 조용히 통과하는
+    실패가 된다. Access Control 과 Arbitrary File Read 가 실제로 그렇게 빠져 있었다.
+    """
+
+    def test_every_proof_type_has_a_cwe(self) -> None:
+        missing = [
+            item.name for item in ValidationProofType if item not in dynast_scoring._CWE
+        ]
+        self.assertEqual(missing, [])
+
+    def test_file_read_and_object_access_cwes(self) -> None:
+        self.assertEqual(
+            dynast_scoring._CWE[ValidationProofType.ARBITRARY_FILE_READ], "CWE-36"
+        )
+        self.assertEqual(
+            dynast_scoring._CWE[ValidationProofType.UNAUTHORIZED_OBJECT_ACCESS],
+            "CWE-639",
+        )
+        # 상대 탈출과 절대 경로는 서로 다른 CWE 로 나간다. 같은 값이면 둘을 나눈
+        # 이유가 수출 결과에서 사라진다.
+        self.assertNotEqual(
+            dynast_scoring._CWE[ValidationProofType.PATH_TRAVERSAL_FILE_READ],
+            dynast_scoring._CWE[ValidationProofType.ARBITRARY_FILE_READ],
+        )
 
 
 if __name__ == "__main__":
