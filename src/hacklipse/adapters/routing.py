@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
 from hacklipse.domain import Candidate, Evidence, RouteDecision, Run, Surface
@@ -22,6 +22,8 @@ from .request_safety import (
     object_identifier_parameters,
 )
 from .open_redirect_analysis import REDIRECT_PARAMETER_HINTS
+from .arbitrary_file_read import file_serving_segment_index
+from .path_traversal_analysis import FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION
 from .cors_analysis import CORS_OBSERVATION, CORS_SEARCH_INPUT_NAMES
 from .graphql_introspection import INTROSPECTION_TYPE, INTROSPECTION_RECON_OBSERVATION
 from .graphql_suggestions import SUGGESTION_TYPE, SUGGESTION_PLAN
@@ -31,7 +33,21 @@ from .error_disclosure import (
 )
 from .sensitive_exposure import CONFIG_ROUTE_OBSERVATION
 from .public_login_credentials import PUBLIC_LOGIN_OBSERVATION, PUBLIC_LOGIN_TYPE
+from .file_upload_analysis import UPLOAD_TYPE, UPLOAD_ANALYZER, UPLOAD_FORM
+from .ssrf_analysis import (
+    SSRF_ANALYZER,
+    SSRF_CALLBACK_CAPABILITY, SSRF_CALLBACK_DECLARED_CAPABILITY,
+    SSRF_CALLBACK_JSON_CAPABILITY, SSRF_CALLBACK_EDITOR_CAPABILITY,
+    SSRF_CANARY_CAPABILITY, SSRF_CANARY_DECLARED_CAPABILITY,
+    SSRF_CANARY_EDITOR_CAPABILITY,
+    SSRF_OWNED_RECEIVER_CAPABILITY, SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY,
+    SSRF_OWNED_RECEIVER_JSON_CAPABILITY, SSRF_OWNED_RECEIVER_EDITOR_CAPABILITY,
+    SSRF_EDITOR_CATCHER_STRUCTURE,
+    SSRF_JSON_PARAMETER_HINTS, SSRF_PARAMETER_HINTS, SSRF_TYPE,
+    observed_url_parameter_names,
+)
 
+from .ssti_analysis import SSTI_PARAMETER_HINTS
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +61,10 @@ class RoutingRule:
     # Observation 자체만으로는 부족한 Agent 계약(예: Path Traversal은 GET만)을
     # 라우팅 단계에서 함께 표현한다. None이면 기존처럼 모든 메서드를 허용한다.
     methods: tuple[str, ...] | None = None
+    observation_parameter_field: str | None = None
+    parameter_hints: tuple[str, ...] = ()
+    capability_id: str = ""
+    analysis_strategy_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,11 +78,14 @@ class SurfaceRoutingRule:
     parameter_hints: tuple[str, ...] = ()
     priority: float = 0.25
     max_candidates_per_origin: int | None = None
+    capability_id: str = ""
+    analysis_strategy_id: str = ""
 
     # SPA 클라이언트 라우트(`/#/search`)는 HTTP 요청 대상이 아니다. fragment 는
     # 서버로 전송되지 않으므로 HTTP 기반 Analyzer 가 받으면 매번 같은 루트 문서만
     # 받아 신호 없이 예산만 쓴다. 브라우저 도구를 쓰는 규칙만 opt-in 한다.
     client_route: bool = False
+    requires_observed_query: bool = False
 
     def matches(self, surface: Surface) -> bool:
         if surface.method.upper() not in self.methods:
@@ -74,6 +97,15 @@ class SurfaceRoutingRule:
         if self.parameter_hints:
             offered = {name.casefold() for name in surface.parameters}
             if not offered.intersection(hint.casefold() for hint in self.parameter_hints):
+                return False
+        if self.requires_observed_query:
+            observed = {name for name, _ in surface.observed_query}
+            observed.update(name for name, _ in parse_qsl(
+                urlsplit(surface.url).query, keep_blank_values=True,
+            ))
+            if not any(name in observed for name in surface.parameters
+                       if not self.parameter_hints or
+                       name.casefold() in {hint.casefold() for hint in self.parameter_hints}):
                 return False
         return True
 
@@ -92,6 +124,19 @@ class DiscoveredSurfaceRoutingRule(SurfaceRoutingRule):
 
     def matches(self, surface: Surface) -> bool:
         return bool(surface.discovery_types) and super().matches(surface)
+
+
+class SsrfSurfaceRoutingRule(SurfaceRoutingRule):
+    """Also route an observed URL value under a nonstandard field name."""
+
+    def matches(self, surface: Surface) -> bool:
+        if super().matches(surface):
+            return True
+        return (
+            surface.method.upper() == "GET"
+            and not urlsplit(surface.url).fragment
+            and bool(set(surface.parameters) & observed_url_parameter_names(surface))
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,8 +164,24 @@ class IdentifierSurfaceRoutingRule:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class FileServingSegmentRoutingRule(SurfaceRoutingRule):
+    """마지막 세그먼트가 파일 이름인 파라미터 없는 라우트.
+
+    파라미터가 없으면 다른 탐색 규칙은 이 표면을 건너뛴다. 디렉터리 단서를 요구하는
+    이유는 요구하지 않으면 파라미터 없는 모든 GET 이 후보가 되기 때문이다 — 후보가
+    표면 수만큼 늘고, 라우팅 기대값을 고정한 기존 테스트가 깨진다.
+    """
+
+    requires_parameters: bool = False
+
+    def matches(self, surface: Surface) -> bool:
+        return file_serving_segment_index(surface) is not None
+
+
 # 첫 버전은 설명 가능하고 재현하기 쉬운 명시적 규칙으로 라우팅한다.
 DEFAULT_RULES = (
+    RoutingRule(UPLOAD_FORM, UPLOAD_TYPE, UPLOAD_ANALYZER, 0.25, methods=("POST",)),
     RoutingRule(
         "postmessage_html_plan", "XSS", "postmessage_xss_analyzer",
         # A fresh browser navigation is needed for the benign probe and both
@@ -165,6 +226,24 @@ DEFAULT_RULES = (
         methods=("GET",),
     ),
     RoutingRule(
+        # 경로에 실린 파일형 입력. 이름만 보고 세우는 query 가설과 달리 값이 실제로
+        # 관측된 좌표라 우선순위를 조금 높게 둔다.
+        FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION,
+        "Path Traversal",
+        "path_traversal_analyzer",
+        0.62,
+        methods=("GET",),
+    ),
+    RoutingRule(
+        # 같은 관측에서 절대 경로 읽기도 올라온다. query 표면에서 url_or_file_parameter가
+        # 두 분석기로 가는 것과 같은 구조다.
+        FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION,
+        "Arbitrary File Read",
+        "arbitrary_file_read_analyzer",
+        0.57,
+        methods=("GET",),
+    ),
+    RoutingRule(
         "file_serving_parameter",
         "Path Traversal",
         "path_traversal_analyzer",
@@ -180,6 +259,15 @@ DEFAULT_RULES = (
     ),
     RoutingRule("template_error", "SSTI", "ssti_analyzer", 0.7),
     RoutingRule("template_execution", "SSTI", "ssti_analyzer", 0.9),
+    # 파일 파라미터를 가리키는 같은 관측에서 상대 탈출과 함께 올라온다. ``..``를
+    # 거르는 필터가 절대 경로는 막지 못하는 경우가 있어 둘 다 시도할 값이 있다.
+    RoutingRule(
+        "url_or_file_parameter",
+        "Arbitrary File Read",
+        "arbitrary_file_read_analyzer",
+        0.55,
+        methods=("GET",),
+    ),
 )
 
 # Public source maps can be deliberately published for debugging or open
@@ -228,17 +316,187 @@ DEFAULT_SURFACE_RULES = (
     SurfaceRoutingRule(
         "SQLi", "sqli_analyzer", methods=("POST",), priority=0.30
     ),
+    # 템플릿에 렌더링되는 좌표의 이름은 대상마다 name·message·template 등으로 다르다.
+    # 힌트 목록은 분석기가 실제로 고를 때 쓰는 집합과 같은 상수를 참조해 두 곳으로
+    # 갈라지지 않게 한다. POST를 username 하나로 좁혀 두었던 것은 그 경로가 프로필에
+    # **쓰는** 요청뿐이었기 때문인데, 이제 응답에만 렌더링되는 폼은 상태를 남기지 않는
+    # 경로로 확인하므로 그 제약이 필요 없다. 저장되는 /profile 쓰기는 분석기와 안전
+    # 검증기가 여전히 username으로만 허용한다.
     SurfaceRoutingRule(
         "SSTI",
         "ssti_analyzer",
         methods=("POST",),
-        parameter_hints=("username",),
+        parameter_hints=tuple(sorted(SSTI_PARAMETER_HINTS)),
+        priority=0.20,
+    ),
+    SurfaceRoutingRule(
+        "SSTI",
+        "ssti_analyzer",
+        methods=("GET",),
+        parameter_hints=tuple(sorted(SSTI_PARAMETER_HINTS)),
         priority=0.20,
     ),
     IdentifierSurfaceRoutingRule(
         "Access Control", "access_control_analyzer", priority=0.35
     ),
+    FileServingSegmentRoutingRule(
+        "Arbitrary File Read", "arbitrary_file_read_analyzer", priority=0.21,
+    ),
 )
+
+OPTIONAL_SSRF_SURFACE_RULES = (
+    SsrfSurfaceRoutingRule(
+        SSRF_TYPE, SSRF_ANALYZER,
+        parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
+        requires_observed_query=True, priority=0.30,
+        capability_id=SSRF_CALLBACK_CAPABILITY,
+        analysis_strategy_id="observed_url_callback_probe",
+    ),
+)
+
+OPTIONAL_SSRF_OBSERVATION_RULES = (
+    RoutingRule(
+        SSRF_EDITOR_CATCHER_STRUCTURE, SSRF_TYPE, SSRF_ANALYZER,
+        0.28, methods=("GET",),
+        observation_parameter_field="query_parameter_names",
+        parameter_hints=(),
+        capability_id=SSRF_CALLBACK_EDITOR_CAPABILITY,
+        analysis_strategy_id="declared_url_callback_probe",
+    ),
+    RoutingRule(
+        "openapi_request_structure", SSRF_TYPE, SSRF_ANALYZER,
+        0.28, methods=("GET",),
+        observation_parameter_field="query_parameter_names",
+        parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
+        capability_id=SSRF_CALLBACK_DECLARED_CAPABILITY,
+        analysis_strategy_id="declared_url_callback_probe",
+    ),
+    RoutingRule(
+        "javascript_json_request_structure", SSRF_TYPE, SSRF_ANALYZER,
+        0.28, methods=("POST",),
+        observation_parameter_field="body_parameter_names",
+        parameter_hints=tuple(sorted(SSRF_JSON_PARAMETER_HINTS)),
+        capability_id=SSRF_CALLBACK_JSON_CAPABILITY,
+        analysis_strategy_id="declared_json_callback_probe",
+    ),
+)
+
+OPTIONAL_SSRF_CANARY_SURFACE_RULES = (
+    SsrfSurfaceRoutingRule(
+        SSRF_TYPE, SSRF_ANALYZER,
+        parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
+        requires_observed_query=True, priority=0.31,
+        capability_id=SSRF_CANARY_CAPABILITY,
+        analysis_strategy_id="observed_url_internal_canary_probe",
+    ),
+)
+
+OPTIONAL_SSRF_CANARY_OBSERVATION_RULES = (
+    RoutingRule(
+        SSRF_EDITOR_CATCHER_STRUCTURE, SSRF_TYPE, SSRF_ANALYZER,
+        0.29, methods=("GET",),
+        observation_parameter_field="query_parameter_names",
+        parameter_hints=(),
+        capability_id=SSRF_CANARY_EDITOR_CAPABILITY,
+        analysis_strategy_id="declared_url_internal_canary_probe",
+    ),
+    RoutingRule(
+        "openapi_request_structure", SSRF_TYPE, SSRF_ANALYZER,
+        0.29, methods=("GET",),
+        observation_parameter_field="query_parameter_names",
+        parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
+        capability_id=SSRF_CANARY_DECLARED_CAPABILITY,
+        analysis_strategy_id="declared_url_internal_canary_probe",
+    ),
+)
+
+OPTIONAL_SSRF_OWNED_RECEIVER_SURFACE_RULES = (
+    SsrfSurfaceRoutingRule(
+        SSRF_TYPE, SSRF_ANALYZER,
+        parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
+        requires_observed_query=True, priority=0.32,
+        capability_id=SSRF_OWNED_RECEIVER_CAPABILITY,
+        analysis_strategy_id="observed_url_internal_request_log_probe",
+    ),
+)
+
+OPTIONAL_SSRF_OWNED_RECEIVER_OBSERVATION_RULES = (
+    RoutingRule(
+        SSRF_EDITOR_CATCHER_STRUCTURE, SSRF_TYPE, SSRF_ANALYZER,
+        0.30, methods=("GET",),
+        observation_parameter_field="query_parameter_names",
+        parameter_hints=(),
+        capability_id=SSRF_OWNED_RECEIVER_EDITOR_CAPABILITY,
+        analysis_strategy_id="declared_url_internal_request_log_probe",
+    ),
+    RoutingRule(
+        "openapi_request_structure", SSRF_TYPE, SSRF_ANALYZER,
+        0.30, methods=("GET",),
+        observation_parameter_field="query_parameter_names",
+        parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
+        capability_id=SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY,
+        analysis_strategy_id="declared_url_internal_request_log_probe",
+    ),
+    RoutingRule(
+        "javascript_json_request_structure", SSRF_TYPE, SSRF_ANALYZER,
+        0.30, methods=("POST",),
+        observation_parameter_field="body_parameter_names",
+        parameter_hints=tuple(sorted(SSRF_JSON_PARAMETER_HINTS)),
+        capability_id=SSRF_OWNED_RECEIVER_JSON_CAPABILITY,
+        analysis_strategy_id="declared_json_internal_request_log_probe",
+    ),
+)
+
+# A registered passive review still needs an exact coordinate Candidate, but it
+# is deliberately not labelled as callback or canary execution.
+OPTIONAL_SSRF_REVIEW_SURFACE_RULES = (
+    SsrfSurfaceRoutingRule(
+        SSRF_TYPE, SSRF_ANALYZER,
+        parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
+        requires_observed_query=True, priority=0.30,
+    ),
+)
+
+OPTIONAL_SSRF_REVIEW_OBSERVATION_RULES = (
+    RoutingRule(
+        SSRF_EDITOR_CATCHER_STRUCTURE, SSRF_TYPE, SSRF_ANALYZER,
+        0.28, methods=("GET",),
+        observation_parameter_field="query_parameter_names",
+        parameter_hints=(),
+    ),
+    RoutingRule(
+        "openapi_request_structure", SSRF_TYPE, SSRF_ANALYZER,
+        0.28, methods=("GET",),
+        observation_parameter_field="query_parameter_names",
+        parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
+    ),
+)
+
+
+def _decision_key(
+    surface_id: str, vulnerability_type: str, capability_id: str = "",
+) -> tuple[str, str]:
+    """Deduplicate provenance variants within one SSRF execution strategy."""
+
+    if capability_id in {
+        SSRF_CALLBACK_CAPABILITY, SSRF_CALLBACK_DECLARED_CAPABILITY,
+        SSRF_CALLBACK_JSON_CAPABILITY, SSRF_CALLBACK_EDITOR_CAPABILITY,
+    }:
+        return surface_id, "ssrf.callback"
+    if capability_id in {
+        SSRF_CANARY_CAPABILITY, SSRF_CANARY_DECLARED_CAPABILITY,
+        SSRF_CANARY_EDITOR_CAPABILITY,
+    }:
+        return surface_id, "ssrf.internal_canary"
+    if capability_id in {
+        SSRF_OWNED_RECEIVER_CAPABILITY,
+        SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY,
+        SSRF_OWNED_RECEIVER_JSON_CAPABILITY,
+        SSRF_OWNED_RECEIVER_EDITOR_CAPABILITY,
+    }:
+        return surface_id, "ssrf.internal_request_log"
+    return surface_id, capability_id or vulnerability_type
+
 
 
 # 규칙이 만든 어떤 Candidate보다도 낮다(현재 규칙 최저값은 SSTI 탐색의 0.20).
@@ -285,6 +543,8 @@ CANDIDATE_EVIDENCE_TYPES = frozenset(
         "file_read_marker",
         "template_execution_marker",
         "cross_principal_response",
+        "ssrf_callback_http",
+        "ssrf_server_request_observation",
     }
 )
 
@@ -406,7 +666,13 @@ class RuleBasedVulnerabilityRouter:
             raise ValueError("review policy must be weak or ambiguous")
         if advisor_mode not in _ADVISOR_MODES:
             raise ValueError("advisor mode must be supplemental or primary")
-        self._rules = {rule.observation_type: rule for rule in rules}
+        grouped_rules: dict[str, list[RoutingRule]] = {}
+        for rule in rules:
+            grouped_rules.setdefault(rule.observation_type, []).append(rule)
+        self._rules = {
+            observation_type: tuple(items)
+            for observation_type, items in grouped_rules.items()
+        }
         self._surface_rules = tuple(surface_rules)
         self._id_factory = id_factory or (lambda: str(uuid4()))
         self._advisor = advisor
@@ -460,10 +726,15 @@ class RuleBasedVulnerabilityRouter:
             "not_configured" if self._advisor is None else "not_called"
         )
         decisions: dict[tuple[str, str], RouteDecision] = {}
-        for item in evidence:
+        for item, rule in (
+            (item, rule)
+            for item in evidence
+            for rule in self._rules.get(
+                str(item.observation.get("type", "")), (),
+            )
+        ):
             observation_type = str(item.observation.get("type", ""))
-            rule = self._rules.get(observation_type)
-            if rule is None or item.surface_id is None:
+            if item.surface_id is None:
                 continue
             surface = next(
                 (
@@ -482,7 +753,22 @@ class RuleBasedVulnerabilityRouter:
                 continue
             if rule.methods is not None and surface.method.upper() not in rule.methods:
                 continue
-            key = (item.surface_id, rule.vulnerability_type)
+            if rule.observation_parameter_field is not None:
+                value = item.observation.get(rule.observation_parameter_field)
+                names = (value,) if isinstance(value, str) else value if isinstance(value, (list, tuple)) else ()
+                offered = {name.casefold() for name in names
+                           if isinstance(name, str) and name in surface.parameters}
+                if rule.parameter_hints and not offered.intersection(
+                    hint.casefold() for hint in rule.parameter_hints
+                ):
+                    continue
+                if not rule.parameter_hints and (
+                    rule.vulnerability_type != SSRF_TYPE or not offered
+                ):
+                    continue
+            key = _decision_key(
+                item.surface_id, rule.vulnerability_type, rule.capability_id,
+            )
             # 동일 Surface와 취약점 유형 조합은 하나의 Candidate만 생성한다.
             if key in decisions:
                 continue
@@ -494,6 +780,8 @@ class RuleBasedVulnerabilityRouter:
                 hypothesis=f"{rule.vulnerability_type} candidate from {observation_type}",
                 assigned_agent=rule.agent_type,
                 evidence_ids=(item.evidence_id,),
+                routing_capability_id=rule.capability_id,
+                analysis_strategy_id=rule.analysis_strategy_id,
             )
             decisions[key] = RouteDecision(candidate=candidate, priority=rule.priority)
 
@@ -537,10 +825,34 @@ class RuleBasedVulnerabilityRouter:
                     continue
                 if not rule.matches(surface):
                     continue
-                key = (surface.surface_id, rule.vulnerability_type)
+                key = _decision_key(
+                    surface.surface_id,
+                    rule.vulnerability_type,
+                    getattr(rule, "capability_id", ""),
+                )
                 # 같은 취약점에 강한 Evidence 규칙이 이미 매칭됐다면 그것을 유지한다.
                 if key in decisions:
-                    continue
+                    existing = decisions[key]
+                    priority = (
+                        rule.priority_for(surface)
+                        if isinstance(rule, SurfaceRoutingRule) else rule.priority
+                    )
+                    # A directly observed coordinate is safer to replay than a
+                    # schema-only declaration for the same execution strategy.
+                    if not (
+                        getattr(rule, "capability_id", "") in {
+                            SSRF_CALLBACK_CAPABILITY,
+                            SSRF_CANARY_CAPABILITY,
+                            SSRF_OWNED_RECEIVER_CAPABILITY,
+                        }
+                        and priority > existing.priority
+                    ):
+                        continue
+                else:
+                    priority = (
+                        rule.priority_for(surface)
+                        if isinstance(rule, SurfaceRoutingRule) else rule.priority
+                    )
                 candidate = Candidate(
                     candidate_id=f"candidate-{self._id_factory()}",
                     run_id=run.run_id,
@@ -552,10 +864,8 @@ class RuleBasedVulnerabilityRouter:
                     ),
                     assigned_agent=rule.agent_type,
                     evidence_ids=(),
-                )
-                priority = (
-                    rule.priority_for(surface)
-                    if isinstance(rule, SurfaceRoutingRule) else rule.priority
+                    routing_capability_id=getattr(rule, "capability_id", ""),
+                    analysis_strategy_id=getattr(rule, "analysis_strategy_id", ""),
                 )
                 decisions[key] = RouteDecision(candidate=candidate, priority=priority)
 
@@ -638,7 +948,10 @@ class RuleBasedVulnerabilityRouter:
 
         assert self._advisor is not None
         review_surfaces = self._review_surfaces(surfaces, decided)
-        routed_for_advisor = set(decided)
+        routed_for_advisor = {
+            (surface_id, decision.candidate.vulnerability_type)
+            for (surface_id, _), decision in decided.items()
+        }
         if self._review_policy == "weak":
             # 단일 Surface 규칙 Candidate를 실제로 검토하려면 그 한 조합은 Advisor의
             # already_covered 목록에서 제외해야 한다. 그렇지 않으면 제안 가능한 유형이
@@ -649,7 +962,10 @@ class RuleBasedVulnerabilityRouter:
                 decisions_by_surface.setdefault(key[0], []).append((key, decision))
             for items in decisions_by_surface.values():
                 if len(items) == 1 and not items[0][1].candidate.evidence_ids:
-                    routed_for_advisor.discard(items[0][0])
+                    routed_for_advisor.discard((
+                        items[0][0][0],
+                        items[0][1].candidate.vulnerability_type,
+                    ))
         try:
             suggestions = self._advisor.advise(
                 run, review_surfaces, evidence, frozenset(routed_for_advisor)
@@ -733,9 +1049,12 @@ class RuleBasedVulnerabilityRouter:
                 rejected += 1
                 outcomes.append((index, "unsupported_evidence_type"))
                 continue
-            capability_key = suggestion.capability_id or suggestion.vulnerability_type
-            key = (suggestion.surface_id, capability_key)
-            rule_key = (suggestion.surface_id, suggestion.vulnerability_type)
+            key = _decision_key(
+                suggestion.surface_id,
+                suggestion.vulnerability_type,
+                suggestion.capability_id,
+            )
+            rule_key = key
             # 규칙이 이미 정한 자리와 Advisor가 중복 제안한 자리는 모두 건너뛴다.
             if rule_key in decided or key in accepted:
                 outcomes.append(

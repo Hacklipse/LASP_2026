@@ -46,6 +46,7 @@ from hacklipse.ports.errors import (
 from hacklipse.ports.llm import LlmClient, LlmMessage, LlmRequest, LlmUsage
 
 from .request_safety import has_state_changing_parameters
+from .security import redacted_internal_url_path
 from .llm_parameter_names import alias_parameter_names
 from .analyzer_capabilities import (
     AnalyzerCapabilityCoverage,
@@ -69,7 +70,6 @@ DEFAULT_MAX_SURFACES = 40
 _AGENTIC_CACHE_LIMIT = 32
 
 _NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,63}$")
-_PATH_SEGMENT = re.compile(r"^[A-Za-z][A-Za-z_-]{0,63}(?:\.[A-Za-z]{1,10})?$")
 
 _SUGGESTION_SCHEMA = {
     "type": "object",
@@ -1333,6 +1333,9 @@ def surface_routing_summary(
         "parameter_names": list(alias_parameter_names(surface.parameters).prompt_names),
         "requires_auth": surface.requires_auth,
         "has_path_identifier": surface.path_identifier is not None,
+        # 경로에 입력이 실려 있다는 구조 사실만 알린다. 관측값은 넣지 않으며, 모델은
+        # 이 좌표를 새로 만들 수 없고 이미 관측된 것의 우선순위만 고를 수 있다.
+        "has_path_assignment": surface.path_assignment is not None,
         "observation_types": sorted(
             {
                 kind
@@ -1347,10 +1350,7 @@ def surface_routing_summary(
 
 
 def _path_hint(path: str) -> str:
-    return "/".join(
-        segment if not segment or _PATH_SEGMENT.fullmatch(segment) else "{value}"
-        for segment in path.split("/")
-    )
+    return redacted_internal_url_path(path)
 
 
 def _add_usage(left: LlmUsage, right: LlmUsage) -> LlmUsage:

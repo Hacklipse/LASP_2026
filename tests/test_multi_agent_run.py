@@ -215,8 +215,9 @@ class _SurfaceOnlyReconAgent:
     한 Run 안에 Candidate가 둘 이상 있어야 한다.
     """
 
-    def __init__(self, surface_store) -> None:
+    def __init__(self, surface_store, *, surface_url: str = "http://localhost/search") -> None:
         self._surfaces = surface_store
+        self._surface_url = surface_url
 
     def handle(self, task):
         from hacklipse.domain import AgentResult, AgentResultStatus, Surface
@@ -224,7 +225,7 @@ class _SurfaceOnlyReconAgent:
         surface = Surface(
             surface_id="surface-search",
             run_id=task.run_id,
-            url="http://localhost/search",
+            url=self._surface_url,
             method="GET",
             parameters=("q",),
         )
@@ -296,12 +297,17 @@ class _BlockingValidator:
             ),
         )
 
-def _application(xss_analyzer, *, validation_agent=None):
+def _application(xss_analyzer, *, validation_agent=None, surface_url=None):
     from hacklipse.bootstrap import build_local_application
 
     app = build_local_application({})
     app.dispatcher.register(
-        "recon", _SurfaceOnlyReconAgent(app.stores.surfaces), allowed_tools=("http_get",)
+        "recon",
+        _SurfaceOnlyReconAgent(
+            app.stores.surfaces,
+            surface_url=surface_url or "http://localhost/search",
+        ),
+        allowed_tools=("http_get",),
     )
     app.dispatcher.register("xss_analyzer", xss_analyzer, allowed_tools=("http_get",))
     app.dispatcher.register(
@@ -907,6 +913,29 @@ class ProgressEventTests(unittest.TestCase):
 
         self.assertEqual(surfaces, {"/search"})
         self.assertFalse(any("?" in path for path in surfaces))
+
+    def test_surface_path_masks_secret_segments_before_progress_storage(self) -> None:
+        secret = "DEMO-SECRET-0123456789"
+        app = _application(
+            _CompletingAnalyzer(),
+            surface_url=(
+                f"http://localhost/api/private/token/{secret}"
+                "?url=http%3A%2F%2Finternal.local"
+            ),
+        )
+
+        run = _start(app)
+        paths = {
+            event.surface_path
+            for event in app.progress_log.list_by_run(run.run_id)
+            if event.surface_path
+        }
+
+        self.assertEqual(paths, {"/api/private/token/{redacted}"})
+        self.assertNotIn(
+            secret,
+            " ".join(paths),
+        )
 
     def test_duplicate_sequence_is_dropped(self) -> None:
         """재개로 같은 구간을 다시 알려도 화면이 두 번 보여주면 안 된다."""

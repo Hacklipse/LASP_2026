@@ -31,6 +31,7 @@ from hacklipse.domain import (
     TaskRecord,
     TaskStatus,
     ValidationProofType,
+    ValidationReasonCode,
 )
 from hacklipse.ports.errors import (
     BudgetExceeded,
@@ -199,7 +200,10 @@ class SQLiteStoreTests(unittest.TestCase):
         task = self._task()
         evidence = self._evidence()
         surface = self._surface()
-        candidate = self._candidate()
+        candidate = replace(
+            self._candidate(), status="rejected",
+            validation_reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+        )
         finding = self._finding()
         report = self._report()
 
@@ -222,6 +226,15 @@ class SQLiteStoreTests(unittest.TestCase):
         )
         self.assertEqual(self.stores.findings.get("run-1", "finding-1"), finding)
         self.assertEqual(self.stores.reports.list_by_run("run-1"), (report,))
+
+    def test_binary_multipart_spec_round_trips_without_changing_bytes(self) -> None:
+        task = self._task()
+        request = replace(task.envelope.evidence_request,
+                          http_request=HttpRequestSpec(method="POST", body="\x89PNG\0\xff", body_encoding="latin-1"))
+        task = replace(task, envelope=replace(task.envelope, evidence_request=request))
+        self.stores.tasks.add(task)
+        restored = self.stores.tasks.get(task.envelope.task_id).envelope.evidence_request.http_request
+        self.assertEqual(restored.body.encode(restored.body_encoding), b"\x89PNG\0\xff")
 
     def test_legacy_run_without_execution_profile_uses_safe_defaults(self) -> None:
         self.stores.runs.add(self._run())

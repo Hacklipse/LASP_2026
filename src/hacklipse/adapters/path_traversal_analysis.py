@@ -3,6 +3,13 @@
 자동 탐침은 임의 파일 경로를 받지 않는다. 일반적인 Linux 컨테이너에 기본 존재하는
 비민감 OS 식별 파일 ``/etc/os-release``만 고정 상대 경로로 요청하고, 응답의 두 표식이
 control에는 없고 probe에만 나타나는지 비교한다. Agent는 요청을 직접 실행하지 않는다.
+
+Arbitrary File Read 분석기와의 경계 — 이쪽은 "경로에 담긴 탈출 시퀀스를 서버가
+따라가는가"를, 저쪽은 "서버가 받은 경로를 그대로 열어 주는가"를 증명한다. 절대 경로
+읽기와 선언된 하위 디렉터리 탈출은 저쪽이 소유한다(``arbitrary_file_read`` 모듈의
+docstring에 세 전략이 정리돼 있다). 같은 관측(``url_or_file_parameter``,
+``file_like_path_assignment``)에서 두 분석기가 각각 라우팅되므로, 한쪽이 거부당해도
+다른 쪽이 증명할 기회가 남는다.
 """
 
 from __future__ import annotations
@@ -12,6 +19,8 @@ from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
 from hacklipse.application.errors import AgentContractError
+import re
+
 from hacklipse.domain import (
     AgentResult,
     AgentResultStatus,
@@ -21,6 +30,7 @@ from hacklipse.domain import (
     HttpRequestKind,
     HttpRequestSpec,
     PATH_TRAVERSAL_BYPASS_SUFFIX,
+    PATH_TRAVERSAL_FILTER_BYPASS_PROBE_PATH,
     PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH,
     PATH_TRAVERSAL_SAFE_PROBE_PATH,
     ExecutionRequest,
@@ -46,6 +56,13 @@ PATH_TRAVERSAL_TOOL = "path_traversal_probe"
 HEURISTIC_PATH_TRAVERSAL_ANALYZER = "heuristic_path_traversal_analyzer"
 PATH_TRAVERSAL_OBSERVATION = "path_traversal_file_read"
 PATH_TRAVERSAL_PROBE_PATH = PATH_TRAVERSAL_SAFE_PROBE_PATH
+# 한 파라미터에 보내는 고정 표기들. 요청을 만드는 쪽과 결과를 파라미터에 귀속시키는 쪽이
+# 같은 목록을 보도록 한 곳에 둔다 — 길이가 어긋나면 어떤 표기의 성공이 다른 파라미터에
+# 붙는다.
+PATH_TRAVERSAL_PROBE_PAYLOADS = (
+    (PATH_TRAVERSAL_SAFE_PROBE_PATH, "safe-file probe"),
+    (PATH_TRAVERSAL_FILTER_BYPASS_PROBE_PATH, "filter-bypass probe"),
+)
 PATH_TRAVERSAL_FORM_PROBE_PATH = PATH_TRAVERSAL_SAFE_FORM_PROBE_PATH
 PATH_TRAVERSAL_PROOF_FILE = "/etc/os-release"
 PATH_TRAVERSAL_PROOF_MARKERS = ("PRETTY_NAME=", "VERSION_ID=")
@@ -55,12 +72,25 @@ PATH_TRAVERSAL_FORM_PROOF_MARKERS = ('"name":', '"version":')
 # 쿼리 파라미터가 아니라 경로 자체가 파일을 가리키는 표면에서 성립한다.
 PATH_TRAVERSAL_BYPASS_OBSERVATION = "path_traversal_filter_bypass"
 RESTRICTED_FILE_OBSERVATION = "restricted_file_path"
+# 경로에 `이름=값`으로 실린 입력을 관측했다는 사실. 입력의 "위치"만 말한다.
+# 서버가 이를 실제 입력으로 처리하는지는 control/probe 비교 전에는 알 수 없다.
+PATH_ASSIGNMENT_OBSERVATION = "path_embedded_assignment"
+PATH_ASSIGNMENT_SOURCE = "observed_url_path"
+# 그 이름이 서버의 파일을 여는 자리로 보인다는 "의미 가설". 위치와 별개의 필드다.
+# 이 관측이 없으면 Path Traversal 가설을 세우지 않는다 — `url`·`redirect`처럼
+# 원격 자원을 가리키는 이름에 파일 탐침을 보내도 파일이 나올 수 없기 때문이다.
+FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION = "file_like_path_assignment"
+# 경로에 `=`가 있었지만 좌표로 인정하지 않은 경우와 그 사유. 추측해서 실행하는 대신
+# 무엇을 건너뛰었는지 감사할 수 있게 남긴다.
+PATH_ASSIGNMENT_SKIPPED_OBSERVATION = "path_assignment_skipped"
+PATH_ASSIGNMENT_CAPABILITY = "path_traversal.http.path_assignment"
 UNLINKED_RENDER_PARAMETER_OBSERVATION = "unlinked_render_parameter_candidate"
 PATH_TRAVERSAL_POST_APPROVAL_REF = "approved-path-traversal-form-probe"
 _INFERRED_PARAMETER_SOURCE = "bounded_unlinked_render_parameter"
 HIDDEN_BODY_CAPABILITY = "path_traversal.hidden_body_parameter"
 HIDDEN_PLAN_OBSERVATION = "hidden_body_parameter_plan"
 _HIDDEN_BENIGN_PATH = "package.json"
+
 
 
 def validate_path_traversal_request(request: ExecutionRequest) -> None:
@@ -101,6 +131,17 @@ def validate_path_traversal_request(request: ExecutionRequest) -> None:
             raise ValueError("path suffix requires the path traversal probe kind")
         if request.query_parameters:
             raise ValueError("path traversal bypass probe cannot add query parameters")
+        return
+    if request.path_assignment_name is not None:
+        # 경로에 실린 입력의 값만 바꾸는 탐침. 도메인이 이미 "고정 증명 경로 하나,
+        # GET, 다른 변형 없음"을 강제했고, 여기서는 이 도구로 들어온 요청에도 같은
+        # 계약이 적용됐는지 독립적으로 다시 확인한다.
+        if request.request_kind is not HttpRequestKind.PATH_TRAVERSAL_PROBE:
+            raise ValueError("path assignment replacement requires the probe kind")
+        if not is_path_traversal_safe_probe_value(request.path_assignment_value or ""):
+            raise ValueError("path assignment probe may only use the fixed safe path")
+        if request.query_parameters:
+            raise ValueError("path assignment probe cannot add query parameters")
         return
     if not request.query_parameters:
         # 우회 흐름의 control 은 표면 URL 을 그대로 받는 평범한 GET 이다. 바꾸는 값이
@@ -186,6 +227,16 @@ class HeuristicPathTraversalAnalyzer:
             )
 
         selected = path_parameters_from_evidence(evidence, surface, parameters)
+        if prefers_path_assignment(candidate, surface, evidence, selected):
+            return handle_path_assignment(
+                task=task,
+                candidate=candidate,
+                surface=surface,
+                evidence=evidence,
+                evidence_store=self._evidence,
+                created_by=HEURISTIC_PATH_TRAVERSAL_ANALYZER,
+                id_factory=self._id_factory,
+            )
         if candidate.exploration_parameters:
             # 탐색 힌트는 성공 증적이 아니다. 다른 Surface의 이름, 숨은 필드 추론,
             # 상태 변경 입력, 클라이언트 전용 URL은 이 경로에서 허용하지 않는다.
@@ -248,6 +299,161 @@ class HeuristicPathTraversalAnalyzer:
             new_evidence_ids=tuple(new_ids),
             candidate_ids=(candidate.candidate_id,),
         )
+
+
+def has_file_like_path_assignment(
+    evidence: Sequence[Evidence], surface: Surface
+) -> bool:
+    """Recon이 이 표면의 경로 입력을 파일형으로 관측했는지 확인한다.
+
+    위치 관측만으로는 부족하다. 경로에 ``redirect=``가 실려 있어도 그 자리에 파일
+    경로를 보내 파일이 나올 수는 없고, 요청만 낭비된다.
+    """
+
+    return any(
+        item.surface_id == surface.surface_id
+        and item.observation.get("type") == FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION
+        and item.observation.get("source") == PATH_ASSIGNMENT_SOURCE
+        and surface.path_assignment is not None
+        and item.observation.get("parameter") == surface.path_assignment.name
+        for item in evidence
+    )
+
+
+def prefers_path_assignment(
+    candidate: Candidate,
+    surface: Surface,
+    evidence: Sequence[Evidence],
+    selected: Sequence[str],
+    *,
+    capability_id: str = PATH_ASSIGNMENT_CAPABILITY,
+) -> bool:
+    """이 Candidate가 query 좌표가 아니라 경로 좌표를 탐침해야 하는지 정한다.
+
+    capability Router는 좌표마다 Candidate를 따로 만들므로 선언된 capability를 그대로
+    따른다. 규칙 Router는 (Surface, 취약점 유형)당 Candidate를 하나만 만들기 때문에
+    한쪽을 골라야 한다 — 기존 query 흐름을 그대로 두고, 고를 query 좌표가 없을 때만
+    경로 좌표를 쓴다. 그래야 기존 결과가 바뀌지 않는다.
+
+    ``capability_id``는 호출하는 분석기의 경로 좌표 capability다. Path Traversal과
+    Arbitrary File Read가 같은 좌표를 서로 다른 값으로 탐침하므로, 어느 쪽 Candidate인지
+    여기서 구분해야 한 분석기가 다른 쪽 Candidate를 가로채지 않는다.
+    """
+
+    if surface.path_assignment is None or not has_file_like_path_assignment(
+        evidence, surface
+    ):
+        return False
+    if candidate.routing_capability_id:
+        return candidate.routing_capability_id == capability_id
+    return not selected and not candidate.exploration_parameters
+
+
+def build_path_assignment_requests(
+    surface: Surface, *, purpose: str
+) -> tuple[EvidenceRequest, ...]:
+    """관측된 URL 그대로의 control 과 값만 교체한 probe 를 만든다.
+
+    control 은 Recon 이 실제로 관측한 GET 요청이다. 값을 바꾸지 않으므로 좌표를 싣지
+    않는다. probe 는 같은 scheme/host/method 와 같은 경로 구조에서 기록된 범위만
+    고정 증명 경로로 바꾼다. 없던 query 를 덧붙이지 않는다.
+    """
+
+    assignment = surface.path_assignment
+    if assignment is None:
+        raise AgentContractError("path assignment probe requires an observed coordinate")
+    if surface.method.upper() != "GET":
+        raise AgentContractError("path assignment probe supports GET surfaces only")
+    if not assignment.matches(surface.url):
+        # 저장본과 URL 이 어긋나면 어디를 바꿔야 하는지 모르는 것이다. 다시 찾아보는
+        # 것은 추측이므로 하지 않는다.
+        raise AgentContractError("path assignment span does not match the surface URL")
+
+    return (
+        EvidenceRequest(
+            evidence_type="http_response",
+            surface_id=surface.surface_id,
+            reason=f"observed path control request for {purpose}",
+            suggested_tool=PATH_TRAVERSAL_TOOL,
+            http_request=HttpRequestSpec(
+                method="GET", request_kind=HttpRequestKind.CONTROL
+            ),
+        ),
+        EvidenceRequest(
+            evidence_type="http_response",
+            surface_id=surface.surface_id,
+            reason=(
+                f"safe-file probe for path assignment {assignment.name} on {purpose}"
+            ),
+            suggested_tool=PATH_TRAVERSAL_TOOL,
+            http_request=HttpRequestSpec(
+                method="GET",
+                request_kind=HttpRequestKind.PATH_TRAVERSAL_PROBE,
+                path_assignment_name=assignment.name,
+                path_assignment_value_start=assignment.value_start,
+                path_assignment_value_end=assignment.value_end,
+                path_assignment_value=PATH_TRAVERSAL_PROBE_PATH,
+            ),
+        ),
+    )
+
+
+def handle_path_assignment(
+    *,
+    task: TaskEnvelope,
+    candidate: Candidate,
+    surface: Surface,
+    evidence: Sequence[Evidence],
+    evidence_store: EvidenceStore,
+    created_by: str,
+    id_factory: Callable[[], str],
+) -> AgentResult:
+    """경로에 실린 입력 자리에서 고정 증명 파일을 읽을 수 있는지 비교한다."""
+
+    assignment = surface.path_assignment
+    assert assignment is not None  # prefers_path_assignment 가 이미 확인했다.
+    requests = build_path_assignment_requests(
+        surface, purpose=f"Path Traversal candidate {candidate.candidate_id}"
+    )
+    collected = tuple(
+        matching_evidence(evidence, surface.url, request) for request in requests
+    )
+    missing = tuple(
+        request for request, item in zip(requests, collected) if item is None
+    )
+    if missing:
+        if task.request_budget < len(missing):
+            raise BudgetExceeded(
+                "path assignment probe lacks budget for its evidence requests"
+            )
+        return AgentResult(
+            task_id=task.task_id,
+            status=AgentResultStatus.NEEDS_EVIDENCE,
+            evidence_requests=missing,
+            candidate_ids=(candidate.candidate_id,),
+        )
+
+    control, probe = collected
+    if control is None or probe is None:  # missing 이후에는 도달하지 않는다.
+        raise AgentContractError("path assignment evidence was not collected")
+    new_ids = record_path_traversal_observations(
+        task=task,
+        surface=surface,
+        selected=(assignment.name,),
+        control=control,
+        probes=(probe,),
+        evidence=evidence,
+        evidence_store=evidence_store,
+        created_by=created_by,
+        id_factory=id_factory,
+        extra={"location": "path_assignment"},
+    )
+    return AgentResult(
+        task_id=task.task_id,
+        status=AgentResultStatus.COMPLETED,
+        new_evidence_ids=tuple(new_ids),
+        candidate_ids=(candidate.candidate_id,),
+    )
 
 
 def is_restricted_file_surface(
@@ -526,28 +732,28 @@ def build_path_traversal_requests(
             ),
         )
     ]
+    # 두 표기를 모두 보낸다. 같은 증명 파일을 가리키지만, 한 번만 훑는 제거 필터가
+    # 걸린 대상에서는 평문 표기가 통째로 지워져 "취약하지 않다"와 "필터에 지워졌다"를
+    # 구분할 수 없다. XBEN-079가 그 경우다 — XBEN-061과 같은 앱에 str_replace 한 줄만
+    # 추가돼 있고, 평문 표기는 필터 후 'etc/os-release'로 남아 트래버설이 사라진다.
     for parameter in selected_parameters:
-        requests.append(
-            EvidenceRequest(
-                evidence_type="http_response",
-                surface_id=surface.surface_id,
-                reason=f"safe-file probe for parameter {parameter} on {purpose}",
-                suggested_tool=PATH_TRAVERSAL_TOOL,
-                http_request=HttpRequestSpec(
-                    method="GET",
-                    query_parameters=tuple(
-                        (
-                            name,
-                            PATH_TRAVERSAL_PROBE_PATH
-                            if name == parameter
-                            else CONTROL_VALUE,
-                        )
-                        for name in all_parameters
+        for payload, label in PATH_TRAVERSAL_PROBE_PAYLOADS:
+            requests.append(
+                EvidenceRequest(
+                    evidence_type="http_response",
+                    surface_id=surface.surface_id,
+                    reason=f"{label} for parameter {parameter} on {purpose}",
+                    suggested_tool=PATH_TRAVERSAL_TOOL,
+                    http_request=HttpRequestSpec(
+                        method="GET",
+                        query_parameters=tuple(
+                            (name, payload if name == parameter else CONTROL_VALUE)
+                            for name in all_parameters
+                        ),
+                        request_kind=HttpRequestKind.PATH_TRAVERSAL_PROBE,
                     ),
-                    request_kind=HttpRequestKind.PATH_TRAVERSAL_PROBE,
-                ),
+                )
             )
-        )
     return tuple(requests)
 
 
@@ -637,10 +843,20 @@ def record_path_traversal_observations(
     """Python이 확인한 고정 safe-file 읽기만 공통 Observation으로 저장한다."""
 
     new_ids: list[str] = []
-    for parameter, probe in zip(selected, probes):
-        if probe is None:
+    width = len(PATH_TRAVERSAL_PROBE_PAYLOADS)
+    # 빌더와 같은 방식으로 중복을 제거한다. 한쪽만 제거하면 묶음 경계가 밀려 어떤
+    # 표기의 성공이 다른 좌표에 귀속된다.
+    for index, parameter in enumerate(dict.fromkeys(selected)):
+        group = list(probes[index * width : (index + 1) * width])
+        if not group or any(item is None for item in group):
             raise AgentContractError("path traversal probe evidence was not collected")
-        if not path_traversal_signal(control, probe):
+        # 표기 중 하나라도 고정 파일을 읽어냈으면 그 좌표의 노출이다. 필터가 걸린
+        # 대상에서는 평문 표기만 지워지고 다른 표기가 통과한다.
+        probe = next(
+            (item for item in group if item and path_traversal_signal(control, item)),
+            None,
+        )
+        if probe is None:
             continue
         if has_observation_record(
             evidence,

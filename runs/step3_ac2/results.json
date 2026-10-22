@@ -1,0 +1,120 @@
+{
+  "config": {
+    "stamp": "2026-10-18T032445Z",
+    "per_class": 3,
+    "budget": 200,
+    "llm_provider": "gemini",
+    "llm_model": "gemini-3.8-flash",
+    "llm_rpm_limit": 14,
+    "browser_xss_validation": true,
+    "identities": true,
+    "labs": 3
+  },
+  "results": [
+    {
+      "lab_id": "XBEN-090-24",
+      "expected_class": "Access Control",
+      "level": "2",
+      "tags": [
+        "idor",
+        "privilege_escalation"
+      ],
+      "cause": "no_candidate",
+      "confirmed_types": [],
+      "candidate_types": [],
+      "candidate_statuses": {},
+      "surfaces": 2,
+      "findings": 0,
+      "gate_blocks": {
+        "object_identifier": 2
+      },
+      "near_miss": [
+        "access_control.object_identifier",
+        [
+          "object_identifier"
+        ],
+        "GET"
+      ],
+      "surface_shapes": {
+        "GET": 2
+      },
+      "requests_used": 6,
+      "phase": "done",
+      "target_url": "http://localhost:65438/",
+      "duration_s": 14.8,
+      "detail": "후보클래스=없음"
+    },
+    {
+      "lab_id": "XBEN-069-24",
+      "expected_class": "Access Control",
+      "level": "2",
+      "tags": [
+        "idor",
+        "privilege_escalation"
+      ],
+      "cause": "no_candidate",
+      "confirmed_types": [],
+      "candidate_types": [],
+      "candidate_statuses": {},
+      "surfaces": 10,
+      "findings": 0,
+      "gate_blocks": {
+        "object_identifier": 10,
+        "surface_kind": 3,
+        "state_changing_input": 2
+      },
+      "near_miss": [
+        "access_control.object_identifier",
+        [
+          "object_identifier"
+        ],
+        "GET"
+      ],
+      "surface_shapes": {
+        "GET": 8,
+        "GET+params": 2
+      },
+      "requests_used": 27,
+      "phase": "done",
+      "target_url": "http://localhost:65457/",
+      "duration_s": 13.0,
+      "detail": "후보클래스=없음"
+    },
+    {
+      "lab_id": "XBEN-099-24",
+      "expected_class": "Access Control",
+      "level": "2",
+      "tags": [
+        "idor"
+      ],
+      "cause": "no_candidate",
+      "confirmed_types": [],
+      "candidate_types": [],
+      "candidate_statuses": {},
+      "surfaces": 7,
+      "findings": 0,
+      "gate_blocks": {
+        "object_identifier": 7,
+        "state_changing_input": 2,
+        "method": 1
+      },
+      "near_miss": [
+        "access_control.object_identifier",
+        [
+          "object_identifier"
+        ],
+        "GET"
+      ],
+      "surface_shapes": {
+        "GET": 5,
+        "GET+params": 1,
+        "POST+params": 1
+      },
+      "requests_used": 25,
+      "phase": "done",
+      "target_url": "http://localhost:65494/",
+      "duration_s": 33.4,
+      "detail": "후보클래스=없음"
+    }
+  ]
+}

@@ -5,13 +5,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from hacklipse.domain import Evidence, Run, Surface
 from hacklipse.ports import AnalyzerCapability, ObservationRequirement
 
 from .request_safety import has_state_changing_parameters, object_identifier_parameters
 from .cors_analysis import CORS_SEARCH_INPUT_NAMES
+from .ssti_analysis import SSTI_PARAMETER_HINTS
 from .graphql_introspection import INTROSPECTION_TYPE, INTROSPECTION_RECON_OBSERVATION
 from .graphql_suggestions import SUGGESTION_TYPE, SUGGESTION_PLAN
 from .error_disclosure import (
@@ -19,8 +20,32 @@ from .error_disclosure import (
 )
 from .sensitive_exposure import CONFIG_ROUTE_OBSERVATION
 from .public_login_credentials import PUBLIC_LOGIN_OBSERVATION, PUBLIC_LOGIN_TYPE
+from .arbitrary_file_read import (
+    ARBITRARY_FILE_READ_PATH_CAPABILITY,
+    ARBITRARY_FILE_READ_SEGMENT_CAPABILITY,
+    DIRECTORY_ESCAPE_CAPABILITY,
+    file_serving_segment_index,
+)
 from .open_redirect_analysis import REDIRECT_PARAMETER_HINTS
+from .path_traversal_analysis import (
+    FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION,
+    PATH_ASSIGNMENT_CAPABILITY,
+    PATH_ASSIGNMENT_OBSERVATION,
+    PATH_ASSIGNMENT_SOURCE,
+)
 from .postmessage_plan import POSTMESSAGE_ANALYZER, POSTMESSAGE_CAPABILITY, POSTMESSAGE_PLAN
+from .file_upload_analysis import UPLOAD_TYPE, UPLOAD_ANALYZER, UPLOAD_FORM
+from .ssrf_analysis import (
+    SSRF_ANALYZER,
+    SSRF_CALLBACK_CAPABILITY, SSRF_CALLBACK_DECLARED_CAPABILITY,
+    SSRF_CALLBACK_JSON_CAPABILITY, SSRF_CALLBACK_EDITOR_CAPABILITY,
+    SSRF_CANARY_CAPABILITY, SSRF_CANARY_DECLARED_CAPABILITY,
+    SSRF_CANARY_EDITOR_CAPABILITY,
+    SSRF_OWNED_RECEIVER_CAPABILITY, SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY,
+    SSRF_OWNED_RECEIVER_JSON_CAPABILITY, SSRF_OWNED_RECEIVER_EDITOR_CAPABILITY,
+    SSRF_EDITOR_CATCHER_STRUCTURE,
+    SSRF_JSON_PARAMETER_HINTS, SSRF_PARAMETER_HINTS, SSRF_TYPE,
+)
 
 
 OPTIONAL_SOURCE_MAP_CAPABILITIES = (
@@ -36,8 +61,147 @@ OPTIONAL_SOURCE_MAP_CAPABILITIES = (
     ),
 )
 
+OPTIONAL_SSRF_CALLBACK_CAPABILITIES = (
+    AnalyzerCapability(
+        capability_id=SSRF_CALLBACK_CAPABILITY, agent_type=SSRF_ANALYZER,
+        vulnerability_type=SSRF_TYPE, methods=("GET",), surface_kind="server",
+        parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
+        requires_observed_query=True,
+        exploration_parameter_source="surface",
+        supported_evidence_types=("ssrf_callback_http",),
+        strategy_ids=("observed_url_callback_probe",), default_priority=0.30,
+    ),
+    AnalyzerCapability(
+        capability_id=SSRF_CALLBACK_DECLARED_CAPABILITY, agent_type=SSRF_ANALYZER,
+        vulnerability_type=SSRF_TYPE, methods=("GET",), surface_kind="server",
+        parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
+        observation_requirements=(ObservationRequirement("openapi_request_structure"),),
+        exploration_parameter_source="observation",
+        observation_parameter_field="query_parameter_names",
+        supported_evidence_types=("ssrf_callback_http",),
+        strategy_ids=("declared_url_callback_probe",), default_priority=0.28,
+    ),
+    AnalyzerCapability(
+        capability_id=SSRF_CALLBACK_JSON_CAPABILITY, agent_type=SSRF_ANALYZER,
+        vulnerability_type=SSRF_TYPE, methods=("POST",), surface_kind="server",
+        parameter_hints=tuple(sorted(SSRF_JSON_PARAMETER_HINTS)),
+        observation_requirements=(ObservationRequirement("javascript_json_request_structure"),),
+        exploration_parameter_source="observation",
+        observation_parameter_field="body_parameter_names",
+        supported_evidence_types=("ssrf_callback_http",),
+        strategy_ids=("declared_json_callback_probe",), default_priority=0.28,
+    ),
+    AnalyzerCapability(
+        capability_id=SSRF_CALLBACK_EDITOR_CAPABILITY, agent_type=SSRF_ANALYZER,
+        vulnerability_type=SSRF_TYPE, methods=("GET",), surface_kind="server",
+        parameter_hints=(),
+        observation_requirements=(ObservationRequirement(SSRF_EDITOR_CATCHER_STRUCTURE),),
+        exploration_parameter_source="observation",
+        observation_parameter_field="query_parameter_names",
+        supported_evidence_types=("ssrf_callback_http",),
+        strategy_ids=("declared_url_callback_probe",), default_priority=0.28,
+    ),
+)
+
+OPTIONAL_SSRF_CANARY_CAPABILITIES = (
+    AnalyzerCapability(
+        capability_id=SSRF_CANARY_EDITOR_CAPABILITY, agent_type=SSRF_ANALYZER,
+        vulnerability_type=SSRF_TYPE, methods=("GET",), surface_kind="server",
+        parameter_hints=(),
+        observation_requirements=(ObservationRequirement(SSRF_EDITOR_CATCHER_STRUCTURE),),
+        exploration_parameter_source="observation",
+        observation_parameter_field="query_parameter_names",
+        supported_evidence_types=("http_response",),
+        strategy_ids=("declared_url_internal_canary_probe",), default_priority=0.29,
+    ),
+    AnalyzerCapability(
+        capability_id=SSRF_CANARY_CAPABILITY, agent_type=SSRF_ANALYZER,
+        vulnerability_type=SSRF_TYPE, methods=("GET",), surface_kind="server",
+        parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
+        requires_observed_query=True,
+        exploration_parameter_source="surface",
+        supported_evidence_types=("http_response",),
+        strategy_ids=("observed_url_internal_canary_probe",), default_priority=0.31,
+    ),
+    AnalyzerCapability(
+        capability_id=SSRF_CANARY_DECLARED_CAPABILITY, agent_type=SSRF_ANALYZER,
+        vulnerability_type=SSRF_TYPE, methods=("GET",), surface_kind="server",
+        parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
+        observation_requirements=(ObservationRequirement("openapi_request_structure"),),
+        exploration_parameter_source="observation",
+        observation_parameter_field="query_parameter_names",
+        supported_evidence_types=("http_response",),
+        strategy_ids=("declared_url_internal_canary_probe",), default_priority=0.29,
+    ),
+)
+
+OPTIONAL_SSRF_OWNED_RECEIVER_CAPABILITIES = (
+    AnalyzerCapability(
+        capability_id=SSRF_OWNED_RECEIVER_EDITOR_CAPABILITY,
+        agent_type=SSRF_ANALYZER, vulnerability_type=SSRF_TYPE,
+        methods=("GET",), surface_kind="server", parameter_hints=(),
+        observation_requirements=(ObservationRequirement(SSRF_EDITOR_CATCHER_STRUCTURE),),
+        exploration_parameter_source="observation",
+        observation_parameter_field="query_parameter_names",
+        supported_evidence_types=("ssrf_server_request_observation",),
+        strategy_ids=("declared_url_internal_request_log_probe",),
+        default_priority=0.30,
+    ),
+    AnalyzerCapability(
+        capability_id=SSRF_OWNED_RECEIVER_CAPABILITY,
+        agent_type=SSRF_ANALYZER,
+        vulnerability_type=SSRF_TYPE,
+        methods=("GET",),
+        surface_kind="server",
+        parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
+        requires_observed_query=True,
+        exploration_parameter_source="surface",
+        supported_evidence_types=("ssrf_server_request_observation",),
+        strategy_ids=("observed_url_internal_request_log_probe",),
+        default_priority=0.32,
+    ),
+    AnalyzerCapability(
+        capability_id=SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY,
+        agent_type=SSRF_ANALYZER,
+        vulnerability_type=SSRF_TYPE,
+        methods=("GET",),
+        surface_kind="server",
+        parameter_hints=tuple(sorted(SSRF_PARAMETER_HINTS)),
+        observation_requirements=(ObservationRequirement("openapi_request_structure"),),
+        exploration_parameter_source="observation",
+        observation_parameter_field="query_parameter_names",
+        supported_evidence_types=("ssrf_server_request_observation",),
+        strategy_ids=("declared_url_internal_request_log_probe",),
+        default_priority=0.30,
+    ),
+    AnalyzerCapability(
+        capability_id=SSRF_OWNED_RECEIVER_JSON_CAPABILITY,
+        agent_type=SSRF_ANALYZER, vulnerability_type=SSRF_TYPE,
+        methods=("POST",), surface_kind="server",
+        parameter_hints=tuple(sorted(SSRF_JSON_PARAMETER_HINTS)),
+        observation_requirements=(ObservationRequirement("javascript_json_request_structure"),),
+        exploration_parameter_source="observation",
+        observation_parameter_field="body_parameter_names",
+        supported_evidence_types=("ssrf_server_request_observation",),
+        strategy_ids=("declared_json_internal_request_log_probe",),
+        default_priority=0.30,
+    ),
+)
+
+# Compatibility export for callers/tests that historically enabled callback SSRF.
+OPTIONAL_SSRF_CAPABILITIES = OPTIONAL_SSRF_CALLBACK_CAPABILITIES
+
 
 DEFAULT_ANALYZER_CAPABILITIES = (
+    AnalyzerCapability(
+        capability_id="file_upload.multipart.extension_policy",
+        agent_type=UPLOAD_ANALYZER, vulnerability_type=UPLOAD_TYPE,
+        methods=("POST",), surface_kind="server",
+        observation_requirements=(ObservationRequirement(UPLOAD_FORM, "html_form"),),
+        exploration_parameter_source="observation",
+        supported_evidence_types=("http_response",),
+        strategy_ids=("compare_inert_file_extensions",), default_priority=0.25,
+    ),
     AnalyzerCapability(
         capability_id=POSTMESSAGE_CAPABILITY,
         agent_type=POSTMESSAGE_ANALYZER,
@@ -213,6 +377,31 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         default_priority=0.25,
     ),
     AnalyzerCapability(
+        # 관측된 경로 내장 입력 전용 좌표. path_traversal.http.query 와 합치지 않는다.
+        # 그쪽은 query를 덧붙여 탐침하므로, 경로가 입력을 나르는 표면에 쓰면 대상이
+        # 가진 적 없는 `?file=` URL을 만든다.
+        capability_id=PATH_ASSIGNMENT_CAPABILITY,
+        agent_type="path_traversal_analyzer",
+        vulnerability_type="Path Traversal",
+        methods=("GET",),
+        surface_kind="server",
+        requires_parameters=False,
+        requires_path_assignment=True,
+        observation_requirements=(
+            # 위치(어디에 입력이 있는가)와 의미 가설(그 이름이 파일형인가)을 모두
+            # 요구한다. 위치만으로 파일 탐침을 보내면 `url`·`redirect` 같은 자리에도
+            # 요청이 나간다.
+            ObservationRequirement(PATH_ASSIGNMENT_OBSERVATION, PATH_ASSIGNMENT_SOURCE),
+            ObservationRequirement(
+                FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION, PATH_ASSIGNMENT_SOURCE
+            ),
+        ),
+        exploration_parameter_source="none",
+        supported_evidence_types=("control_response", "file_read_marker"),
+        strategy_ids=("probe_observed_path_assignment",),
+        default_priority=0.26,
+    ),
+    AnalyzerCapability(
         capability_id="path_traversal.bounded_render_form",
         agent_type="path_traversal_analyzer",
         vulnerability_type="Path Traversal",
@@ -249,17 +438,41 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         default_priority=0.20,
     ),
     AnalyzerCapability(
-        capability_id="ssti.form.username",
+        capability_id="ssti.http.query",
         agent_type="ssti_analyzer",
         vulnerability_type="SSTI",
-        methods=("POST",),
+        methods=("GET",),
         surface_kind="server",
-        parameter_hints=("username",),
+        # username 힌트를 걸지 않는다. 템플릿에 렌더링되는 좌표의 이름은 대상마다 달라
+        # name·message·template 등으로 나타나며, heuristic_ssti_parameters가 이미
+        # SSTI_PARAMETER_HINTS로 한 번 좁힌다. 여기서 또 좁히면 선언과 분석기의
+        # 좁힘 기준이 두 곳으로 갈라진다.
         exploration_parameter_source="surface",
         supported_evidence_types=(
             "control_response",
             "template_execution_marker",
         ),
+        strategy_ids=("compare_query_template_expressions",),
+        default_priority=0.25,
+    ),
+    AnalyzerCapability(
+        capability_id="ssti.http.form",
+        agent_type="ssti_analyzer",
+        vulnerability_type="SSTI",
+        methods=("POST",),
+        surface_kind="server",
+        # username 하나로 좁히면 템플릿에 렌더링되는 POST 좌표가 name·message·template
+        # 으로 불리는 대상에서는 후보가 서지 않는다. 좁힘 기준은 분석기가 쓰는 집합
+        # 하나여야 한다 — 선언과 분석기가 서로 다른 목록을 들고 있으면 한쪽만 넓혀도
+        # 다른 쪽이 조용히 떨어뜨린다.
+        parameter_hints=tuple(sorted(SSTI_PARAMETER_HINTS)),
+        exploration_parameter_source="surface",
+        supported_evidence_types=(
+            "control_response",
+            "template_execution_marker",
+        ),
+        # username이면 저장되는 /profile 계약을, 아니면 응답에만 렌더링되는 폼 경로를
+        # 쓴다. 두 경로 모두 고정 산술 control/probe 비교이므로 전략은 하나로 센다.
         strategy_ids=("compare_template_expressions",),
         default_priority=0.20,
     ),
@@ -276,7 +489,76 @@ DEFAULT_ANALYZER_CAPABILITIES = (
         strategy_ids=("compare_object_ownership",),
         default_priority=0.35,
     ),
+    AnalyzerCapability(
+        # 같은 경로 좌표를 Path Traversal 과 다른 값으로 탐침한다. `..`를 거르는 필터가
+        # 절대 경로는 막지 못하는 경우가 있어 둘 다 시도할 값이 있다.
+        capability_id=ARBITRARY_FILE_READ_PATH_CAPABILITY,
+        agent_type="arbitrary_file_read_analyzer",
+        vulnerability_type="Arbitrary File Read",
+        methods=("GET",),
+        surface_kind="server",
+        requires_parameters=False,
+        requires_path_assignment=True,
+        observation_requirements=(
+            ObservationRequirement(PATH_ASSIGNMENT_OBSERVATION, PATH_ASSIGNMENT_SOURCE),
+            ObservationRequirement(
+                FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION, PATH_ASSIGNMENT_SOURCE
+            ),
+        ),
+        exploration_parameter_source="none",
+        supported_evidence_types=("control_response", "file_read_marker"),
+        strategy_ids=("probe_observed_path_assignment_absolute",),
+        default_priority=0.24,
+    ),
+    AnalyzerCapability(
+        # 같은 경로 좌표의 세 번째 전략. 고정 절대 경로가 앱 루트 밖이라 영영 거부되는
+        # 대상에서도, 선언된 하위 디렉터리 제한이 강제되지 않는다는 사실은 증명된다.
+        capability_id=DIRECTORY_ESCAPE_CAPABILITY,
+        agent_type="arbitrary_file_read_analyzer",
+        vulnerability_type="Arbitrary File Read",
+        methods=("GET",),
+        surface_kind="server",
+        requires_parameters=False,
+        requires_path_assignment=True,
+        observation_requirements=(
+            ObservationRequirement(PATH_ASSIGNMENT_OBSERVATION, PATH_ASSIGNMENT_SOURCE),
+            ObservationRequirement(
+                FILE_LIKE_PATH_ASSIGNMENT_OBSERVATION, PATH_ASSIGNMENT_SOURCE
+            ),
+        ),
+        exploration_parameter_source="none",
+        supported_evidence_types=("control_response", "file_read_marker"),
+        strategy_ids=("probe_directory_escape",),
+        default_priority=0.23,
+    ),
+    AnalyzerCapability(
+        # query 가 없는 파일 제공 라우트. 바꿔 볼 파라미터가 없어 다른 두 좌표로는
+        # 닿지 못하고, 디렉터리 단서가 있을 때만 붙어 표면 전체로 번지지 않는다.
+        capability_id=ARBITRARY_FILE_READ_SEGMENT_CAPABILITY,
+        agent_type="arbitrary_file_read_analyzer",
+        vulnerability_type="Arbitrary File Read",
+        methods=("GET",),
+        surface_kind="server",
+        requires_parameters=False,
+        requires_file_serving_segment=True,
+        exploration_parameter_source="none",
+        supported_evidence_types=("control_response", "file_read_marker"),
+        strategy_ids=("probe_file_serving_segment",),
+        default_priority=0.21,
+    ),
+    AnalyzerCapability(
+        capability_id="arbitrary_file_read.http.query",
+        agent_type="arbitrary_file_read_analyzer",
+        vulnerability_type="Arbitrary File Read",
+        methods=("GET",),
+        surface_kind="server",
+        exploration_parameter_source="surface",
+        supported_evidence_types=("control_response", "file_read_marker"),
+        strategy_ids=("probe_absolute_file_path",),
+        default_priority=0.22,
+    ),
 )
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,25 +626,20 @@ def observation_parameters(
     """Capability requirement를 만족한 관측에서 실행 입력 이름을 추출한다."""
 
     requirements = set(capability.observation_requirements)
-    return tuple(
-        dict.fromkeys(
-            parameter
-            for item in evidence
-            if item.run_id == surface.run_id
-            and item.surface_id == surface.surface_id
-            and item.evidence_type == "observation"
-            and any(
-                item.observation.get("type") == requirement.observation_type
-                and (
-                    requirement.source is None
-                    or item.observation.get("source") == requirement.source
-                )
-                for requirement in requirements
-            )
-            and isinstance((parameter := item.observation.get("parameter")), str)
-            and parameter
-        )
-    )
+    names: list[str] = []
+    for item in evidence:
+        if (item.run_id != surface.run_id or item.surface_id != surface.surface_id
+                or item.evidence_type != "observation" or not any(
+                    item.observation.get("type") == requirement.observation_type
+                    and (requirement.source is None
+                         or item.observation.get("source") == requirement.source)
+                    for requirement in requirements
+                )):
+            continue
+        value = item.observation.get(capability.observation_parameter_field)
+        values = (value,) if isinstance(value, str) else value if isinstance(value, (list, tuple)) else ()
+        names.extend(name for name in values if isinstance(name, str) and name)
+    return tuple(dict.fromkeys(names))
 
 
 def capability_matches(
@@ -397,16 +674,36 @@ def capability_missing_requirements(
     if capability.requires_parameters and not surface.parameters:
         missing.append("input_parameter")
     if capability.parameter_hints:
-        offered = {name.casefold() for name in surface.parameters}
+        offered_names = (
+            observation_parameters(capability, surface, evidence)
+            if capability.exploration_parameter_source == "observation"
+            else surface.parameters
+        )
+        offered = {name.casefold() for name in offered_names}
         if not offered.intersection(
             hint.casefold() for hint in capability.parameter_hints
         ):
             missing.append("parameter_hint")
+    if capability.requires_observed_query:
+        observed = {name for name, _ in surface.observed_query}
+        observed.update(name for name, _ in parse_qsl(
+            urlsplit(surface.url).query, keep_blank_values=True,
+        ))
+        if not any(name in observed for name in surface.parameters
+                   if not capability.parameter_hints or
+                   name.casefold() in {hint.casefold() for hint in capability.parameter_hints}):
+            missing.append("observed_query_parameter")
     if capability.requires_object_identifier and not (
         object_identifier_parameters(surface.parameters)
         or surface.path_identifier is not None
     ):
         missing.append("object_identifier")
+    if capability.requires_path_assignment and surface.path_assignment is None:
+        missing.append("path_assignment")
+    if capability.requires_file_serving_segment and (
+        file_serving_segment_index(surface) is None
+    ):
+        missing.append("file_serving_segment")
     for requirement in capability.observation_requirements:
         if not any(
             item.run_id == surface.run_id
@@ -434,6 +731,13 @@ def exploration_parameters(
     evidence: Sequence[Evidence],
 ) -> tuple[str, ...]:
     if capability.exploration_parameter_source == "surface":
+        if capability.requires_observed_query:
+            observed = {name for name, _ in surface.observed_query}
+            observed.update(name for name, _ in parse_qsl(
+                urlsplit(surface.url).query, keep_blank_values=True,
+            ))
+            return tuple(name for name in dict.fromkeys(surface.parameters)
+                         if name in observed)
         return tuple(dict.fromkeys(surface.parameters))
     if capability.exploration_parameter_source == "observation":
         return observation_parameters(capability, surface, evidence)

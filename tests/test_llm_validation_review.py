@@ -103,11 +103,29 @@ class ReviewerContractTests(unittest.TestCase):
         review = LlmValidationReviewer(llm_client=llm).review(context(), timeout_seconds=2)
         self.assertEqual(review.outcome_class, ValidationOutcomeClass.SIGNAL_NOT_OBSERVED)
         prompt = json.loads(llm.requests[0].messages[0].content)
-        self.assertEqual(prompt["surface"]["path"], "/users/{value}")
+        self.assertEqual(prompt["surface"]["path"], "/users/{redacted}")
         self.assertEqual(prompt["parameter_aliases"], ["q", "parameter_1"])
         rendered = llm.requests[0].messages[0].content
         for secret in ("run-1", "candidate-1", "validation-1", "token", "secret", "ignore"):
             self.assertNotIn(secret, rendered)
+
+    def test_prompt_redacts_short_value_after_sensitive_path_segment(self):
+        llm = FakeLlm({
+            "outcome_class": "signal_not_observed",
+            "reason": "이번 probe에서 신호 미관측",
+        })
+
+        LlmValidationReviewer(llm_client=llm).review(
+            context(surface_path_hint="/private/token/shortsecret"),
+            timeout_seconds=2,
+        )
+
+        rendered = llm.requests[0].messages[0].content
+        self.assertEqual(
+            json.loads(rendered)["surface"]["path"],
+            "/private/token/{redacted}",
+        )
+        self.assertNotIn("shortsecret", rendered)
 
     def test_extra_verdict_or_unsafe_reason_falls_back(self):
         for payload in (

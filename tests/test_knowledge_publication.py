@@ -11,13 +11,18 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from hacklipse.adapters import (
     InMemoryKnowledgeBase, KnowledgeCaseFactory, RuleBasedVulnerabilityRouter,
 )
-from hacklipse.bootstrap import build_local_application
+from hacklipse.bootstrap import (
+    build_local_application,
+    register_standard_agents,
+    standard_router,
+)
 from hacklipse.ports.llm import LlmResponse
 from hacklipse.domain import (
     AgentResult,
@@ -681,6 +686,135 @@ class KnowledgeProgressDisplayTests(unittest.TestCase):
 
         self.assertNotIn("Knowledge", out)
         self.assertNotIn("secret", out)
+
+
+class _RealAgentRuntime:
+    """표준 Agent 로 끝까지 돌리기 위한 대역.
+
+    경로에 실린 파일 입력(선언된 디렉터리 밖은 열어 준다)과 따옴표에서 SQL 오류를
+    흘리는 엔드포인트를 함께 제공한다. 두 유형이 각각 Knowledge 사본 문제와
+    Observation 어휘 문제에 걸려 있던 쪽이다.
+    """
+
+    _ASSET = "web_assets/javascript/app.js"
+
+    def execute(self, request):
+        from hacklipse.domain import ExecutionResult
+
+        parsed = urlsplit(request.resolved_url)
+        values = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        if parsed.path in ("/", "/index.html"):
+            body, status = (
+                f'<html><body><a href="/file={self._ASSET}">js</a>'
+                '<a href="/item?id=1">item</a></body></html>'
+            ), 200
+        elif parsed.path == "/item":
+            identifier = values.get("id", "")
+            if "'" in identifier or '"' in identifier:
+                body, status = (
+                    'sqlite3.OperationalError: unrecognized token'
+                ), 500
+            else:
+                body, status = f"<p>item {identifier}</p>", 200
+        elif parsed.path.startswith("/file="):
+            body, status = self._serve_file(parsed.path[len("/file="):])
+        else:
+            body, status = '{"detail":"not found"}', 404
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            evidence_type="http_response",
+            observation={
+                "type": "http_response", "status": status, "method": "GET",
+                "requested_url": request.resolved_url,
+                "request_kind": request.request_kind.value,
+                "body": body,
+            },
+        )
+
+    def _serve_file(self, raw: str) -> tuple[str, int]:
+        if raw.startswith("/"):
+            # 앱 루트 밖 절대 경로는 거부한다 — CVE-2024-3234 가 그렇다.
+            return '{"detail":"File not allowed"}', 403
+        segments: list[str] = []
+        for segment in raw.split("/"):
+            if segment in ("", "."):
+                continue
+            if segment == "..":
+                if segments:
+                    segments.pop()
+                continue
+            segments.append(segment)
+        resolved = "/".join(segments)
+        if resolved == "README.md":
+            # 선언된 web_assets/ 밖인데도 열린다. 이것이 증명 대상이다.
+            return "# project readme\nnot an asset\n", 200
+        if resolved == self._ASSET:
+            return "console.log(1);", 200
+        return '{"detail":"File not found"}', 404
+
+
+class KnowledgePublicationWithRealAgentsTests(unittest.TestCase):
+    """표준 Agent 가 만든 Observation 으로 Knowledge 발행까지 가는지 확인한다.
+
+    이 파일의 다른 테스트는 Analysis·Validation 을 대역으로 바꿔 끼우므로 Analyzer 가
+    실제로 기록하는 Observation type 을 지나가지 않는다. 그래서 Knowledge 의 사본
+    매핑이 취약점 유형을 9개 빠뜨리고, 남은 값마저 Observation 이 아닌 proof type
+    어휘라 좌표가 조용히 비어 있었는데도 전부 통과했다.
+    """
+
+    def _run(self):
+        knowledge = InMemoryKnowledgeBase()
+        app = build_local_application(
+            {},
+            runtime=_RealAgentRuntime(),
+            router=standard_router(
+                vulnerability_types=("Arbitrary File Read", "SQLi")
+            ),
+            knowledge_base=knowledge,
+        )
+        register_standard_agents(app, recon_max_pages=3)
+        run = app.orchestrator.start(
+            RunRequest(
+                # 이 파일의 _TARGET 은 /search 라서 링크를 실은 루트가 아니다.
+                target_url="http://local.test/",
+                scope=RunScope(allowed_hosts=frozenset({"local.test"})),
+                request_budget=60,
+            )
+        )
+        return app, knowledge, run
+
+    def test_every_confirmed_finding_reaches_the_knowledge_plane(self) -> None:
+        app, _, run = self._run()
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        findings = app.stores.findings.list_by_run(run.run_id)
+        self.assertTrue(findings)
+        # 발행 실패는 Finding 단위로 격리되므로 Run 은 성공한 채 조용히 비어 있을 수 있다.
+        self.assertEqual(app.orchestrator._knowledge_failures, [])
+        self.assertEqual(
+            app.orchestrator._knowledge_published, (len(findings), len(findings))
+        )
+
+    def test_file_read_case_keeps_its_strategy_and_coordinate(self) -> None:
+        app, knowledge, run = self._run()
+
+        cases = knowledge.search(
+            KnowledgeQuery(category="Arbitrary File Read", text="")
+        )
+        self.assertEqual(len(cases), 1)
+        case = cases[0]
+        # 한 Agent 의 두 전략이 하나로 뭉개지지 않는다.
+        self.assertEqual(case.metadata["proof_type"], "directory_escape_file_read")
+        # 좌표는 Analyzer 가 기록한 Observation 에서 나온다.
+        self.assertEqual(case.metadata.get("signal_parameter_names"), "file")
+
+    def test_sqli_case_records_the_parameter_that_produced_the_signal(self) -> None:
+        # 이 유형의 매핑 값은 Observation 과 어휘가 어긋나 좌표가 비어 있었다.
+        _, knowledge, _ = self._run()
+
+        cases = knowledge.search(KnowledgeQuery(category="SQLi", text=""))
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0].metadata.get("signal_parameter_names"), "id")
 
 
 if __name__ == "__main__":

@@ -77,18 +77,42 @@ class _ProfileRuntime:
         )
 
 
+class _StatelessFormRuntime:
+    """보낸 값을 그 응답에만 렌더링하는 POST 폼. 저장도 리다이렉트도 하지 않는다."""
+
+    def __init__(self, *, vulnerable: bool = True) -> None:
+        self.vulnerable = vulnerable
+        self.requests: list[ExecutionRequest] = []
+
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        self.requests.append(request)
+        sent = dict(request.form_parameters).get("name", "")
+        rendered = "12121" if self.vulnerable and sent == "{{713*17}}" else sent
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            evidence_type="http_response",
+            observation={"type": "http_response", "status": 200,
+                         "body": f"<strong>{rendered} is in stock</strong>"},
+        )
+
+
 def _fixture(
     payload: dict[str, object],
     *,
     vulnerable: bool = True,
     parameters: tuple[str, ...] = ("email", "role", "username"),
+    runtime=None,
+    default_approval_ref: str | None = None,
 ):
     llm = _FakeLlmClient(payload)
-    runtime = _ProfileRuntime(vulnerable=vulnerable)
+    runtime = runtime if runtime is not None else _ProfileRuntime(vulnerable=vulnerable)
     app = build_local_application(
         {},
         runtime=runtime,
-        approval_gate=StaticApprovalGate((SSTI_APPROVAL_REF,)),
+        approval_gate=StaticApprovalGate(
+            (SSTI_APPROVAL_REF, *(( default_approval_ref,) if default_approval_ref else ()))
+        ),
+        default_approval_ref=default_approval_ref,
     )
     app.stores.runs.add(
         Run(
@@ -157,6 +181,53 @@ def _collect(result, app, task: TaskEnvelope) -> TaskEnvelope:
         evidence_ids=tuple(ids),
         request_budget=app.budget_manager.remaining(task.run_id),
     )
+
+
+class LlmStatelessParityTests(unittest.TestCase):
+    """LLM 프로파일에도 상태를 남기지 않는 경로가 있어야 한다.
+
+    heuristic에만 경로가 있으면 같은 대상이 구현에 따라 다르게 보인다. SSTI는
+    실제로 그렇게 갈라져 있었다.
+    """
+
+    def test_a_non_username_form_field_still_gets_the_fixed_arithmetic_probe(self) -> None:
+        # POST는 메서드 자체로 상태 변경이므로 운영자가 인가한 런에서만 돌아간다.
+        # 고정 산술값만 보낸다는 계약과 별개로 이 경계는 그대로 유지된다.
+        agent, app, _, runtime, task = _fixture(
+            {"parameters": ["name"], "reason": "rendered back into the page"},
+            parameters=("name",),
+            runtime=_StatelessFormRuntime(),
+            default_approval_ref="approve-state-changing",
+        )
+        result = agent.handle(task)
+        while result.evidence_requests:
+            result = agent.handle(_collect(result, app, task))
+
+        sent = [dict(request.form_parameters)["name"] for request in runtime.requests]
+        # control 1회 + 방언별 probe. /profile 계약의 설정·정리 요청은 없다.
+        self.assertIn("{{713*17}}", sent)
+        # 날 본문이 아니라 구조화된 form 좌표로만 보낸다.
+        self.assertTrue(all(request.body is None for request in runtime.requests))
+        observation = next(
+            item.observation for item in app.stores.evidence.list_by_run(_RUN_ID)
+            if item.observation.get("type") == "template_execution"
+        )
+        self.assertEqual(observation["parameter"], "name")
+        self.assertEqual(observation["engine"], "curly")
+        # 좌표는 LLM이 골랐다는 사실이 관측에 남는다.
+        self.assertEqual(observation["selection_source"], "llm")
+
+    def test_a_field_outside_the_shared_hints_is_dropped(self) -> None:
+        # LLM이 아무 필드나 지목해도 좁힘 기준은 분석기의 집합 하나다.
+        agent, app, _, runtime, task = _fixture(
+            {"parameters": ["role"], "reason": "guessing"},
+            parameters=("role",),
+            runtime=_StatelessFormRuntime(),
+        )
+        result = agent.handle(task)
+
+        self.assertEqual(result.evidence_requests, ())
+        self.assertEqual(runtime.requests, [])
 
 
 class LlmSstiAnalyzerTests(unittest.TestCase):

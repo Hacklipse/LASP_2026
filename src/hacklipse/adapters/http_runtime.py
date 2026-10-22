@@ -24,7 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from hacklipse.domain import ExecutionRequest, ExecutionResult
+from hacklipse.domain import ExecutionRequest, ExecutionResult, HttpRequestKind
 from hacklipse.ports import CredentialResolver
 from hacklipse.ports.errors import CredentialNotFound, ExternalExecutionDisabled
 
@@ -34,7 +34,12 @@ _HTTP_TOOLS = frozenset(
     {
         "http_get",
         "http_post",
+        "http_delete",
         "path_traversal_probe",
+        # 이 도구가 빠져 있던 동안 Arbitrary File Read는 Analyzer와 Validation이
+        # 모두 구현돼 있어도 실제 대상에서 한 건도 실행되지 못했다. 테스트가 Evidence를
+        # 직접 만들어 넣는 대역을 써서 드러나지 않았다.
+        "arbitrary_file_read_probe",
         "access_control_probe",
         "ssti_probe",
     }
@@ -161,6 +166,41 @@ class HttpExecutionRuntime:
                 f"http runtime does not implement tool: {request.tool}"
             )
         requested_url = request.resolved_url
+        if request.request_kind in {
+            HttpRequestKind.SSRF_CSV_UPLOAD_CONTROL,
+            HttpRequestKind.SSRF_CSV_UPLOAD_PROBE,
+            HttpRequestKind.SSRF_CSV_IMPORT_CONTROL,
+            HttpRequestKind.SSRF_CSV_IMPORT_PROBE,
+        }:
+            if request.credential_ref is None or self._credentials is None:
+                raise CredentialNotFound("CSV workflow requires its credential reference")
+            credential = _resolve_credential(
+                self._credentials, request.credential_ref, requested_url,
+            )
+            secrets = dict(credential.query_secrets)
+            required = (
+                ("token", "_token")
+                if request.request_kind in {
+                    HttpRequestKind.SSRF_CSV_UPLOAD_CONTROL,
+                    HttpRequestKind.SSRF_CSV_UPLOAD_PROBE,
+                } else ("token",)
+            )
+            if any(name not in secrets for name in required):
+                raise CredentialNotFound("CSV workflow token is unavailable")
+            parsed = urllib.parse.urlsplit(requested_url)
+            pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+            if any(sum(
+                key == name and value == "hacklipse-credential-" + name
+                for key, value in pairs
+            ) != 1 for name in required):
+                raise ExternalExecutionDisabled("CSV workflow lacks its token placeholder")
+            requested_url = urllib.parse.urlunsplit((
+                parsed.scheme, parsed.netloc, parsed.path,
+                urllib.parse.urlencode(tuple(
+                    (name, secrets[name] if name in required else value)
+                    for name, value in pairs
+                )), parsed.fragment,
+            ))
         scheme = urllib.parse.urlsplit(requested_url).scheme.lower()
         method = request.method.upper()
         if scheme not in _ALLOWED_SCHEMES:
@@ -195,7 +235,7 @@ class HttpExecutionRuntime:
             headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
             body = urllib.parse.urlencode(request.form_parameters).encode("utf-8")
         else:
-            body = request.body.encode("utf-8") if request.body is not None else None
+            body = request.body.encode(request.body_encoding) if request.body is not None else None
         http_request = urllib.request.Request(
             requested_url,
             data=body,
@@ -331,7 +371,14 @@ class HttpExecutionRuntime:
         }
 
         # 텍스트만 디코딩한다. 바이너리는 강제 문자열화하지 않고 크기·해시만 남긴다.
-        if method != "HEAD" and _is_textual(content_type):
+        # 읽어 낸 파일은 application/octet-stream 으로 오는 경우가 많다.
+        # 텍스트만 디코딩하면 본문이 비어 표식을 볼 수 없다.
+        if method != "HEAD" and (
+            _is_textual(content_type)
+            # 도구 이름은 _HTTP_TOOLS 와 같이 리터럴로 둔다 — 이 저수준 Runtime 이
+            # Analyzer 모듈을 import 하면 순환이 생긴다.
+            or request.tool == "arbitrary_file_read_probe"
+        ):
             body_text = raw.decode(_charset(content_type), errors="replace")
             if self._redirect_origin_aliases:
                 request_origin = urllib.parse.urlsplit(requested_url)

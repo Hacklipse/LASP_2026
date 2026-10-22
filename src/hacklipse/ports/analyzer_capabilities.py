@@ -35,11 +35,18 @@ class AnalyzerCapability:
     requires_parameters: bool = True
     parameter_hints: tuple[str, ...] = ()
     requires_object_identifier: bool = False
+    # 경로에 `이름=값`으로 실린 입력 좌표를 Surface가 실제로 들고 있어야 하는가.
+    # 관측 Evidence만으로는 실행할 수 없다 — 교체할 범위는 Surface에만 있다.
+    requires_path_assignment: bool = False
+    # 파라미터 없는 파일 제공 라우트의 마지막 세그먼트를 바꿀 수 있어야 하는가.
+    requires_file_serving_segment: bool = False
     observation_requirements: tuple[ObservationRequirement, ...] = ()
     exploration_parameter_source: ParameterSource = "none"
+    observation_parameter_field: str = "parameter"
     supported_evidence_types: tuple[str, ...] = ()
     strategy_ids: tuple[str, ...] = ("default",)
     default_priority: float = 0.15
+    requires_observed_query: bool = False
 
     def __post_init__(self) -> None:
         if not self.capability_id or not self.agent_type or not self.vulnerability_type:

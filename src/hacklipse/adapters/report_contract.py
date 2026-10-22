@@ -16,14 +16,18 @@ from types import MappingProxyType
 from typing import Literal
 from urllib.parse import urlsplit
 
-from hacklipse.domain import CandidateStatus, ValidationProofType
+from hacklipse.domain import CandidateStatus, SsrfPolicySource, ValidationProofType
 
 
-# v2: run LLM 사용량 세 값과 run:llm-usage fact를 계약에 넣었다. fact_ids 순서가
-# 바뀌므로 이전 버전의 fingerprint와 섞이지 않게 버전을 올린다.
-CONTRACT_VERSION = "report-facts-v2"
+# v5: callback과 internal-canary 상태를 독립 필드로 추가했다. 한 전략의
+# 장애가 다른 전략의 성공 관측을 덮지 않게 하는 사실 계약 변경이다.
+CONTRACT_VERSION = "report-facts-v5"
 MAX_PATH_HINT_LENGTH = 160
 PROOF_DESCRIPTIONS = MappingProxyType({
+    ValidationProofType.ARBITRARY_FILE_READ:
+        "고정 절대 경로 control/probe 비교에서 파일 읽기 확인",
+    ValidationProofType.DIRECTORY_ESCAPE_FILE_READ:
+        "선언된 하위 디렉터리 밖 고정 파일 읽기를 control/probe 비교로 확인",
     ValidationProofType.CORS_ORIGIN_REFLECTION:
         "독립 GET 요청에서 외부 Origin 반사와 credential 허용 확인",
     ValidationProofType.XSS_EXECUTION:
@@ -34,6 +38,8 @@ PROOF_DESCRIPTIONS = MappingProxyType({
         "분리된 주체 세션에서 다른 소유자의 객체 접근 확인",
     ValidationProofType.PATH_TRAVERSAL_FILE_READ:
         "제한된 safe-file control/probe 비교에서 파일 읽기 확인",
+    ValidationProofType.ARBITRARY_FILE_READ:
+        "허용된 비민감 파일의 독립 control/probe 비교에서 파일 읽기 확인",
     ValidationProofType.SSTI_EXECUTION:
         "고정 산술 control/probe 비교에서 서버 측 평가 확인",
     ValidationProofType.SENSITIVE_DATA_EXPOSURE:
@@ -50,6 +56,10 @@ PROOF_DESCRIPTIONS = MappingProxyType({
         "독립 GET 재요청에서 오류 응답의 내부 스택 프레임 확인",
     ValidationProofType.OPEN_REDIRECT:
         "독립 control/probe 비교에서 외부 origin 이동 대상 확인",
+    ValidationProofType.FILE_UPLOAD_RETRIEVAL:
+        "독립 업로드 재현에서 확장자가 보존된 무해 파일의 저장과 동일 바이트 회수 확인",
+    ValidationProofType.SSRF_UNAUTHORIZED_FETCH:
+        "독립 callback 재현과 승인된 내부 canary의 금지 목적지 접근 확인",
 })
 PROOF_UNAVAILABLE = "검증 상세를 사용할 수 없음"
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
@@ -108,6 +118,11 @@ def finding_fact_id(finding_id: str) -> str:
     return "finding:" + sha256(finding_id.encode("utf-8")).hexdigest()
 
 
+def ssrf_callback_surface_fact_id(surface_id: str) -> str:
+    _identifier(surface_id)
+    return "run:ssrf-callback:" + sha256(surface_id.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class FindingReportFact:
     fact_id: str
@@ -136,7 +151,181 @@ class FindingReportFact:
 
     @property
     def proof_description(self) -> str:
+        if self.proof_type is ValidationProofType.SSRF_UNAUTHORIZED_FETCH:
+            return (
+                "independent server-request observation and an exact-Surface "
+                "destination-policy violation were reproduced"
+            )
         return PROOF_UNAVAILABLE if self.proof_type is None else PROOF_DESCRIPTIONS[self.proof_type]
+
+
+@dataclass(frozen=True, slots=True)
+class SsrfCallbackSurfaceFact:
+    """A/B callback reproduction without a destination-policy verdict."""
+
+    fact_id: str
+    surface_path_hint: str
+    analysis_http_callbacks: int
+    validation_http_callbacks: int
+
+    def __post_init__(self) -> None:
+        _identifier(self.fact_id)
+        if not self.fact_id.startswith("run:ssrf-callback:"):
+            raise ValueError("SSRF callback facts must use the callback namespace")
+        if (
+            not self.surface_path_hint.startswith("/")
+            or surface_path_hint(self.surface_path_hint) != self.surface_path_hint
+        ):
+            raise ValueError("report path must already be generalized")
+        _count(self.analysis_http_callbacks)
+        _count(self.validation_http_callbacks)
+        if not self.analysis_http_callbacks or not self.validation_http_callbacks:
+            raise ValueError("SSRF callback surface requires independent A/B HTTP observations")
+
+
+SSRF_REVIEW_STATUSES = frozenset({
+    "NOT_TESTED",
+    "REVIEW_REQUIRED",
+    "CALLBACK_OBSERVED",
+    "CANARY_OBSERVED_POLICY_PENDING",
+    "CONFIRMED_POLICY_VIOLATION",
+    "CALLBACK_PROVIDER_BLOCKED",
+    "OBSERVATION_PROVIDER_BLOCKED",
+    "EXECUTION_APPROVAL_PENDING",
+    "POLICY_EVIDENCE_PENDING",
+    "VALIDATION_BUDGET_INSUFFICIENT",
+    "ALLOWED_DESTINATION",
+    "CALLBACK_NOT_OBSERVED",
+    "CALLBACK_ANALYSIS_OBSERVED",
+    "CALLBACK_NOT_REPRODUCED",
+    "CANARY_ANALYSIS_OBSERVED",
+    "CANARY_NOT_REPRODUCED",
+    "OWNED_RECEIVER_OBSERVED_POLICY_PENDING",
+    "OWNED_RECEIVER_ANALYSIS_OBSERVED",
+    "OWNED_RECEIVER_NOT_REPRODUCED",
+    "OWNED_RECEIVER_NOT_OBSERVED",
+    "OWNED_RECEIVER_PROVIDER_BLOCKED",
+})
+
+SSRF_CALLBACK_STATUSES = frozenset({
+    "NOT_CONFIGURED",
+    "NOT_RUN",
+    "NO_HTTP_CALLBACK",
+    "ANALYSIS_OBSERVED",
+    "VALIDATION_REPRODUCED",
+    "VALIDATION_NOT_REPRODUCED",
+    "PROVIDER_BLOCKED",
+    "VALIDATION_BUDGET_INSUFFICIENT",
+})
+
+SSRF_CANARY_STATUSES = frozenset({
+    "NOT_CONFIGURED",
+    "NOT_RUN",
+    "NO_CANARY_MARKER",
+    "ANALYSIS_OBSERVED",
+    "VALIDATION_NOT_REPRODUCED",
+    "ACCESS_OBSERVED_POLICY_PENDING",
+    "POLICY_MISMATCH",
+    "ALLOWED_DESTINATION",
+    "CONFIRMED_POLICY_VIOLATION",
+    "PROVIDER_BLOCKED",
+    "EXECUTION_APPROVAL_PENDING",
+    "VALIDATION_BUDGET_INSUFFICIENT",
+})
+
+SSRF_OWNED_RECEIVER_STATUSES = frozenset({
+    "NOT_CONFIGURED",
+    "NOT_RUN",
+    "NO_REQUEST_OBSERVED",
+    "ANALYSIS_OBSERVED",
+    "VALIDATION_NOT_REPRODUCED",
+    "ACCESS_OBSERVED_POLICY_PENDING",
+    "POLICY_MISMATCH",
+    "ALLOWED_DESTINATION",
+    "CONFIRMED_POLICY_VIOLATION",
+    "PROVIDER_BLOCKED",
+    "VALIDATION_BUDGET_INSUFFICIENT",
+})
+
+
+@dataclass(frozen=True, slots=True)
+class SsrfReviewFact:
+    """Bounded SSRF assessment facts safe to offer to the report narrator."""
+
+    url_surface_count: int
+    manual_analysis_completed: bool
+    execution_approval_registered: bool
+    destination_policy_registered: bool
+    destination_policy_source: str
+    observation_recorded: bool
+    verification_performed: bool
+    final_status: str
+    reason_code: str
+    callback_status: str = "NOT_CONFIGURED"
+    canary_status: str = "NOT_CONFIGURED"
+    owned_receiver_status: str = "NOT_CONFIGURED"
+    destination_hint_use_approved: bool = False
+    approved_surface_id: str = ""
+
+    def __post_init__(self) -> None:
+        _count(self.url_surface_count)
+        for value in (
+            self.manual_analysis_completed,
+            self.execution_approval_registered,
+            self.destination_policy_registered,
+            self.observation_recorded,
+            self.verification_performed,
+            self.destination_hint_use_approved,
+        ):
+            if type(value) is not bool:
+                raise ValueError("SSRF review flags must be booleans")
+        allowed_sources = {"", *(item.value for item in SsrfPolicySource)}
+        if self.destination_policy_source not in allowed_sources:
+            raise ValueError("SSRF review policy source must be a trusted closed value")
+        if self.destination_policy_registered != bool(self.destination_policy_source):
+            raise ValueError("SSRF review policy registration and source must agree")
+        if self.final_status not in SSRF_REVIEW_STATUSES:
+            raise ValueError("unsupported SSRF review status")
+        if self.callback_status not in SSRF_CALLBACK_STATUSES:
+            raise ValueError("unsupported SSRF callback strategy status")
+        if self.canary_status not in SSRF_CANARY_STATUSES:
+            raise ValueError("unsupported SSRF canary strategy status")
+        if self.owned_receiver_status not in SSRF_OWNED_RECEIVER_STATUSES:
+            raise ValueError("unsupported SSRF owned-receiver strategy status")
+        if self.approved_surface_id:
+            _identifier(self.approved_surface_id)
+            if not self.execution_approval_registered:
+                raise ValueError("SSRF approved Surface requires execution approval")
+        if re.fullmatch(r"ssrf_[a-z0-9_]{1,95}", self.reason_code) is None:
+            raise ValueError("SSRF review requires a stable reason code")
+        if self.final_status == "CONFIRMED_POLICY_VIOLATION" and not (
+            self.observation_recorded
+            and self.verification_performed
+            and self.execution_approval_registered
+            and bool(self.approved_surface_id)
+            and self.destination_policy_registered
+            and (
+                self.canary_status == "CONFIRMED_POLICY_VIOLATION"
+                or self.owned_receiver_status == "CONFIRMED_POLICY_VIOLATION"
+            )
+        ):
+            raise ValueError(
+                "confirmed SSRF review requires observation, verification and policy"
+            )
+        if self.final_status == "ALLOWED_DESTINATION" and not (
+            self.observation_recorded
+            and self.verification_performed
+            and self.execution_approval_registered
+            and bool(self.approved_surface_id)
+            and self.destination_policy_registered
+            and (
+                self.canary_status == "ALLOWED_DESTINATION"
+                or self.owned_receiver_status == "ALLOWED_DESTINATION"
+            )
+        ):
+            raise ValueError(
+                "allowed SSRF destination requires observation, verification and policy"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +334,9 @@ class RunReportFacts:
     format_version: Literal["v2"]
     candidate_counts: tuple[tuple[CandidateStatus, int], ...]
     findings: tuple[FindingReportFact, ...]
+    ssrf_callback_surfaces: tuple[SsrfCallbackSurfaceFact, ...] = ()
+    ssrf_destination_hint_count: int = 0
+    ssrf_review: SsrfReviewFact | None = None
     request_budget_total: int | None = None
     request_budget_used: int | None = None
     # 실제 발견 범위의 수치만 추가한다. URL/파라미터 원문은 계약에 넣지 않는다.
@@ -160,7 +352,11 @@ class RunReportFacts:
         _identifier(self.run_id)
         if self.format_version != "v2":
             raise ValueError("report facts require format v2")
-        if not isinstance(self.candidate_counts, tuple) or not isinstance(self.findings, tuple):
+        if (
+            not isinstance(self.candidate_counts, tuple)
+            or not isinstance(self.findings, tuple)
+            or not isinstance(self.ssrf_callback_surfaces, tuple)
+        ):
             raise ValueError("report collections must be immutable tuples")
         counts = {}
         for entry in self.candidate_counts:
@@ -175,13 +371,24 @@ class RunReportFacts:
             raise ValueError("all candidate statuses must be counted")
         if any(not isinstance(item, FindingReportFact) for item in self.findings):
             raise ValueError("findings must be report facts")
+        if any(
+            not isinstance(item, SsrfCallbackSurfaceFact)
+            for item in self.ssrf_callback_surfaces
+        ):
+            raise ValueError("SSRF callback surfaces must be report facts")
+        if self.ssrf_review is not None and not isinstance(self.ssrf_review, SsrfReviewFact):
+            raise ValueError("SSRF review must use the structured report fact")
         for field in ("finding_id", "fact_id"):
             ids = [getattr(item, field) for item in self.findings]
             if len(ids) != len(set(ids)):
                 raise ValueError("duplicate report finding or fact identifier")
+        callback_ids = [item.fact_id for item in self.ssrf_callback_surfaces]
+        if len(callback_ids) != len(set(callback_ids)):
+            raise ValueError("duplicate SSRF callback surface fact identifier")
         usage = (self.llm_calls, self.llm_input_tokens, self.llm_output_tokens)
         for value in (self.request_budget_total, self.request_budget_used,
-                      self.surface_count, self.parameter_count, *usage):
+                      self.surface_count, self.parameter_count,
+                      self.ssrf_destination_hint_count, *usage):
             if value is not None:
                 _count(value)
         if (self.request_budget_total is not None and self.request_budget_used is not None
@@ -194,12 +401,19 @@ class RunReportFacts:
             raise ValueError("llm usage cannot report tokens without a call")
         object.__setattr__(self, "candidate_counts", tuple((s, counts[s]) for s in CandidateStatus))
         object.__setattr__(self, "findings", tuple(sorted(self.findings, key=lambda f: f.finding_id)))
+        object.__setattr__(
+            self, "ssrf_callback_surfaces",
+            tuple(sorted(self.ssrf_callback_surfaces, key=lambda item: item.fact_id)),
+        )
 
     @property
     def fact_ids(self) -> tuple[str, ...]:
         return (
             "run:scope", "run:request-budget", "run:llm-usage",
+            "run:ssrf-destination-hints",
+            *(("run:ssrf-review",) if self.ssrf_review is not None else ()),
             *(f"run:candidates:{status.value}" for status in CandidateStatus),
+            *(item.fact_id for item in self.ssrf_callback_surfaces),
             *(finding.fact_id for finding in self.findings),
         )
 
@@ -238,6 +452,11 @@ def _facts_payload(facts: RunReportFacts) -> dict[str, object]:
         "format_version": facts.format_version,
         "fact_ids": facts.fact_ids,
         "candidate_counts": [(status.value, count) for status, count in facts.candidate_counts],
+        "ssrf_callback_surfaces": [
+            asdict(item) for item in facts.ssrf_callback_surfaces
+        ],
+        "ssrf_destination_hint_count": facts.ssrf_destination_hint_count,
+        "ssrf_review": asdict(facts.ssrf_review) if facts.ssrf_review is not None else None,
         "findings": [
             {**asdict(finding), "proof_type": finding.proof_type.value if finding.proof_type else None,
              "proof_description": finding.proof_description}
@@ -293,10 +512,21 @@ def _comparable_payload(facts: RunReportFacts) -> dict[str, object]:
         }
         for finding in facts.findings
     ]
+    callback_surfaces = [
+        {
+            "surface_path_hint": item.surface_path_hint,
+            "analysis_http_callbacks": item.analysis_http_callbacks,
+            "validation_http_callbacks": item.validation_http_callbacks,
+        }
+        for item in facts.ssrf_callback_surfaces
+    ]
     return {
         "contract_version": CONTRACT_VERSION,
         "format_version": facts.format_version,
         "candidate_counts": [(status.value, count) for status, count in facts.candidate_counts],
+        "ssrf_callback_surfaces": sorted(callback_surfaces, key=_json),
+        "ssrf_destination_hint_count": facts.ssrf_destination_hint_count,
+        "ssrf_review": asdict(facts.ssrf_review) if facts.ssrf_review is not None else None,
         "findings": sorted(findings, key=_json),
         "request_budget_total": facts.request_budget_total,
         "request_budget_used": facts.request_budget_used,

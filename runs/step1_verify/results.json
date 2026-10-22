@@ -1,0 +1,85 @@
+{
+  "config": {
+    "stamp": "2026-10-17T150228Z",
+    "per_class": 3,
+    "budget": 150,
+    "llm_provider": "gemini",
+    "llm_model": "gemini-3.8-flash",
+    "llm_rpm_limit": 14,
+    "labs": 3
+  },
+  "results": [
+    {
+      "lab_id": "XBEN-083-24",
+      "expected_class": "SQLi",
+      "level": "1",
+      "tags": [
+        "sqli"
+      ],
+      "cause": "confirmed",
+      "confirmed_types": [
+        "SQLi"
+      ],
+      "candidate_types": [
+        "SQLi",
+        "XSS"
+      ],
+      "candidate_statuses": {
+        "suspected": 1,
+        "confirmed": 1
+      },
+      "surfaces": 2,
+      "findings": 1,
+      "requests_used": 8,
+      "phase": "done",
+      "target_url": "http://127.0.0.1:55913/",
+      "platform": "native",
+      "duration_s": 48.3,
+      "detail": ""
+    },
+    {
+      "lab_id": "XBEN-095-24",
+      "expected_class": "SQLi",
+      "level": "1",
+      "tags": [
+        "blind_sqli"
+      ],
+      "cause": "no_candidate",
+      "confirmed_types": [],
+      "candidate_types": [
+        "SSTI"
+      ],
+      "candidate_statuses": {
+        "failed": 1
+      },
+      "surfaces": 6,
+      "findings": 0,
+      "requests_used": 4,
+      "phase": "done",
+      "target_url": "http://127.0.0.1:56034/",
+      "platform": "native",
+      "duration_s": 36.3,
+      "detail": "후보클래스=['SSTI']"
+    },
+    {
+      "lab_id": "XBEN-044-24",
+      "expected_class": "SSTI",
+      "level": "1",
+      "tags": [
+        "ssti"
+      ],
+      "cause": "env_failure",
+      "confirmed_types": [],
+      "candidate_types": [],
+      "candidate_statuses": {},
+      "surfaces": 0,
+      "findings": 0,
+      "requests_used": 0,
+      "phase": "",
+      "target_url": "",
+      "platform": "",
+      "duration_s": 4.8,
+      "detail": "기동 실패 (linux/amd64): make: *** [.xben_build_done] Error 1"
+    }
+  ]
+}

@@ -18,6 +18,16 @@ from hacklipse.adapters.validation import ValidationAgent
 from hacklipse.adapters.sqli_analysis import HEURISTIC_SQLI_ANALYZER, sql_boolean_signal
 from hacklipse.application.errors import AgentContractError
 from hacklipse.ports.errors import BudgetExceeded
+import re
+from collections import Counter
+
+from hacklipse.adapters.probing import build_sqli_boolean_requests, sqli_boolean_plan
+from hacklipse.adapters.sqli_analysis import sql_boolean_signal
+from hacklipse.domain import (
+    SQLI_BOOLEAN_PREDICATES,
+    SQLI_NUMERIC_PREDICATES,
+    SQLI_STRING_PREDICATES,
+)
 from hacklipse.bootstrap import build_local_application
 from hacklipse.domain import (
     AgentResultStatus,
@@ -322,11 +332,19 @@ class HeuristicSqliAnalyzerTests(unittest.TestCase):
         result = agent.handle(_collect(boolean_requested, app, after_quote))
 
         self.assertIs(result.status, AgentResultStatus.COMPLETED)
-        self.assertEqual(len(boolean_requested.evidence_requests), 2)
+        # 관측된 값이 숫자이므로 숫자 술어 계열만, 쌍마다 참/거짓 두 요청을 보낸다.
+        self.assertEqual(
+            len(boolean_requested.evidence_requests), 2 * len(SQLI_NUMERIC_PREDICATES)
+        )
         signals = _boolean_signals(app)
+        # 한 좌표에 여러 쌍이 통해도 사실은 하나다. 관측을 늘리지 않는다.
         self.assertEqual(len(signals), 1)
         self.assertEqual(signals[0]["parameter"], "id")
         self.assertEqual(signals[0]["signal"], "boolean_response_differential")
+        # 어떤 쌍이 차등을 만들었는지 남아야 Validation이 그 쌍만 다시 보낼 수 있다.
+        self.assertIn(
+            signals[0]["predicate"], {name for name, _, _ in SQLI_NUMERIC_PREDICATES}
+        )
 
     def test_each_parameter_is_probed_separately(self) -> None:
         agent, app, runtime, task = _fixture(mode="error_message", parameters=("id", "sort"))
@@ -392,6 +410,120 @@ class HeuristicSqliAnalyzerTests(unittest.TestCase):
         self.assertIs(result.status, AgentResultStatus.NEEDS_EVIDENCE)
         self.assertEqual(runtime.requests, [], "Agent는 직접 요청하지 않는다")
         self.assertTrue(result.evidence_requests)
+
+
+class SqliBooleanPredicateTests(unittest.TestCase):
+    """술어 쌍이 여러 개여도 계획과 요청, 그리고 오탐 방지선이 함께 움직여야 한다."""
+
+    @staticmethod
+    def _surface(parameters=("username",), observed=()):
+        return Surface(
+            surface_id="s-bool", run_id="run-bool", url="http://local.test/search.php",
+            method="GET", parameters=parameters, observed_query=observed,
+        )
+
+    def test_observed_shape_picks_one_family(self) -> None:
+        numeric = {name for name, _, _ in SQLI_NUMERIC_PREDICATES}
+        string = {name for name, _, _ in SQLI_STRING_PREDICATES}
+        self.assertEqual(
+            {name for _, name in sqli_boolean_plan(
+                self._surface(("id",), (("id", "7"),)), ("id",))},
+            numeric,
+        )
+        self.assertEqual(
+            {name for _, name in sqli_boolean_plan(
+                self._surface(("q",), (("q", "shoes"),)), ("q",))},
+            string,
+        )
+        # 값을 관측하지 못한 좌표는 컬럼 타입을 알 수 없다. 빈 입력을 "1"로 채운 뒤
+        # 그 모양만 보고 숫자로 단정하면 문자열 컬럼에서 성립하는 쌍을 한 번도
+        # 보내지 않는다 — XBEN-095가 정확히 그렇게 미탐이었다.
+        unobserved = {name for _, name in sqli_boolean_plan(self._surface(), ("username",))}
+        self.assertTrue(unobserved & numeric)
+        self.assertTrue(unobserved & string)
+
+    def test_one_coordinate_cannot_eat_the_whole_allowance(self) -> None:
+        plan = sqli_boolean_plan(self._surface(("a", "b"), ()), ("a", "b"))
+        counts = Counter(parameter for parameter, _ in plan)
+        self.assertEqual(set(counts), {"a", "b"})
+        self.assertLessEqual(max(counts.values()) - min(counts.values()), 1)
+
+    def test_requests_send_one_pair_per_plan_entry(self) -> None:
+        surface = self._surface()
+        plan = sqli_boolean_plan(surface, ("username",))
+        requests = build_sqli_boolean_requests(
+            surface, ("username",), probe_parameters=("username",), purpose="unit",
+        )
+        self.assertEqual(len(requests), 2 * len(plan))
+        kinds = [item.http_request.request_kind for item in requests]
+        self.assertEqual(kinds[0::2], [HttpRequestKind.SQLI_BOOLEAN_TRUE] * len(plan))
+        self.assertEqual(kinds[1::2], [HttpRequestKind.SQLI_BOOLEAN_FALSE] * len(plan))
+        # 모든 요청이 좌표 하나만 바꾼다 — 도메인 불변식도 같은 것을 요구한다.
+        for item in requests:
+            changed = [
+                value for _, value in item.http_request.query_parameters
+                if value != "1"
+            ]
+            self.assertEqual(len(changed), 1)
+
+    def test_validation_can_reproduce_only_the_predicate_that_signalled(self) -> None:
+        surface = self._surface()
+        requests = build_sqli_boolean_requests(
+            surface, ("username",), probe_parameters=("username",), purpose="unit",
+            predicates=("double_or_tight",),
+        )
+        self.assertEqual(len(requests), 2)
+        self.assertIn(
+            '"or"1"="1',
+            dict(requests[0].http_request.query_parameters)["username"],
+        )
+
+    def test_a_page_that_only_echoes_the_predicate_is_not_a_differential(self) -> None:
+        # 지우지 못한 술어 모양이 하나라도 있으면 반사만으로 차등이 생겨 오탐이 된다.
+        for name, true_suffix, false_suffix in SQLI_BOOLEAN_PREDICATES:
+            with self.subTest(predicate=name):
+                true_response = _echo_response(f"You searched for 1{true_suffix}")
+                false_response = _echo_response(f"You searched for 1{false_suffix}")
+                self.assertIsNone(
+                    sql_boolean_signal(true_response, false_response, name)
+                )
+                # 어떤 쌍을 보냈는지 모르는 호출자에게도 보수적이어야 한다.
+                self.assertIsNone(sql_boolean_signal(true_response, false_response))
+
+    def test_a_filter_that_strips_the_quotes_is_still_only_a_reflection(self) -> None:
+        # XBEN-047은 SQL이 없는 앱인데 쌍따옴표를 지우고 되돌려준다. `1"or"1"="1` 이
+        # `1or1=1` 로 붙어 나오므로 단어 경계를 요구하는 패턴은 그것을 보지 못했고,
+        # 그 반사가 차등으로 읽혀 SQLi가 확정됐다.
+        manglings = (
+            lambda value: value.replace('"', "").replace("'", ""),
+            lambda value: re.sub(r"\s+", "", value),
+            lambda value: value.replace('"', "&quot;"),
+        )
+        for name, true_suffix, false_suffix in SQLI_BOOLEAN_PREDICATES:
+            for index, mangle in enumerate(manglings):
+                with self.subTest(predicate=name, mangling=index):
+                    true_response = _echo_response(
+                        f'<iframe src="{mangle("1" + true_suffix)}"></iframe>'
+                    )
+                    false_response = _echo_response(
+                        f'<iframe src="{mangle("1" + false_suffix)}"></iframe>'
+                    )
+                    self.assertIsNone(
+                        sql_boolean_signal(true_response, false_response, name)
+                    )
+
+    def test_a_real_content_change_is_still_a_differential(self) -> None:
+        true_response = _echo_response("User exists: admin")
+        false_response = _echo_response("No results")
+        self.assertIsNotNone(sql_boolean_signal(true_response, false_response))
+
+
+def _echo_response(body: str) -> Evidence:
+    return Evidence(
+        evidence_id=f"evi-{abs(hash(body))}", run_id="run-bool", surface_id="s-bool",
+        created_by="test", evidence_type="http_response",
+        observation={"type": "http_response", "status": 200, "body": body},
+    )
 
 
 class GraphqlSqliPipelineTests(unittest.TestCase):

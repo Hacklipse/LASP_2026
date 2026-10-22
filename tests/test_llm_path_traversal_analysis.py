@@ -384,7 +384,8 @@ class LlmPathTraversalAnalyzerTests(unittest.TestCase):
         _collect(requested, app, task)
 
         self.assertEqual(len(llm.requests), 1)
-        self.assertEqual(len(runtime.requests), 2)
+        # control 하나 + 고정된 두 표기. LLM은 파라미터만 고르고 경로는 Python이 쥔다.
+        self.assertEqual(len(runtime.requests), 3)
         sent_values = {
             value for request in runtime.requests for _, value in request.query_parameters
         }

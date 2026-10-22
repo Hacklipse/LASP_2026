@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from urllib.parse import urlsplit
+from dataclasses import replace
 
 from hacklipse.application.errors import AgentContractError
 from hacklipse.domain import (
@@ -11,12 +13,17 @@ from hacklipse.domain import (
     Candidate,
     Evidence,
     EvidenceRequest,
+    SsrfAssessmentReason,
+    SsrfDestinationRule,
+    SsrfObservationPhase,
+    SsrfVerificationStrategy,
     TaskEnvelope,
     ValidationProof,
     ValidationProofType,
     ValidationReasonCode,
     ValidationResult,
     ValidationVerdict,
+    ssrf_destination_origin,
 )
 from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
@@ -24,6 +31,7 @@ from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 from .probing import (
     build_probe_requests,
     build_sqli_boolean_requests,
+    sqli_boolean_plan,
     matching_evidence,
     probe_marker,
 )
@@ -32,12 +40,17 @@ from .path_traversal_analysis import (
     PATH_TRAVERSAL_BYPASS_OBSERVATION,
     PATH_TRAVERSAL_OBSERVATION,
     PATH_TRAVERSAL_TOOL,
+    build_path_assignment_requests,
     build_path_traversal_bypass_requests,
     build_path_traversal_requests,
+    has_file_like_path_assignment,
     is_restricted_file_surface,
     path_parameter_candidates,
+    path_parameters_from_evidence,
     path_traversal_bypass_signal,
+    PATH_TRAVERSAL_PROBE_PAYLOADS,
     path_traversal_signal,
+    prefers_path_assignment,
 )
 from .access_control_analysis import (
     ACCESS_CONTROL_TOOL,
@@ -57,15 +70,37 @@ from .graphql_suggestions import (
     SUGGESTION_TYPE, SUGGESTION_OBSERVATION,
     suggestion_request, suggested_field,
 )
+from .arbitrary_file_read import (
+    ARBITRARY_FILE_READ_OBSERVATION,
+    ARBITRARY_FILE_READ_PATH_CAPABILITY,
+    ARBITRARY_FILE_READ_TOOL,
+    arbitrary_file_read_signal,
+    build_arbitrary_file_read_path_requests,
+    build_arbitrary_file_read_requests,
+    build_arbitrary_file_read_segment_requests,
+    build_directory_escape_requests,
+    build_public_file_check,
+    declared_root_of,
+    directory_escape_signal,
+    file_serving_segment_index,
+    proof_file_is_public,
+    looks_like_file_parameter,
+)
 from .ssti_analysis import (
+    build_ssti_form_requests,
     SSTI_OBSERVATION,
     SSTI_TOOL,
+    build_ssti_query_requests,
     build_ssti_requests,
     matching_ssti_evidence,
     ssti_execution_signal,
+    ssti_query_execution_signal,
 )
 from .xss_execution import (
-    BROWSER_XSS_TOOL, XSS_EXECUTION_MARKER_PREFIX, attribute_execution_marker,
+    BROWSER_XSS_TOOL,
+    XSS_EXECUTION_MARKER_PREFIX,
+    attribute_execution_marker,
+    context_execution_marker,
 )
 from .postmessage_plan import POSTMESSAGE_ANALYZER
 from .postmessage_xss_analysis import message_request
@@ -90,6 +125,17 @@ from .cors_analysis import (
     CORS_TYPE, CORS_OBSERVATION, CORS_VALIDATION_ORIGIN,
     build_cors_requests, cors_reflection_signal, cors_probe_shape,
 )
+from .file_upload_analysis import (
+    UPLOAD_TYPE, UPLOAD_ANALYZER, UPLOAD_RESULT, UPLOAD_RISK_EXTENSIONS,
+    check_upload_extensions,
+)
+from .ssrf_analysis import (
+    SSRF_RESULT_TYPE, SSRF_TYPE, build_ssrf_canary_requests,
+    build_ssrf_owned_receiver_requests, build_ssrf_requests,
+    canary_marker_signal, has_http_callback, has_owned_receiver_observation,
+    poll_ssrf_callbacks, ssrf_candidate_verification_strategy, ssrf_parameters,
+)
+from .ssrf_assessment import resolve_ssrf_assessment
 
 # Router가 Candidate를 만들 때 쓴 것과 같은 taxonomy. Candidate가 알려진 취약점
 # 유형을 벗어나면(Router가 만들 수 없는 값) 계약 위반으로 간주한다. Analysis
@@ -98,6 +144,7 @@ _EXPECTED_SIGNAL = {
     rule.vulnerability_type: rule.observation_type
     for rule in (*DEFAULT_RULES, *OPTIONAL_SOURCE_MAP_RULES)
 }
+_EXPECTED_SIGNAL[SSRF_TYPE] = "ssrf_callback_http"
 
 # HttpExecutionRuntime(및 그 대역)이 실제 재현 요청 결과에 붙이는 Observation 유형.
 # 최초 Recon이 남긴 신호 관측(예: "url_or_file_parameter")과는 구분되는, Validator
@@ -162,11 +209,15 @@ class ValidationAgent:
             candidate.vulnerability_type == "Access Control"
             and ACCESS_CONTROL_TOOL in task.allowed_tools
         )
+        specialized_file_read_validation = (
+            candidate.vulnerability_type == "Arbitrary File Read"
+            and ARBITRARY_FILE_READ_TOOL in task.allowed_tools
+        )
         specialized_ssti_validation = (
             candidate.vulnerability_type == "SSTI" and SSTI_TOOL in task.allowed_tools
         )
         specialized_login_validation = candidate.vulnerability_type == PUBLIC_LOGIN_TYPE
-        if candidate.vulnerability_type == "SQLi":
+        if candidate.vulnerability_type in {"SQLi", SSRF_TYPE}:
             surface = self._surfaces.get(task.run_id, candidate.surface_id)
             required_tool = (
                 "http_post" if surface.method.upper() == "POST" else _REPRODUCTION_TOOL
@@ -177,6 +228,8 @@ class ValidationAgent:
             required_tool = ACCESS_CONTROL_TOOL
         elif specialized_ssti_validation:
             required_tool = SSTI_TOOL
+        elif specialized_file_read_validation:
+            required_tool = ARBITRARY_FILE_READ_TOOL
         elif specialized_login_validation:
             required_tool = "http_post"
         else:
@@ -194,8 +247,12 @@ class ValidationAgent:
             if _is_reproduction_evidence(item, task.validation_id)
         ]
 
+        if candidate.vulnerability_type == UPLOAD_TYPE:
+            return self._validate_file_upload(task, candidate, evidence)
         if candidate.vulnerability_type == "SQLi":
             return self._validate_sqli(task, candidate, evidence, reproduction)
+        if candidate.vulnerability_type == SSRF_TYPE:
+            return self._validate_ssrf(task, candidate, evidence)
         if candidate.vulnerability_type == EXPOSURE_TYPE:
             return self._validate_sensitive_exposure(task, candidate, evidence, reproduction)
         if specialized_login_validation:
@@ -220,6 +277,10 @@ class ValidationAgent:
             return self._validate_access_control(task, candidate, evidence)
         if specialized_ssti_validation:
             return self._validate_ssti(task, candidate, evidence, reproduction)
+        if specialized_file_read_validation:
+            return self._validate_arbitrary_file_read(
+                task, candidate, evidence, reproduction
+            )
         if (
             candidate.vulnerability_type == "XSS"
             and BROWSER_XSS_TOOL in task.allowed_tools
@@ -233,6 +294,762 @@ class ValidationAgent:
         if not reproduction:
             return self._needs_evidence(task, candidate.surface_id, EXPOSURE_TYPE)
         return self._decide(task, reproduction)
+
+    def _validate_file_upload(
+        self, task: TaskEnvelope, candidate: Candidate, evidence: Sequence[Evidence],
+    ) -> AgentResult:
+        analysis = next((item.observation for item in reversed(evidence)
+                         if item.surface_id == candidate.surface_id
+                         and item.created_by == UPLOAD_ANALYZER
+                         and item.observation.get("type") == UPLOAD_RESULT), None)
+        rows = analysis.get("results", ()) if analysis else ()
+        accepted = tuple(row for row in rows
+                         if row.get("outcome") == "accepted"
+                         and row.get("extension") in UPLOAD_RISK_EXTENSIONS
+                         and row.get("stored_extension", row["extension"]).casefold()
+                         in {extension.casefold() for extension in UPLOAD_RISK_EXTENSIONS})
+        if not accepted:
+            rejected = bool(rows) and all(row.get("outcome") == "rejected" for row in rows)
+            if rejected:
+                return self._validation_result(
+                    task, verdict=ValidationVerdict.REJECTED, evidence=(),
+                    reason="all tested uploads rejected; this does not establish the server extension policy",
+                    reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+                )
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED,
+                evidence=(), reason="no risky extension acceptance verified; consult per-extension observations",
+                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+            )
+        if self._collector is None:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="independent upload collector unavailable",
+                reason_code=ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR,
+            )
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        form_page = (self._surfaces.get(task.run_id, analysis["source_surface_id"])
+                     if analysis.get("refresh_form") else None)
+        reproduced, ids = check_upload_extensions(
+            self._collector, task, surface, analysis["parameter"],
+            form_page=form_page, probes=((accepted[0]["extension"], accepted[0].get("profile", "text_octet")),),
+        )
+        # outcome="accepted"는 업로드 응답만으로 서지 않는다. 저장된 파일을 되읽어
+        # 바이트가 일치했을 때만 붙는다. 여기에 확장자 보존까지 겹치면 "서버가 임의
+        # 타입 파일을 그 타입 그대로 보관하고 되돌려준다"는 재현된 사실이므로 CONFIRMED로
+        # 본다. 스크립트 실행은 별개이고 주장하지 않는다.
+        risky = {extension.casefold() for extension in UPLOAD_RISK_EXTENSIONS}
+        stored = next((row for row in reproduced
+                       if row["outcome"] == "accepted"
+                       and row.get("stored_extension", "").casefold() in risky), None)
+        if stored is not None:
+            proof_evidence = self._evidence.get_many(
+                task.run_id, tuple(stored.get("evidence_ids") or ids),
+            )
+            if proof_evidence:
+                served = stored.get("served_content_type") or "an unclassified type"
+                return self._validation_result(
+                    task, verdict=ValidationVerdict.CONFIRMED, evidence=proof_evidence,
+                    reason=(
+                        f"independent upload stored an inert {stored['stored_extension']} file "
+                        f"with its extension intact and served it back byte-identical as {served}"
+                    ),
+                    reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+                    proof=ValidationProof(
+                        proof_type=ValidationProofType.FILE_UPLOAD_RETRIEVAL,
+                        evidence_ids=tuple(item.evidence_id for item in proof_evidence),
+                        summary=(
+                            f"independent session uploaded an inert file to {analysis['parameter']} "
+                            f"and retrieved it byte-identical at a stored {stored['stored_extension']} "
+                            f"path served as {served}; the server keeps an arbitrary file type, "
+                            "which is not by itself proof of script execution"
+                        ),
+                    ),
+                )
+        # 되읽기는 됐지만 서버가 확장자를 정규화했다면 임의 타입 보관이 아니다.
+        if any(row["outcome"] == "accepted" for row in reproduced):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED,
+                evidence=self._evidence.get_many(task.run_id, ids),
+                reason="inert upload independently stored, but the server normalized the extension it is served under",
+                reason_code=ValidationReasonCode.GENERIC_NO_PROOF,
+            )
+        return self._validation_result(
+            task, verdict=ValidationVerdict.BLOCKED,
+            evidence=self._evidence.get_many(task.run_id, ids),
+            reason="independent upload acceptance could not be verified",
+            reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+        )
+
+    def _validate_ssrf(
+        self, task: TaskEnvelope, candidate: Candidate, evidence: Sequence[Evidence],
+    ) -> AgentResult:
+        if self._collector is None:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="SSRF validation collector is unavailable",
+                reason_code=ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR,
+            )
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        surface_evidence = tuple(item for item in self._evidence.list_by_run(task.run_id)
+                                 if item.surface_id == surface.surface_id)
+        available_parameters = ssrf_parameters(surface, surface_evidence)
+        canary = self._collector.ssrf_canary_proof_for_run(task.run_id)
+        try:
+            strategy = ssrf_candidate_verification_strategy(candidate)
+        except AgentContractError:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="unsupported or mixed SSRF verification strategy",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        registration = self._collector.ssrf_review_for_surface(
+            task.run_id, candidate.surface_id, strategy,
+        )
+        callback_candidate = strategy is SsrfVerificationStrategy.CALLBACK
+        canary_candidate = strategy is SsrfVerificationStrategy.INTERNAL_CANARY
+        owned_receiver_candidate = strategy is SsrfVerificationStrategy.OWNED_RECEIVER
+        passive_candidate = strategy is SsrfVerificationStrategy.PASSIVE
+        if (canary_candidate or owned_receiver_candidate) and registration is None:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="SSRF verification requires a Surface-bound execution approval",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        if owned_receiver_candidate:
+            if not self._collector.ssrf_owned_receiver_enabled:
+                return self._validation_result(
+                    task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                    reason="operator-owned SSRF receiver is unavailable",
+                    reason_code=ValidationReasonCode.SSRF_OWNED_RECEIVER_UNAVAILABLE,
+                )
+            assert registration is not None
+            return self._validate_registered_ssrf_owned_receiver(
+                task,
+                candidate,
+                evidence,
+                surface,
+                surface_evidence,
+                available_parameters,
+                registration,
+            )
+        if canary_candidate and registration is not None and canary is not None:
+            return self._validate_registered_ssrf_canary(
+                task, candidate, evidence, surface, surface_evidence,
+                available_parameters, registration, canary,
+            )
+        if (
+            passive_candidate
+            and registration is not None
+            and self._collector.ssrf_observation_enabled
+        ):
+            return self._validate_registered_ssrf_review(
+                task, candidate, available_parameters, registration,
+            )
+        if passive_candidate:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="passive SSRF review provider or registration is unavailable",
+                reason_code=ValidationReasonCode.SSRF_MANUAL_REVIEW_REQUIRED,
+            )
+        if canary_candidate:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="approved internal canary endpoint is unavailable",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        if registration is not None:
+            available_parameters = tuple(
+                item for item in available_parameters
+                if item == registration.parameter
+            )
+        if not self._collector.ssrf_enabled:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="SSRF callback service is unavailable",
+                reason_code=ValidationReasonCode.SSRF_CALLBACK_PROVIDER_UNAVAILABLE,
+            )
+        if not available_parameters:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="observed or declared URL input is unavailable",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        analysis_evidence = tuple(item for item in evidence if item.validation_id is None)
+        results = tuple(
+            item for item in analysis_evidence
+            if item.created_by == "ssrf_analyzer"
+            and item.observation.get("type") == SSRF_RESULT_TYPE
+            and item.observation.get("candidate_id") == candidate.candidate_id
+        )
+        if any(item.observation.get("status") == "provider_error" for item in results):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="SSRF callback provider failed during analysis",
+                reason_code=ValidationReasonCode.SSRF_CALLBACK_PROVIDER_UNAVAILABLE,
+            )
+        first_probe = None
+        parameter = None
+        first_hits = tuple(item for item in analysis_evidence
+                           if item.created_by == "execution_runtime:ssrf_callback")
+        for outcome in results:
+            selected = outcome.observation.get("parameter")
+            if selected not in available_parameters or outcome.observation.get("status") != "http":
+                continue
+            try:
+                analysis_ticket = self._collector.issue_ssrf_ticket(
+                    task.run_id, candidate.candidate_id, selected,
+                )
+            except (OSError, TimeoutError):
+                return self._validation_result(
+                    task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                    reason="SSRF callback provider could not reload the analysis ticket",
+                    reason_code=ValidationReasonCode.SSRF_CALLBACK_PROVIDER_UNAVAILABLE,
+                )
+            _, analysis_probe = build_ssrf_requests(
+                surface, selected, analysis_ticket.url, surface_evidence,
+            )
+            candidate_probe = matching_evidence(analysis_evidence, surface.url, analysis_probe)
+            if candidate_probe is not None and has_http_callback(first_hits, candidate_probe.evidence_id):
+                first_probe, parameter = candidate_probe, selected
+                break
+        if first_probe is None or parameter is None:
+            dns_seen = any(item.observation.get("status") == "dns" for item in results)
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.SUSPECTED,
+                evidence=(),
+                reason=("analysis observed DNS only" if dns_seen
+                        else "no HTTP callback arrived within the bounded wait"),
+                reason_code=ValidationReasonCode.SSRF_CALLBACK_NOT_OBSERVED,
+            )
+        assert task.validation_id is not None
+        try:
+            ticket = self._collector.issue_ssrf_ticket(
+                task.run_id, candidate.candidate_id, parameter,
+                validation_id=task.validation_id,
+            )
+        except (OSError, TimeoutError):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="SSRF callback provider could not issue a validation ticket",
+                reason_code=ValidationReasonCode.SSRF_CALLBACK_PROVIDER_UNAVAILABLE,
+            )
+        requests = build_ssrf_requests(surface, parameter, ticket.url, surface_evidence)
+        session_evidence = tuple(item for item in evidence
+                                 if item.validation_id == task.validation_id)
+        collected = tuple(matching_evidence(session_evidence, surface.url, request)
+                          for request in requests)
+        missing = tuple(request for request, item in zip(requests, collected) if item is None)
+        if missing:
+            if task.request_budget < len(missing):
+                return self._validation_result(
+                    task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                    reason="independent SSRF control/probe budget is unavailable",
+                    reason_code=ValidationReasonCode.SSRF_PROOF_BUDGET_EXHAUSTED,
+                )
+            return AgentResult(
+                task_id=task.task_id, status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+        probe = collected[1]
+        assert probe is not None
+        try:
+            callback_ids = poll_ssrf_callbacks(
+                self._collector, self._evidence, task, surface, requests[1], probe.evidence_id,
+            )
+        except (OSError, TimeoutError):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=collected,
+                reason="SSRF callback provider failed during validation",
+                reason_code=ValidationReasonCode.SSRF_CALLBACK_PROVIDER_UNAVAILABLE,
+            )
+        callback_evidence = self._evidence.get_many(task.run_id, callback_ids)
+        reproduced = tuple(item for item in collected if item is not None) + callback_evidence
+        if has_http_callback(callback_evidence, probe.evidence_id):
+            result = self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduced,
+                reason="independent HTTP callback reproduced; server attribution and "
+                       "destination rule violation remain unproven",
+                reason_code=ValidationReasonCode.SSRF_CALLBACK_ONLY,
+            )
+        else:
+            result = self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduced,
+                reason="analysis HTTP callback was not independently reproduced",
+                reason_code=ValidationReasonCode.SSRF_CALLBACK_NOT_OBSERVED,
+            )
+        return replace(result, new_evidence_ids=callback_ids)
+
+    def _validate_registered_ssrf_owned_receiver(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        evidence: Sequence[Evidence],
+        surface,
+        surface_evidence: tuple[Evidence, ...],
+        available_parameters: Sequence[str],
+        registration,
+    ) -> AgentResult:
+        """Reproduce a trusted receiver hit with a fresh Validation ticket."""
+
+        parameter = registration.parameter
+        if (
+            parameter not in available_parameters
+            or candidate.exploration_parameters != (parameter,)
+        ):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=(),
+                reason="owned receiver coordinate does not match this Candidate",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        analysis_evidence = tuple(
+            item for item in evidence if item.validation_id is None
+        )
+        results = tuple(
+            item
+            for item in analysis_evidence
+            if item.created_by == "ssrf_analyzer"
+            and item.observation.get("type") == SSRF_RESULT_TYPE
+            and item.observation.get("candidate_id") == candidate.candidate_id
+            and item.observation.get("parameter") == parameter
+        )
+        if any(item.observation.get("status") == "provider_error" for item in results):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=(),
+                reason="operator-owned SSRF receiver failed during Analysis",
+                reason_code=ValidationReasonCode.SSRF_OWNED_RECEIVER_UNAVAILABLE,
+            )
+        try:
+            analysis_ticket = self._collector.issue_ssrf_owned_receiver_ticket(
+                task.run_id,
+                candidate.candidate_id,
+                candidate.surface_id,
+                parameter,
+            )
+        except (AgentContractError, OSError, TimeoutError):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=(),
+                reason="operator-owned SSRF receiver could not restore ticket A",
+                reason_code=ValidationReasonCode.SSRF_OWNED_RECEIVER_UNAVAILABLE,
+            )
+        analysis_requests = build_ssrf_owned_receiver_requests(
+            surface, parameter, analysis_ticket.url, surface_evidence,
+        )
+        analysis_probe = matching_evidence(
+            analysis_evidence, surface.url, analysis_requests[1],
+        )
+        analysis_observations = tuple(
+            item
+            for item in analysis_evidence
+            if item.created_by == "execution_runtime:ssrf_observation_provider"
+        )
+        result_seen = any(
+            item.observation.get("status") == "owned_request_observed"
+            and item.observation.get("probe_evidence_id")
+            == (analysis_probe.evidence_id if analysis_probe is not None else None)
+            for item in results
+        )
+        if (
+            analysis_probe is None
+            or not result_seen
+            or not has_owned_receiver_observation(
+                analysis_observations, analysis_probe.evidence_id,
+            )
+        ):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.SUSPECTED,
+                evidence=analysis_observations,
+                reason="operator-owned receiver did not establish request A",
+                reason_code=ValidationReasonCode.SSRF_OWNED_RECEIVER_NOT_OBSERVED,
+            )
+        assert task.validation_id is not None
+        try:
+            validation_ticket = self._collector.issue_ssrf_owned_receiver_ticket(
+                task.run_id,
+                candidate.candidate_id,
+                candidate.surface_id,
+                parameter,
+                validation_id=task.validation_id,
+            )
+        except (AgentContractError, OSError, TimeoutError):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=analysis_observations,
+                reason="operator-owned SSRF receiver could not issue fresh ticket B",
+                reason_code=ValidationReasonCode.SSRF_OWNED_RECEIVER_UNAVAILABLE,
+            )
+        requests = build_ssrf_owned_receiver_requests(
+            surface, parameter, validation_ticket.url, surface_evidence,
+        )
+        session_evidence = tuple(
+            item for item in evidence if item.validation_id == task.validation_id
+        )
+        collected = tuple(
+            matching_evidence(
+                session_evidence, request.request_target_url or surface.url, request,
+            )
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                return self._validation_result(
+                    task,
+                    verdict=ValidationVerdict.BLOCKED,
+                    evidence=(),
+                    reason="independent owned-receiver request budget is unavailable",
+                    reason_code=ValidationReasonCode.SSRF_PROOF_BUDGET_EXHAUSTED,
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+        probe = collected[1]
+        assert probe is not None
+        try:
+            observation_ids = self._collector.collect_ssrf_owned_receiver_observations(
+                task.run_id,
+                candidate.candidate_id,
+                surface.url,
+                requests[1],
+                probe.evidence_id,
+                task_id=task.task_id,
+                validation_id=task.validation_id,
+                poll_timeout_seconds=(
+                    self._collector.ssrf_owned_receiver_poll_wait_seconds
+                ),
+            )
+        except (AgentContractError, OSError, TimeoutError):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=tuple(item for item in collected if item is not None),
+                reason="operator-owned SSRF receiver failed during Validation",
+                reason_code=ValidationReasonCode.SSRF_OWNED_RECEIVER_UNAVAILABLE,
+            )
+        validation_observations = self._evidence.get_many(
+            task.run_id, observation_ids,
+        )
+        if not has_owned_receiver_observation(
+            validation_observations, probe.evidence_id,
+        ):
+            result = self._validation_result(
+                task,
+                verdict=ValidationVerdict.SUSPECTED,
+                evidence=tuple(item for item in collected if item is not None),
+                reason="request A was observed but fresh request B was not reproduced",
+                reason_code=ValidationReasonCode.SSRF_OWNED_RECEIVER_NOT_OBSERVED,
+            )
+            return replace(result, new_evidence_ids=observation_ids)
+        return self._validate_registered_ssrf_review(
+            task,
+            candidate,
+            available_parameters,
+            registration,
+            owned_receiver=True,
+        )
+
+    def _validate_registered_ssrf_canary(
+        self, task: TaskEnvelope, candidate: Candidate, evidence: Sequence[Evidence],
+        surface, surface_evidence: tuple[Evidence, ...],
+        available_parameters: Sequence[str], registration, canary,
+    ) -> AgentResult:
+        """Reproduce the approved, exact endpoint independently of Analysis."""
+
+        parameter = registration.parameter
+        if (
+            canary.surface_id != candidate.surface_id
+            or registration.execution_approval.verification_endpoint_ref
+            != self._collector.ssrf_verification_endpoint_ref(task.run_id, canary.url)
+            or parameter not in available_parameters
+            or candidate.exploration_parameters != (parameter,)
+        ):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="approved SSRF coordinate or policy does not match",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        requests = build_ssrf_canary_requests(
+            surface, parameter, canary.url, surface_evidence,
+        )
+        analysis_evidence = tuple(
+            item for item in evidence if item.validation_id is None
+        )
+        analysis_control, analysis_probe = tuple(
+            matching_evidence(analysis_evidence, surface.url, request)
+            for request in requests
+        )
+        result_seen = any(
+            item.created_by == "ssrf_analyzer"
+            and item.observation.get("type") == SSRF_RESULT_TYPE
+            and item.observation.get("candidate_id") == candidate.candidate_id
+            and item.observation.get("parameter") == parameter
+            and item.observation.get("probe_evidence_id") == (
+                analysis_probe.evidence_id if analysis_probe is not None else None
+            )
+            and item.observation.get("status") == "controlled_marker"
+            for item in analysis_evidence
+        )
+        if (
+            analysis_control is None or analysis_probe is None or not result_seen
+            or not canary_marker_signal(analysis_control, analysis_probe)
+        ):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=(),
+                reason="approved endpoint marker was not established during Analysis",
+                reason_code=ValidationReasonCode.SSRF_CANARY_ANALYSIS_NOT_ESTABLISHED,
+            )
+        assert task.validation_id is not None
+        session_evidence = tuple(
+            item for item in evidence if item.validation_id == task.validation_id
+        )
+        collected = tuple(
+            matching_evidence(session_evidence, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                return self._validation_result(
+                    task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                    reason="independent SSRF verification request budget is unavailable",
+                    reason_code=ValidationReasonCode.SSRF_PROOF_BUDGET_EXHAUSTED,
+                )
+            return AgentResult(
+                task_id=task.task_id, status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+        control, probe = collected
+        assert control is not None and probe is not None
+        reproduced = (control, probe)
+        if not canary_marker_signal(control, probe):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduced,
+                reason="approved endpoint marker was not independently reproduced",
+                reason_code=ValidationReasonCode.SSRF_CANARY_NOT_REPRODUCED,
+            )
+        policy = registration.destination_policy
+        if policy is None:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduced,
+                reason="internal canary was independently reproduced, but no destination "
+                       "policy was registered",
+                reason_code=ValidationReasonCode.SSRF_DESTINATION_POLICY_MISSING,
+            )
+        if (
+            canary.destination_policy is not None
+            and canary.destination_policy != policy
+        ):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduced,
+                reason="internal canary policy does not match the Run-bound policy",
+                reason_code=ValidationReasonCode.SSRF_DESTINATION_POLICY_MISMATCH,
+            )
+        if candidate.surface_id not in policy.surface_ids:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduced,
+                reason="destination policy is not bound to this Surface",
+                reason_code=ValidationReasonCode.SSRF_DESTINATION_POLICY_SURFACE_MISMATCH,
+            )
+        if policy.destination_rule is not SsrfDestinationRule.FORBIDDEN:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.REJECTED, evidence=reproduced,
+                reason="destination policy explicitly allows this access",
+                reason_code=ValidationReasonCode.SSRF_DESTINATION_POLICY_ALLOWS_ACCESS,
+            )
+        if not policy.confirms_for(candidate.surface_id, canary.url):
+            if policy.destination_origin != ssrf_destination_origin(canary.url):
+                return self._validation_result(
+                    task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduced,
+                    reason="internal canary was reproduced, but policy origin does not "
+                           "match the approved endpoint",
+                    reason_code=(
+                        ValidationReasonCode.SSRF_DESTINATION_POLICY_ORIGIN_MISMATCH
+                    ),
+                )
+            return self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduced,
+                reason="internal canary was reproduced, but policy assertion or evidence "
+                       "status is insufficient",
+                reason_code=(
+                    ValidationReasonCode.SSRF_DESTINATION_POLICY_EVIDENCE_INVALID
+                ),
+            )
+        proof = ValidationProof(
+            proof_type=ValidationProofType.SSRF_UNAUTHORIZED_FETCH,
+            evidence_ids=(control.evidence_id, probe.evidence_id),
+            summary=(
+                "approved endpoint marker independently reproduced; policy "
+                f"source={policy.source_type.value}, reference={policy.source_reference}, "
+                f"surface={candidate.surface_id}, assertion={policy.assertion.value}, "
+                f"status={policy.evidence_status.value}"
+            ),
+        )
+        return self._validation_result(
+            task, verdict=ValidationVerdict.CONFIRMED, evidence=reproduced,
+            reason="approved endpoint response was independently reproduced",
+            reason_code=(
+                ValidationReasonCode.SSRF_CONFIRMED_DESTINATION_POLICY_VIOLATION
+            ),
+            proof=proof,
+        )
+
+    def _validate_registered_ssrf_review(
+        self, task: TaskEnvelope, candidate: Candidate,
+        available_parameters: Sequence[str], registration,
+        *, owned_receiver: bool = False,
+    ) -> AgentResult:
+        """Map sanitized provider observations into the normal Validation contract."""
+
+        parameter = registration.parameter
+        if (
+            parameter not in available_parameters
+            or candidate.exploration_parameters != (parameter,)
+        ):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="registered SSRF coordinate is not available to this Candidate",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        assert task.validation_id is not None
+        review_strategy = (
+            SsrfVerificationStrategy.OWNED_RECEIVER
+            if owned_receiver else SsrfVerificationStrategy.PASSIVE
+        )
+        try:
+            provider_status, observations, mapping = (
+                self._collector.collect_server_request_observations(
+                    run_id=task.run_id,
+                    surface_id=candidate.surface_id,
+                    parameter=parameter,
+                    task_id=task.task_id,
+                    validation_id=task.validation_id,
+                    strategy=review_strategy,
+                )
+            )
+        except (AgentContractError, OSError, TimeoutError):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="registered SSRF observation failed provenance validation",
+                reason_code=ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR,
+            )
+        analysis_sessions = {
+            item.verification_session_id for item in observations
+            if item.phase is SsrfObservationPhase.ANALYSIS
+        }
+        # A provider record is the only trusted proof that a verification
+        # session actually ran. With zero records there is no safe distinction
+        # between "not attempted" and "attempted with no request", so the
+        # deterministic resolver keeps this case BLOCKED rather than negative.
+        analysis_session = (
+            next(iter(analysis_sessions)) if len(analysis_sessions) == 1 else None
+        )
+        assessment = resolve_ssrf_assessment(
+            observations,
+            provider_status=provider_status,
+            run_id=task.run_id,
+            surface_id=candidate.surface_id,
+            parameter=parameter,
+            execution_approval=registration.execution_approval,
+            destination_policy=registration.destination_policy,
+            request_budget_available=task.request_budget > 0,
+            analysis_verification_session_id=analysis_session,
+            validation_verification_session_id=task.validation_id,
+        )
+        assessment_id = self._collector.record_ssrf_assessment(
+            run_id=task.run_id,
+            surface_id=candidate.surface_id,
+            parameter=parameter,
+            task_id=task.task_id,
+            validation_id=task.validation_id,
+            assessment=assessment,
+            observation_evidence_ids=mapping,
+            strategy=review_strategy,
+        )
+        current_observation_ids = tuple(
+            mapping[item.observation_id]
+            for item in observations
+            if item.phase is SsrfObservationPhase.VALIDATION
+            and item.verification_session_id == task.validation_id
+            and item.observation_id in assessment.observation_ids
+        )
+        validation_evidence_ids = tuple(dict.fromkeys(
+            (*current_observation_ids, assessment_id)
+        ))
+        validation_evidence = self._evidence.get_many(
+            task.run_id, validation_evidence_ids,
+        )
+        proof = None
+        if assessment.verdict is ValidationVerdict.CONFIRMED:
+            proof = ValidationProof(
+                proof_type=ValidationProofType.SSRF_UNAUTHORIZED_FETCH,
+                evidence_ids=validation_evidence_ids,
+                summary=(
+                    "independent operator-owned request observation and an exact-Surface "
+                    "destination policy were reproduced in the validation session"
+                ),
+            )
+        reason = f"structured SSRF assessment: {assessment.reason_code.value}"
+        if assessment.verdict is ValidationVerdict.CONFIRMED:
+            result = self._validation_result(
+                task, verdict=assessment.verdict, evidence=validation_evidence,
+                reason=reason, reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+                proof=proof,
+            )
+        elif assessment.verdict is ValidationVerdict.BLOCKED:
+            result = self._validation_result(
+                task, verdict=assessment.verdict, evidence=validation_evidence,
+                reason=reason,
+                reason_code=ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR,
+            )
+        elif (
+            assessment.verdict is ValidationVerdict.SUSPECTED
+            and assessment.reason_code is SsrfAssessmentReason.MANUAL_REVIEW_REQUIRED
+        ):
+            result = self._validation_result(
+                task, verdict=assessment.verdict, evidence=validation_evidence,
+                reason=reason,
+                reason_code=ValidationReasonCode.SSRF_MANUAL_REVIEW_REQUIRED,
+            )
+        elif (
+            assessment.verdict is ValidationVerdict.SUSPECTED
+            and owned_receiver
+        ):
+            result = self._validation_result(
+                task, verdict=assessment.verdict, evidence=validation_evidence,
+                reason=reason,
+                reason_code=ValidationReasonCode.SSRF_OWNED_RECEIVER_ONLY,
+            )
+        elif assessment.verdict is ValidationVerdict.SUSPECTED:
+            result = self._validation_result(
+                task, verdict=assessment.verdict, evidence=validation_evidence,
+                reason=reason,
+                reason_code=ValidationReasonCode.SSRF_MANUAL_REVIEW_REQUIRED,
+            )
+        else:
+            result = self._validation_result(
+                task, verdict=assessment.verdict, evidence=validation_evidence,
+                reason=reason,
+                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+            )
+        return replace(
+            result,
+            new_evidence_ids=tuple(dict.fromkeys((*mapping.values(), assessment_id))),
+        )
 
     def _validate_public_login(
         self, task: TaskEnvelope, candidate: Candidate, evidence: Sequence[Evidence],
@@ -816,11 +1633,25 @@ class ValidationAgent:
             and item.observation.get("type") == "dom_secondary_attribute_sink"
             and isinstance((attribute := item.observation.get("attribute")), str)
         ))[:2]
+        # Analysis가 응답 본문에서 계산한 반사 맥락. HTML text 맥락을 가정한 기본
+        # payload는 JS 문자열 리터럴이나 URI 속성에서는 실행되지 않으므로, 맥락마다
+        # 그 맥락에서만 발화하는 고정 payload를 따로 재현한다.
+        signaled_contexts = tuple(dict.fromkeys(
+            context
+            for item in evidence
+            if item.surface_id == candidate.surface_id
+            and item.observation.get("type") == "reflection"
+            for context in (item.observation.get("payload_contexts") or ())
+            if isinstance(context, str) and context != "html_text"
+        ))[:2]
         secondary_plans = []
-        for attribute in secondary_attributes:
+        for seed, builder in (
+            *((attribute, attribute_execution_marker) for attribute in secondary_attributes),
+            *((context, context_execution_marker) for context in signaled_contexts),
+        ):
             try:
-                secondary_marker = attribute_execution_marker(
-                    f"{task.validation_id}{candidate.candidate_id}", attribute
+                secondary_marker = builder(
+                    f"{task.validation_id}{candidate.candidate_id}", seed
                 )
             except ValueError:
                 continue
@@ -989,9 +1820,12 @@ class ValidationAgent:
             return self._validate_graphql_sqli(
                 task, candidate, evidence, reproduction, surface, graphql_plans
             )
-        boolean_parameters = tuple(
+        # Analysis가 차등을 만든 술어 쌍까지 적어 둔다. 그 쌍 하나만 다시 보내면
+        # 재현이 싸고, 증명이 "어떤 모양으로 성립했는지"까지 가리킨다. 옛 Evidence에는
+        # 그 이름이 없으므로 없으면 전체 쌍으로 되돌아간다.
+        boolean_signals = tuple(
             dict.fromkeys(
-                parameter
+                (parameter, item.observation.get("predicate"))
                 for item in evidence
                 if item.surface_id == candidate.surface_id
                 and item.observation.get("type") == "sqli_differential"
@@ -999,6 +1833,17 @@ class ValidationAgent:
                 and parameter in surface.parameters
             )
         )
+        boolean_parameters = tuple(dict.fromkeys(name for name, _ in boolean_signals))
+        boolean_predicates = tuple(
+            dict.fromkeys(
+                predicate for _, predicate in boolean_signals
+                if isinstance(predicate, str)
+            )
+        )
+        # 술어 이름을 적지 않던 Evidence는 어떤 쌍이 통했는지 알려주지 않는다. 전체
+        # 쌍으로 넓히면 재현이 분석보다 비싸지므로 좌표마다 첫 쌍 하나만 다시 보낸다.
+        boolean_limit = None if boolean_predicates else 1
+        boolean_predicates = boolean_predicates or None
         signaled_parameters = tuple(
             dict.fromkeys(
                 parameter
@@ -1015,6 +1860,12 @@ class ValidationAgent:
                 surface.parameters,
                 probe_parameters=boolean_parameters,
                 purpose=f"SQLi validation {task.validation_id}",
+                predicates=boolean_predicates,
+                per_parameter_limit=boolean_limit,
+            )
+            boolean_plan = sqli_boolean_plan(
+                surface, boolean_parameters, predicates=boolean_predicates,
+                per_parameter_limit=boolean_limit,
             )
             collected = tuple(
                 matching_evidence(reproduction, surface.url, request)
@@ -1035,12 +1886,14 @@ class ValidationAgent:
                 )
 
             reproduced = tuple(item for item in collected if item is not None)
-            for index, parameter in enumerate(boolean_parameters):
+            for index, (parameter, _predicate) in enumerate(boolean_plan):
                 true_response = collected[index * 2]
                 false_response = collected[index * 2 + 1]
                 if true_response is None or false_response is None:
                     continue
-                if sql_boolean_signal(true_response, false_response) is None:
+                if sql_boolean_signal(
+                    true_response, false_response, _predicate
+                ) is None:
                     continue
                 proof_evidence = (true_response, false_response)
                 proof = ValidationProof(
@@ -1410,6 +2263,19 @@ class ValidationAgent:
             return self._validate_path_traversal_bypass(
                 task, candidate, surface, evidence, reproduction
             )
+        # Analysis 가 고른 것과 같은 좌표를 재현해야 한다. 분기 입력도 Analyzer 와
+        # 똑같이 계산해, 한쪽은 query 를 보고 다른 쪽은 경로를 보는 일이 없게 한다.
+        if prefers_path_assignment(
+            candidate,
+            surface,
+            evidence,
+            path_parameters_from_evidence(
+                evidence, surface, tuple(dict.fromkeys(surface.parameters))
+            ),
+        ):
+            return self._validate_path_assignment(
+                task, candidate, surface, evidence, reproduction
+            )
         signaled_parameters = tuple(
             dict.fromkeys(
                 parameter
@@ -1469,8 +2335,16 @@ class ValidationAgent:
             )
 
         control = reproduced[0]
-        for parameter, probe in zip(signaled_parameters, reproduced[1:]):
-            if not path_traversal_signal(control, probe):
+        # 한 파라미터에 고정 표기 여러 개를 보내므로 묶음으로 짝짓는다. 인덱스를 1:1로
+        # 가정하면 어떤 표기의 성공이 다른 파라미터에 귀속된다.
+        width = len(PATH_TRAVERSAL_PROBE_PAYLOADS)
+        rest = reproduced[1:]
+        for index, parameter in enumerate(signaled_parameters):
+            group = rest[index * width : (index + 1) * width]
+            probe = next(
+                (item for item in group if path_traversal_signal(control, item)), None
+            )
+            if probe is None:
                 continue
             proof_evidence = (control, probe)
             proof = ValidationProof(
@@ -1494,6 +2368,110 @@ class ValidationAgent:
             task,
             verdict=ValidationVerdict.REJECTED,
             evidence=reproduced,
+            reason="independent probe did not reproduce the safe-file read",
+            reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+        )
+
+    def _validate_path_assignment(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        surface,
+        evidence: Sequence[Evidence],
+        reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """경로에 실린 입력 자리의 파일 읽기를 독립 세션에서 다시 만든다.
+
+        Analysis 의 증적을 그대로 쓰지 않는다. 좌표(어느 표면의 어느 자리인가)만
+        가져오고 control 과 probe 를 이 Validation 세션에서 새로 보낸다. 판정 근거는
+        고정 증명 파일의 표식이 probe 에만 나타났는지 하나뿐이다 — 상태 코드 차이나
+        서버 오류 화면은 확정 근거가 아니다.
+        """
+
+        assignment = surface.path_assignment
+        if assignment is None or not has_file_like_path_assignment(evidence, surface):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=(),
+                reason="observed path assignment coordinate is unavailable for replay",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        signaled = any(
+            item.surface_id == candidate.surface_id
+            and item.observation.get("type") == PATH_TRAVERSAL_OBSERVATION
+            and item.observation.get("location") == "path_assignment"
+            and item.observation.get("parameter") == assignment.name
+            for item in evidence
+        )
+        if not signaled:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no safe-file read signal to reproduce",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+
+        requests = build_path_assignment_requests(
+            surface, purpose=f"Path Traversal validation {task.validation_id}"
+        )
+        collected = tuple(
+            matching_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "Path Traversal validation lacks budget for independent requests",
+                    required_requests=len(missing),
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+        control, probe = collected
+        if any(
+            item.observation.get("type") in {"http_error", "http_redirect"}
+            for item in collected
+        ):
+            # 정상 control 을 못 만들었으면 비교 자체가 성립하지 않는다. 확정도
+            # 기각도 아닌 상태로 남기고 이유를 표시한다.
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=tuple(collected),
+                reason=(
+                    "independent safe-file reproduction could not obtain comparable responses"
+                ),
+                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+            )
+        if path_traversal_signal(control, probe):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence=(control, probe),
+                reason=(
+                    "independent control/probe comparison reproduced the safe-file read"
+                ),
+                reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+                proof=ValidationProof(
+                    proof_type=ValidationProofType.PATH_TRAVERSAL_FILE_READ,
+                    evidence_ids=(control.evidence_id, probe.evidence_id),
+                    summary=(
+                        "independent fixed safe-file probe reproduced an out-of-directory "
+                        f"file read through the observed path assignment {assignment.name}"
+                    ),
+                ),
+            )
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.REJECTED,
+            evidence=tuple(collected),
             reason="independent probe did not reproduce the safe-file read",
             reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
         )
@@ -1607,6 +2585,511 @@ class ValidationAgent:
             proof=proof,
         )
 
+    def _validate_ssti_stateless(
+        self,
+        task: TaskEnvelope,
+        surface: Surface,
+        signaled_parameters: Sequence[str],
+        reproduction: Sequence[Evidence],
+        build: Callable[..., tuple[EvidenceRequest, ...]],
+    ) -> AgentResult:
+        """상태를 남기지 않는 좌표의 평가를 Validation 세션에서 다시 확인한다.
+
+        /profile 경로의 정리(cleanup) 검사를 쓰지 않는다. 이 경로는 상태를 남기지
+        않으므로 복원할 것이 없고, 마지막 요청의 302/303을 요구하면 정상 응답(200)을
+        실패로 읽는다. 요청 모양만 build가 결정한다.
+        """
+
+        if not signaled_parameters:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no fixed-arithmetic SSTI signal to reproduce",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        parameter = signaled_parameters[0]
+        requests = build(
+            surface,
+            parameter,
+            purpose=f"SSTI validation {task.validation_id}",
+        )
+        collected = tuple(
+            matching_ssti_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "SSTI stateless validation lacks budget for its independent request set"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+
+        reproduced = tuple(item for item in collected if item is not None)
+        if any(item.observation.get("type") == "http_error" for item in reproduced):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=reproduced,
+                reason="independent SSTI query sequence encountered an HTTP execution error",
+                reason_code=ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR,
+            )
+        dialect = ssti_query_execution_signal(collected)
+        if not dialect:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=reproduced,
+                reason="independent fixed arithmetic probe was not evaluated by the template",
+                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+            )
+
+        proof = ValidationProof(
+            proof_type=ValidationProofType.SSTI_EXECUTION,
+            evidence_ids=tuple(item.evidence_id for item in reproduced),
+            summary=(
+                "independent control/probe query comparison reproduced fixed server-side "
+                f"arithmetic evaluation through the {dialect} template dialect"
+            ),
+        )
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.CONFIRMED,
+            evidence=reproduced,
+            reason="independent control/probe comparison reproduced the SSTI effect",
+            reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+            proof=proof,
+        )
+
+    def _validate_arbitrary_file_read(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        evidence,
+        reproduction,
+    ) -> AgentResult:
+        """Analysis가 남긴 신호를 독립 요청으로 다시 만들어야 확정한다."""
+
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        # Analysis 가 고른 것과 같은 좌표를 재현한다. 경로 좌표 Candidate 는 query 를
+        # 건드리지 않고, query Candidate 는 경로를 건드리지 않는다.
+        if prefers_path_assignment(
+            candidate,
+            surface,
+            evidence,
+            tuple(
+                name
+                for name in dict.fromkeys(surface.parameters)
+                if looks_like_file_parameter(name)
+            ),
+            capability_id=ARBITRARY_FILE_READ_PATH_CAPABILITY,
+        ):
+            return self._validate_arbitrary_file_read_path(
+                task, candidate, surface, evidence, reproduction
+            )
+        if file_serving_segment_index(surface) is not None:
+            return self._validate_arbitrary_file_read_segment(
+                task, candidate, surface, evidence, reproduction
+            )
+        signaled = tuple(
+            dict.fromkeys(
+                parameter
+                for item in evidence
+                if item.surface_id == candidate.surface_id
+                and item.observation.get("type") == ARBITRARY_FILE_READ_OBSERVATION
+                and isinstance((parameter := item.observation.get("parameter")), str)
+                and parameter in surface.parameters
+            )
+        )
+        if not signaled:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no absolute-path read signal to reproduce",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+
+        requests = build_arbitrary_file_read_requests(
+            surface,
+            surface.parameters,
+            signaled,
+            purpose=f"Arbitrary File Read validation {task.validation_id}",
+        )
+        collected = tuple(
+            matching_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "Arbitrary File Read validation lacks budget for independent requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+
+        reproduced = tuple(item for item in collected if item is not None)
+        if any(
+            item.observation.get("type") in {"http_error", "http_redirect"}
+            for item in reproduced
+        ):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=reproduced,
+                reason="independent absolute-path reproduction could not obtain comparable responses",
+                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+            )
+
+        control = reproduced[0]
+        # 좌표마다 표기가 여러 개 재현되므로 1:1 로 짝지으면 첫 표기만 보고 기각한다.
+        # 형태로 막는 대상에서는 그 첫 표기가 거부되는 쪽이라 특히 문제가 된다.
+        forms = max(1, len(reproduced[1:]) // max(1, len(signaled)))
+        for index, probe in enumerate(reproduced[1:]):
+            parameter = signaled[min(index // forms, len(signaled) - 1)]
+            if not arbitrary_file_read_signal(control, probe):
+                continue
+            proof_evidence = (control, probe)
+            public = self._public_proof_file_rejection(
+                task, surface, reproduction, evidence
+            )
+            if public is not None:
+                return public
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence=proof_evidence,
+                reason="independent control/probe comparison reproduced the absolute-path read",
+                reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+                proof=ValidationProof(
+                    proof_type=ValidationProofType.ARBITRARY_FILE_READ,
+                    evidence_ids=tuple(item.evidence_id for item in proof_evidence),
+                    summary=(
+                        "independent fixed absolute-path probe reproduced a file read "
+                        f"for parameter {parameter}"
+                    ),
+                ),
+            )
+
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.REJECTED,
+            evidence=reproduced,
+            reason="independent probe did not reproduce the absolute-path read",
+            reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+        )
+
+    def _public_proof_file_rejection(
+        self,
+        task: TaskEnvelope,
+        surface,
+        reproduction: Sequence[Evidence],
+        evidence: Sequence[Evidence],
+    ) -> AgentResult | None:
+        """증명 파일이 원래 공개돼 있으면 확정하지 않는다.
+
+        앱이 정적 핸들러로 이미 그 파일을 내주고 있다면, 파라미터로 읽힌 것은 취약점이
+        아니라 공개 자료다. 확정 직전에 확인하므로, 신호가 없는 대상에는 요청을 쓰지
+        않는다.
+        """
+
+        request = build_public_file_check(
+            surface, purpose=f"Arbitrary File Read validation {task.validation_id}"
+        )
+        check = matching_evidence(
+            reproduction, request.target_url_override or surface.url, request
+        )
+        if check is None:
+            if task.request_budget < 1:
+                raise BudgetExceeded(
+                    "Arbitrary File Read validation lacks budget for the public check"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=(request,),
+            )
+        if not proof_file_is_public(check):
+            return None
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.REJECTED,
+            evidence=(check,),
+            reason="the proof file is already served publicly on this origin",
+            reason_code=ValidationReasonCode.CONTROL_SIGNAL_PRESENT,
+        )
+
+    def _validate_arbitrary_file_read_segment(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        surface,
+        evidence: Sequence[Evidence],
+        reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """마지막 경로 세그먼트 교체 읽기를 독립 세션에서 다시 만든다."""
+
+        segments = urlsplit(surface.url).path.split("/")
+        signaled = any(
+            item.surface_id == candidate.surface_id
+            and item.observation.get("type") == ARBITRARY_FILE_READ_OBSERVATION
+            and item.observation.get("location") == "path_segment"
+            for item in evidence
+        )
+        if not signaled:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no absolute-path read signal to reproduce",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        requests = build_arbitrary_file_read_segment_requests(
+            surface, purpose=f"Arbitrary File Read validation {task.validation_id}"
+        )
+        collected = tuple(
+            matching_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "Arbitrary File Read validation lacks budget for independent requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+        if any(item is None for item in collected):
+            raise AgentContractError("segment reproduction was not collected")
+        control, probes = collected[0], collected[1:]
+        if any(
+            item.observation.get("type") in {"http_error", "http_redirect"}
+            for item in collected
+        ):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=tuple(collected),
+                reason=(
+                    "independent absolute-path reproduction could not obtain "
+                    "comparable responses"
+                ),
+                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+            )
+        probe = next(
+            (item for item in probes if arbitrary_file_read_signal(control, item)),
+            None,
+        )
+        if probe is None:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=tuple(collected),
+                reason="independent probe did not reproduce the absolute-path read",
+                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+            )
+        public = self._public_proof_file_rejection(
+            task, surface, reproduction, evidence
+        )
+        if public is not None:
+            return public
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.CONFIRMED,
+            evidence=(control, probe),
+            reason=(
+                "independent control/probe comparison reproduced the absolute-path read"
+            ),
+            reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+            proof=ValidationProof(
+                proof_type=ValidationProofType.ARBITRARY_FILE_READ,
+                evidence_ids=(control.evidence_id, probe.evidence_id),
+                summary=(
+                    "independent fixed absolute-path probe reproduced a file read "
+                    f"by replacing the final path segment {segments[-1]!r}"
+                ),
+            ),
+        )
+
+    def _validate_arbitrary_file_read_path(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        surface,
+        evidence: Sequence[Evidence],
+        reproduction: Sequence[Evidence],
+    ) -> AgentResult:
+        """경로에 실린 입력 자리의 절대 경로 읽기를 독립 세션에서 다시 만든다."""
+
+        assignment = surface.path_assignment
+        if assignment is None or not has_file_like_path_assignment(evidence, surface):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=(),
+                reason="observed path assignment coordinate is unavailable for replay",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        signaled = any(
+            item.surface_id == candidate.surface_id
+            and item.observation.get("type") == ARBITRARY_FILE_READ_OBSERVATION
+            and item.observation.get("location") == "path_assignment"
+            and item.observation.get("parameter") == assignment.name
+            for item in evidence
+        )
+        if not signaled:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(),
+                reason="analysis produced no absolute-path read signal to reproduce",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+
+        purpose = f"Arbitrary File Read validation {task.validation_id}"
+        requests = build_arbitrary_file_read_path_requests(surface, purpose=purpose)
+        collected = tuple(
+            matching_evidence(reproduction, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "Arbitrary File Read validation lacks budget for independent requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+
+        control, probes = collected[0], collected[1:]
+        if control is None or any(item is None for item in probes):
+            raise AgentContractError(
+                "arbitrary file read path reproduction was not collected"
+            )
+        # 표기 중 하나라도 재현되면 확정이다. 같은 파일을 다른 표기로 읽은 것이므로
+        # 발견이 여럿이 되는 것은 아니다.
+        probe = next(
+            (item for item in probes if arbitrary_file_read_signal(control, item)),
+            probes[0],
+        )
+        if any(
+            item.observation.get("type") in {"http_error", "http_redirect"}
+            for item in (control, probe)
+        ):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=(control, probe),
+                reason=(
+                    "independent absolute-path reproduction could not obtain "
+                    "comparable responses"
+                ),
+                reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+            )
+        if arbitrary_file_read_signal(control, probe):
+            public = self._public_proof_file_rejection(
+                task, surface, reproduction, evidence
+            )
+            if public is not None:
+                return public
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.CONFIRMED,
+                evidence=(control, probe),
+                reason=(
+                    "independent control/probe comparison reproduced the absolute-path read"
+                ),
+                reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+                proof=ValidationProof(
+                    proof_type=ValidationProofType.ARBITRARY_FILE_READ,
+                    evidence_ids=(control.evidence_id, probe.evidence_id),
+                    summary=(
+                        "independent fixed absolute-path probe reproduced a file read "
+                        f"through the observed path assignment {assignment.name}"
+                    ),
+                ),
+            )
+        # 절대 경로가 막혔어도 선언된 디렉터리 밖으로는 나갈 수 있다. Analysis 와 같은
+        # 순서로 escalate 해, 재현 요청 수도 같게 유지한다.
+        if declared_root_of(surface.path_assignment) is None:
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(control, probe),
+                reason="independent probe did not reproduce the absolute-path read",
+                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+            )
+        escalated = build_directory_escape_requests(surface, purpose=purpose)
+        collected = tuple(
+            matching_evidence(reproduction, surface.url, request)
+            for request in escalated
+        )
+        missing = tuple(
+            request for request, item in zip(escalated, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                raise BudgetExceeded(
+                    "Arbitrary File Read validation lacks budget for independent requests"
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+        if any(item is None for item in collected):
+            raise AgentContractError(
+                "directory escape reproduction was not collected"
+            )
+        escape_control, absent, escape = collected
+        if not directory_escape_signal(escape_control, absent, escape):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.REJECTED,
+                evidence=(escape_control, absent, escape),
+                reason="independent probe did not reproduce a read outside the directory",
+                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+            )
+        return self._validation_result(
+            task,
+            verdict=ValidationVerdict.CONFIRMED,
+            evidence=(escape_control, absent, escape),
+            reason="independent probe reproduced a read outside the declared directory",
+            reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+            proof=ValidationProof(
+                proof_type=ValidationProofType.DIRECTORY_ESCAPE_FILE_READ,
+                evidence_ids=(escape_control.evidence_id, escape.evidence_id),
+                summary=(
+                    "independent probe read a file outside the declared directory "
+                    f"{declared_root_of(surface.path_assignment)!r} through the "
+                    f"observed path assignment {assignment.name}"
+                ),
+            ),
+        )
+
     def _validate_ssti(
         self,
         task: TaskEnvelope,
@@ -1627,13 +3110,17 @@ class ValidationAgent:
                 and parameter in surface.parameters
             )
         )
+        if surface.method.upper() == "GET":
+            return self._validate_ssti_stateless(
+                task, surface, signaled_parameters, reproduction,
+                build_ssti_query_requests,
+            )
+
         if "username" not in signaled_parameters:
-            return self._validation_result(
-                task,
-                verdict=ValidationVerdict.REJECTED,
-                evidence=(),
-                reason="analysis produced no fixed-arithmetic SSTI signal to reproduce",
-                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            # /profile 저장 계약이 아닌 좌표는 응답에만 렌더링되는 폼 경로로 재현한다.
+            return self._validate_ssti_stateless(
+                task, surface, signaled_parameters, reproduction,
+                build_ssti_form_requests,
             )
 
         requests = build_ssti_requests(

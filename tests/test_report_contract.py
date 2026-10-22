@@ -7,11 +7,12 @@ import unittest
 from hacklipse.adapters.report_contract import (
     CONTRACT_VERSION, MAX_PATH_HINT_LENGTH, PROOF_DESCRIPTIONS,
     FindingReportFact, NarratorFingerprintConfig, RunReportFacts,
+    SsrfCallbackSurfaceFact, SsrfReviewFact,
     comparable_report_facts_hash, finding_fact_id, report_facts_hash,
-    report_input_fingerprint,
+    report_input_fingerprint, ssrf_callback_surface_fact_id,
     serialize_report_facts, surface_path_hint,
 )
-from hacklipse.domain import CandidateStatus, ValidationProofType
+from hacklipse.domain import CandidateStatus, SsrfPolicySource, ValidationProofType
 
 
 def example_facts() -> RunReportFacts:
@@ -32,10 +33,11 @@ class ReportContractTests(unittest.TestCase):
     def test_serialization_contract_has_explicit_fields_and_order(self):
         facts = example_facts()
         payload = json.loads(serialize_report_facts(facts))
-        self.assertEqual(CONTRACT_VERSION, "report-facts-v2")
+        self.assertEqual(CONTRACT_VERSION, "report-facts-v5")
         self.assertEqual(payload, {
-            "contract_version": "report-facts-v2", "run_id": "run-1", "format_version": "v2",
+            "contract_version": "report-facts-v5", "run_id": "run-1", "format_version": "v2",
             "fact_ids": ["run:scope", "run:request-budget", "run:llm-usage",
+                         "run:ssrf-destination-hints",
                          "run:candidates:routed", "run:candidates:analyzed",
                          "run:candidates:confirmed", "run:candidates:suspected",
                          "run:candidates:rejected", "run:candidates:blocked",
@@ -43,6 +45,8 @@ class ReportContractTests(unittest.TestCase):
             "candidate_counts": [["routed", 0], ["analyzed", 0], ["confirmed", 1],
                                  ["suspected", 0], ["rejected", 0], ["blocked", 0],
                                  ["failed", 0], ["skipped_budget", 0]],
+            "ssrf_callback_surfaces": [], "ssrf_destination_hint_count": 0,
+            "ssrf_review": None,
             "findings": [{
                 "fact_id": "finding:one", "finding_id": "finding-1", "vulnerability_type": "XSS",
                 "surface_path_hint": "/users/{value}", "proof_type": "xss_execution",
@@ -55,8 +59,8 @@ class ReportContractTests(unittest.TestCase):
         })
         self.assertEqual(serialize_report_facts(facts), json.dumps(
             payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
-        self.assertEqual(report_facts_hash(facts), "91bc996fabcb1ead2c10f600c6d63f86bb7b17fa3e4c16092cb28b840bf7d936")
-        self.assertEqual(report_input_fingerprint(facts), "2449077085310ae071c2b8897c0c3be1fc900ddb0348bd3fde6e8209ac40573d")
+        self.assertEqual(report_facts_hash(facts), "5049ed5b6aa69abee608d453010fd92cc4412770eee3598f860bd7a1b9184083")
+        self.assertEqual(report_input_fingerprint(facts), "ae0bc62383675b14a61dd3a17afbf1e9ed2cb821fe404d245be7eb99a374de5d")
 
     def test_input_order_does_not_change_json_or_fingerprint(self):
         facts = example_facts()
@@ -202,6 +206,95 @@ class ReportContractTests(unittest.TestCase):
         self.assertEqual(
             comparable_report_facts_hash(forward), comparable_report_facts_hash(reverse),
         )
+
+    def test_ssrf_callback_surface_is_a_separate_non_finding_fact(self):
+        facts = example_facts()
+        item = SsrfCallbackSurfaceFact(
+            fact_id=ssrf_callback_surface_fact_id("surface-1"),
+            surface_path_hint="/preview",
+            analysis_http_callbacks=1,
+            validation_http_callbacks=1,
+        )
+        changed = replace(
+            facts, ssrf_callback_surfaces=(item,), ssrf_destination_hint_count=2,
+        )
+        payload = json.loads(serialize_report_facts(changed))
+        self.assertEqual(len(payload["findings"]), 1)
+        self.assertEqual(payload["ssrf_callback_surfaces"][0]["surface_path_hint"], "/preview")
+        self.assertEqual(payload["ssrf_destination_hint_count"], 2)
+        self.assertIn(item.fact_id, changed.fact_ids)
+        self.assertNotEqual(report_facts_hash(facts), report_facts_hash(changed))
+        with self.assertRaises(ValueError):
+            replace(item, validation_http_callbacks=0)
+
+    def test_ssrf_review_fact_is_closed_and_contains_no_destination_material(self):
+        review = SsrfReviewFact(
+            url_surface_count=2,
+            manual_analysis_completed=True,
+            execution_approval_registered=True,
+            destination_policy_registered=True,
+            destination_policy_source=SsrfPolicySource.OPERATOR_ATTESTATION.value,
+            observation_recorded=True,
+            verification_performed=True,
+            final_status="CONFIRMED_POLICY_VIOLATION",
+            reason_code="ssrf_confirmed_destination_policy_violation",
+            callback_status="PROVIDER_BLOCKED",
+            canary_status="CONFIRMED_POLICY_VIOLATION",
+            owned_receiver_status="NOT_CONFIGURED",
+            destination_hint_use_approved=True,
+            approved_surface_id="surface-1",
+        )
+        changed = replace(example_facts(), ssrf_review=review)
+        serialized = serialize_report_facts(changed)
+        payload = json.loads(serialized)["ssrf_review"]
+
+        self.assertEqual(payload["url_surface_count"], 2)
+        self.assertEqual(payload["destination_policy_source"], "operator_attestation")
+        self.assertEqual(payload["callback_status"], "PROVIDER_BLOCKED")
+        self.assertEqual(payload["canary_status"], "CONFIRMED_POLICY_VIOLATION")
+        self.assertEqual(payload["owned_receiver_status"], "NOT_CONFIGURED")
+        self.assertTrue(payload["destination_hint_use_approved"])
+        self.assertEqual(payload["approved_surface_id"], "surface-1")
+        self.assertNotIn("destination_origin", payload)
+        self.assertNotIn("path_hint", payload)
+        self.assertNotIn("callback_token", serialized)
+        self.assertIn("run:ssrf-review", changed.fact_ids)
+        self.assertNotEqual(report_facts_hash(example_facts()), report_facts_hash(changed))
+
+        for update in (
+            {"destination_policy_source": "any-string"},
+            {"destination_policy_registered": False},
+            {"observation_recorded": False},
+            {"verification_performed": False},
+            {"reason_code": "free form error"},
+            {"callback_status": "anything"},
+            {"canary_status": "anything"},
+            {"owned_receiver_status": "anything"},
+            {"destination_hint_use_approved": "yes"},
+            {"execution_approval_registered": False},
+            {"approved_surface_id": ""},
+            {"approved_surface_id": "https://secret.example/path"},
+        ):
+            with self.subTest(update=update), self.assertRaises(ValueError):
+                replace(review, **update)
+
+        allowed = replace(
+            review,
+            final_status="ALLOWED_DESTINATION",
+            reason_code="ssrf_destination_policy_allows_access",
+            canary_status="ALLOWED_DESTINATION",
+        )
+        for update in (
+            {"execution_approval_registered": False},
+            {"approved_surface_id": ""},
+            {"destination_policy_registered": False,
+             "destination_policy_source": ""},
+            {"observation_recorded": False},
+            {"verification_performed": False},
+            {"canary_status": "NOT_RUN"},
+        ):
+            with self.subTest(allowed_update=update), self.assertRaises(ValueError):
+                replace(allowed, **update)
 
     def test_llm_usage_has_its_own_offered_fact(self):
         self.assertIn("run:llm-usage", example_facts().fact_ids)

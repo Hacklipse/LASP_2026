@@ -8,7 +8,7 @@ import re
 import sys
 import tempfile
 import unittest
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
 
@@ -33,10 +33,12 @@ from hacklipse.domain import (
     DomainInvariantError,
     Evidence,
     ExecutionResult,
+    Run,
     RunExecutionProfile,
     RunPhase,
     RunRequest,
     RunScope,
+    Surface,
 )
 from hacklipse.ports.errors import LlmCredentialsMissing, LlmTimeout
 from hacklipse.ports.llm import LlmResponse
@@ -126,6 +128,78 @@ def _execute(*, mode="hybrid", recon="hybrid", compare=True, log=None, method="G
 
 
 class RouterPipelineTests(unittest.TestCase):
+    def test_default_review_registry_does_not_imply_ssrf_was_tested(self):
+        app = build_local_application({})
+        run = Run(
+            run_id="run-off",
+            target_url="https://target.example/",
+            scope=RunScope(allowed_hosts=frozenset({"target.example"})),
+            policy_profile="safe",
+            request_budget=10,
+        )
+        surface = Surface(
+            surface_id="surface-url",
+            run_id=run.run_id,
+            url="https://target.example/fetch?url=value",
+            method="GET",
+            parameters=("url",),
+            observed_query=(("url", "value"),),
+        )
+
+        router = app.orchestrator._router
+        decisions = router.route(run, (surface,), ())
+
+        self.assertFalse(any(
+            item.candidate.vulnerability_type == "SSRF" for item in decisions
+        ))
+        self.assertFalse(any(
+            item.vulnerability_type == "SSRF"
+            for item in getattr(router, "last_analyzer_coverage", ())
+        ))
+
+    def test_post_recon_gate_profile_update_survives_route_transition(self):
+        runtime = _Runtime(method="GET")
+        router = standard_router(
+            ("Path Traversal",), mode="heuristic", compare=False,
+        )
+        holder = {}
+
+        def gate(discovered_run):
+            self.assertTrue(discovered_run.surface_ids)
+            app = holder["app"]
+            persisted = app.stores.runs.get(discovered_run.run_id)
+            profile = replace(
+                persisted.execution_profile,
+                ssrf_execution_approval_registered=True,
+            )
+            app.stores.runs.save(persisted.with_updates(execution_profile=profile))
+
+        app = build_local_application(
+            {},
+            runtime=runtime,
+            router=router,
+            config=OrchestratorConfig(
+                max_evidence_rounds=2,
+                post_recon_gate=gate,
+            ),
+        )
+        holder["app"] = app
+        register_standard_agents(app, recon_max_pages=6)
+
+        run = app.orchestrator.start(RunRequest(
+            target_url="http://local.test/",
+            scope=RunScope(allowed_hosts=frozenset({"local.test"})),
+            request_budget=30,
+            execution_profile=RunExecutionProfile(),
+        ))
+
+        self.assertIs(run.phase, RunPhase.DONE)
+        self.assertTrue(run.execution_profile.ssrf_execution_approval_registered)
+        self.assertTrue(
+            app.stores.runs.get(run.run_id).execution_profile
+            .ssrf_execution_approval_registered
+        )
+
     def test_paired_routers_receive_identical_objects_in_identical_order(self):
         calls = []
 
@@ -161,7 +235,8 @@ class RouterPipelineTests(unittest.TestCase):
             self.assertIs(candidates[0].status, CandidateStatus.CONFIRMED)
             self.assertEqual(candidates[0].exploration_parameters, ("blob",))
             probes = [r for r in runtime.requests if r.tool == PATH_TRAVERSAL_TOOL]
-            self.assertEqual(len(probes), 4)  # analyzer control/probe + independent validator repeat
+            # analyzer control + 고정 두 표기, 그리고 독립 Validator의 같은 반복
+            self.assertEqual(len(probes), 6)
             findings = app.stores.findings.list_by_run(run.run_id)
             proof = app.stores.evidence.get_many(run.run_id, findings[0].evidence_ids)
             self.assertEqual(len(proof), 2)

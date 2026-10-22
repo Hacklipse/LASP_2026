@@ -98,6 +98,49 @@ Run the local verification suite with:
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
+The `File Upload` analyzer compares PHP variants (`.php`, `.phtml`, `.php3`–`.php8`,
+`.pht`, `.phar`, `.phps`), ASP/JSP/CGI extensions, HTML/SVG variants, images,
+documents, archives, extensionless names, mixed-case and double extensions,
+plus trailing-dot PHP filenames. The 55-name matrix is `UPLOAD_EXTENSIONS` in
+`file_upload_analysis.py`. Inert text and valid one-pixel PNGs are compared with
+`application/octet-stream` and `image/png`, changing one dimension per comparison.
+The PNG contains only a random text comment; no PHP, SVG, HTML or executable
+payload is embedded. Normal-image controls and representative server families
+run before rare suffixes. Extra MIME/content cases run only after a normal PNG
+is verified, giving up to 67 cases within the request/time budget.
+
+The standard router discovers single-file HTML POST forms with
+`multipart/form-data`. Hidden fields, selected options, checked controls, text
+defaults and an unambiguous named submit are supported. Forms with extra fields
+are fetched again before every upload so rotating CSRF values stay fresh.
+Field values stay in memory; only names/references enter the analysis plan,
+and multipart control values are redacted from stored responses. Required
+inputs without defaults, ambiguous multi-file/multi-submit forms, query-bearing
+actions and JavaScript-only upload flows are not replayed.
+Explicit HTML `form` ownership is respected, including controls outside the form.
+As with other POST probes, the central policy requires state-changing approval
+in the safe profile. Select `File Upload` through `standard_router` to run it alone.
+
+Per-extension outcomes appear in the Markdown report and
+`file_upload_extension_result` observations. `accepted` requires retrieval of
+the exact uploaded bytes/hash from a same-origin, in-scope URL advertised by the
+upload response. Nested JSON links, renamed files and bounded download-ID URLs
+are supported. The stored extension and serving Content-Type are recorded;
+normalizing a risky extension to a safe one does not establish a risky-file finding.
+A generic success, missing retrieval link or image rewritten by the server
+remains `inconclusive`. Explicit extension, MIME and content rejections are
+separated from authentication, CSRF, size and rate-limit failures. Global
+authentication/quota failures stop further uploads; untested cases remain visible.
+The same stop rules apply to download responses. CSRF form candidates reserve
+three requests for independent validation: fresh form, upload and retrieval.
+Observed MIME/content/extension differences appear in the Markdown report.
+This checks observed extension handling, not an exhaustive server
+blacklist/allowlist: MIME, content checks, and authentication can affect results.
+The form's `accept` value is recorded as client metadata, not server policy.
+Risky-extension acceptance is independently replayed and remains `suspected`,
+never a confirmed execution finding. Each probe uses a fresh filename; test
+files may remain on the target because no deletion endpoint is assumed.
+
 The Juice Shop runner accepts `--orchestrator hybrid` as an independent LLM
 option. After routing, the advisor may select one already discovered, unread,
 same-scope GET page for an extra Recon visit. The application checks the
@@ -138,3 +181,47 @@ fact preservation, offered-set citation containment, status representation, and
 narrator cost. Neither establishes semantic accuracy: the fixed-fixture human
 blind review that the measurement contract also requires is not part of this
 tool. Keep the target and its state fixed when collecting the runs.
+
+# Arbitrary File Read detector
+
+The `Arbitrary File Read` agent proves that a server opens a path it was not
+meant to serve. The `Path Traversal` agent stays separate and proves a different
+fact — that the server follows an escape sequence it was handed.
+
+It works three ways, all on observed GET coordinates:
+
+- an observed query input, carrying the fixed absolute proof path;
+- a path that carries its input as `name=value` (`/file=web_assets/app.js`),
+  replacing only the span the value occupies, never appending a query;
+- when the absolute path is refused, a read that leaves the directory the
+  observed values live in. That one escalation is why a target which rejects
+  both the escape sequence and the absolute path can still be proven.
+
+The file to read is fixed per probe kind in the domain, so neither an agent nor
+a model can choose another one, and only a marker seen in the probe and absent
+from the control confirms. Validation repeats the pair independently. Analyzer
+and module docstrings carry the probe contract and the cases it cannot reach;
+bodies of any kind are the main one.
+
+Run the common pipeline against an authorized local application:
+
+```bash
+python scripts/run_baseline.py 'http://127.0.0.1:8000/download?file=sample' 80
+```
+
+Three coordinates, then. A query input, a value carried in the path as
+`name=value`, and the final segment of a parameterless file route such as
+`/download/report.pdf` — the last one asks for a directory cue before it
+offers a candidate, so it does not attach to every GET without a query.
+
+Each coordinate is tried in every spelling the domain fixes for its probe
+kind, because filters reject a shape rather than a file: a target that refuses
+`/etc/os-release` may still serve it when the separator arrives encoded. Every
+spelling resolves to the same file, so what gets read is still not a choice.
+Reading it two ways is one finding, not two.
+
+Before confirming, the proof file is fetched directly on the same origin. If
+the app already publishes it, the read proves nothing and the candidate is
+rejected.
+
+Merged in from `feat/arbitrary-file-read-detection-plan`.

@@ -20,6 +20,7 @@ from hacklipse.domain import (
     KnowledgeCase,
     KnowledgeQuery,
     Surface,
+    ValidationProofType,
 )
 from hacklipse.ports.errors import DuplicateRecord
 
@@ -67,6 +68,7 @@ class KnowledgeCaseFactoryTests(unittest.TestCase):
         candidate_id: str = "candidate-1",
         surface_id: str = "surface-1",
         vulnerability_type: str = "XSS",
+        proof_type: ValidationProofType | None = ValidationProofType.XSS_EXECUTION,
     ) -> Finding:
         return Finding(
             finding_id=finding_id,
@@ -77,6 +79,10 @@ class KnowledgeCaseFactoryTests(unittest.TestCase):
             surface_id=surface_id,
             evidence_ids=("evidence-1",),
             severity="high",
+            # 확정 Finding 은 Finding.from_confirmed 를 거치므로 항상 proof type 이
+            # 있고, 도메인 불변식이 재현 횟수도 함께 요구한다.
+            proof_type=proof_type,
+            reproduction_count=1 if proof_type is not None else 0,
         )
 
     def test_generalizes_only_structured_confirmed_finding_fields(self) -> None:
@@ -150,7 +156,7 @@ class KnowledgeCaseFactoryTests(unittest.TestCase):
                 self._surface(),
             )
 
-    def test_rejects_vulnerability_without_a_structured_proof_type(self) -> None:
+    def test_rejects_a_finding_without_the_proof_that_confirmed_it(self) -> None:
         candidate = Candidate(
             candidate_id="candidate-1",
             run_id="run-1",
@@ -161,12 +167,100 @@ class KnowledgeCaseFactoryTests(unittest.TestCase):
             evidence_ids=("evidence-1",),
             status="confirmed",
         )
-        with self.assertRaisesRegex(ValueError, "supported vulnerability proof type"):
+        with self.assertRaisesRegex(ValueError, "confirmed vulnerability proof"):
             KnowledgeCaseFactory().from_finding(
-                self._finding(vulnerability_type="Unknown"),
+                self._finding(vulnerability_type="Unknown", proof_type=None),
                 candidate,
                 self._surface(),
             )
+
+    def test_publishes_a_vulnerability_type_the_old_map_omitted(self) -> None:
+        # Arbitrary File Read 는 이 매핑에 없어서 발행이 Finding 마다 실패했다.
+        # 취약점 유형이 아니라 Finding 의 proof 를 보므로 더 이상 유형별 등록이 없다.
+        candidate = Candidate(
+            candidate_id="candidate-1", run_id="run-1", surface_id="surface-1",
+            vulnerability_type="Arbitrary File Read", hypothesis="absolute path",
+            assigned_agent="arbitrary_file_read_analyzer",
+            evidence_ids=("evidence-1",), status="confirmed",
+        )
+        case = KnowledgeCaseFactory().from_finding(
+            self._finding(
+                vulnerability_type="Arbitrary File Read",
+                proof_type=ValidationProofType.ARBITRARY_FILE_READ,
+            ),
+            candidate,
+            self._surface(),
+        )
+        self.assertEqual(case.category, "Arbitrary File Read")
+        self.assertEqual(case.metadata["proof_type"], "arbitrary_file_read")
+
+    def test_directory_escape_proof_is_recorded_as_its_own_strategy(self) -> None:
+        # 한 Agent 의 두 전략이 같은 proof type 으로 뭉개지지 않는지 확인한다.
+        candidate = Candidate(
+            candidate_id="candidate-1", run_id="run-1", surface_id="surface-1",
+            vulnerability_type="Arbitrary File Read", hypothesis="directory escape",
+            assigned_agent="arbitrary_file_read_analyzer",
+            evidence_ids=("evidence-1",), status="confirmed",
+        )
+        case = KnowledgeCaseFactory().from_finding(
+            self._finding(
+                vulnerability_type="Arbitrary File Read",
+                proof_type=ValidationProofType.DIRECTORY_ESCAPE_FILE_READ,
+            ),
+            candidate,
+            self._surface(),
+        )
+        self.assertEqual(case.metadata["proof_type"], "directory_escape_file_read")
+
+    def test_every_routable_vulnerability_type_has_a_signal_decision(self) -> None:
+        """좌표가 있든 없든 유형마다 명시적 결정이 있어야 한다.
+
+        빠뜨리면 ``.get()`` 이 None 을 돌려주고 signal_parameter_names 가 조용히
+        비어 버린다. 실제로 그렇게 비어 있었다.
+        """
+
+        from hacklipse.adapters.analyzer_capabilities import (
+            DEFAULT_ANALYZER_CAPABILITIES,
+            OPTIONAL_SOURCE_MAP_CAPABILITIES,
+        )
+        from hacklipse.adapters.knowledge import (
+            _SIGNAL_OBSERVATIONS_BY_VULNERABILITY,
+        )
+
+        routable = {
+            capability.vulnerability_type
+            for capability in (
+                *DEFAULT_ANALYZER_CAPABILITIES, *OPTIONAL_SOURCE_MAP_CAPABILITIES,
+            )
+        }
+        self.assertEqual(routable - set(_SIGNAL_OBSERVATIONS_BY_VULNERABILITY), set())
+
+    def test_signal_observation_types_are_the_ones_analyzers_record(self) -> None:
+        """값이 Observation type 어휘인지 확인한다.
+
+        이전 판은 ValidationProofType 문자열을 넣어 두어 Path Traversal 하나만
+        우연히 맞았다. 어휘가 어긋나면 어느 Observation 과도 매칭되지 않는다.
+        """
+
+        from hacklipse.adapters.knowledge import (
+            _SIGNAL_OBSERVATIONS_BY_VULNERABILITY,
+        )
+
+        self.assertEqual(
+            _SIGNAL_OBSERVATIONS_BY_VULNERABILITY["SSTI"], ("template_execution",)
+        )
+        self.assertEqual(
+            _SIGNAL_OBSERVATIONS_BY_VULNERABILITY["Access Control"], ("object_id_auth",)
+        )
+        self.assertEqual(
+            _SIGNAL_OBSERVATIONS_BY_VULNERABILITY["XSS"], ("reflection",)
+        )
+        for vulnerability in ("XSS", "SQLi", "SSTI", "Access Control"):
+            with self.subTest(vulnerability=vulnerability):
+                self.assertNotIn(
+                    vulnerability.lower().replace(" ", "_"),
+                    _SIGNAL_OBSERVATIONS_BY_VULNERABILITY[vulnerability],
+                )
 
     def test_preserves_only_structured_parameters_that_produced_a_probe_signal(self) -> None:
         surface = Surface(

@@ -418,6 +418,76 @@ class ValidationAgentTests(unittest.TestCase):
                         ("evi-control", "evi-secondary"),
                     )
 
+    def test_xss_reflection_context_gets_its_own_fixed_probe(self) -> None:
+        # HTML text 맥락을 가정한 기본 payload는 JS 문자열 리터럴 안에서는 실행되지
+        # 않는다. Analysis가 계산한 맥락마다 그 맥락 전용 고정 탐침을 따로 재현한다.
+        for executes in (True, False):
+            with self.subTest(executes=executes):
+                agent, candidates, evidence, _ = _make_agent()
+                candidates.add(_make_candidate("XSS", evidence_ids=("evi-reflection",)))
+                evidence.append(Evidence(
+                    evidence_id="evi-reflection", run_id=_RUN_ID, surface_id=_SURFACE_ID,
+                    created_by="heuristic_xss_analyzer", evidence_type="observation",
+                    observation={"type": "reflection", "parameter": "q",
+                                 "payload_contexts": ["js_string_double"],
+                                 "context_source": "python"},
+                ))
+
+                def task(ids, budget=5):
+                    return TaskEnvelope(
+                        task_id="task-validate", run_id=_RUN_ID,
+                        agent_type="validation", surface_id=_SURFACE_ID,
+                        candidate_id=_CANDIDATE_ID, evidence_ids=tuple(ids),
+                        allowed_tools=("http_get", "browser_xss"),
+                        request_budget=budget, validation_id=_VALIDATION_ID,
+                    )
+
+                ids = ["evi-reflection"]
+                first = agent.handle(task(ids))
+                self.assertEqual(len(first.evidence_requests), 3)
+                for evidence_id, request in zip(
+                    ("evi-control", "evi-direct"), first.evidence_requests[:2]
+                ):
+                    evidence.append(_browser_collected_for_request(
+                        evidence_id, request, executed=False, marker=None
+                    ))
+                    ids.append(evidence_id)
+                context_request = first.evidence_requests[2]
+                assert context_request.http_request is not None
+                marker = dict(context_request.http_request.query_parameters)["q"]
+                self.assertIn("ctx_jsd_", marker)
+                evidence.append(_browser_collected_for_request(
+                    "evi-context", context_request,
+                    executed=executes, marker=marker if executes else None,
+                ))
+                ids.append("evi-context")
+                third = agent.handle(task(ids, budget=2))
+                assert third.validation is not None
+                self.assertIs(
+                    third.validation.verdict,
+                    ValidationVerdict.CONFIRMED if executes else ValidationVerdict.REJECTED,
+                )
+
+    def test_xss_html_text_context_adds_no_extra_probe(self) -> None:
+        # html_text는 기본 payload가 이미 덮는 맥락이다. 같은 일을 하는 탐침을
+        # 하나 더 보내면 요청만 쓴다.
+        agent, candidates, evidence, _ = _make_agent()
+        candidates.add(_make_candidate("XSS", evidence_ids=("evi-reflection",)))
+        evidence.append(Evidence(
+            evidence_id="evi-reflection", run_id=_RUN_ID, surface_id=_SURFACE_ID,
+            created_by="heuristic_xss_analyzer", evidence_type="observation",
+            observation={"type": "reflection", "parameter": "q",
+                         "payload_contexts": ["html_text"], "context_source": "python"},
+        ))
+        result = agent.handle(TaskEnvelope(
+            task_id="task-validate", run_id=_RUN_ID, agent_type="validation",
+            surface_id=_SURFACE_ID, candidate_id=_CANDIDATE_ID,
+            evidence_ids=("evi-reflection",),
+            allowed_tools=("http_get", "browser_xss"),
+            request_budget=5, validation_id=_VALIDATION_ID,
+        ))
+        self.assertEqual(len(result.evidence_requests), 2)
+
     def test_xss_direct_proof_is_not_starved_by_secondary_probe_budget(self) -> None:
         agent, candidates, evidence, _ = _make_agent()
         candidates.add(_make_candidate(

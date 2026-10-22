@@ -14,8 +14,12 @@ from hacklipse.ports.llm import LlmMessage, LlmRequest
 
 from .probing import validate_probe_selection
 from .ssti_analysis import (
+    SSTI_PARAMETER_HINTS,
     SSTI_TOOL,
+    build_ssti_form_requests,
+    build_ssti_query_requests,
     build_ssti_requests,
+    handle_stateless_ssti_surface,
     matching_ssti_evidence,
     record_ssti_observation,
     resolve_ssti_task,
@@ -84,14 +88,21 @@ class LlmSstiAnalyzer:
             plan, plan_id = stored
 
         selected = tuple(plan["parameters"])
-        # Python 안전 계약은 현재 Juice Shop의 username 하나만 허용한다. LLM이 다른
-        # 텍스트 필드를 선택해도 상태 변경 요청으로 확장하지 않는다.
+        # 상태를 남기지 않는 좌표는 heuristic 구현과 **같은 함수**로 확인한다. 이 분기가
+        # 없으면 LLM 프로파일에서는 GET 쿼리와 POST 폼 경로가 통째로 사라져, 같은
+        # 대상이 구현에 따라 다르게 보인다.
+        if surface.method.upper() == "GET":
+            return self._stateless(
+                task, candidate, surface, selected, build_ssti_query_requests,
+                plan, plan_id, evidence, new_ids,
+            )
+        # Python 안전 계약은 저장되는 /profile 쓰기를 username 하나로만 허용한다. LLM이
+        # 다른 텍스트 필드를 골라도 상태 변경 요청으로 확장하지 않고, 응답에만
+        # 렌더링되는 폼 경로로 확인한다.
         if "username" not in selected:
-            return AgentResult(
-                task_id=task.task_id,
-                status=AgentResultStatus.COMPLETED,
-                new_evidence_ids=tuple(new_ids),
-                candidate_ids=(candidate.candidate_id,),
+            return self._stateless(
+                task, candidate, surface, selected, build_ssti_form_requests,
+                plan, plan_id, evidence, new_ids,
             )
 
         requests = build_ssti_requests(
@@ -138,6 +149,45 @@ class LlmSstiAnalyzer:
             status=AgentResultStatus.COMPLETED,
             new_evidence_ids=tuple(new_ids),
             candidate_ids=(candidate.candidate_id,),
+        )
+
+    def _stateless(
+        self,
+        task: TaskEnvelope,
+        candidate,
+        surface: Surface,
+        selected: tuple[str, ...],
+        build,
+        plan: dict[str, object],
+        plan_id: str,
+        evidence: tuple,
+        new_ids: list[str],
+    ) -> AgentResult:
+        """LLM이 고른 좌표를 heuristic과 같은 고정 산술 흐름으로 확인한다.
+
+        LLM은 어느 좌표를 볼지만 고른다. 좁힘 기준은 분석기의 집합 하나이므로 모델이
+        아무 필드나 지목해도 그 집합 밖으로는 나가지 않는다.
+        """
+
+        return handle_stateless_ssti_surface(
+            task=task,
+            candidate=candidate,
+            surface=surface,
+            selected=tuple(
+                name for name in selected
+                if name.casefold() in SSTI_PARAMETER_HINTS and name in surface.parameters
+            ),
+            build=build,
+            evidence=evidence,
+            evidence_store=self._evidence,
+            created_by=LLM_SSTI_ANALYZER,
+            id_factory=self._id_factory,
+            new_evidence_ids=tuple(new_ids),
+            extra={
+                "plan_evidence_id": plan_id,
+                "selection_source": "llm",
+                "selection_reason": str(plan["reason"]),
+            },
         )
 
     def _plan(

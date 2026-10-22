@@ -22,6 +22,7 @@ class FormLoginSpec:
     username_field: str = "username"
     password_field: str = "password"
     csrf_field: str | None = None
+    preflight_url: str | None = None
     extra_fields: tuple[tuple[str, str], ...] = field(default=(), repr=False)
     success_statuses: tuple[int, ...] = (200, 302, 303)
     failure_marker: str | None = None
@@ -33,6 +34,8 @@ class FormLoginSpec:
     def __post_init__(self) -> None:
         if not self.login_url:
             raise ValueError("form login requires a login URL")
+        if self.preflight_url is not None and not self.preflight_url.strip():
+            raise ValueError("form login preflight URL cannot be blank")
         if not self.username_field or not self.password_field:
             raise ValueError("form login field names cannot be empty")
         if not self.success_statuses:
@@ -65,6 +68,7 @@ class ResolvedHttpCredential:
 
     authorization: str | None = field(default=None, repr=False)
     cookies: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+    query_secrets: tuple[tuple[str, str], ...] = field(default=(), repr=False)
     form_login: FormLoginSpec | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -81,11 +85,20 @@ class ResolvedHttpCredential:
             if "\r" in value or "\n" in value:
                 raise ValueError("credential cookie value cannot contain line breaks")
             names.add(name)
-        if self.authorization is None and not self.cookies and self.form_login is None:
+        query_names: set[str] = set()
+        for name, value in self.query_secrets:
+            if name not in {"token", "_token"} or not value or len(value) > 4096 or "\r" in value or "\n" in value:
+                raise ValueError("credential query secret must be a bounded token")
+            if name in query_names:
+                raise ValueError("credential query secret names cannot repeat")
+            query_names.add(name)
+        if (self.authorization is None and not self.cookies
+                and not self.query_secrets and self.form_login is None):
             raise ValueError("resolved HTTP credential cannot be empty")
 
     def secret_values(self) -> tuple[str, ...]:
         values = [value for _, value in self.cookies if value]
+        values.extend(value for _, value in self.query_secrets if value)
         if self.authorization:
             values.append(self.authorization)
         if self.form_login is not None:

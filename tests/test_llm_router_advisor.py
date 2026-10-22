@@ -119,7 +119,7 @@ def _legacy_hypothesis(item: dict) -> dict:
         "Access Control": (
             "access_control.object_identifier", "compare_object_ownership"
         ),
-        "SSTI": ("ssti.form.username", "compare_template_expressions"),
+        "SSTI": ("ssti.http.form", "compare_template_expressions"),
     }[vulnerability_type]
     return {
         "surface_id": item["surface_id"],
@@ -1001,7 +1001,7 @@ class OfferSelectionTests(unittest.TestCase):
             for item in advisor.last_trace.analyzer_coverage
         }
         self.assertEqual(
-            coverage["ssti.form.username"].missing_requirements,
+            coverage["ssti.http.form"].missing_requirements,
             ("method", "input_parameter", "parameter_hint"),
         )
         self.assertEqual(
@@ -1141,6 +1141,18 @@ class PromptHygieneTests(unittest.TestCase):
         # 관측된 값은 어느 것도 실리지 않는다.
         for forbidden in ("s3cr3t-session-value", "View Profile", "Cookie", "Authorization"):
             self.assertNotIn(forbidden, prompt)
+
+    def test_prompt_redacts_short_value_after_sensitive_path_segment(self) -> None:
+        llm = _FakeLlmClient({"suggestions": []})
+        surface = _surface(
+            url="http://localhost/private/token/shortsecret?source=old",
+        )
+
+        _advise(llm, surfaces=(surface,))
+
+        prompt = llm.requests[0].messages[0].content
+        self.assertIn("path=/private/token/{redacted}", prompt)
+        self.assertNotIn("shortsecret", prompt)
 
     def test_untrusted_parameter_name_is_aliased_without_dropping_surface(self) -> None:
         llm = _FakeLlmClient({"suggestions": []})
