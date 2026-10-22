@@ -15,6 +15,7 @@ from hacklipse.domain import (
     AccessPrincipalRole,
     AgentResult,
     AgentResultStatus,
+    Candidate,
     DomainInvariantError,
     Evidence,
     EvidenceRequest,
@@ -37,6 +38,7 @@ from hacklipse.domain import (
     SsrfPolicyEvidenceStatus,
     SsrfPolicySource,
     SsrfReviewRegistration,
+    SsrfVerificationStrategy,
     TaskEnvelope,
 )
 from hacklipse.domain.url_redaction import ssrf_destination_reference_parts
@@ -75,6 +77,54 @@ _SSRF_POLICY_EVIDENCE_PRODUCERS = {
         "execution_runtime:ssrf_openapi_policy_loader",
 }
 _SSRF_SECRET_REDACTION = "<redacted-ssrf-verification>"
+_SSRF_CAPABILITY_STRATEGIES = {
+    "ssrf.callback_observed_url_query": SsrfVerificationStrategy.CALLBACK,
+    "ssrf.callback_declared_url_query": SsrfVerificationStrategy.CALLBACK,
+    "ssrf.internal_canary_observed_url_query": (
+        SsrfVerificationStrategy.INTERNAL_CANARY
+    ),
+    "ssrf.internal_canary_declared_url_query": (
+        SsrfVerificationStrategy.INTERNAL_CANARY
+    ),
+    "ssrf.internal_request_log_observed_url_query": (
+        SsrfVerificationStrategy.OWNED_RECEIVER
+    ),
+    "ssrf.internal_request_log_declared_url_query": (
+        SsrfVerificationStrategy.OWNED_RECEIVER
+    ),
+}
+_SSRF_ANALYSIS_STRATEGIES = {
+    "observed_url_callback_probe": SsrfVerificationStrategy.CALLBACK,
+    "declared_url_callback_probe": SsrfVerificationStrategy.CALLBACK,
+    "observed_url_internal_canary_probe": (
+        SsrfVerificationStrategy.INTERNAL_CANARY
+    ),
+    "declared_url_internal_canary_probe": (
+        SsrfVerificationStrategy.INTERNAL_CANARY
+    ),
+    "observed_url_internal_request_log_probe": (
+        SsrfVerificationStrategy.OWNED_RECEIVER
+    ),
+    "declared_url_internal_request_log_probe": (
+        SsrfVerificationStrategy.OWNED_RECEIVER
+    ),
+}
+
+
+def ssrf_candidate_verification_strategy(
+    candidate: Candidate,
+) -> SsrfVerificationStrategy:
+    """Resolve one authoritative Candidate strategy and reject mixed contracts."""
+
+    capability = _SSRF_CAPABILITY_STRATEGIES.get(candidate.routing_capability_id)
+    analysis = _SSRF_ANALYSIS_STRATEGIES.get(candidate.analysis_strategy_id)
+    if candidate.routing_capability_id and capability is None:
+        raise AgentContractError("unsupported SSRF routing capability")
+    if candidate.analysis_strategy_id and analysis is None:
+        raise AgentContractError("unsupported SSRF analysis strategy")
+    if capability is not None and analysis is not None and capability is not analysis:
+        raise AgentContractError("SSRF Candidate mixes verification strategies")
+    return capability or analysis or SsrfVerificationStrategy.PASSIVE
 
 
 def _redact_exact_ssrf_values(value: object, secrets_to_remove: tuple[str, ...]) -> object:
@@ -252,7 +302,10 @@ class RuntimeEvidenceCollector:
     ) -> None:
         """Bind one exact approved endpoint to its reviewed Run in memory."""
 
-        registration = self.ssrf_review_for_surface(run_id, canary.surface_id)
+        registration = self.ssrf_review_for_surface(
+            run_id, canary.surface_id,
+            SsrfVerificationStrategy.INTERNAL_CANARY,
+        )
         if (
             registration is None
             or registration.execution_approval.verification_endpoint_ref
@@ -342,6 +395,7 @@ class RuntimeEvidenceCollector:
         parameter: str,
         hint_evidence_id: str | None,
         approval: SsrfExecutionApproval,
+        verification_strategy: SsrfVerificationStrategy,
         destination_policy: SsrfDestinationPolicy | None = None,
         hint_use_approved: bool = False,
         approved_destination_url: str | None = None,
@@ -357,6 +411,7 @@ class RuntimeEvidenceCollector:
             execution_approval=approval,
             destination_policy=destination_policy,
             hint_use_approved=hint_use_approved,
+            verification_strategy=verification_strategy,
         )
         run = self._validate_ssrf_review_registration(registration)
         self._validate_ssrf_destination_binding(
@@ -370,9 +425,14 @@ class RuntimeEvidenceCollector:
         profile = replace(
             run.execution_profile,
             ssrf_execution_approval_registered=True,
-            ssrf_destination_policy_registered=destination_policy is not None,
+            ssrf_destination_policy_registered=(
+                run.execution_profile.ssrf_destination_policy_registered
+                or destination_policy is not None
+            ),
             ssrf_destination_policy_source=(
-                destination_policy.source_type if destination_policy is not None else None
+                destination_policy.source_type
+                if destination_policy is not None
+                else run.execution_profile.ssrf_destination_policy_source
             ),
         )
         self._runs.save(run.with_updates(
@@ -440,13 +500,16 @@ class RuntimeEvidenceCollector:
                 "SSRF approved destination does not match the selected Recon hint"
             )
 
-    def restore_ssrf_review(self, run_id: str) -> SsrfReviewRegistration | None:
-        """Hydrate the same-Run registry from one sanitized central Evidence record."""
+    def restore_ssrf_review(
+        self, run_id: str,
+        strategy: SsrfVerificationStrategy | None = None,
+    ) -> SsrfReviewRegistration | None:
+        """Hydrate staged registrations from sanitized central Evidence records."""
 
         if self._ssrf_reviews is None:
             return None
-        existing = self._ssrf_reviews.get_for_run(run_id)
-        if existing is not None:
+        existing = self._ssrf_reviews.get_for_run(run_id, strategy)
+        if strategy is not None and existing is not None:
             return existing
         stored = tuple(
             item for item in self._evidence.list_by_run(run_id)
@@ -456,46 +519,61 @@ class RuntimeEvidenceCollector:
             and item.observation.get("type") == "ssrf_review_registration"
         )
         if not stored:
-            return None
-        if len(stored) != 1:
-            raise AgentContractError("SSRF review has multiple persisted registrations")
-        registration = self._registration_from_evidence(stored[0])
-        run = self._validate_ssrf_review_registration(registration)
-        try:
-            self._ssrf_reviews.register(registration)
-        except (TypeError, ValueError) as error:
-            raise AgentContractError(
-                "persisted SSRF review conflicts with this Run"
-            ) from error
-        policy = registration.destination_policy
-        profile = replace(
-            run.execution_profile,
-            ssrf_execution_approval_registered=True,
-            ssrf_destination_policy_registered=policy is not None,
-            ssrf_destination_policy_source=(
-                policy.source_type if policy is not None else None
-            ),
-        )
-        self._runs.save(run.with_updates(
-            execution_profile=profile,
-            evidence_ids=tuple(dict.fromkeys((*run.evidence_ids, stored[0].evidence_id))),
-        ))
-        return registration
+            return existing
+        restored: list[SsrfReviewRegistration] = []
+        run = self._runs.get(run_id)
+        evidence_ids = list(run.evidence_ids)
+        profile = run.execution_profile
+        for item in stored:
+            registration = self._registration_from_evidence(item)
+            if strategy is not None and registration.verification_strategy is not strategy:
+                continue
+            self._validate_ssrf_review_registration(registration)
+            try:
+                self._ssrf_reviews.register(registration)
+            except (TypeError, ValueError) as error:
+                raise AgentContractError(
+                    "persisted SSRF review conflicts with this Run"
+                ) from error
+            policy = registration.destination_policy
+            profile = replace(
+                profile,
+                ssrf_execution_approval_registered=True,
+                ssrf_destination_policy_registered=(
+                    profile.ssrf_destination_policy_registered or policy is not None
+                ),
+                ssrf_destination_policy_source=(
+                    policy.source_type
+                    if policy is not None else profile.ssrf_destination_policy_source
+                ),
+            )
+            evidence_ids.append(item.evidence_id)
+            restored.append(registration)
+        if restored:
+            self._runs.save(run.with_updates(
+                execution_profile=profile,
+                evidence_ids=tuple(dict.fromkeys(evidence_ids)),
+            ))
+        if strategy is not None:
+            return self._ssrf_reviews.get_for_run(run_id, strategy)
+        registrations = self._ssrf_reviews.list_for_run(run_id)
+        return registrations[0] if len(registrations) == 1 else None
 
     def ssrf_review_for_surface(
         self, run_id: str, surface_id: str,
+        strategy: SsrfVerificationStrategy | None = None,
     ) -> SsrfReviewRegistration | None:
         if self._ssrf_reviews is None:
             return None
         registration = self._ssrf_reviews.get_for_surface(
-            run_id=run_id, surface_id=surface_id,
+            run_id=run_id, surface_id=surface_id, strategy=strategy,
         )
         if registration is not None:
             return registration
-        restored = self.restore_ssrf_review(run_id)
-        if restored is None or restored.surface_id != surface_id:
-            return None
-        return restored
+        self.restore_ssrf_review(run_id, strategy)
+        return self._ssrf_reviews.get_for_surface(
+            run_id=run_id, surface_id=surface_id, strategy=strategy,
+        )
 
     def _validate_ssrf_review_registration(
         self, registration: SsrfReviewRegistration,
@@ -637,6 +715,7 @@ class RuntimeEvidenceCollector:
             "parameter": registration.parameter,
             "hint_evidence_id": registration.hint_evidence_id,
             "hint_use_approved": registration.hint_use_approved,
+            "verification_strategy": registration.verification_strategy.value,
             "approval_id": approval.approval_id,
             "verification_endpoint_ref": approval.verification_endpoint_ref,
             "approved_by": approval.approved_by,
@@ -661,7 +740,9 @@ class RuntimeEvidenceCollector:
                     if policy.evidence_status is not None else None
                 ),
             })
-        digest = hashlib.sha256(registration.run_id.encode()).hexdigest()
+        digest = hashlib.sha256("\0".join((
+            registration.run_id, registration.verification_strategy.value,
+        )).encode()).hexdigest()
         item = Evidence(
             evidence_id=f"evi-ssrf-review-registration-{digest[:32]}",
             run_id=registration.run_id,
@@ -722,6 +803,11 @@ class RuntimeEvidenceCollector:
             hint_use_approved = data.get("hint_use_approved", False)
             if type(hint_use_approved) is not bool:
                 raise TypeError("persisted SSRF hint-use approval is invalid")
+            verification_strategy = (
+                SsrfVerificationStrategy.PASSIVE
+                if "verification_strategy" not in data
+                else SsrfVerificationStrategy(str(data["verification_strategy"]))
+            )
             registration = SsrfReviewRegistration(
                 run_id=item.run_id,
                 parameter=str(data["parameter"]),
@@ -732,12 +818,19 @@ class RuntimeEvidenceCollector:
                 execution_approval=approval,
                 destination_policy=policy,
                 hint_use_approved=hint_use_approved,
+                verification_strategy=verification_strategy,
             )
         except (KeyError, TypeError, ValueError, DomainInvariantError) as error:
             raise AgentContractError("persisted SSRF review Evidence is invalid") from error
-        digest = hashlib.sha256(item.run_id.encode()).hexdigest()
+        digest = hashlib.sha256("\0".join((
+            item.run_id, registration.verification_strategy.value,
+        )).encode()).hexdigest()
+        legacy_digest = hashlib.sha256(item.run_id.encode()).hexdigest()
         if (
-            item.evidence_id != f"evi-ssrf-review-registration-{digest[:32]}"
+            item.evidence_id not in {
+                f"evi-ssrf-review-registration-{digest[:32]}",
+                f"evi-ssrf-review-registration-{legacy_digest[:32]}",
+            }
             or item.surface_id != registration.surface_id
         ):
             raise AgentContractError("persisted SSRF review Evidence identity changed")
@@ -751,6 +844,7 @@ class RuntimeEvidenceCollector:
         parameter: str,
         task_id: str,
         validation_id: str | None = None,
+        strategy: SsrfVerificationStrategy = SsrfVerificationStrategy.PASSIVE,
     ) -> tuple[
         SsrfObservationProviderStatus,
         tuple[ServerRequestObservation, ...],
@@ -758,7 +852,7 @@ class RuntimeEvidenceCollector:
     ]:
         """Import sanitized provider records through the central Evidence boundary."""
 
-        registration = self.ssrf_review_for_surface(run_id, surface_id)
+        registration = self.ssrf_review_for_surface(run_id, surface_id, strategy)
         if registration is None or registration.parameter != parameter:
             raise AgentContractError("SSRF observation import lacks an exact review registration")
         run = self._runs.get(run_id)
@@ -860,10 +954,11 @@ class RuntimeEvidenceCollector:
         validation_id: str,
         assessment: SsrfAssessment,
         observation_evidence_ids: dict[str, str],
+        strategy: SsrfVerificationStrategy = SsrfVerificationStrategy.PASSIVE,
     ) -> str:
         """Persist policy provenance as current-session central Evidence."""
 
-        registration = self.ssrf_review_for_surface(run_id, surface_id)
+        registration = self.ssrf_review_for_surface(run_id, surface_id, strategy)
         if registration is None or registration.parameter != parameter:
             raise AgentContractError("SSRF assessment lacks an exact review registration")
         if not set(assessment.observation_ids).issubset(observation_evidence_ids):
@@ -1126,7 +1221,7 @@ class RuntimeEvidenceCollector:
     ) -> SsrfCallbackTicket:
         """Run/Candidate/입력 좌표/Validation에 묶인 일회성 URL을 발급한다."""
 
-        self._runs.get(run_id)
+        run = self._runs.get(run_id)
         if not parameter or len(parameter) > 128 or not parameter.isascii() or not all(
             char.isalnum() or char in "_-" for char in parameter
         ):
@@ -1134,6 +1229,20 @@ class RuntimeEvidenceCollector:
         service = self._ssrf_callback
         if service is None:
             raise ExternalExecutionDisabled("SSRF callback service is not configured")
+        public_oast = getattr(service, "public_oast", None)
+        if type(public_oast) is not bool:
+            raise AgentContractError(
+                "SSRF callback service must declare whether it is a public OAST"
+            )
+        profile = run.execution_profile
+        if public_oast and not (
+            profile.recorded
+            and profile.ssrf_oast_mode == "public_interactsh"
+            and profile.ssrf_public_oast_consented is True
+        ):
+            raise ExternalExecutionDisabled(
+                "public SSRF OAST requires recorded Run consent"
+            )
         phase = f"validation:{validation_id}" if validation_id is not None else "analysis"
         key = hashlib.sha256(
             f"{run_id}\0{candidate_id}\0{parameter}\0{phase}".encode()
@@ -1179,7 +1288,9 @@ class RuntimeEvidenceCollector:
             raise ExternalExecutionDisabled("SSRF owned receiver is not configured")
         if getattr(receiver, "operator_owned", False) is not True:
             raise AgentContractError("SSRF owned receiver trust was not established")
-        registration = self.ssrf_review_for_surface(run_id, surface_id)
+        registration = self.ssrf_review_for_surface(
+            run_id, surface_id, SsrfVerificationStrategy.OWNED_RECEIVER,
+        )
         if (
             registration is None
             or registration.parameter != parameter
@@ -1326,6 +1437,7 @@ class RuntimeEvidenceCollector:
             return ()
         registration = self.ssrf_review_for_surface(
             run_id, probe_request.surface_id,
+            SsrfVerificationStrategy.OWNED_RECEIVER,
         )
         assert registration is not None
         phase = (

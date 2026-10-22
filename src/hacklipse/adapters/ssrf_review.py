@@ -12,14 +12,12 @@ from hacklipse.domain import (
     RouteDecision,
     Run,
     SsrfReviewRegistration,
+    SsrfVerificationStrategy,
     Surface,
 )
 from hacklipse.ports import VulnerabilityRouter
 
-from .ssrf_analysis import (
-    SSRF_CANARY_CAPABILITY, SSRF_CANARY_DECLARED_CAPABILITY,
-    SSRF_OWNED_RECEIVER_CAPABILITY, SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY,
-)
+from .ssrf_analysis import ssrf_candidate_verification_strategy
 
 
 class InMemorySsrfReviewRegistry:
@@ -27,75 +25,101 @@ class InMemorySsrfReviewRegistry:
 
     def __init__(self) -> None:
         self._condition = Condition(RLock())
-        self._registrations: dict[str, SsrfReviewRegistration] = {}
-        self._skipped: set[str] = set()
+        self._registrations: dict[
+            tuple[str, SsrfVerificationStrategy], SsrfReviewRegistration
+        ] = {}
+        self._skipped: set[tuple[str, SsrfVerificationStrategy]] = set()
 
     def register(self, registration: SsrfReviewRegistration) -> None:
-        """Register exactly one immutable coordinate and release the Run gate."""
+        """Register one immutable coordinate per verification strategy."""
 
         if not isinstance(registration, SsrfReviewRegistration):
             raise TypeError("SSRF review must use SsrfReviewRegistration")
+        key = (registration.run_id, registration.verification_strategy)
         with self._condition:
-            if registration.run_id in self._skipped:
-                raise ValueError("SSRF review was already skipped for this Run")
-            existing = self._registrations.get(registration.run_id)
+            if key in self._skipped:
+                raise ValueError("SSRF review strategy was already skipped for this Run")
+            existing = self._registrations.get(key)
             if existing is not None and existing != registration:
-                raise ValueError("SSRF review Run already has a different registration")
-            self._registrations[registration.run_id] = registration
+                raise ValueError("SSRF review strategy already has a different registration")
+            self._registrations[key] = registration
             self._condition.notify_all()
 
-    def skip(self, run_id: str) -> None:
-        """Release the Run gate without enabling observation-based validation."""
+    def skip(
+        self, run_id: str,
+        strategy: SsrfVerificationStrategy = SsrfVerificationStrategy.PASSIVE,
+    ) -> None:
+        """Release one strategy gate without enabling its validation path."""
 
+        key = (run_id, strategy)
         with self._condition:
-            if run_id in self._registrations:
-                raise ValueError("SSRF review is already registered for this Run")
-            self._skipped.add(run_id)
+            if key in self._registrations:
+                raise ValueError("SSRF review strategy is already registered for this Run")
+            self._skipped.add(key)
             self._condition.notify_all()
 
     def get(
         self, *, run_id: str, surface_id: str, parameter: str,
+        strategy: SsrfVerificationStrategy | None = None,
     ) -> SsrfReviewRegistration | None:
         """Return only an exact coordinate match; never fall back to another Surface."""
 
         with self._condition:
-            registration = self._registrations.get(run_id)
-            if registration is None:
-                return None
-            if (
-                registration.surface_id != surface_id
-                or registration.parameter != parameter
-            ):
-                return None
-            return registration
+            return next((
+                item for item in self._registrations.values()
+                if item.run_id == run_id
+                and item.surface_id == surface_id
+                and item.parameter == parameter
+                and (strategy is None or item.verification_strategy is strategy)
+            ), None)
 
     def get_for_surface(
         self, *, run_id: str, surface_id: str,
+        strategy: SsrfVerificationStrategy | None = None,
     ) -> SsrfReviewRegistration | None:
         """Return the Run's single registration when it targets this Surface."""
 
         with self._condition:
-            registration = self._registrations.get(run_id)
-            if registration is None or registration.surface_id != surface_id:
-                return None
-            return registration
+            return next((
+                item for item in self._registrations.values()
+                if item.run_id == run_id and item.surface_id == surface_id
+                and (strategy is None or item.verification_strategy is strategy)
+            ), None)
 
-    def get_for_run(self, run_id: str) -> SsrfReviewRegistration | None:
-        """Return the Run's single immutable registration, if one was approved."""
+    def get_for_run(
+        self, run_id: str, strategy: SsrfVerificationStrategy | None = None,
+    ) -> SsrfReviewRegistration | None:
+        """Return one exact strategy, or the sole registration for legacy callers."""
 
         with self._condition:
-            return self._registrations.get(run_id)
+            if strategy is not None:
+                return self._registrations.get((run_id, strategy))
+            matches = tuple(
+                item for item in self._registrations.values()
+                if item.run_id == run_id
+            )
+            return matches[0] if len(matches) == 1 else None
+
+    def list_for_run(self, run_id: str) -> tuple[SsrfReviewRegistration, ...]:
+        with self._condition:
+            return tuple(
+                item for item in self._registrations.values()
+                if item.run_id == run_id
+            )
 
     def discard(self, run_id: str) -> None:
         """Forget the in-memory review gate state for a terminal Run."""
 
         with self._condition:
-            self._registrations.pop(run_id, None)
-            self._skipped.discard(run_id)
+            for key in tuple(self._registrations):
+                if key[0] == run_id:
+                    self._registrations.pop(key, None)
+            self._skipped = {key for key in self._skipped if key[0] != run_id}
             self._condition.notify_all()
 
     def wait_for_review(
-        self, run_id: str, *, timeout_seconds: float | None = None,
+        self, run_id: str, *, strategy: SsrfVerificationStrategy | None = None,
+        timeout_seconds: float | None = None,
     ) -> str:
         """Wait for `registered` or `skipped`; raise on an explicit deadline."""
 
@@ -103,12 +127,23 @@ class InMemorySsrfReviewRegistry:
             raise ValueError("SSRF review timeout must be positive")
         deadline = None if timeout_seconds is None else monotonic() + timeout_seconds
         with self._condition:
-            while run_id not in self._registrations and run_id not in self._skipped:
+            def resolved() -> str | None:
+                registered = any(
+                    key[0] == run_id and (strategy is None or key[1] is strategy)
+                    for key in self._registrations
+                )
+                skipped = any(
+                    key[0] == run_id and (strategy is None or key[1] is strategy)
+                    for key in self._skipped
+                )
+                return "registered" if registered else "skipped" if skipped else None
+
+            while resolved() is None:
                 remaining = None if deadline is None else deadline - monotonic()
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError("SSRF review wait timed out")
                 self._condition.wait(remaining)
-            return "registered" if run_id in self._registrations else "skipped"
+            return resolved() or "skipped"
 
 
 class SsrfReviewAwareRouter:
@@ -148,10 +183,11 @@ class SsrfReviewAwareRouter:
         evidence: Sequence[Evidence],
     ) -> tuple[RouteDecision, ...]:
         delegated = tuple(self._delegate.route(run, surfaces, evidence))
-        registration = self._registry.get_for_run(run.run_id)
-        if registration is None and self._registration_loader is not None:
-            registration = self._registration_loader(run.run_id)
-        if registration is None:
+        registrations = self._registry.list_for_run(run.run_id)
+        if not registrations and self._registration_loader is not None:
+            self._registration_loader(run.run_id)
+            registrations = self._registry.list_for_run(run.run_id)
+        if not registrations:
             if self._preserve_unregistered_ssrf:
                 return delegated
             return tuple(
@@ -162,65 +198,70 @@ class SsrfReviewAwareRouter:
             item for item in delegated
             if item.candidate.vulnerability_type != "SSRF"
         )
-        callback = tuple(
-            replace(
-                item,
-                candidate=replace(
-                    item.candidate,
-                    exploration_parameters=(registration.parameter,),
-                ),
+        preserved = tuple(
+            item for item in delegated
+            if self._preserve_unregistered_ssrf
+            and all(
+                registration.verification_strategy
+                is not SsrfVerificationStrategy.PASSIVE
+                for registration in registrations
             )
-            if item.candidate.surface_id == registration.surface_id else item
-            for item in delegated
-            if (
-                item.candidate.vulnerability_type == "SSRF"
-                and item.candidate.surface_id == registration.surface_id
-            )
-        ) if self._preserve_unregistered_ssrf else ()
-        if not self._enable_registered_ssrf:
-            return (*base, *callback)
+            and item.candidate.vulnerability_type == "SSRF"
+        )
         canary = (
             self._canary_loader(run.run_id)
             if self._canary_loader is not None else None
         )
+        if not self._enable_registered_ssrf:
+            return base
         selected: list[RouteDecision] = []
-        for decision in self._ssrf_router.route(run, surfaces, evidence):
-            candidate = decision.candidate
-            if (
-                candidate.vulnerability_type != "SSRF"
-                or candidate.surface_id != registration.surface_id
-            ):
-                continue
-            is_canary = candidate.routing_capability_id in {
-                SSRF_CANARY_CAPABILITY, SSRF_CANARY_DECLARED_CAPABILITY,
-            }
-            is_owned_receiver = candidate.routing_capability_id in {
-                SSRF_OWNED_RECEIVER_CAPABILITY,
-                SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY,
-            }
-            if is_owned_receiver:
-                if not self._owned_receiver_enabled:
+        combined = (
+            *self._ssrf_router.route(run, surfaces, evidence),
+            *(item for item in delegated if item.candidate.vulnerability_type == "SSRF"),
+        )
+        review_decisions = tuple({
+            (
+                item.candidate.surface_id,
+                item.candidate.routing_capability_id,
+                item.candidate.analysis_strategy_id,
+            ): item
+            for item in combined
+        }.values())
+        for registration in registrations:
+            wanted = registration.verification_strategy
+            for decision in review_decisions:
+                candidate = decision.candidate
+                if (
+                    candidate.vulnerability_type != "SSRF"
+                    or candidate.surface_id != registration.surface_id
+                ):
                     continue
-            elif is_canary:
-                if canary is not None:
-                    pass
-                elif self._owned_receiver_enabled or callback:
+                actual = ssrf_candidate_verification_strategy(candidate)
+                if actual is not wanted:
                     continue
-                else:
-                    # With no active verifier, keep the existing passive
-                    # reviewed-coordinate flow for manual observations.
-                    candidate = replace(
+                if (
+                    wanted is SsrfVerificationStrategy.OWNED_RECEIVER
+                    and not self._owned_receiver_enabled
+                ):
+                    continue
+                elif (
+                    wanted is SsrfVerificationStrategy.INTERNAL_CANARY
+                    and canary is None
+                ):
+                    continue
+                selected.append(replace(
+                    decision,
+                    candidate=replace(
                         candidate,
-                        routing_capability_id="",
-                        analysis_strategy_id="",
-                    )
-            elif canary is not None or self._owned_receiver_enabled:
-                continue
-            selected.append(replace(
-                decision,
-                candidate=replace(
-                    candidate,
-                    exploration_parameters=(registration.parameter,),
-                ),
-            ))
-        return (*base, *callback, *selected)
+                        exploration_parameters=(registration.parameter,),
+                    ),
+                ))
+        ssrf = {
+            (
+                item.candidate.surface_id,
+                item.candidate.routing_capability_id,
+                item.candidate.analysis_strategy_id,
+            ): item
+            for item in (*preserved, *selected)
+        }
+        return (*base, *ssrf.values())

@@ -35,10 +35,15 @@ class InteractshCliCallbackService:
     poll_wait_seconds = 10.0
 
     def __init__(
-        self, *, server: str, callback_domain: str | None = None,
+        self, *, server: str, public_oast: bool,
+        public_oast_consent: bool = False, callback_domain: str | None = None,
         token: str = "", binary: str = "interactsh-client",
         startup_timeout_seconds: float = 20.0,
     ) -> None:
+        if type(public_oast) is not bool or type(public_oast_consent) is not bool:
+            raise ValueError("Interactsh public OAST flags must be boolean")
+        if public_oast and not public_oast_consent:
+            raise ValueError("public Interactsh requires explicit construction consent")
         parsed = urlsplit(server if "://" in server else f"https://{server}")
         domain = (parsed.hostname or "").casefold()
         callback_domain = (callback_domain or domain).casefold()
@@ -59,6 +64,7 @@ class InteractshCliCallbackService:
         resolved_binary = shutil.which(binary)
         if resolved_binary is None:
             raise OSError("interactsh-client is not installed")
+        self._public_oast = public_oast
         self.origin = f"https://{callback_domain}"
         self._condition = threading.Condition()
         self._tickets: dict[str, SsrfCallbackTicket] = {}
@@ -119,6 +125,10 @@ class InteractshCliCallbackService:
         finally:
             config_path.unlink(missing_ok=True)
             payload_path.unlink(missing_ok=True)
+
+    @property
+    def public_oast(self) -> bool:
+        return self._public_oast
 
     def issue(self, idempotency_key: str) -> SsrfCallbackTicket:
         if not idempotency_key:

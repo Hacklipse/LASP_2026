@@ -14,13 +14,15 @@ from hacklipse.adapters.ssrf_analysis import (
     SSRF_CALLBACK_CAPABILITY,
     SSRF_CANARY_CAPABILITY,
     SSRF_RESULT_TYPE,
+    is_ssrf_callback_candidate,
+    is_ssrf_canary_candidate,
+    is_ssrf_owned_receiver_candidate,
 )
 from hacklipse.application.task_factory import TaskFactory
 from hacklipse.application.errors import AgentContractError
-from hacklipse.application.errors import AgentContractError
 from hacklipse.bootstrap import build_local_application, register_standard_agents
 from hacklipse.domain import (
-    AgentResultStatus,
+    AgentResultStatus, Candidate, CandidateStatus,
     Evidence,
     ExecutionResult,
     HttpRequestKind,
@@ -29,7 +31,7 @@ from hacklipse.domain import (
     SsrfCanaryProofTarget, SsrfDestinationPolicy, SsrfDestinationRule,
     SsrfExecutionApproval,
     SsrfPolicyAssertion, SsrfPolicyEvidenceStatus, SsrfPolicySource,
-    SsrfReviewRegistration,
+    SsrfReviewRegistration, SsrfVerificationStrategy,
     Surface,
     ValidationReasonCode, ValidationVerdict,
 )
@@ -62,12 +64,37 @@ class _CanaryRuntime:
 
 class _IssueFailingCallback:
     origin = "https://callback.example"
+    public_oast = False
 
     def issue(self, key):
         raise OSError("callback provider unavailable")
 
     def poll(self, token, *, timeout_seconds):
         raise AssertionError("canary strategy must not poll callback provider")
+
+
+class _ForbiddenCallback:
+    origin = "https://callback.example"
+    public_oast = False
+
+    def __init__(self) -> None:
+        self.issue_calls = 0
+
+    def issue(self, key):
+        self.issue_calls += 1
+        raise AssertionError("PASSIVE strategy must not issue a callback ticket")
+
+    def poll(self, token, *, timeout_seconds):
+        raise AssertionError("PASSIVE strategy must not poll a callback provider")
+
+
+class _ForbiddenLlm:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, request):
+        self.calls += 1
+        raise AssertionError("PASSIVE strategy must not invoke the LLM")
 
 
 class _ErrorMarkerRuntime(_CanaryRuntime):
@@ -138,6 +165,7 @@ class SsrfStrategySeparationTests(unittest.TestCase):
             run_id=self.run.run_id,
             parameter="url",
             hint_evidence_id=self.review.evidence_id,
+            verification_strategy=SsrfVerificationStrategy.INTERNAL_CANARY,
             approval=SsrfExecutionApproval(
                 approval_id="approval-1",
                 surface_id=self.surface.surface_id,
@@ -228,6 +256,92 @@ class SsrfStrategySeparationTests(unittest.TestCase):
             ))
         return tuple(ids)
 
+    def _passive_app(self, *, llm=None):
+        callback = _ForbiddenCallback()
+        budget = InMemoryBudgetManager()
+        app = build_local_application(
+            {}, budget_manager=budget, runtime=self.runtime,
+            ssrf_callback_service=callback,
+        )
+        register_standard_agents(app, llm_client=llm)
+        app.stores.runs.add(self.run)
+        app.stores.surfaces.add(self.surface)
+        app.stores.evidence.append(self.review)
+        budget.open_run(self.run.run_id, self.run.request_budget)
+        return app, callback
+
+    def test_passive_analysis_never_falls_through_to_callback(self) -> None:
+        for llm in (None, _ForbiddenLlm()):
+            with self.subTest(profile="llm" if llm is not None else "heuristic"):
+                app, callback = self._passive_app(llm=llm)
+                candidate = Candidate(
+                    candidate_id="candidate-passive",
+                    run_id=self.run.run_id,
+                    surface_id=self.surface.surface_id,
+                    vulnerability_type="SSRF",
+                    hypothesis="manual observation only",
+                    assigned_agent="ssrf_analyzer",
+                    evidence_ids=(self.review.evidence_id,),
+                    exploration_parameters=("url",),
+                )
+                app.stores.candidates.add(candidate)
+
+                result = app.dispatcher.dispatch(TaskFactory().analysis(
+                    self.run, candidate, target_url=self.surface.url,
+                    request_budget=4,
+                ))
+
+                self.assertEqual(result.status, AgentResultStatus.COMPLETED)
+                self.assertEqual(result.evidence_requests, ())
+                self.assertEqual(result.new_evidence_ids, ())
+                self.assertEqual(callback.issue_calls, 0)
+                if llm is not None:
+                    self.assertEqual(llm.calls, 0)
+
+    def test_passive_validation_without_manual_provider_is_blocked(self) -> None:
+        app, callback = self._passive_app()
+        candidate = Candidate(
+            candidate_id="candidate-passive",
+            run_id=self.run.run_id,
+            surface_id=self.surface.surface_id,
+            vulnerability_type="SSRF",
+            hypothesis="manual observation only",
+            assigned_agent="ssrf_analyzer",
+            evidence_ids=(self.review.evidence_id,),
+            status=CandidateStatus.ANALYZED,
+            exploration_parameters=("url",),
+        )
+        app.stores.candidates.add(candidate)
+
+        result = app.dispatcher.dispatch(TaskFactory().validation(
+            self.run, candidate, validation_id="validation-passive",
+            agent_type="validation", request_budget=2,
+        ))
+
+        self.assertEqual(result.validation.verdict, ValidationVerdict.BLOCKED)
+        self.assertEqual(
+            result.validation.reason_code,
+            ValidationReasonCode.SSRF_MANUAL_REVIEW_REQUIRED,
+        )
+        self.assertEqual(callback.issue_calls, 0)
+
+    def test_mixed_strategy_is_not_classified_for_reporting(self) -> None:
+        candidate = Candidate(
+            candidate_id="candidate-mixed",
+            run_id=self.run.run_id,
+            surface_id=self.surface.surface_id,
+            vulnerability_type="SSRF",
+            hypothesis="mixed contract",
+            assigned_agent="ssrf_analyzer",
+            evidence_ids=(),
+            routing_capability_id=SSRF_CALLBACK_CAPABILITY,
+            analysis_strategy_id="observed_url_internal_canary_probe",
+        )
+
+        self.assertFalse(is_ssrf_callback_candidate(candidate))
+        self.assertFalse(is_ssrf_canary_candidate(candidate))
+        self.assertFalse(is_ssrf_owned_receiver_candidate(candidate))
+
     def test_callback_and_canary_route_as_distinct_candidates(self) -> None:
         app = self._app(_IssueFailingCallback())
         decisions = app.orchestrator._router.route(
@@ -300,6 +414,22 @@ class SsrfStrategySeparationTests(unittest.TestCase):
         )
         self.assertEqual(app.collector.ssrf_callback_usage, (0, 0))
 
+    def test_typed_canary_candidate_fails_closed_without_process_proof(self) -> None:
+        app = self._app()
+        candidate = self._canary_candidate(app)
+        app.stores.candidates.add(candidate)
+        app.collector._ssrf_canary_proof = None
+
+        with self.assertRaisesRegex(
+            AgentContractError, "lacks its process-local proof",
+        ):
+            app.dispatcher.dispatch(TaskFactory().analysis(
+                self.run,
+                candidate,
+                target_url=self.surface.url,
+                request_budget=4,
+            ))
+
     def test_callback_failure_does_not_touch_canary_strategy(self) -> None:
         app = self._app(_IssueFailingCallback())
         candidate = self._canary_candidate(app)
@@ -349,6 +479,7 @@ class SsrfStrategySeparationTests(unittest.TestCase):
             run_id=self.run.run_id,
             parameter="url",
             hint_evidence_id=self.review.evidence_id,
+            verification_strategy=SsrfVerificationStrategy.INTERNAL_CANARY,
             execution_approval=SsrfExecutionApproval(
                 approval_id="approval-1",
                 surface_id=self.surface.surface_id,
@@ -431,6 +562,7 @@ class SsrfStrategySeparationTests(unittest.TestCase):
             run_id=self.run.run_id,
             parameter="url",
             hint_evidence_id=self.review.evidence_id,
+            verification_strategy=SsrfVerificationStrategy.INTERNAL_CANARY,
             approval=SsrfExecutionApproval(
                 approval_id="approval-1",
                 surface_id=self.surface.surface_id,

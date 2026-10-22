@@ -15,6 +15,7 @@ from hacklipse.domain import (
     SsrfAssessmentReason,
     SsrfDestinationRule,
     SsrfObservationPhase,
+    SsrfVerificationStrategy,
     TaskEnvelope,
     ValidationProof,
     ValidationProofType,
@@ -99,7 +100,7 @@ from .ssrf_analysis import (
     SSRF_RESULT_TYPE, SSRF_TYPE, build_ssrf_canary_requests,
     build_ssrf_owned_receiver_requests, build_ssrf_requests,
     canary_marker_signal, has_http_callback, has_owned_receiver_observation,
-    poll_ssrf_callbacks, ssrf_parameters,
+    poll_ssrf_callbacks, ssrf_candidate_verification_strategy, ssrf_parameters,
 )
 from .ssrf_assessment import resolve_ssrf_assessment
 
@@ -111,51 +112,6 @@ _EXPECTED_SIGNAL = {
     for rule in (*DEFAULT_RULES, *OPTIONAL_SOURCE_MAP_RULES)
 }
 _EXPECTED_SIGNAL[SSRF_TYPE] = "ssrf_callback_http"
-
-_SSRF_CALLBACK_CAPABILITIES = frozenset({
-    "ssrf.callback_observed_url_query",
-    "ssrf.callback_declared_url_query",
-})
-_SSRF_CALLBACK_STRATEGIES = frozenset({
-    "observed_url_callback_probe",
-    "declared_url_callback_probe",
-})
-_SSRF_CANARY_CAPABILITIES = frozenset({
-    "ssrf.internal_canary_observed_url_query",
-    "ssrf.internal_canary_declared_url_query",
-})
-_SSRF_CANARY_STRATEGIES = frozenset({
-    "observed_url_internal_canary_probe",
-    "declared_url_internal_canary_probe",
-})
-_SSRF_OWNED_RECEIVER_CAPABILITIES = frozenset({
-    "ssrf.internal_request_log_observed_url_query",
-    "ssrf.internal_request_log_declared_url_query",
-})
-_SSRF_OWNED_RECEIVER_STRATEGIES = frozenset({
-    "observed_url_internal_request_log_probe",
-    "declared_url_internal_request_log_probe",
-})
-_SSRF_STRATEGY_PAIRS = frozenset({
-    ("ssrf.callback_observed_url_query", "observed_url_callback_probe"),
-    ("ssrf.callback_declared_url_query", "declared_url_callback_probe"),
-    (
-        "ssrf.internal_canary_observed_url_query",
-        "observed_url_internal_canary_probe",
-    ),
-    (
-        "ssrf.internal_canary_declared_url_query",
-        "declared_url_internal_canary_probe",
-    ),
-    (
-        "ssrf.internal_request_log_observed_url_query",
-        "observed_url_internal_request_log_probe",
-    ),
-    (
-        "ssrf.internal_request_log_declared_url_query",
-        "declared_url_internal_request_log_probe",
-    ),
-})
 
 # HttpExecutionRuntime(및 그 대역)이 실제 재현 요청 결과에 붙이는 Observation 유형.
 # 최초 Recon이 남긴 신호 관측(예: "url_or_file_parameter")과는 구분되는, Validator
@@ -307,77 +263,22 @@ class ValidationAgent:
         surface_evidence = tuple(item for item in self._evidence.list_by_run(task.run_id)
                                  if item.surface_id == surface.surface_id)
         available_parameters = ssrf_parameters(surface, surface_evidence)
-        registration = self._collector.ssrf_review_for_surface(
-            task.run_id, candidate.surface_id,
-        )
         canary = self._collector.ssrf_canary_proof_for_run(task.run_id)
-        callback_candidate = (
-            candidate.routing_capability_id in _SSRF_CALLBACK_CAPABILITIES
-            or candidate.analysis_strategy_id in _SSRF_CALLBACK_STRATEGIES
-        )
-        canary_candidate = (
-            candidate.routing_capability_id in _SSRF_CANARY_CAPABILITIES
-            or candidate.analysis_strategy_id in _SSRF_CANARY_STRATEGIES
-        )
-        owned_receiver_candidate = (
-            candidate.routing_capability_id in _SSRF_OWNED_RECEIVER_CAPABILITIES
-            or candidate.analysis_strategy_id in _SSRF_OWNED_RECEIVER_STRATEGIES
-        )
-        legacy_candidate = not (
-            candidate.routing_capability_id or candidate.analysis_strategy_id
-        )
-        known_capabilities = (
-            _SSRF_CALLBACK_CAPABILITIES
-            | _SSRF_CANARY_CAPABILITIES
-            | _SSRF_OWNED_RECEIVER_CAPABILITIES
-        )
-        known_strategies = (
-            _SSRF_CALLBACK_STRATEGIES
-            | _SSRF_CANARY_STRATEGIES
-            | _SSRF_OWNED_RECEIVER_STRATEGIES
-        )
-        if (
-            candidate.routing_capability_id
-            and candidate.routing_capability_id not in known_capabilities
-        ) or (
-            candidate.analysis_strategy_id
-            and candidate.analysis_strategy_id not in known_strategies
-        ):
+        try:
+            strategy = ssrf_candidate_verification_strategy(candidate)
+        except AgentContractError:
             return self._validation_result(
                 task, verdict=ValidationVerdict.BLOCKED, evidence=(),
-                reason="unsupported SSRF capability or analysis strategy",
+                reason="unsupported or mixed SSRF verification strategy",
                 reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
             )
-        if (
-            candidate.routing_capability_id
-            and candidate.analysis_strategy_id
-            and (
-                candidate.routing_capability_id,
-                candidate.analysis_strategy_id,
-            ) not in _SSRF_STRATEGY_PAIRS
-        ):
-            return self._validation_result(
-                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
-                reason="SSRF capability and analysis strategy do not match",
-                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
-            )
-        if sum((callback_candidate, canary_candidate, owned_receiver_candidate)) > 1:
-            return self._validation_result(
-                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
-                reason="SSRF verification strategies cannot be mixed in one Candidate",
-                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
-            )
-        if not (
-            callback_candidate
-            or canary_candidate
-            or owned_receiver_candidate
-            or legacy_candidate
-        ):
-            return self._validation_result(
-                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
-                reason="unsupported SSRF capability or analysis strategy",
-                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
-            )
+        registration = self._collector.ssrf_review_for_surface(
+            task.run_id, candidate.surface_id, strategy,
+        )
+        callback_candidate = strategy is SsrfVerificationStrategy.CALLBACK
+        canary_candidate = strategy is SsrfVerificationStrategy.INTERNAL_CANARY
+        owned_receiver_candidate = strategy is SsrfVerificationStrategy.OWNED_RECEIVER
+        passive_candidate = strategy is SsrfVerificationStrategy.PASSIVE
         if (canary_candidate or owned_receiver_candidate) and registration is None:
             return self._validation_result(
                 task, verdict=ValidationVerdict.BLOCKED, evidence=(),
@@ -401,22 +302,24 @@ class ValidationAgent:
                 available_parameters,
                 registration,
             )
-        if (
-            (canary_candidate or legacy_candidate)
-            and registration is not None
-            and canary is not None
-        ):
+        if canary_candidate and registration is not None and canary is not None:
             return self._validate_registered_ssrf_canary(
                 task, candidate, evidence, surface, surface_evidence,
                 available_parameters, registration, canary,
             )
         if (
-            (canary_candidate or legacy_candidate)
+            passive_candidate
             and registration is not None
             and self._collector.ssrf_observation_enabled
         ):
             return self._validate_registered_ssrf_review(
                 task, candidate, available_parameters, registration,
+            )
+        if passive_candidate:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="passive SSRF review provider or registration is unavailable",
+                reason_code=ValidationReasonCode.SSRF_MANUAL_REVIEW_REQUIRED,
             )
         if canary_candidate:
             return self._validation_result(
@@ -890,6 +793,10 @@ class ValidationAgent:
                 reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
             )
         assert task.validation_id is not None
+        review_strategy = (
+            SsrfVerificationStrategy.OWNED_RECEIVER
+            if owned_receiver else SsrfVerificationStrategy.PASSIVE
+        )
         try:
             provider_status, observations, mapping = (
                 self._collector.collect_server_request_observations(
@@ -898,6 +805,7 @@ class ValidationAgent:
                     parameter=parameter,
                     task_id=task.task_id,
                     validation_id=task.validation_id,
+                    strategy=review_strategy,
                 )
             )
         except (AgentContractError, OSError, TimeoutError):
@@ -937,6 +845,7 @@ class ValidationAgent:
             validation_id=task.validation_id,
             assessment=assessment,
             observation_evidence_ids=mapping,
+            strategy=review_strategy,
         )
         current_observation_ids = tuple(
             mapping[item.observation_id]
@@ -996,7 +905,7 @@ class ValidationAgent:
             result = self._validation_result(
                 task, verdict=assessment.verdict, evidence=validation_evidence,
                 reason=reason,
-                reason_code=ValidationReasonCode.SSRF_CALLBACK_ONLY,
+                reason_code=ValidationReasonCode.SSRF_MANUAL_REVIEW_REQUIRED,
             )
         else:
             result = self._validation_result(

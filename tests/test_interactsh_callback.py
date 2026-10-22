@@ -70,7 +70,8 @@ class InteractshCallbackTests(unittest.TestCase):
         with patch("shutil.which", return_value="/fake/interactsh-client"), patch(
             "subprocess.Popen", side_effect=fake_popen,
         ), InteractshCliCallbackService(
-            server="https://oast.example", token="private-secret",
+            server="https://oast.example", public_oast=False,
+            token="private-secret",
         ) as service:
             first = service.issue("run:candidate:analysis")
             self.assertEqual(first, service.issue("run:candidate:analysis"))
@@ -78,6 +79,7 @@ class InteractshCallbackTests(unittest.TestCase):
             self.assertNotEqual(first.token, second.token)
             self.assertNotEqual(first.url, second.url)
             self.assertEqual(service.origin, "https://oast.example")
+            self.assertFalse(service.public_oast)
             self.assertNotIn("private-secret", " ".join(processes[0].args))
             self.assertIn("private-secret", processes[0].config)
             self.assertEqual(processes[0].config_mode, 0o600)
@@ -103,7 +105,7 @@ class InteractshCallbackTests(unittest.TestCase):
             "subprocess.Popen",
             side_effect=lambda args, **kwargs: _FakeProcess(args, hosts_domain="evil.test"),
         ), self.assertRaisesRegex(OSError, "unexpected callback domain"):
-            InteractshCliCallbackService(server="oast.example")
+            InteractshCliCallbackService(server="oast.example", public_oast=False)
 
     def test_provider_polling_error_is_not_reported_as_no_hit(self) -> None:
         processes: list[_FakeProcess] = []
@@ -115,7 +117,9 @@ class InteractshCallbackTests(unittest.TestCase):
 
         with patch("shutil.which", return_value="/fake/interactsh-client"), patch(
             "subprocess.Popen", side_effect=fake_popen,
-        ), InteractshCliCallbackService(server="oast.example") as service:
+        ), InteractshCliCallbackService(
+            server="oast.example", public_oast=False,
+        ) as service:
             ticket = service.issue("run:candidate:analysis")
             processes[0].stderr.send("[ERR] Could not poll Interactsh server\n")
             with self.assertRaisesRegex(OSError, "unavailable"):
@@ -124,7 +128,9 @@ class InteractshCallbackTests(unittest.TestCase):
     def test_dns_does_not_end_poll_before_delayed_http(self) -> None:
         with patch("shutil.which", return_value="/fake/interactsh-client"), patch(
             "subprocess.Popen", side_effect=lambda args, **kwargs: _FakeProcess(args),
-        ), InteractshCliCallbackService(server="oast.example") as service:
+        ), InteractshCliCallbackService(
+            server="oast.example", public_oast=False,
+        ) as service:
             ticket = service.issue("run:candidate:analysis")
             now = datetime.now(timezone.utc).isoformat()
             service._record_interaction(json.dumps({
@@ -147,7 +153,9 @@ class InteractshCallbackTests(unittest.TestCase):
     def test_dns_only_waits_until_deadline_and_cannot_fill_http_slots(self) -> None:
         with patch("shutil.which", return_value="/fake/interactsh-client"), patch(
             "subprocess.Popen", side_effect=lambda args, **kwargs: _FakeProcess(args),
-        ), InteractshCliCallbackService(server="oast.example") as service:
+        ), InteractshCliCallbackService(
+            server="oast.example", public_oast=False,
+        ) as service:
             ticket = service.issue("run:candidate:analysis")
             for index in range(8):
                 service._record_interaction(json.dumps({
@@ -177,7 +185,9 @@ class InteractshCallbackTests(unittest.TestCase):
 
         with patch("shutil.which", return_value="/fake/interactsh-client"), patch(
             "subprocess.Popen", side_effect=fake_popen,
-        ), InteractshCliCallbackService(server="oast.example") as service:
+        ), InteractshCliCallbackService(
+            server="oast.example", public_oast=False,
+        ) as service:
             self.assertEqual(processes[0].config, "")
             self.assertNotIn("-token", processes[0].args)
             self.assertEqual(service.poll_wait_seconds, 10.0)
@@ -185,7 +195,9 @@ class InteractshCallbackTests(unittest.TestCase):
     def test_discard_forgets_ticket_hits_and_never_reuses_its_session_host(self) -> None:
         with patch("shutil.which", return_value="/fake/interactsh-client"), patch(
             "subprocess.Popen", side_effect=lambda args, **kwargs: _FakeProcess(args),
-        ), InteractshCliCallbackService(server="oast.example") as service:
+        ), InteractshCliCallbackService(
+            server="oast.example", public_oast=False,
+        ) as service:
             first = service.issue("run-1:analysis")
             service._record_interaction(json.dumps({
                 "full-id": first.token, "protocol": "http",
@@ -203,9 +215,29 @@ class InteractshCallbackTests(unittest.TestCase):
 
     def test_bad_server_and_missing_binary_are_rejected_without_contact(self) -> None:
         with self.assertRaises(ValueError):
-            InteractshCliCallbackService(server="http://oast.example")
+            InteractshCliCallbackService(
+                server="http://oast.example", public_oast=False,
+            )
         with patch("shutil.which", return_value=None), self.assertRaises(OSError):
-            InteractshCliCallbackService(server="oast.example")
+            InteractshCliCallbackService(server="oast.example", public_oast=False)
+
+    def test_public_oast_requires_construction_consent_before_process_start(self) -> None:
+        with patch("shutil.which") as which, patch("subprocess.Popen") as popen:
+            with self.assertRaisesRegex(ValueError, "explicit construction consent"):
+                InteractshCliCallbackService(
+                    server="oast.example", public_oast=True,
+                )
+        which.assert_not_called()
+        popen.assert_not_called()
+
+        with patch("shutil.which", return_value="/fake/interactsh-client"), patch(
+            "subprocess.Popen",
+            side_effect=lambda args, **kwargs: _FakeProcess(args),
+        ), InteractshCliCallbackService(
+            server="oast.example", public_oast=True,
+            public_oast_consent=True,
+        ) as service:
+            self.assertTrue(service.public_oast)
 
 
 if __name__ == "__main__":

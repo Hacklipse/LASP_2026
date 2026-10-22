@@ -22,6 +22,7 @@ from hacklipse.ports.errors import PolicyViolation
 class LocalSsrfCallbackTests(unittest.TestCase):
     def test_docker_host_origin_keeps_listener_on_loopback(self) -> None:
         with LocalSsrfCallbackService(advertised_host="host.docker.internal") as service:
+            self.assertFalse(service.public_oast)
             ticket = service.issue("docker-target")
             self.assertTrue(ticket.url.startswith("http://host.docker.internal:"))
             with urlopen(ticket.url.replace("host.docker.internal", "127.0.0.1"), timeout=2) as response:

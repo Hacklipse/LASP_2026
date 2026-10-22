@@ -5,11 +5,14 @@ from __future__ import annotations
 import hashlib
 from urllib.parse import parse_qsl, urlsplit
 
-from hacklipse.application.execution import RuntimeEvidenceCollector
+from hacklipse.application.execution import (
+    RuntimeEvidenceCollector, ssrf_candidate_verification_strategy,
+)
 from hacklipse.application.errors import AgentContractError
 from hacklipse.domain import (
     AgentResult, AgentResultStatus, Evidence, EvidenceRequest, HttpRequestKind,
     HttpRequestSpec, Surface, TaskEnvelope,
+    SsrfVerificationStrategy,
 )
 from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 from hacklipse.ports.errors import BudgetExceeded, RecordNotFound
@@ -54,39 +57,40 @@ SSRF_RESULT_TYPE = "ssrf_probe_result"
 SSRF_DESTINATION_HINT_TYPE = "ssrf_destination_hint"
 SSRF_URL_FETCH_REVIEW_TYPE = "ssrf_url_fetch_review"
 
-
 def is_ssrf_canary_candidate(candidate) -> bool:
     """Return whether a Candidate is explicitly bound to internal canary work."""
 
-    return (
-        candidate.routing_capability_id in {
-            SSRF_CANARY_CAPABILITY, SSRF_CANARY_DECLARED_CAPABILITY,
-        }
-        or candidate.analysis_strategy_id in SSRF_CANARY_STRATEGIES
-    )
+    try:
+        return (
+            ssrf_candidate_verification_strategy(candidate)
+            is SsrfVerificationStrategy.INTERNAL_CANARY
+        )
+    except AgentContractError:
+        return False
 
 
 def is_ssrf_callback_candidate(candidate) -> bool:
     """Return whether a Candidate is explicitly bound to callback work."""
 
-    return (
-        candidate.routing_capability_id in {
-            SSRF_CALLBACK_CAPABILITY, SSRF_CALLBACK_DECLARED_CAPABILITY,
-        }
-        or candidate.analysis_strategy_id in SSRF_CALLBACK_STRATEGIES
-    )
+    try:
+        return (
+            ssrf_candidate_verification_strategy(candidate)
+            is SsrfVerificationStrategy.CALLBACK
+        )
+    except AgentContractError:
+        return False
 
 
 def is_ssrf_owned_receiver_candidate(candidate) -> bool:
     """Return whether a Candidate uses an operator-owned inbound request log."""
 
-    return (
-        candidate.routing_capability_id in {
-            SSRF_OWNED_RECEIVER_CAPABILITY,
-            SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY,
-        }
-        or candidate.analysis_strategy_id in SSRF_OWNED_RECEIVER_STRATEGIES
-    )
+    try:
+        return (
+            ssrf_candidate_verification_strategy(candidate)
+            is SsrfVerificationStrategy.OWNED_RECEIVER
+        )
+    except AgentContractError:
+        return False
 
 
 def ssrf_local_validation_reserve(task: TaskEnvelope) -> int:
@@ -400,11 +404,12 @@ class SsrfAnalyzer:
             task, vulnerability_type=SSRF_TYPE,
             candidate_store=self._candidates, surface_store=self._surfaces,
         )
+        strategy = ssrf_candidate_verification_strategy(candidate)
         registration = self._collector.ssrf_review_for_surface(
-            task.run_id, surface.surface_id,
+            task.run_id, surface.surface_id, strategy,
         )
         canary = self._collector.ssrf_canary_proof_for_run(task.run_id)
-        if is_ssrf_owned_receiver_candidate(candidate):
+        if strategy is SsrfVerificationStrategy.OWNED_RECEIVER:
             if registration is None or not self._collector.ssrf_owned_receiver_enabled:
                 return AgentResult(
                     task_id=task.task_id, status=AgentResultStatus.COMPLETED,
@@ -413,23 +418,34 @@ class SsrfAnalyzer:
             return self._handle_owned_receiver(
                 task, candidate, surface, registration,
             )
-        if is_ssrf_canary_candidate(candidate):
-            if registration is None or canary is None:
-                return AgentResult(
-                    task_id=task.task_id, status=AgentResultStatus.COMPLETED,
-                    candidate_ids=(candidate.candidate_id,),
+        if strategy is SsrfVerificationStrategy.INTERNAL_CANARY:
+            if registration is None:
+                raise AgentContractError(
+                    "typed SSRF canary Candidate lacks its execution approval"
+                )
+            if canary is None:
+                raise AgentContractError(
+                    "typed SSRF canary Candidate lacks its process-local proof"
                 )
             return self._handle_registered_canary(task, candidate, surface, registration)
-        if not is_ssrf_callback_candidate(candidate):
+        if strategy is SsrfVerificationStrategy.PASSIVE:
             reviewed = self._handle_registered_review(task, candidate, surface)
             if reviewed is not None:
                 return reviewed
+            # PASSIVE is a manual/provider-observation contract. It must never
+            # fall through into callback ticket issuance merely because a
+            # callback service happens to be configured for the Run.
+            return AgentResult(
+                task_id=task.task_id, status=AgentResultStatus.COMPLETED,
+                candidate_ids=(candidate.candidate_id,),
+            )
         surface_evidence = tuple(item for item in self._evidence.list_by_run(task.run_id)
                                  if item.surface_id == surface.surface_id)
         sources = dict(ssrf_parameter_sources(surface, surface_evidence))
         parameters = tuple(sources)
         registration = self._collector.ssrf_review_for_surface(
             task.run_id, surface.surface_id,
+            SsrfVerificationStrategy.CALLBACK,
         )
         if registration is not None:
             parameters = tuple(
@@ -640,6 +656,7 @@ class SsrfAnalyzer:
     ) -> AgentResult | None:
         registration = self._collector.ssrf_review_for_surface(
             task.run_id, surface.surface_id,
+            SsrfVerificationStrategy.PASSIVE,
         )
         if registration is None or not self._collector.ssrf_observation_enabled:
             return None

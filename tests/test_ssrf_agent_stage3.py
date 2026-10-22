@@ -25,7 +25,7 @@ from hacklipse.domain import (
     AgentResultStatus, CandidateStatus, ExecutionResult, HttpRequestKind,
     DestinationPolicy, Evidence, Run, RunPhase, RunRequest, RunScope,
     SsrfCanaryProofTarget, SsrfDestinationRule, SsrfPolicySource, Surface,
-    SsrfExecutionApproval,
+    SsrfExecutionApproval, SsrfVerificationStrategy,
     ValidationProofType, ValidationReasonCode, ValidationVerdict,
 )
 from hacklipse.ports import SsrfCallbackHit, SsrfCallbackTicket
@@ -35,6 +35,7 @@ from hacklipse.ports.llm import LlmResponse
 
 class _Service:
     origin = "https://callback.example"
+    public_oast = False
 
     def __init__(self) -> None:
         self.tickets: dict[str, SsrfCallbackTicket] = {}
@@ -389,6 +390,7 @@ class SsrfStage3Tests(unittest.TestCase):
                 approved_by="operator-security",
                 approved_at=datetime.now(timezone.utc),
             ),
+            verification_strategy=SsrfVerificationStrategy.CALLBACK,
         )
         decisions = self.app.orchestrator._router.route(
             self.run, (self.surface,), (review,),
@@ -444,6 +446,7 @@ class SsrfStage3Tests(unittest.TestCase):
                 approved_by="operator-security",
                 approved_at=datetime.now(timezone.utc),
             ),
+            verification_strategy=SsrfVerificationStrategy.CALLBACK,
         )
 
         result = app.dispatcher.dispatch(self.factory.analysis(
@@ -484,6 +487,7 @@ class SsrfStage3Tests(unittest.TestCase):
                     approved_by="operator-cli-test",
                     approved_at=datetime.now(timezone.utc),
                 ),
+                verification_strategy=SsrfVerificationStrategy.CALLBACK,
             )
 
         app = build_local_application(
@@ -519,6 +523,50 @@ class SsrfStage3Tests(unittest.TestCase):
             for probe in probes
         ))
         self.assertEqual(run.finding_ids, ())
+
+    def test_skipped_callback_review_cannot_auto_route_available_oast(self) -> None:
+        service = _Service()
+        runtime = _Runtime(service)
+        reviewed: list[str] = []
+        app = None
+
+        def skip_callback(run: Run) -> None:
+            assert app is not None
+            self.assertTrue(any(
+                item.observation.get("type") == "ssrf_url_fetch_review"
+                for item in app.stores.evidence.list_by_run(run.run_id)
+            ))
+            reviewed.append(run.run_id)
+            app.ssrf_reviews.skip(
+                run.run_id, SsrfVerificationStrategy.CALLBACK,
+            )
+
+        app = build_local_application(
+            {}, runtime=runtime, ssrf_callback_service=service,
+            router=standard_router(
+                ("SSRF",), ssrf_callback_service=service,
+            ),
+            config=OrchestratorConfig(post_recon_gate=skip_callback),
+        )
+        register_standard_agents(app, recon_max_pages=4)
+
+        run = app.orchestrator.start(RunRequest(
+            target_url="https://target.example/",
+            scope=RunScope(allowed_hosts=frozenset({"target.example"})),
+            request_budget=20,
+        ))
+
+        self.assertEqual(run.phase, RunPhase.DONE)
+        self.assertEqual(reviewed, [run.run_id])
+        self.assertFalse(any(
+            item.vulnerability_type == "SSRF"
+            for item in app.stores.candidates.list_by_run(run.run_id)
+        ))
+        self.assertEqual(service.tickets, {})
+        self.assertFalse(any(
+            item.request_kind is HttpRequestKind.SSRF_PROBE
+            for item in runtime.requests
+        ))
 
     def test_failed_second_callback_stays_suspected(self) -> None:
         self.runtime.reproduce = False

@@ -32,6 +32,9 @@ class SsrfCallbackService(Protocol):
 
     origin: str
 
+    @property
+    def public_oast(self) -> bool: ...
+
     def issue(self, idempotency_key: str) -> SsrfCallbackTicket: ...
 
     def poll(self, token: str, *, timeout_seconds: float) -> Sequence[SsrfCallbackHit]: ...

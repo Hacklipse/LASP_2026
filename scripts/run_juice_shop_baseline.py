@@ -101,6 +101,8 @@ from hacklipse.domain import (  # noqa: E402
     SsrfPolicyAssertion,
     SsrfPolicyEvidenceStatus,
     SsrfPolicySource,
+    SsrfVerificationStrategy,
+    ValidationReasonCode,
     ssrf_destination_origin,
     validate_ssrf_opaque_reference,
 )
@@ -586,7 +588,8 @@ def _prompt_opaque_ssrf_reference(
 
 def _run_ssrf_review_gate(
     app, run: Run, *, callback_mode: str, owned_receiver_mode: bool = False,
-    input_fn=None, secret_input_fn=None,
+    input_fn=None, secret_input_fn=None, allow_initial_internal: bool = False,
+    preselected_registration=None, force_internal: bool = False,
 ) -> bool:
     """Review one exact coordinate after Recon, without persisting endpoint URLs."""
 
@@ -601,16 +604,27 @@ def _run_ssrf_review_gate(
         print("  현재 Run에서 검토 가능한 URL 입력 좌표가 없습니다.")
         # An optional Recon round may still discover an eligible coordinate.
         return False
-    for index, item in enumerate(coordinates, start=1):
-        print(
-            f"  {index}. Surface {item['surface_id']} · "
-            f"parameter {item['parameter']} · source {item['source']}"
+    if preselected_registration is None:
+        for index, item in enumerate(coordinates, start=1):
+            print(
+                f"  {index}. Surface {item['surface_id']} · "
+                f"parameter {item['parameter']} · source {item['source']}"
+            )
+        selected = _prompt_choice(
+            "검토할 좌표 번호 (Enter: 건너뛰기): ", coordinates, input_fn=input_fn,
         )
-    selected = _prompt_choice(
-        "검토할 좌표 번호 (Enter: 건너뛰기): ", coordinates, input_fn=input_fn,
-    )
+    else:
+        selected = next((
+            item for item in coordinates
+            if item["surface_id"] == preselected_registration.surface_id
+            and item["parameter"] == preselected_registration.parameter
+        ), None)
     if selected is None:
-        app.ssrf_reviews.skip(run.run_id)
+        app.ssrf_reviews.skip(
+            run.run_id,
+            SsrfVerificationStrategy.INTERNAL_CANARY
+            if force_internal else SsrfVerificationStrategy.PASSIVE,
+        )
         print("  이번 Run의 SSRF 좌표 검토를 건너뜁니다.")
         return True
     assert isinstance(selected, dict)
@@ -630,7 +644,7 @@ def _run_ssrf_review_gate(
     else:
         print("  이 Run에 정제된 목적지 단서는 없습니다.")
 
-    if owned_receiver_mode and input_fn(
+    if not force_internal and owned_receiver_mode and input_fn(
         "명시적으로 실행한 운영자 소유 로컬 Receiver로 "
         "서버 발신을 확인합니까? [y/N] "
     ).strip().casefold() == "y":
@@ -638,7 +652,9 @@ def _run_ssrf_review_gate(
             "이 Receiver 주소로 선택한 좌표의 확인 요청을 "
             "실행하도록 승인합니까? [y/N] "
         ).strip().casefold() != "y":
-            app.ssrf_reviews.skip(run.run_id)
+            app.ssrf_reviews.skip(
+                run.run_id, SsrfVerificationStrategy.OWNED_RECEIVER,
+            )
             print("  실행 승인이 없어 이번 검토를 건너뜁니다.")
             return True
         approved_by = _prompt_opaque_ssrf_reference(
@@ -647,7 +663,9 @@ def _run_ssrf_review_gate(
         now = datetime.now(timezone.utc)
         receiver_origin = app.ssrf_owned_receiver_origin
         if not receiver_origin:
-            app.ssrf_reviews.skip(run.run_id)
+            app.ssrf_reviews.skip(
+                run.run_id, SsrfVerificationStrategy.OWNED_RECEIVER,
+            )
             print("  운영자 소유 Receiver가 사용 불가해 건너뜁니다.")
             return True
         register_policy = input_fn(
@@ -688,6 +706,7 @@ def _run_ssrf_review_gate(
             destination_policy=policy,
             hint_use_approved=False,
             approved_destination_url=receiver_origin,
+            verification_strategy=SsrfVerificationStrategy.OWNED_RECEIVER,
         )
         print(
             "  운영자 소유 Receiver A/B 확인을 진행합니다. "
@@ -698,18 +717,25 @@ def _run_ssrf_review_gate(
         )
         return True
 
-    internal = input_fn(
-        "운영자 소유의 비민감 내부 확인 주소를 사용합니까? [y/N] "
-    ).strip().casefold() == "y"
+    internal = force_internal or (
+        allow_initial_internal
+        and input_fn(
+            "운영자 소유의 비민감 내부 확인 주소를 사용합니까? [y/N] "
+        ).strip().casefold() == "y"
+    )
     if internal:
         marker = os.environ.get("HACKLIPSE_SSRF_CANARY_MARKER", "")
         if not marker:
             print("  내부 확인에는 HACKLIPSE_SSRF_CANARY_MARKER 설정이 필요합니다.")
-            app.ssrf_reviews.skip(run.run_id)
+            app.ssrf_reviews.skip(
+                run.run_id, SsrfVerificationStrategy.INTERNAL_CANARY,
+            )
             return True
         if secret_input_fn is None and not sys.stdin.isatty():
             print("  내부 확인 주소는 비표시 입력을 지원하는 터미널에서만 받습니다.")
-            app.ssrf_reviews.skip(run.run_id)
+            app.ssrf_reviews.skip(
+                run.run_id, SsrfVerificationStrategy.INTERNAL_CANARY,
+            )
             return True
         try:
             with warnings.catch_warnings():
@@ -719,16 +745,22 @@ def _run_ssrf_review_gate(
                 ).strip()
         except (EOFError, OSError, getpass.GetPassWarning):
             print("  비표시 입력을 사용할 수 없어 이번 검토를 건너뜁니다.")
-            app.ssrf_reviews.skip(run.run_id)
+            app.ssrf_reviews.skip(
+                run.run_id, SsrfVerificationStrategy.INTERNAL_CANARY,
+            )
             return True
         if not exact_url:
             print("  확인 주소를 입력하지 않아 이번 검토를 건너뜁니다.")
-            app.ssrf_reviews.skip(run.run_id)
+            app.ssrf_reviews.skip(
+                run.run_id, SsrfVerificationStrategy.INTERNAL_CANARY,
+            )
             return True
         if input_fn(
             "이 주소로 선택한 좌표의 확인 요청을 실행하도록 승인합니까? [y/N] "
         ).strip().casefold() != "y":
-            app.ssrf_reviews.skip(run.run_id)
+            app.ssrf_reviews.skip(
+                run.run_id, SsrfVerificationStrategy.INTERNAL_CANARY,
+            )
             print("  실행 승인이 없어 이번 검토를 건너뜁니다.")
             return True
         hint_use_approved = False
@@ -775,7 +807,9 @@ def _run_ssrf_review_gate(
                 destination_policy=policy, operator_approved=True,
             )
         except ValueError as error:
-            app.ssrf_reviews.skip(run.run_id)
+            app.ssrf_reviews.skip(
+                run.run_id, SsrfVerificationStrategy.INTERNAL_CANARY,
+            )
             print(f"  내부 확인 주소 또는 marker가 유효하지 않아 건너뜁니다: {error}")
             return True
         approval = SsrfExecutionApproval(
@@ -798,9 +832,12 @@ def _run_ssrf_review_gate(
                 destination_policy=policy,
                 hint_use_approved=hint_use_approved,
                 approved_destination_url=exact_url,
+                verification_strategy=SsrfVerificationStrategy.INTERNAL_CANARY,
             )
         except AgentContractError:
-            app.ssrf_reviews.skip(run.run_id)
+            app.ssrf_reviews.skip(
+                run.run_id, SsrfVerificationStrategy.INTERNAL_CANARY,
+            )
             print(
                 "  선택한 Recon 단서와 승인 주소가 일치하지 않아 "
                 "이번 검토를 건너뜁니다."
@@ -817,11 +854,11 @@ def _run_ssrf_review_gate(
         return True
 
     if callback_mode == "off":
-        app.ssrf_reviews.skip(run.run_id)
+        app.ssrf_reviews.skip(run.run_id, SsrfVerificationStrategy.CALLBACK)
         print("  callback과 내부 확인 주소가 없어 이번 검토를 건너뜁니다.")
         return True
     if input_fn("선택한 좌표에 callback 확인 요청을 실행할까요? [y/N] ").strip().casefold() != "y":
-        app.ssrf_reviews.skip(run.run_id)
+        app.ssrf_reviews.skip(run.run_id, SsrfVerificationStrategy.CALLBACK)
         print("  이번 Run의 SSRF 좌표 검토를 건너뜁니다.")
         return True
     approved_by = _prompt_opaque_ssrf_reference(
@@ -843,9 +880,151 @@ def _run_ssrf_review_gate(
         destination_policy=None,
         hint_use_approved=False,
         approved_destination_url=None,
+        verification_strategy=SsrfVerificationStrategy.CALLBACK,
     )
     print("  선택한 입력 좌표에서 callback 확인을 진행합니다. 확정 판정은 하지 않습니다.")
     return True
+
+
+def _restore_ssrf_internal_canary_proof(
+    app, run: Run, registration, primary, *, secret_input_fn=None,
+) -> bool:
+    """Re-enter one approved endpoint without persisting its URL or marker."""
+
+    if (
+        registration.surface_id != primary.surface_id
+        or registration.parameter != primary.parameter
+    ):
+        print("  Stored internal approval does not match the A/B-proven coordinate.")
+        return False
+    marker = os.environ.get("HACKLIPSE_SSRF_CANARY_MARKER", "")
+    if not marker:
+        print("  Re-entry requires HACKLIPSE_SSRF_CANARY_MARKER.")
+        return False
+    if secret_input_fn is None and not sys.stdin.isatty():
+        print("  Re-entry requires a terminal that supports hidden input.")
+        return False
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            exact_url = (secret_input_fn or getpass.getpass)(
+                "Previously approved internal URL (hidden; blank to decline): "
+            ).strip()
+    except (EOFError, OSError, getpass.GetPassWarning):
+        print("  Hidden input is unavailable; the follow-up is stopped safely.")
+        return False
+    if not exact_url:
+        print("  Internal URL re-entry was declined; the follow-up is stopped safely.")
+        return False
+    if not secrets.compare_digest(
+        registration.execution_approval.verification_endpoint_ref,
+        app.ssrf_verification_endpoint_ref(run.run_id, exact_url),
+    ):
+        print("  Re-entered URL does not match the persisted approval reference.")
+        return False
+    try:
+        app.register_ssrf_canary_proof(
+            run.run_id,
+            SsrfCanaryProofTarget(
+                url=exact_url,
+                marker=marker,
+                surface_id=registration.surface_id,
+                destination_policy=registration.destination_policy,
+                operator_approved=True,
+            ),
+        )
+    except (AgentContractError, DomainInvariantError, ValueError):
+        print("  Stored internal approval could not be restored safely.")
+        return False
+    print("  Restored the approved internal proof in process memory.")
+    return True
+
+
+def _run_ssrf_internal_followup_gate(
+    app, run: Run, *, input_fn=None, secret_input_fn=None,
+) -> bool:
+    """Approve one internal-canary pass for the exact A/B-proven coordinate."""
+
+    input_fn = input if input_fn is None else input_fn
+    eligible = []
+    for candidate in app.stores.candidates.list_by_run(run.run_id):
+        strategy = None
+        if (
+            candidate.status is CandidateStatus.SUSPECTED
+            and candidate.validation_reason_code
+            is ValidationReasonCode.SSRF_CALLBACK_ONLY
+        ):
+            strategy = SsrfVerificationStrategy.CALLBACK
+        elif (
+            candidate.status is CandidateStatus.SUSPECTED
+            and candidate.validation_reason_code
+            is ValidationReasonCode.SSRF_OWNED_RECEIVER_ONLY
+        ):
+            strategy = SsrfVerificationStrategy.OWNED_RECEIVER
+        if strategy is None:
+            continue
+        registration = app.ssrf_reviews.get_for_surface(
+            run_id=run.run_id,
+            surface_id=candidate.surface_id,
+            strategy=strategy,
+        )
+        if registration is not None:
+            eligible.append((candidate.candidate_id, registration))
+    if not eligible:
+        print("  A/B로 재현된 SSRF 좌표와 실행 승인을 찾지 못했습니다.")
+        return False
+    _, primary = min(eligible, key=lambda item: item[0])
+
+    existing = app.ssrf_reviews.get_for_run(
+        run.run_id, SsrfVerificationStrategy.INTERNAL_CANARY,
+    )
+    if existing is not None:
+        if app.collector.ssrf_canary_proof_for_run(run.run_id) is None:
+            return _restore_ssrf_internal_canary_proof(
+                app, run, existing, primary, secret_input_fn=secret_input_fn,
+            )
+        # Exact URL and marker intentionally remain process-local. A restored
+        # registration without those secrets must never be executed blindly.
+        if app.collector.ssrf_canary_proof_for_run(run.run_id) is not None:
+            return True
+        print(
+            "  이전 내부 확인 승인의 비밀값이 재시작 후 복원되지 "
+            "않아 추가 탐침을 실행하지 않습니다."
+        )
+        return False
+
+    print("\n[SSRF 내부 목적지 후속 검토]")
+    print(
+        "  독립적인 callback/Receiver A·B 재현이 확인된 같은 "
+        "Surface·parameter만 사용합니다."
+    )
+    if input_fn(
+        "Recon 단서나 운영자 입력의 비민감 내부 확인 주소로 "
+        "후속 검증할까요? [y/N] "
+    ).strip().casefold() != "y":
+        app.ssrf_reviews.skip(
+            run.run_id, SsrfVerificationStrategy.INTERNAL_CANARY,
+        )
+        return False
+
+    _run_ssrf_review_gate(
+        app,
+        run,
+        callback_mode="off",
+        owned_receiver_mode=False,
+        input_fn=input_fn,
+        secret_input_fn=secret_input_fn,
+        allow_initial_internal=False,
+        preselected_registration=primary,
+        force_internal=True,
+    )
+    registration = app.ssrf_reviews.get_for_run(
+        run.run_id, SsrfVerificationStrategy.INTERNAL_CANARY,
+    )
+    return (
+        registration is not None
+        and app.collector.ssrf_canary_proof_for_run(run.run_id) is not None
+    )
 
 
 def _blocked_analyzer_gaps(router) -> tuple[object, ...]:
@@ -1409,8 +1588,8 @@ def main(
     parser.add_argument(
         "--ssrf-review", action="store_true",
         help=(
-            "Recon 후 URL 입력 좌표 하나를 검토하고 callback 또는 "
-            "운영자 소유 내부 확인 주소를 선택한다(기본 off)"
+            "Recon 후 URL 입력 좌표의 callback/Owned Receiver를 먼저 "
+            "독립 재현하고, 성공 시 별도 승인으로 내부 확인을 진행한다(기본 off)"
         ),
     )
     parser.add_argument(
@@ -1853,6 +2032,8 @@ def main(
             ssrf_callback = InteractshCliCallbackService(
                 server=("oast.pro" if args.ssrf_oast == "public_interactsh"
                         else args.ssrf_interactsh_server),
+                public_oast=args.ssrf_oast == "public_interactsh",
+                public_oast_consent=args.ssrf_public_oast_consent,
                 callback_domain=args.ssrf_interactsh_callback_domain,
                 token=(os.environ.get("HACKLIPSE_INTERACTSH_TOKEN", "")
                        if args.ssrf_oast == "private_interactsh" else ""),
@@ -1904,8 +2085,16 @@ def main(
         if _run_ssrf_review_gate(
             app, run, callback_mode=callback_mode,
             owned_receiver_mode=ssrf_owned_receiver is not None,
+            allow_initial_internal=False,
         ):
             reviewed_ssrf_run_ids.add(run.run_id)
+
+    def post_ssrf_callback_review(run: Run) -> bool:
+        # Eligibility (independent A/B proof and four-request floor) is owned by
+        # the Orchestrator. This hook only gathers an explicit second approval.
+        if app is None:
+            raise RuntimeError("SSRF review application is not assembled")
+        return _run_ssrf_internal_followup_gate(app, run)
 
     app = assemble_with_ssrf_cleanup(
         build_local_application, ssrf_callback,
@@ -1952,6 +2141,9 @@ def main(
             browser_xss_validation=needs_browser,
             budget_allocation_enabled=args.budget_allocation != "off",
             post_recon_gate=(post_recon_ssrf_review if args.ssrf_review else None),
+            post_ssrf_callback_gate=(
+                post_ssrf_callback_review if args.ssrf_review else None
+            ),
         ),
     )
     base_path = parsed.path if parsed.path.endswith("/") else f"{parsed.path}/"

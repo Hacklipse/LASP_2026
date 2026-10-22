@@ -16,7 +16,12 @@ class RunStateMachine:
         RunPhase.RECON: frozenset({RunPhase.ROUTE, RunPhase.FAILED}),
         RunPhase.ROUTE: frozenset({RunPhase.RECON, RunPhase.ANALYZE, RunPhase.REPORT, RunPhase.FAILED}),
         RunPhase.ANALYZE: frozenset({RunPhase.VALIDATE, RunPhase.FAILED}),
-        RunPhase.VALIDATE: frozenset({RunPhase.REPORT, RunPhase.FAILED}),
+        RunPhase.VALIDATE: frozenset({
+            RunPhase.SSRF_REVIEW, RunPhase.REPORT, RunPhase.FAILED,
+        }),
+        RunPhase.SSRF_REVIEW: frozenset({
+            RunPhase.ROUTE, RunPhase.REPORT, RunPhase.FAILED,
+        }),
         RunPhase.REPORT: frozenset({RunPhase.DONE, RunPhase.FAILED}),
         RunPhase.DONE: frozenset(),
         RunPhase.FAILED: frozenset(),

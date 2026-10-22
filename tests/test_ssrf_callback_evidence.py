@@ -25,6 +25,7 @@ from hacklipse.domain import (
     HttpRequestKind,
     HttpRequestSpec,
     Run,
+    RunExecutionProfile,
     RunScope,
     SsrfCanaryProofTarget,
     Surface,
@@ -35,6 +36,7 @@ from hacklipse.ports.errors import ExternalExecutionDisabled
 
 class _CallbackService:
     origin = "https://callback.example"
+    public_oast = False
 
     def __init__(self) -> None:
         self.tickets: dict[str, SsrfCallbackTicket] = {}
@@ -65,6 +67,10 @@ class _CallbackService:
             received_at=datetime.now(timezone.utc),
             source="192.0.2.42 test-agent",
         ))
+
+
+class _PublicCallbackService(_CallbackService):
+    public_oast = True
 
 
 class _Runtime:
@@ -147,6 +153,57 @@ class _HeaderOnlyCanaryRuntime:
 
 
 class SsrfCallbackEvidenceTests(unittest.TestCase):
+    def test_public_oast_ticket_requires_recorded_run_consent(self) -> None:
+        service = _PublicCallbackService()
+        stores = MemoryStoreBundle()
+        budget = InMemoryBudgetManager()
+
+        def collector_for(run: Run) -> RuntimeEvidenceCollector:
+            stores.runs.add(run)
+            budget.open_run(run.run_id, run.request_budget)
+            return RuntimeEvidenceCollector(
+                run_store=stores.runs,
+                evidence_store=stores.evidence,
+                policy_gate=AllowlistPolicyGate(
+                    ssrf_callback_origin=service.origin,
+                ),
+                budget_manager=budget,
+                runtime=_Runtime(),
+                ssrf_callback_service=service,
+            )
+
+        denied = Run(
+            run_id="run-public-denied",
+            target_url="https://target.example/",
+            scope=RunScope(allowed_hosts=frozenset({"target.example"})),
+            policy_profile="safe",
+            request_budget=4,
+        )
+        with self.assertRaisesRegex(
+            ExternalExecutionDisabled, "recorded Run consent",
+        ):
+            collector_for(denied).issue_ssrf_ticket(
+                denied.run_id, "candidate-1", "url",
+            )
+        self.assertEqual(service.sequence, 0)
+        self.assertEqual(service.tickets, {})
+
+        allowed = Run(
+            run_id="run-public-allowed",
+            target_url="https://target.example/",
+            scope=RunScope(allowed_hosts=frozenset({"target.example"})),
+            policy_profile="safe",
+            request_budget=4,
+            execution_profile=RunExecutionProfile(
+                ssrf_oast_mode="public_interactsh",
+                ssrf_public_oast_consented=True,
+            ),
+        )
+        ticket = collector_for(allowed).issue_ssrf_ticket(
+            allowed.run_id, "candidate-1", "url",
+        )
+        self.assertEqual(ticket.url, "https://callback.example/token-1")
+
     def test_browser_created_callback_record_is_not_server_callback_evidence(self) -> None:
         browser_record = Evidence(
             evidence_id="evi-browser-callback",

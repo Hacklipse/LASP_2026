@@ -67,6 +67,7 @@ from hacklipse.domain import (
     SsrfPolicyAssertion,
     SsrfPolicyEvidenceStatus,
     SsrfPolicySource,
+    SsrfVerificationStrategy,
     ssrf_destination_origin,
 )
 from hacklipse.domain.models import utc_now
@@ -781,6 +782,15 @@ class RunSupervisor:
                 destination_policy=policy,
                 hint_use_approved=submission.hint_use_approved,
                 approved_destination_url=approved_destination_url,
+                verification_strategy=(
+                    SsrfVerificationStrategy.OWNED_RECEIVER
+                    if submission.use_owned_receiver
+                    else SsrfVerificationStrategy.INTERNAL_CANARY
+                    if submission.verification_url
+                    else SsrfVerificationStrategy.CALLBACK
+                    if app.collector.ssrf_enabled
+                    else SsrfVerificationStrategy.PASSIVE
+                ),
             )
             if canary is not None:
                 app.register_ssrf_canary_proof(submission.run_id, canary)
@@ -970,6 +980,8 @@ class RunSupervisor:
                 ssrf_callback = InteractshCliCallbackService(
                     server=("oast.pro" if options.ssrf_oast == "public_interactsh"
                             else options.ssrf_interactsh_server),
+                    public_oast=options.ssrf_oast == "public_interactsh",
+                    public_oast_consent=options.ssrf_public_oast_consent,
                     callback_domain=options.ssrf_interactsh_callback_domain or None,
                     token=(secrets.interactsh_token
                            if options.ssrf_oast == "private_interactsh" else ""),

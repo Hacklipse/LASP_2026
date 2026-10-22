@@ -24,7 +24,9 @@ from hacklipse.domain import (
     Run,
     RunPhase,
     RunRequest,
+    SsrfVerificationStrategy,
     Surface,
+    ValidationReasonCode,
     ValidationProofType,
     ValidationVerdict,
     redacted_internal_url_path,
@@ -55,6 +57,7 @@ from hacklipse.ports.errors import (
 )
 
 from .errors import AgentContractError, WorkflowExecutionError, safe_error_reason
+from .execution import ssrf_candidate_verification_strategy
 from .state_machine import RunStateMachine
 from .task_executor import TaskExecutor
 from .task_factory import TaskFactory
@@ -99,6 +102,11 @@ class OrchestratorConfig:
     # Optional UI checkpoint. The callback may block while an operator reviews
     # the persisted Recon result; CLI/default assembly leaves it unset.
     post_recon_gate: Callable[[Run], None] | None = None
+    # Optional second checkpoint. It is reached only after independent
+    # callback/owned-receiver A/B reproduction and must return whether an
+    # internal-canary registration was approved for one bounded follow-up.
+    post_ssrf_callback_gate: Callable[[Run], bool] | None = None
+    min_budget_for_ssrf_followup: int = 4
 
     def __post_init__(self) -> None:
         if self.max_evidence_rounds < 0:
@@ -111,6 +119,8 @@ class OrchestratorConfig:
             raise ValueError("min_budget_for_extra_recon must leave later execution budget")
         if self.max_validation_reserve_per_candidate < 1:
             raise ValueError("validation reserve maximum must be positive")
+        if self.min_budget_for_ssrf_followup < 4:
+            raise ValueError("SSRF follow-up must reserve Analysis and Validation pairs")
 
 
 class Orchestrator:
@@ -242,6 +252,7 @@ class Orchestrator:
                 RunPhase.ROUTE,
                 RunPhase.ANALYZE,
                 RunPhase.VALIDATE,
+                RunPhase.SSRF_REVIEW,
             }:
                 # 프로세스 재시작 시 메모리 CookieJar가 사라질 수 있으므로 resume마다
                 # 중앙 인증 Worker를 다시 실행한다. 비밀 원문은 Task에 들어가지 않는다.
@@ -259,6 +270,9 @@ class Orchestrator:
                     run = self._merge_agent_result(run, auth_result)
                     self._runs.save(run)
             # 단계 순서와 분기만 판단하고 실제 작업은 하위 컴포넌트에 맡긴다.
+            if self._ssrf_followup_requires_readiness(run):
+                run = self._ensure_resumed_ssrf_followup_ready(run)
+                self._runs.save(run)
             while run.phase not in {RunPhase.DONE, RunPhase.FAILED}:
                 self._emit(run, ProgressEventKind.PHASE_CHANGED)
                 if run.phase is RunPhase.RECON:
@@ -284,7 +298,17 @@ class Orchestrator:
                         )
                         next_phase = RunPhase.RECON
                     else:
-                        next_phase = RunPhase.ANALYZE if run.candidate_ids else RunPhase.REPORT
+                        has_pending_analysis = any(
+                            _pending_in(
+                                self._candidates.get(run.run_id, candidate_id),
+                                CandidateStatus.ROUTED,
+                            )
+                            for candidate_id in run.candidate_ids
+                        )
+                        next_phase = (
+                            RunPhase.ANALYZE
+                            if has_pending_analysis else RunPhase.REPORT
+                        )
                         if next_phase is RunPhase.ANALYZE:
                             run = self._plan_budget(run)
                     run = self._state.transition(run, next_phase)
@@ -296,7 +320,14 @@ class Orchestrator:
                     run = self._state.transition(run, RunPhase.VALIDATE)
                 elif run.phase is RunPhase.VALIDATE:
                     run = self._validate(run)
-                    run = self._state.transition(run, RunPhase.REPORT)
+                    next_phase = (
+                        RunPhase.SSRF_REVIEW
+                        if self._should_review_ssrf_followup(run)
+                        else RunPhase.REPORT
+                    )
+                    run = self._state.transition(run, next_phase)
+                elif run.phase is RunPhase.SSRF_REVIEW:
+                    run = self._run_ssrf_followup_gate(run)
                 elif run.phase is RunPhase.REPORT:
                     run = self._report(run)
                     # _report 는 이미 만든 보고서가 있으면 조기 반환한다. 발행은 그
@@ -440,7 +471,17 @@ class Orchestrator:
 
         surfaces = self._surfaces.list_by_run(run.run_id)
         evidence = self._evidence.get_many(run.run_id, run.evidence_ids)
-        decisions = self._router.route(run, surfaces, evidence)
+        decisions = tuple(self._router.route(run, surfaces, evidence))
+        if any(item.candidate.run_id != run.run_id for item in decisions):
+            raise AgentContractError("router returned a candidate for another run")
+        if run.ssrf_followup_rounds:
+            # The second route exists only to materialize the approved SSRF
+            # proof strategy. Re-running an Agentic Router must not introduce
+            # unrelated new hypotheses after their original validation pass.
+            decisions = tuple(
+                item for item in decisions
+                if item.candidate.vulnerability_type == "SSRF"
+            )
         # Router가 매긴 우선순위를 실행 순서로 쓴다. 예산이 모자라면 뒤쪽이 잘리므로
         # 어떤 Candidate가 먼저 실행되는지가 곧 무엇을 포기하는지에 대한 결정이 된다.
         # 같은 우선순위는 Router가 만든 순서를 유지한다(안정 정렬).
@@ -455,9 +496,6 @@ class Orchestrator:
         candidate_ids.extend(existing.values())
         for decision in decisions:
             candidate = decision.candidate
-            # Router가 다른 Run의 Candidate를 섞는 계약 위반을 차단한다.
-            if candidate.run_id != run.run_id:
-                raise AgentContractError("router returned a candidate for another run")
             key = (candidate.surface_id, candidate.routing_capability_id or candidate.vulnerability_type)
             if key in existing:
                 stored = self._candidates.get(run.run_id, existing[key])
@@ -476,6 +514,131 @@ class Orchestrator:
             )
         return run.with_updates(candidate_ids=tuple(dict.fromkeys(candidate_ids)))
 
+    def _should_review_ssrf_followup(self, run: Run) -> bool:
+        """Open one bounded internal-canary gate after callback A/B proof.
+
+        The Orchestrator consumes only the Validator's structured reason code.
+        It never infers a strategy from enabled network services, and it never
+        starts a public OAST provider. Provider selection and third-party
+        consent remain construction-time policy decisions.
+        """
+
+        if (
+            self._config.post_ssrf_callback_gate is None
+            or run.ssrf_followup_rounds >= 1
+        ):
+            return False
+        eligible = any(
+            candidate.vulnerability_type == "SSRF"
+            and candidate.status is CandidateStatus.SUSPECTED
+            and candidate.validation_reason_code in {
+                ValidationReasonCode.SSRF_CALLBACK_ONLY,
+                ValidationReasonCode.SSRF_OWNED_RECEIVER_ONLY,
+            }
+            for candidate in self._candidates.list_by_run(run.run_id)
+        )
+        if not eligible:
+            return False
+        if (
+            self._global_remaining(run.run_id)
+            < self._config.min_budget_for_ssrf_followup
+        ):
+            self._emit_orchestration_decision(
+                run, "skipped", "ssrf_followup_insufficient_budget"
+            )
+            return False
+        return True
+
+    def _run_ssrf_followup_gate(self, run: Run) -> Run:
+        """Collect one explicit internal-canary decision, then route or report."""
+
+        gate = self._config.post_ssrf_callback_gate
+        if gate is None or run.ssrf_followup_rounds >= 1:
+            return self._state.transition(run, RunPhase.REPORT)
+        if (
+            self._global_remaining(run.run_id)
+            < self._config.min_budget_for_ssrf_followup
+        ):
+            self._emit_orchestration_decision(
+                run, "skipped", "ssrf_followup_insufficient_budget"
+            )
+            return self._state.transition(
+                run.with_updates(ssrf_followup_rounds=1), RunPhase.REPORT
+            )
+        approved = gate(run)
+        if type(approved) is not bool:
+            raise AgentContractError("SSRF follow-up gate must return a boolean")
+        # The gate may persist an approval/profile update. Reload it before
+        # changing phase so the local copy cannot overwrite those facts.
+        current = self._runs.get(run.run_id).with_updates(
+            ssrf_followup_rounds=run.ssrf_followup_rounds + 1,
+        )
+        if not approved:
+            return self._state.transition(current, RunPhase.REPORT)
+        # A new typed Candidate will be appended by ROUTE. A prior allocation
+        # cannot legally omit it, so discard only the plan metadata and let the
+        # normal planner rebuild it from all stored candidates.
+        current = current.with_updates(
+            budget_candidate_order=(),
+            budget_candidate_weights=(),
+            budget_validation_reserve=0,
+            budget_allocation_source="",
+            budget_active_candidate_id=None,
+            budget_active_phase=None,
+            budget_active_floor=None,
+        )
+        return self._state.transition(current, RunPhase.ROUTE)
+
+    def _ensure_resumed_ssrf_followup_ready(self, run: Run) -> Run:
+        """Restore process-local proof before persisted follow-up work."""
+
+        gate = self._config.post_ssrf_callback_gate
+        if gate is None:
+            self._emit_orchestration_decision(
+                run, "skipped", "ssrf_followup_proof_unavailable",
+            )
+            current = run
+            if current.phase is RunPhase.ANALYZE:
+                current = self._state.transition(current, RunPhase.VALIDATE)
+            return self._state.transition(current, RunPhase.REPORT)
+        ready = gate(run)
+        if type(ready) is not bool:
+            raise AgentContractError("SSRF follow-up gate must return a boolean")
+        current = self._runs.get(run.run_id)
+        if ready:
+            return current
+        self._emit_orchestration_decision(
+            current, "skipped", "ssrf_followup_proof_unavailable",
+        )
+        if current.phase is RunPhase.ANALYZE:
+            current = self._state.transition(current, RunPhase.VALIDATE)
+        return self._state.transition(current, RunPhase.REPORT)
+
+    def _ssrf_followup_requires_readiness(self, run: Run) -> bool:
+        """Return whether a resumed phase can still execute internal-canary work."""
+
+        if not run.ssrf_followup_rounds or run.phase not in {
+            RunPhase.ROUTE, RunPhase.ANALYZE, RunPhase.VALIDATE,
+        }:
+            return False
+        # ROUTE has not materialized the approved Candidate yet, so its
+        # process-local proof is always checked before routing.
+        if run.phase is RunPhase.ROUTE:
+            return True
+        for candidate in self._candidates.list_by_run(run.run_id):
+            if candidate.vulnerability_type != "SSRF" or not (
+                _pending_in(candidate, CandidateStatus.ROUTED)
+                or _pending_in(candidate, CandidateStatus.ANALYZED)
+            ):
+                continue
+            try:
+                strategy = ssrf_candidate_verification_strategy(candidate)
+            except AgentContractError:
+                continue
+            if strategy is SsrfVerificationStrategy.INTERNAL_CANARY:
+                return True
+        return False
+
     def _select_extra_recon(self, run: Run) -> Surface | None:
         """Capability gap 중 안전한 미관측 GET만 한 번 Recon으로 되돌린다.
 
@@ -483,6 +646,8 @@ class Orchestrator:
         모두 통과한 Surface만 Recon 대상으로 정해 역할 경계를 유지한다.
         """
 
+        if run.ssrf_followup_rounds:
+            return None
         capabilities = tuple(
             getattr(self._router, "last_capability_assessments", ())
         )

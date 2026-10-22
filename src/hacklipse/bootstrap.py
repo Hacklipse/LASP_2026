@@ -428,6 +428,7 @@ def build_local_application(
     )
     review_ssrf_router = standard_router(
         ("SSRF",), ssrf_review_registry=selected_ssrf_reviews,
+        ssrf_callback_service=ssrf_callback_service,
         ssrf_canary_enabled=True,
         ssrf_owned_receiver_enabled=ssrf_owned_receiver_service is not None,
     )
@@ -435,7 +436,10 @@ def build_local_application(
         selected_router,
         review_ssrf_router,
         selected_ssrf_reviews,
-        preserve_unregistered_ssrf=ssrf_callback_service is not None,
+        preserve_unregistered_ssrf=(
+            ssrf_callback_service is not None
+            and selected_config.post_recon_gate is None
+        ),
         enable_registered_ssrf=(
             collector.ssrf_enabled or collector.ssrf_observation_enabled
             or collector.ssrf_owned_receiver_enabled
@@ -595,9 +599,7 @@ def standard_router(
             *(OPTIONAL_SSRF_OWNED_RECEIVER_OBSERVATION_RULES
               if ssrf_owned_receiver_enabled else ()),
             *(OPTIONAL_SSRF_REVIEW_OBSERVATION_RULES
-              if ssrf_review_registry is not None
-              and not ssrf_canary_enabled
-              and not ssrf_owned_receiver_enabled else ()),
+              if ssrf_review_registry is not None else ()),
         )
         if rule.agent_type in IMPLEMENTED_ANALYZERS
         and (selected_types is None or rule.vulnerability_type in selected_types)
@@ -613,9 +615,7 @@ def standard_router(
             *(OPTIONAL_SSRF_OWNED_RECEIVER_SURFACE_RULES
               if ssrf_owned_receiver_enabled else ()),
             *(OPTIONAL_SSRF_REVIEW_SURFACE_RULES
-              if ssrf_review_registry is not None
-              and not ssrf_canary_enabled
-              and not ssrf_owned_receiver_enabled else ()),
+              if ssrf_review_registry is not None else ()),
         )
         if rule.agent_type in IMPLEMENTED_ANALYZERS
         and (selected_types is None or rule.vulnerability_type in selected_types)

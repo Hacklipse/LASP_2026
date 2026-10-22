@@ -7,7 +7,10 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from hacklipse.adapters import InMemoryBudgetManager
-from hacklipse.adapters.ssrf_analysis import SSRF_OWNED_RECEIVER_CAPABILITY
+from hacklipse.adapters.ssrf_analysis import (
+    SSRF_OWNED_RECEIVER_CAPABILITY,
+    SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY,
+)
 from hacklipse.application.task_factory import TaskFactory
 from hacklipse.bootstrap import build_local_application, register_standard_agents
 from hacklipse.domain import (
@@ -23,15 +26,27 @@ from hacklipse.domain import (
     SsrfPolicyAssertion,
     SsrfPolicyEvidenceStatus,
     SsrfPolicySource,
+    SsrfVerificationStrategy,
     Surface,
     ValidationReasonCode,
     ValidationVerdict,
 )
 from hacklipse.ports import SsrfCallbackHit, SsrfCallbackTicket
+from hacklipse.ports.llm import LlmResponse
+
+
+class _UnexpectedLlm:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, request):
+        self.calls += 1
+        return LlmResponse(payload={"tool": "stop"}, model="unexpected")
 
 
 class _OwnedReceiver:
     origin = "http://owned-receiver.internal:8025"
+    public_oast = False
     operator_owned = True
 
     def __init__(self) -> None:
@@ -84,14 +99,18 @@ class _TargetRuntime:
 
 
 class SsrfOwnedReceiverTests(unittest.TestCase):
-    def _run(self, *, with_policy: bool):
+    def _run(
+        self, *, with_policy: bool, llm_profile: bool = False,
+        declared_coordinate: bool = False,
+    ):
         receiver = _OwnedReceiver()
+        llm = _UnexpectedLlm() if llm_profile else None
         budget = InMemoryBudgetManager()
         app = build_local_application(
             {}, budget_manager=budget, runtime=_TargetRuntime(receiver),
             ssrf_owned_receiver_service=receiver,
         )
-        register_standard_agents(app)
+        register_standard_agents(app, llm_client=llm)
         run = Run(
             run_id="run-owned", target_url="https://target.example/",
             scope=RunScope(allowed_hosts=frozenset({"target.example"})),
@@ -100,7 +119,12 @@ class SsrfOwnedReceiverTests(unittest.TestCase):
         )
         surface = Surface(
             surface_id="surface-owned", run_id=run.run_id,
-            url="https://target.example/fetch?url=old", method="GET",
+            url=(
+                "https://target.example/fetch"
+                if declared_coordinate
+                else "https://target.example/fetch?url=old"
+            ),
+            method="GET",
             parameters=("url",),
         )
         review = Evidence(
@@ -112,6 +136,20 @@ class SsrfOwnedReceiverTests(unittest.TestCase):
         app.stores.runs.add(run)
         app.stores.surfaces.add(surface)
         app.stores.evidence.append(review)
+        route_evidence = [review]
+        if declared_coordinate:
+            declaration = Evidence(
+                evidence_id="evi-openapi", run_id=run.run_id,
+                surface_id=surface.surface_id, created_by="recon",
+                evidence_type="observation",
+                observation={
+                    "type": "openapi_request_structure",
+                    "method": "GET",
+                    "query_parameter_names": ["url"],
+                },
+            )
+            app.stores.evidence.append(declaration)
+            route_evidence.append(declaration)
         budget.open_run(run.run_id, run.request_budget)
         policy = None
         if with_policy:
@@ -134,12 +172,17 @@ class SsrfOwnedReceiverTests(unittest.TestCase):
                 approved_by="operator-security", approved_at=datetime.now(timezone.utc),
             ),
             destination_policy=policy,
+            verification_strategy=SsrfVerificationStrategy.OWNED_RECEIVER,
+        )
+        expected_capability = (
+            SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY
+            if declared_coordinate else SSRF_OWNED_RECEIVER_CAPABILITY
         )
         candidate = next(
             item.candidate for item in app.orchestrator._router.route(
-                run, (surface,), (review,),
+                run, (surface,), tuple(route_evidence),
             )
-            if item.candidate.routing_capability_id == SSRF_OWNED_RECEIVER_CAPABILITY
+            if item.candidate.routing_capability_id == expected_capability
         )
         app.stores.candidates.add(candidate)
         factory = TaskFactory()
@@ -174,10 +217,10 @@ class SsrfOwnedReceiverTests(unittest.TestCase):
             run, candidate, validation_id=validation_id,
             agent_type="validation", request_budget=1,
         ))
-        return app, receiver, result
+        return app, receiver, result, llm
 
     def test_fresh_ab_without_policy_remains_suspected_and_secret_free(self):
-        app, receiver, result = self._run(with_policy=False)
+        app, receiver, result, _ = self._run(with_policy=False)
         self.assertEqual(result.validation.verdict, ValidationVerdict.SUSPECTED)
         self.assertEqual(
             result.validation.reason_code,
@@ -189,9 +232,29 @@ class SsrfOwnedReceiverTests(unittest.TestCase):
         self.assertNotIn("/ssrf/ticket-", serialized)
 
     def test_exact_forbidden_policy_confirms_independent_owned_receiver(self):
-        _, _, result = self._run(with_policy=True)
+        _, _, result, _ = self._run(with_policy=True)
         self.assertEqual(result.validation.verdict, ValidationVerdict.CONFIRMED)
         self.assertIsNotNone(result.validation.proof)
+
+    def test_llm_profile_uses_typed_owned_receiver_contract_without_model_choice(self):
+        _, receiver, result, llm = self._run(
+            with_policy=False, llm_profile=True,
+        )
+        self.assertEqual(result.validation.verdict, ValidationVerdict.SUSPECTED)
+        self.assertEqual(len(receiver.tickets), 2)
+        self.assertIsNotNone(llm)
+        self.assertEqual(llm.calls, 0)
+
+    def test_llm_profile_dispatches_declared_owned_receiver_without_model_choice(self):
+        _, receiver, result, llm = self._run(
+            with_policy=False,
+            llm_profile=True,
+            declared_coordinate=True,
+        )
+        self.assertEqual(result.validation.verdict, ValidationVerdict.SUSPECTED)
+        self.assertEqual(len(receiver.tickets), 2)
+        self.assertIsNotNone(llm)
+        self.assertEqual(llm.calls, 0)
 
 
 if __name__ == "__main__":

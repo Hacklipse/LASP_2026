@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unicodedata
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from itertools import product
 from types import SimpleNamespace
@@ -34,12 +35,19 @@ from hacklipse.application import Orchestrator
 from hacklipse.application.errors import AgentContractError
 from hacklipse.bootstrap import build_local_application, register_standard_agents
 from hacklipse.domain import (
+    Candidate,
+    CandidateStatus,
     Evidence,
+    Run,
+    RunScope,
+    SsrfExecutionApproval,
     SsrfDestinationRule,
     SsrfPolicyAssertion,
     SsrfPolicyEvidenceStatus,
     SsrfPolicySource,
+    SsrfVerificationStrategy,
     Surface,
+    ValidationReasonCode,
 )
 from hacklipse.ports.errors import LlmCredentialsMissing
 
@@ -55,6 +63,7 @@ class _NoCallsLlm:
 
 class _FakeLocalCallback:
     origin = "http://127.0.0.1:39123"
+    public_oast = False
     operator_owned = True
 
     def __init__(self, **kwargs):
@@ -134,7 +143,7 @@ class RoutingCliTests(unittest.TestCase):
         )
         run = SimpleNamespace(run_id="run-1", surface_ids=("surface-1",))
         answers = iter((
-            "1", "1", "n", "y",
+            "1", "1", "y",
             "https://must-not-be-accepted.invalid/private?token=secret",
             "operator:alice",
         ))
@@ -220,6 +229,7 @@ class RoutingCliTests(unittest.TestCase):
             completed = juice._run_ssrf_review_gate(
                 app, run, callback_mode="off", input_fn=lambda _: next(answers),
                 secret_input_fn=lambda _: exact_url,
+                allow_initial_internal=True,
             )
 
         self.assertTrue(completed)
@@ -347,6 +357,7 @@ class RoutingCliTests(unittest.TestCase):
             juice._run_ssrf_review_gate(
                 app, run, callback_mode="off", input_fn=lambda _: next(answers),
                 secret_input_fn=lambda _: "http://service.internal:8025/approved-check",
+                allow_initial_internal=True,
             )
         app.ssrf_reviews.skip.assert_not_called()
         registration = app.collector.register_ssrf_review.call_args.kwargs
@@ -414,6 +425,7 @@ class RoutingCliTests(unittest.TestCase):
                 app, SimpleNamespace(run_id="run-1", surface_ids=("surface-1",)),
                 callback_mode="off", input_fn=lambda _: next(answers),
                 secret_input_fn=lambda _: "http://service.internal:8025/wrong",
+                allow_initial_internal=True,
             )
 
         self.assertTrue(completed)
@@ -424,7 +436,9 @@ class RoutingCliTests(unittest.TestCase):
             "http://service.internal:8025/wrong",
         )
         app.register_ssrf_canary_proof.assert_not_called()
-        app.ssrf_reviews.skip.assert_called_once_with("run-1")
+        app.ssrf_reviews.skip.assert_called_once_with(
+            "run-1", SsrfVerificationStrategy.INTERNAL_CANARY,
+        )
         self.assertIn("일치하지 않아", output.getvalue())
         self.assertNotIn(
             "http://service.internal:8025/wrong", output.getvalue(),
@@ -458,7 +472,9 @@ class RoutingCliTests(unittest.TestCase):
                 app, run, callback_mode="local_callback", input_fn=lambda _: "",
             )
 
-        app.ssrf_reviews.skip.assert_called_once_with("run-1")
+        app.ssrf_reviews.skip.assert_called_once_with(
+            "run-1", SsrfVerificationStrategy.PASSIVE,
+        )
         app.collector.register_ssrf_review.assert_not_called()
 
     def test_ssrf_review_waits_for_optional_recon_when_no_coordinate_exists(self):
@@ -479,6 +495,126 @@ class RoutingCliTests(unittest.TestCase):
         self.assertFalse(finished)
         app.ssrf_reviews.skip.assert_not_called()
         app.collector.register_ssrf_review.assert_not_called()
+
+    def test_ssrf_internal_followup_reuses_ab_proven_coordinate(self):
+        app = build_local_application({})
+        run = Run(
+            run_id="run-followup",
+            target_url="http://local.test/",
+            scope=RunScope(allowed_hosts=frozenset({"local.test"})),
+            policy_profile="safe",
+            request_budget=8,
+            surface_ids=("surface-fetch",),
+            candidate_ids=("candidate-callback",),
+        )
+        surface = Surface(
+            surface_id="surface-fetch",
+            run_id=run.run_id,
+            url="http://local.test/api/fetch?url=old",
+            method="GET",
+            parameters=("url",),
+            observed_query=(("url", "old"),),
+        )
+        review = Evidence(
+            evidence_id="evi-review",
+            run_id=run.run_id,
+            surface_id=surface.surface_id,
+            created_by="recon",
+            evidence_type="observation",
+            observation={
+                "type": "ssrf_url_fetch_review",
+                "parameter_names": ["url"],
+                "parameter_sources": [
+                    {"name": "url", "source": "observed_query"},
+                ],
+            },
+        )
+        app.stores.runs.add(run)
+        app.stores.surfaces.add(surface)
+        app.stores.evidence.append(review)
+        app.stores.candidates.add(Candidate(
+            candidate_id="candidate-callback",
+            run_id=run.run_id,
+            surface_id=surface.surface_id,
+            vulnerability_type="SSRF",
+            hypothesis="callback A/B observed",
+            assigned_agent="ssrf_analyzer",
+            evidence_ids=(),
+            status=CandidateStatus.SUSPECTED,
+            validation_reason_code=ValidationReasonCode.SSRF_CALLBACK_ONLY,
+            exploration_parameters=("url",),
+        ))
+        app.collector.register_ssrf_review(
+            run_id=run.run_id,
+            parameter="url",
+            hint_evidence_id=review.evidence_id,
+            approval=SsrfExecutionApproval(
+                approval_id="approval-callback",
+                surface_id=surface.surface_id,
+                verification_endpoint_ref="callback-local-test",
+                approved_by="operator-test",
+                approved_at=datetime.now(timezone.utc),
+            ),
+            destination_policy=None,
+            verification_strategy=SsrfVerificationStrategy.CALLBACK,
+        )
+        marker = "owned-marker-followup-2026"
+        exact_url = "http://service.internal:8025/proof"
+        answers = iter(("y", "y", "n", "operator:alice"))
+
+        with (
+            patch.dict(os.environ, {"HACKLIPSE_SSRF_CANARY_MARKER": marker}),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            approved = juice._run_ssrf_internal_followup_gate(
+                app,
+                app.stores.runs.get(run.run_id),
+                input_fn=lambda _: next(answers),
+                secret_input_fn=lambda _: exact_url,
+            )
+
+        self.assertTrue(approved)
+        internal = app.ssrf_reviews.get_for_run(
+            run.run_id, SsrfVerificationStrategy.INTERNAL_CANARY,
+        )
+        self.assertIsNotNone(internal)
+        self.assertEqual(internal.surface_id, surface.surface_id)
+        self.assertEqual(internal.parameter, "url")
+        self.assertIsNotNone(app.collector.ssrf_canary_proof_for_run(run.run_id))
+        self.assertNotIn(exact_url, output.getvalue())
+        self.assertNotIn(marker, output.getvalue())
+
+        # Simulate an interrupted follow-up that kept the opaque approval but
+        # lost only the process-local exact endpoint and marker binding.
+        app.collector._ssrf_run_canaries.pop(run.run_id)
+        with (
+            patch.dict(os.environ, {"HACKLIPSE_SSRF_CANARY_MARKER": marker}),
+            contextlib.redirect_stdout(io.StringIO()) as rejected_output,
+        ):
+            rejected = juice._run_ssrf_internal_followup_gate(
+                app,
+                app.stores.runs.get(run.run_id),
+                input_fn=lambda _: self.fail("stored approval must not be replaced"),
+                secret_input_fn=lambda _: "http://different.internal:8025/proof",
+            )
+        self.assertFalse(rejected)
+        self.assertIsNone(app.collector.ssrf_canary_proof_for_run(run.run_id))
+        self.assertNotIn("different.internal", rejected_output.getvalue())
+
+        with (
+            patch.dict(os.environ, {"HACKLIPSE_SSRF_CANARY_MARKER": marker}),
+            contextlib.redirect_stdout(io.StringIO()) as restored_output,
+        ):
+            restored = juice._run_ssrf_internal_followup_gate(
+                app,
+                app.stores.runs.get(run.run_id),
+                input_fn=lambda _: self.fail("stored approval must not be replaced"),
+                secret_input_fn=lambda _: exact_url,
+            )
+        self.assertTrue(restored)
+        self.assertIsNotNone(app.collector.ssrf_canary_proof_for_run(run.run_id))
+        self.assertNotIn(exact_url, restored_output.getvalue())
+        self.assertNotIn(marker, restored_output.getvalue())
 
     def test_ssrf_passive_summary_distinguishes_unverified_from_no_finding(self):
         review = SsrfReviewFact(
@@ -1036,7 +1172,7 @@ class RoutingCliTests(unittest.TestCase):
             patch.object(
                 juice, "InteractshCliCallbackService",
                 side_effect=OSError("provider unavailable"),
-            ),
+            ) as provider,
             patch.object(juice, "build_run_router", return_value=object()) as router,
             patch.object(
                 juice, "build_local_application",
@@ -1055,6 +1191,8 @@ class RoutingCliTests(unittest.TestCase):
 
         self.assertIsNone(router.call_args.kwargs["ssrf_callback_service"])
         self.assertIsNone(build.call_args.kwargs["ssrf_callback_service"])
+        self.assertTrue(provider.call_args.kwargs["public_oast"])
+        self.assertTrue(provider.call_args.kwargs["public_oast_consent"])
         self.assertIn("callback 전략만 비활성화", output.getvalue())
 
     def test_unprotected_private_oast_reaches_confirmation_without_token(self):

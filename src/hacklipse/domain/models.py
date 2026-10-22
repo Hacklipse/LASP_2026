@@ -30,6 +30,7 @@ class RunPhase(str, Enum):
     ROUTE = "route"
     ANALYZE = "analyze"
     VALIDATE = "validate"
+    SSRF_REVIEW = "ssrf_review"
     REPORT = "report"
     DONE = "done"
     FAILED = "failed"
@@ -136,6 +137,15 @@ class SsrfDestinationRule(str, Enum):
 
     FORBIDDEN = "forbidden"
     ALLOWED = "allowed"
+
+
+class SsrfVerificationStrategy(str, Enum):
+    """Operator-approved proof path for one exact SSRF coordinate."""
+
+    PASSIVE = "passive"
+    CALLBACK = "callback"
+    OWNED_RECEIVER = "owned_receiver"
+    INTERNAL_CANARY = "internal_canary"
 
 
 class SsrfPolicySource(str, Enum):
@@ -638,6 +648,7 @@ class SsrfReviewRegistration:
     parameter: str
     hint_evidence_id: str | None
     execution_approval: SsrfExecutionApproval
+    verification_strategy: SsrfVerificationStrategy
     destination_policy: SsrfDestinationPolicy | None = None
     hint_use_approved: bool = False
 
@@ -657,6 +668,8 @@ class SsrfReviewRegistration:
             )
         if type(self.hint_use_approved) is not bool:
             raise DomainInvariantError("SSRF hint-use approval must be boolean")
+        if not isinstance(self.verification_strategy, SsrfVerificationStrategy):
+            raise DomainInvariantError("SSRF review verification strategy is invalid")
         if self.hint_use_approved and self.hint_evidence_id is None:
             raise DomainInvariantError(
                 "SSRF hint-use approval requires one destination hint Evidence"
@@ -1097,6 +1110,10 @@ class Run:
     # is stored before re-entering RECON so resume cannot ask the advisor again.
     extra_recon_rounds: int = 0
     recon_target_surface_id: str | None = None
+    # Callback/owned-receiver A/B proof may unlock one operator-approved
+    # internal-canary pass. Persist the bounded round so resume cannot prompt
+    # or probe indefinitely.
+    ssrf_followup_rounds: int = 0
     last_error: str | None = None
     # The allocation order and protected validation units are decided before
     # ANALYZE and reused on resume. Empty order means allocation is disabled.
@@ -1115,6 +1132,11 @@ class Run:
             raise DomainInvariantError("extra recon rounds cannot be negative")
         if self.recon_target_surface_id is not None and self.extra_recon_rounds == 0:
             raise DomainInvariantError("targeted recon requires an extra recon round")
+        if (
+            type(self.ssrf_followup_rounds) is not int
+            or not 0 <= self.ssrf_followup_rounds <= 1
+        ):
+            raise DomainInvariantError("SSRF follow-up rounds must be 0 or 1")
         if type(self.budget_validation_reserve) is not int or self.budget_validation_reserve < 0:
             raise DomainInvariantError("validation reserve cannot be negative")
         if (

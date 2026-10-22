@@ -18,6 +18,7 @@ from hacklipse.domain import (
     RunScope,
     SsrfCanaryProofTarget,
     SsrfExecutionApproval,
+    SsrfVerificationStrategy,
     Surface,
 )
 from hacklipse.application.orchestrator import OrchestratorConfig
@@ -26,6 +27,7 @@ from hacklipse.ports import SsrfCallbackHit, SsrfCallbackTicket
 
 class _DiscardingCallbackService:
     origin = "https://callback.example"
+    public_oast = False
 
     def __init__(self) -> None:
         self.tickets: dict[str, SsrfCallbackTicket] = {}
@@ -196,6 +198,7 @@ class SsrfRunSecretCleanupTests(unittest.TestCase):
                 approved_by="operator-security",
                 approved_at=datetime.now(timezone.utc),
             ),
+            verification_strategy=SsrfVerificationStrategy.INTERNAL_CANARY,
         )
         app.register_ssrf_canary_proof(run.run_id, canary)
 

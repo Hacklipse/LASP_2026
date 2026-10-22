@@ -58,6 +58,10 @@ class LocalSsrfCallbackService:
         self._thread.start()
 
     @property
+    def public_oast(self) -> bool:
+        return False
+
+    @property
     def operator_owned(self) -> bool:
         """Permit explicit reuse as a local-research owned receiver.
 

@@ -534,7 +534,13 @@ class RuleBasedVulnerabilityRouter:
             raise ValueError("review policy must be weak or ambiguous")
         if advisor_mode not in _ADVISOR_MODES:
             raise ValueError("advisor mode must be supplemental or primary")
-        self._rules = {rule.observation_type: rule for rule in rules}
+        grouped_rules: dict[str, list[RoutingRule]] = {}
+        for rule in rules:
+            grouped_rules.setdefault(rule.observation_type, []).append(rule)
+        self._rules = {
+            observation_type: tuple(items)
+            for observation_type, items in grouped_rules.items()
+        }
         self._surface_rules = tuple(surface_rules)
         self._id_factory = id_factory or (lambda: str(uuid4()))
         self._advisor = advisor
@@ -588,10 +594,15 @@ class RuleBasedVulnerabilityRouter:
             "not_configured" if self._advisor is None else "not_called"
         )
         decisions: dict[tuple[str, str], RouteDecision] = {}
-        for item in evidence:
+        for item, rule in (
+            (item, rule)
+            for item in evidence
+            for rule in self._rules.get(
+                str(item.observation.get("type", "")), (),
+            )
+        ):
             observation_type = str(item.observation.get("type", ""))
-            rule = self._rules.get(observation_type)
-            if rule is None or item.surface_id is None:
+            if item.surface_id is None:
                 continue
             surface = next(
                 (

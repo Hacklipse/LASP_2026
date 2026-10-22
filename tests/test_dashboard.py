@@ -503,14 +503,19 @@ class ExecutionProfileFidelityTests(unittest.TestCase):
             allowed_hosts=frozenset({"127.0.0.1"}), defaults=options,
         )
         provider = Mock(origin="https://oast.pro")
+        provider.public_oast = True
         with (
             patch.object(supervisor, "_build_llm_client", return_value=(None, None)),
-            patch("dashboard_core.InteractshCliCallbackService", return_value=provider),
+            patch(
+                "dashboard_core.InteractshCliCallbackService", return_value=provider,
+            ) as constructor,
             patch("dashboard_core.build_run_router", return_value=object()),
             patch("dashboard_core.build_local_application", side_effect=RuntimeError("assembly failed")),
             self.assertRaisesRegex(RuntimeError, "assembly failed"),
         ):
             supervisor._execute_run(options, RunSecrets())
+        self.assertTrue(constructor.call_args.kwargs["public_oast"])
+        self.assertTrue(constructor.call_args.kwargs["public_oast_consent"])
         provider.close.assert_called_once()
 
     def test_owned_receiver_is_separate_and_closes_on_assembly_failure(self) -> None:
@@ -524,6 +529,7 @@ class ExecutionProfileFidelityTests(unittest.TestCase):
         )
         class Receiver:
             origin = "http://127.0.0.1:39124"
+            public_oast = False
             operator_owned = True
 
             def __init__(self):
@@ -838,6 +844,7 @@ class SsrfReviewGateTests(unittest.TestCase):
                 parameter=kwargs["parameter"],
                 hint_evidence_id=kwargs["hint_evidence_id"],
                 execution_approval=kwargs["approval"],
+                verification_strategy=kwargs["verification_strategy"],
                 destination_policy=kwargs["destination_policy"],
                 hint_use_approved=kwargs["hint_use_approved"],
             ))

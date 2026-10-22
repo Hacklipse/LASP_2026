@@ -18,6 +18,7 @@ from hacklipse.domain import (
     RunScope,
     SsrfCanaryProofTarget,
     SsrfExecutionApproval,
+    SsrfVerificationStrategy,
     Surface,
     TaskEnvelope,
 )
@@ -176,6 +177,7 @@ class SsrfHintBindingTests(unittest.TestCase):
             hint_use_approved=True,
             approved_destination_url=_HINT_URL,
             approval=self._approval(app, run.run_id, _HINT_URL),
+            verification_strategy=SsrfVerificationStrategy.INTERNAL_CANARY,
         )
         self.assertTrue(registration.hint_use_approved)
 
@@ -215,6 +217,7 @@ class SsrfHintBindingTests(unittest.TestCase):
                         hint_use_approved=True,
                         approved_destination_url=approved_url,
                         approval=self._approval(app, run.run_id, approved_url),
+                        verification_strategy=SsrfVerificationStrategy.INTERNAL_CANARY,
                     )
 
     def test_fingerprint_from_another_run_cannot_bind(self) -> None:
@@ -242,6 +245,7 @@ class SsrfHintBindingTests(unittest.TestCase):
                 hint_use_approved=True,
                 approved_destination_url=_HINT_URL,
                 approval=self._approval(app, run.run_id, _HINT_URL),
+                verification_strategy=SsrfVerificationStrategy.INTERNAL_CANARY,
             )
 
     def test_unapproved_hint_is_provenance_only(self) -> None:
@@ -254,6 +258,7 @@ class SsrfHintBindingTests(unittest.TestCase):
             hint_use_approved=False,
             approved_destination_url=unrelated_url,
             approval=self._approval(app, run.run_id, unrelated_url),
+            verification_strategy=SsrfVerificationStrategy.INTERNAL_CANARY,
         )
         self.assertFalse(registration.hint_use_approved)
         persisted = next(
@@ -271,6 +276,7 @@ class SsrfHintBindingTests(unittest.TestCase):
             hint_use_approved=True,
             approved_destination_url=_HINT_URL,
             approval=self._approval(app, run.run_id, _HINT_URL),
+            verification_strategy=SsrfVerificationStrategy.INTERNAL_CANARY,
         )
         self.assertIn(run.run_id, app.collector._ssrf_run_hash_keys)
 

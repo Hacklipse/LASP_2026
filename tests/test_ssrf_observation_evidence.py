@@ -35,6 +35,7 @@ from hacklipse.domain import (
     SsrfPolicyEvidenceStatus,
     SsrfPolicySource,
     SsrfReviewRegistration,
+    SsrfVerificationStrategy,
     Surface,
     ValidationProofType,
     ValidationResult,
@@ -134,6 +135,7 @@ class SsrfObservationEvidenceTests(unittest.TestCase):
             parameter="url",
             hint_evidence_id="evi-review",
             approval=self.approval,
+            verification_strategy=SsrfVerificationStrategy.PASSIVE,
             destination_policy=self.policy,
         )
 
@@ -239,6 +241,7 @@ class SsrfObservationEvidenceTests(unittest.TestCase):
             parameter="url",
             hint_evidence_id="evi-review",
             execution_approval=self.approval,
+            verification_strategy=SsrfVerificationStrategy.PASSIVE,
             destination_policy=policy,
         )
         with self.assertRaisesRegex(AgentContractError, "source Evidence is unavailable"):
@@ -332,6 +335,7 @@ class SsrfObservationEvidenceTests(unittest.TestCase):
         app.collector.register_ssrf_review(
             run_id="run-1", parameter="url", hint_evidence_id="evi-review",
             approval=self.approval,
+            verification_strategy=SsrfVerificationStrategy.PASSIVE,
         )
         register_standard_agents(app)
         candidate = Candidate(
@@ -404,7 +408,9 @@ class SsrfObservationEvidenceTests(unittest.TestCase):
         app = build_local_application({}, stores=stores)
         app.collector.register_ssrf_review(
             run_id="run-1", parameter="url", hint_evidence_id="evi-review",
-            approval=self.approval, destination_policy=self.policy,
+            approval=self.approval,
+            verification_strategy=SsrfVerificationStrategy.PASSIVE,
+            destination_policy=self.policy,
         )
 
         decisions = app.orchestrator._router.route(
@@ -464,6 +470,7 @@ class SsrfObservationEvidenceTests(unittest.TestCase):
                 approval_id="approval-2",
                 approved_at=datetime.now(timezone.utc),
             ),
+            verification_strategy=SsrfVerificationStrategy.PASSIVE,
             destination_policy=self.policy,
         ))
         restarted = build_local_application(
@@ -481,6 +488,7 @@ class SsrfObservationEvidenceTests(unittest.TestCase):
         with self.assertRaises(AgentContractError):
             self.app.collector.register_ssrf_review(
                 run_id="run-1", parameter="url", hint_evidence_id=None,
+                verification_strategy=SsrfVerificationStrategy.CALLBACK,
                 approval=replace(
                     self.approval,
                     verification_endpoint_ref="https://owned.example/verify",
@@ -489,6 +497,7 @@ class SsrfObservationEvidenceTests(unittest.TestCase):
         with self.assertRaises(AgentContractError):
             self.app.collector.register_ssrf_review(
                 run_id="run-1", parameter="url", hint_evidence_id="evi-review",
+                verification_strategy=SsrfVerificationStrategy.CALLBACK,
                 approval=replace(
                     self.approval, verification_endpoint_ref="evi-review",
                 ),
@@ -504,7 +513,9 @@ class SsrfObservationEvidenceTests(unittest.TestCase):
         )
         app.collector.register_ssrf_review(
             run_id="run-1", parameter="url", hint_evidence_id="evi-review",
-            approval=self.approval, destination_policy=self.policy,
+            approval=self.approval,
+            verification_strategy=SsrfVerificationStrategy.PASSIVE,
+            destination_policy=self.policy,
         )
         register_standard_agents(app)
         candidate = Candidate(
@@ -543,6 +554,7 @@ class SsrfReviewRouterTests(unittest.TestCase):
                 approved_by="operator-security",
                 approved_at=datetime.now(timezone.utc),
             ),
+            verification_strategy=SsrfVerificationStrategy.PASSIVE,
         )
         registry.register(registration)
         registry.register(registration)
@@ -551,7 +563,7 @@ class SsrfReviewRouterTests(unittest.TestCase):
             "registered",
         )
 
-        registry.skip("run-skipped")
+        registry.skip("run-skipped", SsrfVerificationStrategy.PASSIVE)
         self.assertEqual(
             registry.wait_for_review("run-skipped", timeout_seconds=0.01),
             "skipped",
@@ -595,6 +607,7 @@ class SsrfReviewRouterTests(unittest.TestCase):
                 approved_by="operator-security",
                 approved_at=datetime.now(timezone.utc),
             ),
+            verification_strategy=SsrfVerificationStrategy.PASSIVE,
         ))
 
         decisions = router.route(run, surfaces, ())
@@ -642,6 +655,7 @@ class SsrfReviewRouterTests(unittest.TestCase):
                 approved_by="operator-security",
                 approved_at=datetime.now(timezone.utc),
             ),
+            verification_strategy=SsrfVerificationStrategy.PASSIVE,
         ))
 
         decisions = router.route(run, surfaces, ())
@@ -651,6 +665,8 @@ class SsrfReviewRouterTests(unittest.TestCase):
             if item.candidate.vulnerability_type == "SSRF"
         )
         self.assertEqual(len(ssrf_decisions), 1)
+        self.assertEqual(ssrf_decisions[0].candidate.routing_capability_id, "")
+        self.assertEqual(ssrf_decisions[0].candidate.analysis_strategy_id, "")
         self.assertEqual(
             {item.candidate.surface_id for item in ssrf_decisions}, {"surface-1"},
         )
@@ -684,6 +700,7 @@ class SsrfReviewRouterTests(unittest.TestCase):
                 approved_by="operator-security",
                 approved_at=datetime.now(timezone.utc),
             ),
+            verification_strategy=SsrfVerificationStrategy.PASSIVE,
         ))
 
         decisions = router.route(run, (surface,), ())

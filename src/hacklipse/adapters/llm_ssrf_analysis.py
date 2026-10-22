@@ -9,7 +9,10 @@ import time
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from hacklipse.domain import AgentResult, AgentResultStatus, Evidence, TaskEnvelope
+from hacklipse.domain import (
+    AgentResult, AgentResultStatus, Evidence, SsrfVerificationStrategy,
+    TaskEnvelope,
+)
 from hacklipse.application.execution import RuntimeEvidenceCollector
 from hacklipse.ports import CandidateStore, EvidenceStore, LlmClient, SurfaceStore
 from hacklipse.ports.errors import (
@@ -24,9 +27,9 @@ from .security import redacted_internal_url_path
 from .ssrf_analysis import (
     SSRF_ANALYSIS_TOOLS, SSRF_ANALYZER, SSRF_CONTEXT_TOOL, SSRF_PROBE_TOOL, SSRF_RESULT_TOOL,
     SSRF_DESTINATION_HINT_TYPE, SSRF_RESULT_TYPE, SSRF_TYPE, SsrfAnalyzer, build_ssrf_requests,
-    is_ssrf_callback_candidate, is_ssrf_canary_candidate, poll_ssrf_callbacks,
-    record_ssrf_result, ssrf_local_validation_reserve, ssrf_parameter_sources,
-    ssrf_result_status,
+    poll_ssrf_callbacks, record_ssrf_result,
+    ssrf_candidate_verification_strategy, ssrf_local_validation_reserve,
+    ssrf_parameter_sources, ssrf_result_status,
 )
 
 _PLAN_TYPE = "ssrf_probe_plan"
@@ -86,14 +89,21 @@ class LlmSsrfAnalyzer(SsrfAnalyzer):
             task, vulnerability_type=SSRF_TYPE,
             candidate_store=self._candidates, surface_store=self._surfaces,
         )
-        if is_ssrf_canary_candidate(candidate):
-            # Internal canary execution is a deterministic proof contract. The
-            # model neither chooses the approved endpoint nor gates its use.
+        strategy = ssrf_candidate_verification_strategy(candidate)
+        if strategy in {
+            SsrfVerificationStrategy.INTERNAL_CANARY,
+            SsrfVerificationStrategy.OWNED_RECEIVER,
+        }:
+            # Approved proof strategies are deterministic contracts. The model
+            # neither chooses the endpoint/provider nor gates its use.
             return super().handle(task)
-        if not is_ssrf_callback_candidate(candidate):
+        if strategy is SsrfVerificationStrategy.PASSIVE:
             reviewed = self._handle_registered_review(task, candidate, surface)
             if reviewed is not None:
                 return reviewed
+            # Candidate strategy is authoritative. The model must not turn a
+            # passive/manual review into a callback probe by falling through.
+            return self._complete(task, candidate.candidate_id, [])
         evidence = list(self._evidence.get_many(task.run_id, task.evidence_ids))
         run_evidence = tuple(self._evidence.list_by_run(task.run_id))
         surface_evidence = tuple(item for item in run_evidence
@@ -106,6 +116,7 @@ class LlmSsrfAnalyzer(SsrfAnalyzer):
         sources = dict(ssrf_parameter_sources(surface, surface_evidence))
         registration = self._collector.ssrf_review_for_surface(
             task.run_id, surface.surface_id,
+            SsrfVerificationStrategy.CALLBACK,
         )
         if registration is not None:
             sources = {
