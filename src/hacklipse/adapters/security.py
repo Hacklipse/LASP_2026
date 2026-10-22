@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ipaddress
+import hashlib
 import json
 import re
 import sqlite3
@@ -11,11 +13,18 @@ from email import policy as email_policy
 from email.parser import BytesParser
 from html import unescape
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from hacklipse.domain import ExecutionRequest, ExecutionResult, Run
+from hacklipse.domain import (
+    ExecutionRequest,
+    ExecutionResult,
+    HttpRequestKind,
+    Run,
+    redacted_internal_url_path,
+)
 from hacklipse.ports import (
     ExecutionAuditEvent,
     ResolvedHttpCredential,
@@ -66,6 +75,106 @@ _SENSITIVE_FIELD_HINTS = (
     "nonce",
 )
 _REQUEST_SECRET_FIELD_HINTS = (*_SENSITIVE_FIELD_HINTS, "username", "email")
+_EMBEDDED_HTTP_URL = re.compile(
+    r"(?i)https?://[^\s\"'`<>\\]{1,1024}"
+)
+
+
+class _AnchorHrefCollector(HTMLParser):
+    """Collect bounded anchor destinations before response text is redacted."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hrefs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.casefold() != "a" or len(self.hrefs) >= 64:
+            return
+        for name, value in attrs:
+            if (
+                name.casefold() == "href" and isinstance(value, str)
+                and 0 < len(value) <= 2048
+            ):
+                self.hrefs.append(value)
+                break
+
+
+def _open_redirect_destination_hashes(observation: Mapping[str, object]) -> tuple[str, ...]:
+    """Derive URL-free comparison facts before embedded destinations are masked."""
+
+    destinations: list[str] = []
+    location = observation.get("location")
+    if isinstance(location, str) and 0 < len(location) <= 2048:
+        destinations.append(location)
+    body = observation.get("body")
+    media = observation.get("content_type")
+    if (
+        observation.get("status") == 200
+        and isinstance(body, str) and len(body) <= 128 * 1024
+        and isinstance(media, str)
+        and media.split(";", 1)[0].strip().casefold() == "text/html"
+        and observation.get("truncated") is not True
+    ):
+        parser = _AnchorHrefCollector()
+        parser.feed(body)
+        destinations.extend(parser.hrefs)
+    return tuple(sorted({
+        hashlib.sha256(value.encode("utf-8")).hexdigest()
+        for value in destinations
+    }))
+
+
+def _sanitize_evidence_url(value: str) -> str | None:
+    """Keep an HTTP(S) URL's shape while removing destination credentials."""
+
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.casefold()
+    if scheme not in {"http", "https"} or hostname is None:
+        return None
+    normalized_host = hostname.casefold().rstrip(".")
+    try:
+        address = ipaddress.ip_address(normalized_host)
+    except ValueError:
+        try:
+            normalized_host = normalized_host.encode("idna").decode("ascii")
+        except UnicodeError:
+            return None
+    else:
+        normalized_host = address.compressed
+    rendered_host = (
+        f"[{normalized_host}]" if ":" in normalized_host else normalized_host
+    )
+    authority = rendered_host + (f":{port}" if port is not None else "")
+    # Keep an origin-only header value byte-for-byte equivalent in shape.
+    # Adding ``/`` to a reflected CORS Origin changes the security signal even
+    # though both strings identify the same web origin.  Paths that are
+    # actually present still go through the normal secret redaction.
+    path = (
+        redacted_internal_url_path(parsed.path).replace("{redacted}", "redacted")
+        if parsed.path
+        else ""
+    )
+    query = urlencode(tuple(
+        (name, _REDACTED)
+        for name, _ in parse_qsl(parsed.query, keep_blank_values=True)
+    ))
+    return urlunsplit((scheme, authority, path, query, ""))
+
+
+def _sanitize_embedded_http_urls(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        candidate = raw.rstrip(".,;:)]}")
+        suffix = raw[len(candidate):]
+        sanitized = _sanitize_evidence_url(candidate)
+        return (sanitized if sanitized is not None else candidate) + suffix
+
+    return _EMBEDDED_HTTP_URL.sub(replace, value)
 
 
 def contains_personal_data(value: str) -> bool:
@@ -188,6 +297,14 @@ class SensitiveDataSanitizer:
         )
 
         raw_observation = dict(result.observation)
+        redirect_destination_hashes = (
+            _open_redirect_destination_hashes(raw_observation)
+            if (
+                request.request_kind is HttpRequestKind.OPEN_REDIRECT_PROBE
+                or request.purpose.startswith("redirect control for ")
+            )
+            else ()
+        )
         # Only this adapter may publish the trusted derived field. A custom
         # Runtime result cannot assert the signal by supplying the same key.
         raw_observation.pop(TRUSTED_EXPOSURE_FIELDS, None)
@@ -206,12 +323,16 @@ class SensitiveDataSanitizer:
             *(value for pair in login_pairs for value in pair),
         )))
         observation = self._sanitize_mapping(raw_observation, secrets)
+        if redirect_destination_hashes:
+            observation["open_redirect_destination_hashes"] = list(
+                redirect_destination_hashes
+            )
         if field_paths:
             observation[TRUSTED_EXPOSURE_FIELDS] = list(field_paths)
         if login_pairs:
             observation[TRUSTED_LOGIN_PAIR_COUNT] = len(login_pairs)
         artifacts = {
-            key: self._sanitize_text(value, secrets)
+            key: self._sanitize_text(_sanitize_embedded_http_urls(value), secrets)
             for key, value in result.artifact_refs.items()
         }
         return ExecutionResult(
@@ -233,8 +354,17 @@ class SensitiveDataSanitizer:
                 sanitized[key] = _REDACTED
             elif lowered == "headers" and isinstance(item, (list, tuple)):
                 sanitized[key] = self._sanitize_headers(item, secrets)
+            elif lowered == "body" and isinstance(item, str):
+                sanitized[key] = self._sanitize_text(
+                    _sanitize_embedded_http_urls(item), secrets,
+                )
             else:
-                sanitized[key] = self._sanitize_value(item, secrets)
+                # requested_url is a trusted execution coordinate used by
+                # analyzers; its query is already field-aware sanitized. All
+                # response-provided strings receive stricter URL masking.
+                sanitized[key] = self._sanitize_value(
+                    item, secrets, sanitize_urls=lowered != "requested_url",
+                )
         return sanitized
 
     def _sanitize_headers(
@@ -243,22 +373,40 @@ class SensitiveDataSanitizer:
         sanitized: list[object] = []
         for pair in headers:
             if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-                sanitized.append(self._sanitize_value(pair, secrets))
+                sanitized.append(
+                    self._sanitize_value(
+                        pair, secrets, sanitize_urls=True,
+                    )
+                )
                 continue
             name, value = pair
             if isinstance(name, str) and name.casefold() in _SENSITIVE_HEADER_NAMES:
                 sanitized.append([name, _REDACTED])
             else:
-                sanitized.append([name, self._sanitize_value(value, secrets)])
+                sanitized.append([
+                    name,
+                    self._sanitize_value(
+                        value, secrets, sanitize_urls=True,
+                    ),
+                ])
         return sanitized
 
-    def _sanitize_value(self, value: object, secrets: Sequence[str]) -> object:
+    def _sanitize_value(
+        self, value: object, secrets: Sequence[str], *, sanitize_urls: bool = False,
+    ) -> object:
         if isinstance(value, str):
+            if sanitize_urls:
+                value = _sanitize_embedded_http_urls(value)
             return self._sanitize_text(value, secrets)
         if isinstance(value, Mapping):
             return self._sanitize_mapping(value, secrets)
         if isinstance(value, (list, tuple)):
-            return [self._sanitize_value(item, secrets) for item in value]
+            return [
+                self._sanitize_value(
+                    item, secrets, sanitize_urls=sanitize_urls,
+                )
+                for item in value
+            ]
         return value
 
     @staticmethod

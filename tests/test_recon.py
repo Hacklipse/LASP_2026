@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import unittest
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 from hacklipse.adapters import HttpExecutionRuntime
 from hacklipse.adapters.browser_recon import BrowserReconResult
 from hacklipse.adapters.memory import InMemoryEvidenceStore, InMemorySurfaceStore
-from hacklipse.adapters.recon import ReconAgent, _json_links_from_response, _parse_page
+from hacklipse.adapters.recon import (
+    ReconAgent, _data_navigation_links, _json_links_from_response, _parse_page,
+    _openapi_html_document_urls, _script_ssrf_json_shapes,
+    sanitize_url_reference, ssrf_destination_hints,
+)
 from hacklipse.adapters.routing import RuleBasedVulnerabilityRouter
 from hacklipse.application.errors import AgentContractError, WorkflowExecutionError
-from hacklipse.bootstrap import build_local_application
+from hacklipse.bootstrap import build_local_application, standard_router
 from hacklipse.domain import (
     AgentResult,
     AgentResultStatus,
@@ -38,6 +44,53 @@ _SAMPLE_HTML = """
 <a href="/about.php">about</a>
 </body></html>
 """
+
+
+class SsrfJsonShapeTests(unittest.TestCase):
+    def test_data_navigation_accepts_only_local_nonmutating_get(self) -> None:
+        body = (
+            '<button data-url="/articles/new">New</button>'
+            '<button data-url="/articles/delete/1">Delete</button>'
+            '<button data-url="https://elsewhere.example/collect">Elsewhere</button>'
+            '<button data-url="/articles/edit" data-method="POST">Post</button>'
+        )
+        self.assertEqual(
+            _data_navigation_links(body, "https://target.example/articles"),
+            ("https://target.example/articles/new",),
+        )
+
+    def test_inline_fetch_shape_keeps_only_single_url_field(self) -> None:
+        script = (
+            "fetch('/api/preview',{method:'POST',headers:{'Content-Type':'application/json'},"
+            "body:JSON.stringify({url:u})});"
+            "fetch('/api/ping',{method:'POST',headers:{'Content-Type':'application/json'},"
+            "body:JSON.stringify({target:h})});"
+        )
+        self.assertEqual(
+            _script_ssrf_json_shapes(script, urlsplit("http://localhost/")),
+            (("http://localhost/api/preview", "url"),),
+        )
+
+    def test_openapi_html_sampling_ignores_mutations_and_malformed_entries(self) -> None:
+        document = {"openapi": "3.0.0", "paths": {
+            "/console": {"get": {"responses": {
+                "200": {"content": {"text/html": {}}},
+            }}},
+            "/write": {"post": {"responses": {
+                "200": {"content": {"text/html": {}}},
+            }}},
+            "/broken": {"get": {"responses": ["bad"]}},
+        }}
+        evidence = Evidence(
+            evidence_id="schema", run_id="run-1", surface_id=None,
+            created_by="recon", evidence_type="http_response",
+            observation={"status": 200, "content_type": "application/json",
+                         "body": json.dumps(document)},
+        )
+        self.assertEqual(
+            _openapi_html_document_urls(evidence, urlsplit("http://localhost/")),
+            ("http://localhost/console",),
+        )
 
 
 class _FakeCollector:
@@ -147,6 +200,144 @@ def _task(
 
 
 class ReconAgentTests(unittest.TestCase):
+    def test_internal_destination_hints_store_only_origin_and_redacted_path(self) -> None:
+        run_key = b"r" * 32
+        body = (
+            '"http://mailpit:8025/private/token/DEMO-SECRET?token=secret#fragment" '
+            '"http://10.0.0.7:8080/health" "https://public.example/api" '
+            '"mailpit:8025" "https://user:pass@localhost/api/status?key=hidden"'
+        )
+        hints = ssrf_destination_hints(body, run_key=run_key)
+        self.assertEqual(
+            {(item.destination_origin, item.path_hint) for item in hints},
+            {
+                ("http://10.0.0.7:8080", "/health"),
+                ("http://mailpit:8025", "/private/token/{redacted}"),
+                ("https://localhost", "/api/status"),
+            },
+        )
+        serialized = json.dumps([
+            {
+                "destination_origin": item.destination_origin,
+                "path_hint": item.path_hint,
+                "destination_fingerprint": item.destination_fingerprint,
+            }
+            for item in hints
+        ])
+        for secret in ("DEMO-SECRET", "user", "pass", "hidden", "token=secret"):
+            self.assertNotIn(secret, serialized)
+        self.assertNotIn("destination_url", serialized)
+        self.assertEqual(hints, ssrf_destination_hints(body, run_key=run_key))
+
+    def test_destination_fingerprint_is_stable_only_for_the_same_run_key(self) -> None:
+        raw_url = "http://mailpit:8025/private/token/DEMO-SECRET"
+        first_key = b"a" * 32
+        second_key = b"b" * 32
+
+        first = sanitize_url_reference(raw_url, run_key=first_key)
+        same_run = sanitize_url_reference(raw_url, run_key=first_key)
+        another_run = sanitize_url_reference(raw_url, run_key=second_key)
+        assert first is not None and same_run is not None and another_run is not None
+
+        self.assertEqual(
+            first.destination_fingerprint, same_run.destination_fingerprint,
+        )
+        self.assertNotEqual(
+            first.destination_fingerprint, another_run.destination_fingerprint,
+        )
+        self.assertNotEqual(
+            first.destination_fingerprint, hashlib.sha256(raw_url.encode()).hexdigest(),
+        )
+        self.assertNotIn("DEMO-SECRET", first.destination_fingerprint)
+
+    def test_url_reference_sanitizer_returns_only_persistence_safe_fields(self) -> None:
+        uuid = "550e8400-e29b-41d4-a716-446655440000"
+        jwt = (
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+            "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        )
+        raw_url = (
+            "https://user:password@service.local/private/token/"
+            f"{uuid}/{jwt}/%41%50%49%2d%4b%45%59"
+            "?api_key=DEMO-SECRET#session-value"
+        )
+
+        hint = sanitize_url_reference(raw_url, run_key=b"k" * 32)
+
+        self.assertIsNotNone(hint)
+        assert hint is not None
+        self.assertEqual(
+            set(hint.__dataclass_fields__),
+            {"destination_origin", "path_hint", "destination_fingerprint"},
+        )
+        self.assertEqual(hint.destination_origin, "https://service.local")
+        self.assertEqual(
+            hint.path_hint,
+            "/private/token/{redacted}/{redacted}/{redacted}",
+        )
+        serialized = repr(hint)
+        for secret in (
+            "user", "password", uuid, jwt, "%41", "api_key", "DEMO-SECRET",
+            "session-value",
+        ):
+            self.assertNotIn(secret, serialized)
+
+    def test_url_reference_sanitizer_rejects_invalid_input_and_short_key(self) -> None:
+        self.assertIsNone(
+            sanitize_url_reference("file:///etc/passwd", run_key=b"k" * 32),
+        )
+        with self.assertRaises(ValueError):
+            sanitize_url_reference("https://service.local/path", run_key=b"short")
+
+    def test_url_reference_sanitizer_masks_secret_shaped_hostname_labels(self) -> None:
+        uuid = "550e8400-e29b-41d4-a716-446655440000"
+        random_label = "QWxhZGRpbjpvcGVuU2VzYW1lMTIzNA"
+        raw_url = f"https://{uuid}.{random_label}.internal/health"
+
+        hint = sanitize_url_reference(raw_url, run_key=b"k" * 32)
+
+        self.assertIsNotNone(hint)
+        assert hint is not None
+        self.assertEqual(
+            hint.destination_origin,
+            "https://redacted.redacted.internal",
+        )
+        self.assertEqual(hint.path_hint, "/health")
+        self.assertNotIn(uuid, repr(hint))
+        self.assertNotIn(random_label, repr(hint))
+
+    def test_internal_destination_path_masks_secret_shaped_segments(self) -> None:
+        uuid = "550e8400-e29b-41d4-a716-446655440000"
+        jwt = (
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+            "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        )
+        base64url = "QWxhZGRpbjpvcGVuU2VzYW1lMTIzNA"
+        api_key = "AKIAIOSFODNN7EXAMPLE"
+        encoded = "%44%45%4D%4F%2D%53%45%43%52%45%54"
+        body = " ".join((
+            f'"http://service.local/id/{uuid}"',
+            f'"http://service.local/session/{jwt}"',
+            f'"http://service.local/blob/{base64url}"',
+            f'"http://service.local/key/{api_key}"',
+            f'"http://service.local/encoded/{encoded}"',
+            '"http://service.local/api/status"',
+        ))
+
+        hints = ssrf_destination_hints(body, run_key=b"r" * 32)
+
+        self.assertEqual(
+            {item.path_hint for item in hints},
+            {
+                "/id/{redacted}", "/session/{redacted}",
+                "/blob/{redacted}", "/key/{redacted}",
+                "/encoded/{redacted}", "/api/status",
+            },
+        )
+        serialized = repr(hints)
+        for secret in (uuid, jwt, base64url, api_key, encoded):
+            self.assertNotIn(secret, serialized)
+
     def test_html_preloaded_script_chunks_enter_existing_script_frontier(self) -> None:
         _, _, sources, _ = _parse_page(
             '<script src="/app.js"></script>'
@@ -574,6 +765,7 @@ class _RoutingCollector:
                 observation={
                     "type": "http_response",
                     "status": 200,
+                    "requested_url": target_url,
                     "body": self._bodies.get(target_url, "<html></html>"),
                     **(
                         {"content_type": self._content_types[target_url]}
@@ -603,6 +795,131 @@ def _crawling_agent(bodies: dict[str, str], **kwargs):
 
 
 class ReconCrawlTests(unittest.TestCase):
+    def test_authenticated_form_does_not_create_unobserved_csv_workflow(self) -> None:
+        base = "http://localhost"
+        page = base + "/admin-dev/index.php?controller=AdminImport"
+        form = (
+            '<html><body>AdminImport Categories'
+            '<input name="file"><input name="csv"><select name="entity"></select>'
+        )
+        route = (
+            '/admin-dev/index.php/configure/advanced/import/file/upload'
+            '?_token=opaque'
+        )
+        for include_route in (False, True):
+            body = form + (f'<a href="{route}">Upload</a>' if include_route else "")
+            agent, collector, surfaces = _crawling_agent(
+                {page: body + "</body></html>"}, max_pages=1,
+            )
+            run_id = f"presta-csv-{include_route}"
+            agent.handle(replace(
+                _task(run_id, page, credential_ref="presta-admin"),
+                request_budget=10,
+            ))
+            workflow = [
+                item for item in collector._evidence.list_by_run(run_id)
+                if item.observation.get("type") == "admin_csv_image_import_workflow"
+            ]
+            self.assertEqual(workflow, [])
+
+    def test_script_does_not_invent_model_download_workflow(self) -> None:
+        base = "http://localhost"
+        list_url = base + "/externalmodel/getlist?mode=cache"
+        model_script = (
+            "const data = item.originalData;"
+            "fetchApi('/manager/queue/install_model',"
+            "{method:'POST',body:JSON.stringify(data)});"
+            "fetchApi('/manager/queue/start');"
+            "fetchData(`/externalmodel/getlist?mode=${mode}`);"
+        )
+        agent, collector, surfaces = _crawling_agent(
+            {
+                base + "/": (
+                    '<script src="/model-manager.js"></script>'
+                    '<script src="/main.js"></script>'
+                ),
+                base + "/model-manager.js": model_script,
+                base + "/main.js": "const option = {value:'cache'};",
+                list_url: json.dumps({"models": [{
+                    "filename": "sample.safetensors", "type": "clip",
+                    "base": "clip", "save_path": "default",
+                }]}),
+            },
+            content_types={
+                base + "/model-manager.js": "application/javascript",
+                base + "/main.js": "application/javascript",
+                list_url: "application/json",
+            },
+            max_pages=6, max_scripts=3,
+        )
+        agent.handle(replace(_task("model-flow", base + "/"), request_budget=30))
+        self.assertNotIn(list_url, collector.calls)
+        evidence = collector._evidence.list_by_run("model-flow")
+        workflow = [
+            item for item in evidence
+            if item.observation.get("type") == "javascript_model_download_workflow"
+        ]
+        self.assertEqual(workflow, [])
+
+    def test_observed_ueditor_config_declares_ssrf_coordinate(self) -> None:
+        base = "http://localhost"
+        upload = base + "/admin/upload/index.html"
+        config_url = upload + "?from=ueditor&action=config"
+        agent, collector, surfaces = _crawling_agent(
+            {
+                base + "/": f'<a href="{upload}">Upload</a>',
+                upload: "<html></html>",
+                config_url: json.dumps({
+                    "catcherActionName": "catch_image",
+                    "catcherFieldName": "remote_image",
+                }),
+            },
+            content_types={config_url: "application/json"},
+            max_pages=3,
+        )
+        agent.handle(replace(_task("ueditor", base + "/"), request_budget=20))
+        self.assertIn(config_url, collector.calls)
+        found = surfaces.list_by_run("ueditor")
+        editor = next(item for item in found if "remote_image[]" in item.parameters)
+        self.assertEqual(editor.observed_query, (
+            ("from", "ueditor"), ("action", "catch_image"),
+        ))
+        evidence = collector._evidence.list_by_run("ueditor")
+        self.assertTrue(any(
+            item.surface_id == editor.surface_id
+            and item.observation.get("type") == "editor_catcher_request_structure"
+            for item in evidence
+        ))
+        run = Run(
+            run_id="ueditor", target_url=base + "/",
+            scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+            policy_profile="safe", request_budget=20,
+        )
+        decisions = standard_router(
+            ("SSRF",), ssrf_owned_receiver_enabled=True,
+        ).route(run, found, evidence)
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].candidate.surface_id, editor.surface_id)
+
+    def test_unrelated_upload_response_does_not_declare_catcher(self) -> None:
+        base = "http://localhost"
+        upload = base + "/admin/upload/index.html"
+        config_url = upload + "?from=ueditor&action=config"
+        agent, collector, surfaces = _crawling_agent(
+            {
+                base + "/": f'<a href="{upload}">Upload</a>',
+                config_url: json.dumps({"catcherFieldName": "file"}),
+            },
+            content_types={config_url: "application/json"},
+            max_pages=2,
+        )
+        agent.handle(replace(_task("not-ueditor", base + "/"), request_budget=20))
+        self.assertIn(config_url, collector.calls)
+        self.assertFalse(any(
+            "file[]" in item.parameters
+            for item in surfaces.list_by_run("not-ueditor")
+        ))
+
     def test_search_query_surface_requires_observed_echo(self) -> None:
         base = "http://localhost"
         marker = "hacklipse-search-control"
@@ -689,6 +1006,138 @@ class ReconCrawlTests(unittest.TestCase):
             for item in surfaces.list_by_run("sparse-schema")
         ))
 
+    def test_openapi_declared_ssrf_get_is_routed_only_with_callback(self) -> None:
+        base = "http://localhost"
+        schema = {"openapi": "3.0.0", "paths": {
+            "/api/fetch": {"get": {"parameters": [
+                {"name": "url", "in": "query", "schema": {"type": "string"}},
+            ]}},
+            "/api/submit": {"post": {"requestBody": {"content": {
+                "application/json": {"schema": {"properties": {"url": {"type": "string"}}}}
+            }}}},
+        }}
+        agent, collector, surfaces = _crawling_agent(
+            {base + "/": "<html><body>Welcome</body></html>",
+             base + "/openapi.json": json.dumps(schema)},
+            content_types={base + "/openapi.json": "application/json"},
+        )
+        agent.handle(replace(_task("ssrf-openapi", base + "/"), request_budget=20))
+        run = Run(
+            run_id="ssrf-openapi", target_url=base + "/",
+            scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+            policy_profile="safe", request_budget=20,
+        )
+        found = surfaces.list_by_run(run.run_id)
+        evidence = collector._evidence.list_by_run(run.run_id)
+        self.assertEqual(
+            standard_router(("SSRF",)).route(run, found, evidence), (),
+        )
+        reviews = [
+            item.observation for item in evidence
+            if item.observation.get("type") == "ssrf_url_fetch_review"
+        ]
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(reviews[0]["parameter_names"], ["url"])
+        self.assertEqual(
+            reviews[0]["parameter_sources"],
+            [{"name": "url", "source": "openapi_declaration"}],
+        )
+        self.assertFalse(reviews[0]["verification_performed"])
+        decisions = standard_router(
+            ("SSRF",), ssrf_callback_service=object(),
+        ).route(run, found, evidence)
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].candidate.surface_id, next(
+            item.surface_id for item in found if item.url == base + "/api/fetch"
+        ))
+
+    def test_observed_url_input_gets_one_passive_review_on_resume(self) -> None:
+        base = "http://localhost"
+        target = base + "/preview?url=https%3A%2F%2Fexample.com%2Fpublic"
+        agent, collector, _ = _crawling_agent({
+            base + "/": f'<a href="{target}">Preview</a>',
+            target: "ok",
+        })
+        task = replace(_task("ssrf-passive", base + "/"), request_budget=20)
+        agent.handle(task)
+        agent.handle(task)
+        reviews = [
+            item.observation
+            for item in collector._evidence.list_by_run("ssrf-passive")
+            if item.observation.get("type") == "ssrf_url_fetch_review"
+        ]
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(reviews[0]["parameter_names"], ["url"])
+        self.assertEqual(
+            reviews[0]["parameter_sources"],
+            [{"name": "url", "source": "observed_query"}],
+        )
+        self.assertNotIn("example.com", str(reviews[0]))
+
+    def test_openapi_and_javascript_record_internal_destinations_without_probing(self) -> None:
+        base = "http://localhost"
+        schema = {"openapi": "3.0.0", "paths": {
+            "/api/fetch": {"get": {
+                "description": (
+                    "forwards to http://mailpit:8025/private/token/DEMO-SECRET"
+                    "?key=hidden"
+                ),
+                "parameters": [{"name": "url", "in": "query"}],
+            }},
+        }}
+        agent, collector, surfaces = _crawling_agent(
+            {
+                base + "/": '<script src="/app.js"></script>',
+                base + "/app.js": 'const health = "http://10.0.0.8:9000/health";',
+                base + "/openapi.json": json.dumps(schema),
+            },
+            content_types={
+                base + "/app.js": "application/javascript",
+                base + "/openapi.json": "application/json",
+            },
+            max_pages=8,
+        )
+        agent.handle(replace(_task("ssrf-hints", base + "/"), request_budget=30))
+
+        # A process restart intentionally creates a new HMAC key. Dedupe must
+        # therefore use only the already-sanitized origin/path pair rather than
+        # a fingerprint that cannot remain stable across restarts.
+        resumed_ids = iter(range(10_000, 20_000))
+        resumed = ReconAgent(
+            collector=collector,
+            evidence_store=collector._evidence,
+            surface_store=surfaces,
+            id_factory=lambda: str(next(resumed_ids)),
+            max_pages=8,
+        )
+        resumed.handle(replace(_task("ssrf-hints", base + "/"), request_budget=30))
+
+        hints = [
+            item.observation for item in collector._evidence.list_by_run("ssrf-hints")
+            if item.observation.get("type") == "ssrf_destination_hint"
+        ]
+        self.assertEqual(
+            {
+                (item["destination_origin"], item["path_hint"], item["source"])
+                for item in hints
+            },
+            {
+                ("http://10.0.0.8:9000", "/health", "delivered_javascript"),
+                (
+                    "http://mailpit:8025", "/private/token/{redacted}",
+                    "openapi_document",
+                ),
+            },
+        )
+        self.assertTrue(all(item["observed"] for item in hints))
+        self.assertTrue(all(item["probe_authorized"] is False for item in hints))
+        serialized = json.dumps(hints, sort_keys=True)
+        self.assertNotIn("destination_url", serialized)
+        self.assertNotIn("DEMO-SECRET", serialized)
+        self.assertNotIn("key=hidden", serialized)
+        self.assertFalse(any("mailpit" in url or "10.0.0.8" in url
+                             for url in collector.calls))
+
     def test_openapi_get_sampling_follows_response_links_without_mutation(self) -> None:
         base = "http://localhost"
         schema = {"openapi": "3.0.0", "paths": {
@@ -715,6 +1164,21 @@ class ReconCrawlTests(unittest.TestCase):
         self.assertTrue(any(
             item.url == base + "/api/linked" and item.parameters == ("term",)
             for item in surfaces.list_by_run("schema-get-sample")
+        ))
+
+    def test_html_navigation_records_but_does_not_fetch_mutating_get(self) -> None:
+        base = "http://localhost"
+        agent, collector, surfaces = _crawling_agent({
+            base + "/": '<a href="/admin/logout">Exit</a>'
+                        '<a href="/admin/dashboard">Dashboard</a>',
+            base + "/admin/dashboard": "<html>Dashboard</html>",
+        })
+        agent.handle(replace(_task("admin-navigation", base + "/"), request_budget=10))
+        self.assertNotIn(base + "/admin/logout", collector.calls)
+        self.assertIn(base + "/admin/dashboard", collector.calls)
+        self.assertTrue(any(
+            item.url == base + "/admin/logout"
+            for item in surfaces.list_by_run("admin-navigation")
         ))
 
     def test_template_only_openapi_is_recorded_without_guessing_another_schema_url(self) -> None:
@@ -1234,6 +1698,39 @@ class ReconCrawlTests(unittest.TestCase):
         self.assertFalse(any("evil.example" in surface.url for surface in found.values()))
         self.assertFalse(any("dynamicPath" in surface.url for surface in found.values()))
         self.assertFalse(any(url.endswith("/api/messages") for url in collector.calls))
+
+    def test_json_module_manifest_reveals_fetchapi_post_shape(self) -> None:
+        base = "http://localhost"
+        main = (
+            'async function modules() { return await(await '
+            'api.fetchApi("/extensions", {cache:"no-store"})).json() }'
+        )
+        extension = (
+            'await api.fetchApi("/api/install", {'
+            'method: "POST", body: JSON.stringify(item)});'
+        )
+        agent, collector, surfaces = _crawling_agent(
+            {
+                base + "/": '<script src="/main.js"></script>',
+                base + "/main.js": main,
+                base + "/extensions": json.dumps(["/extensions/model.js"]),
+                base + "/extensions/model.js": extension,
+            },
+            content_types={
+                base + "/main.js": "application/javascript",
+                base + "/extensions": "application/json",
+                base + "/extensions/model.js": "application/javascript",
+            },
+            max_pages=8,
+        )
+        agent.handle(replace(
+            _task("json-module-manifest", base + "/"), request_budget=40
+        ))
+        found = {(item.url, item.method): item
+                 for item in surfaces.list_by_run("json-module-manifest")}
+        self.assertIn((base + "/api/install", "POST"), found)
+        self.assertIn(base + "/extensions/model.js", collector.calls)
+        self.assertNotIn(base + "/api/install", collector.calls)
 
     def test_discovers_post_ajax_shape_and_localized_runtime_values(self) -> None:
         html = """

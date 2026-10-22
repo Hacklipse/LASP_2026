@@ -31,7 +31,7 @@ from hacklipse.domain import (
 )
 from hacklipse.ports import BudgetAllocationDecision
 from hacklipse.ports.llm import LlmResponse
-from hacklipse.ports.errors import LlmTimeout
+from hacklipse.ports.errors import BudgetExceeded, LlmTimeout
 
 
 class _Runtime:
@@ -122,10 +122,13 @@ class _PlannedValidationAgent:
 
 
 class _PlannedAnalysisAgent:
-    def __init__(self, app, counts: dict[str, int], calls: list):
+    def __init__(
+        self, app, counts: dict[str, int], calls: list, *, validation_reserve: int = 0,
+    ):
         self._app = app
         self._counts = counts
         self._calls = calls
+        self._validation_reserve = validation_reserve
 
     def handle(self, task):
         self._calls.append(("analysis", task.candidate_id))
@@ -135,6 +138,14 @@ class _PlannedAnalysisAgent:
             and item.evidence_type == "http_response"]
         missing_count = self._counts.get(task.candidate_id, 0) - len(existing)
         if missing_count > 0:
+            required = missing_count + max(
+                0, self._validation_reserve - task.validation_request_reserve,
+            )
+            if task.request_budget < required:
+                raise BudgetExceeded(
+                    "planned analysis must preserve its proof budget",
+                    required_requests=required,
+                )
             return AgentResult(
                 task_id=task.task_id, status=AgentResultStatus.NEEDS_EVIDENCE,
                 evidence_requests=tuple(EvidenceRequest(
@@ -147,7 +158,8 @@ class _PlannedAnalysisAgent:
 
 
 def _app(*, stores=None, budget=None, advisor=None, analysis=None, validation=None,
-         planned_analysis=None, planned_validation=None):
+         planned_analysis=None, planned_validation=None,
+         planned_analysis_validation_reserve=0):
     runtime = _Runtime()
     app = build_local_application(
         {},
@@ -160,10 +172,20 @@ def _app(*, stores=None, budget=None, advisor=None, analysis=None, validation=No
     calls: list[tuple[str, str]] = []
     app.dispatcher.register(
         "test_analyzer",
-        (_PlannedAnalysisAgent(app, planned_analysis, calls)
+        (_PlannedAnalysisAgent(
+            app, planned_analysis, calls,
+            validation_reserve=planned_analysis_validation_reserve,
+        )
          if planned_analysis is not None else
          _Agent(app, stage="analysis", request_counts=analysis or {}, calls=calls)),
-        allowed_tools=("http_get",),
+        allowed_tools=(
+            "http_get",
+            *((
+                "get_surface_context",
+                "probe_observed_url_input",
+                "read_probe_result",
+            ) if planned_analysis_validation_reserve else ()),
+        ),
     )
     app.dispatcher.register(
         "validation",
@@ -176,7 +198,8 @@ def _app(*, stores=None, budget=None, advisor=None, analysis=None, validation=No
 
 
 def _seed(app, *, budget: int = 7, planned_order=(), planned_weights=(), reserve=0,
-          active_candidate=None, active_phase=None, active_floor=None):
+          active_candidate=None, active_phase=None, active_floor=None,
+          vulnerability_type="XSS"):
     run = Run(
         run_id="run-budget",
         target_url="http://localhost/",
@@ -210,7 +233,7 @@ def _seed(app, *, budget: int = 7, planned_order=(), planned_weights=(), reserve
                 candidate_id=f"candidate-{name}",
                 run_id=run.run_id,
                 surface_id=f"surface-{name}",
-                vulnerability_type="XSS",
+                vulnerability_type=vulnerability_type,
                 hypothesis="untrusted hypothesis text",
                 assigned_agent="test_analyzer",
                 evidence_ids=(),
@@ -284,6 +307,58 @@ class BudgetAllocationTests(unittest.TestCase):
                     app.stores.candidates.get(run.run_id, "candidate-b").status,
                     CandidateStatus.REJECTED,
                 )
+
+    def test_deferred_ssrf_analysis_keeps_two_request_validation_reserve(self):
+        app, runtime, _ = _app(
+            planned_analysis={"candidate-a": 2, "candidate-b": 2},
+            planned_analysis_validation_reserve=2,
+            planned_validation={"candidate-a": 2, "candidate-b": 2},
+        )
+        run = _seed(
+            app, budget=6,
+            planned_order=("candidate-a", "candidate-b"), reserve=1,
+            vulnerability_type="SSRF",
+        )
+
+        completed = app.orchestrator.resume(run.run_id)
+
+        self.assertIs(completed.phase, RunPhase.DONE)
+        self.assertEqual(runtime.calls, 4)
+        self.assertIs(
+            app.stores.candidates.get(run.run_id, "candidate-a").status,
+            CandidateStatus.REJECTED,
+        )
+        second = app.stores.candidates.get(run.run_id, "candidate-b")
+        self.assertIs(second.status, CandidateStatus.SKIPPED_BUDGET)
+        self.assertIs(second.resume_status, CandidateStatus.ROUTED)
+
+    def test_weighted_ssrf_validation_uses_actual_two_request_floor(self):
+        app, runtime, _ = _app(
+            planned_validation={"candidate-a": 2, "candidate-b": 2},
+        )
+        run = _seed(
+            app, budget=4,
+            planned_order=("candidate-a", "candidate-b"),
+            planned_weights=(1, 3), reserve=1,
+            vulnerability_type="SSRF",
+        )
+        for candidate_id in run.candidate_ids:
+            app.stores.candidates.save(
+                app.stores.candidates.get(run.run_id, candidate_id).set_status(
+                    CandidateStatus.ANALYZED,
+                )
+            )
+
+        completed = app.orchestrator.resume(run.run_id)
+
+        self.assertIs(completed.phase, RunPhase.DONE)
+        self.assertEqual(runtime.calls, 4)
+        self.assertEqual(app.budget_manager.global_remaining(run.run_id), 0)
+        self.assertTrue(all(
+            app.stores.candidates.get(run.run_id, candidate_id).status
+            is CandidateStatus.REJECTED
+            for candidate_id in run.candidate_ids
+        ))
 
     def test_deferred_validation_reuses_only_a_fully_affordable_batch(self):
         for budget, expected_calls, first_status in (

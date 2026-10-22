@@ -42,9 +42,11 @@ class AnalyzerCapability:
     requires_file_serving_segment: bool = False
     observation_requirements: tuple[ObservationRequirement, ...] = ()
     exploration_parameter_source: ParameterSource = "none"
+    observation_parameter_field: str = "parameter"
     supported_evidence_types: tuple[str, ...] = ()
     strategy_ids: tuple[str, ...] = ("default",)
     default_priority: float = 0.15
+    requires_observed_query: bool = False
 
     def __post_init__(self) -> None:
         if not self.capability_id or not self.agent_type or not self.vulnerability_type:

@@ -818,11 +818,16 @@ class PathAssignmentAnalyzerSelectionTests(unittest.TestCase):
         agent, task = self._fixture(parameters=("page",))
         result = agent.handle(task)
 
-        probe = result.evidence_requests[-1].http_request
-        assert probe is not None
-        self.assertIsNone(probe.path_assignment_name)
-        self.assertEqual(
-            dict(probe.query_parameters)["page"], PATH_TRAVERSAL_PROBE_PATH
+        probes = tuple(
+            item.http_request for item in result.evidence_requests
+            if item.http_request is not None
+            and item.http_request.request_kind is HttpRequestKind.PATH_TRAVERSAL_PROBE
+        )
+        self.assertTrue(probes)
+        self.assertTrue(all(probe.path_assignment_name is None for probe in probes))
+        self.assertIn(
+            PATH_TRAVERSAL_PROBE_PATH,
+            tuple(dict(probe.query_parameters)["page"] for probe in probes),
         )
 
     def test_capability_routed_candidate_probes_only_its_own_coordinate(self) -> None:

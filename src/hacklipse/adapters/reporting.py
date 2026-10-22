@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from hacklipse.domain import (
     AgentResult, AgentResultStatus, CandidateStatus, Evidence, Finding, ReportArtifact,
-    RunExecutionProfile, TaskEnvelope,
+    RunExecutionProfile, TaskEnvelope, ValidationReasonCode,
 )
 from hacklipse.ports import (
     BudgetManager, CandidateStore, EvidenceStore, FindingStore, RunStore, SurfaceStore,
@@ -23,8 +23,19 @@ from .llm_report_narrative import ReportNarrative, ReportNarrator, deterministic
 from .file_upload_analysis import UPLOAD_ANALYZER, UPLOAD_RESULT
 from .report_contract import (
     CONTRACT_VERSION, FindingReportFact, NarratorFingerprintConfig, RunReportFacts,
+    SsrfCallbackSurfaceFact, SsrfReviewFact,
     comparable_report_facts_hash, finding_fact_id, report_facts_hash,
-    report_input_fingerprint, surface_path_hint,
+    report_input_fingerprint, ssrf_callback_surface_fact_id, surface_path_hint,
+)
+from .ssrf_analysis import (
+    SSRF_CALLBACK_STRATEGIES,
+    SSRF_CANARY_STRATEGIES,
+    SSRF_OWNED_RECEIVER_STRATEGIES,
+    SSRF_DESTINATION_HINT_TYPE,
+    SSRF_TYPE,
+    is_ssrf_callback_candidate,
+    is_ssrf_canary_candidate,
+    is_ssrf_owned_receiver_candidate,
 )
 
 
@@ -96,6 +107,22 @@ def _execution_lines(execution: RunExecutionProfile | None) -> list[str]:
         f"- Orchestrator: {_code(execution.orchestrator_mode)} · 예산 배분 {_code(execution.budget_allocation_mode)}",
         f"- Validation: {_code(execution.validation_mode)}",
         f"- Report: {_code(execution.report_mode)}",
+        f"- SSRF analysis: {_code(execution.ssrf_analysis_mode)}",
+        "- SSRF execution approval: "
+        + ("registered" if execution.ssrf_execution_approval_registered else "not registered"),
+        "- SSRF destination policy: "
+        + (
+            "registered / " + _code(execution.ssrf_destination_policy_source.value)
+            if execution.ssrf_destination_policy_source is not None
+            else "not registered"
+        ),
+        f"- SSRF OAST: {_code(execution.ssrf_oast_mode)}"
+        + (" · 공개 전송 동의" if execution.ssrf_public_oast_consented else ""),
+        "- SSRF canary 증명: "
+        + (
+            "legacy opaque reference registered (value omitted)"
+            if execution.ssrf_canary_policy_ref else "사용 안 함"
+        ),
         "- 상태 변경 가능 요청: "
         + ("명시적으로 승인" if execution.state_changing_approved else "차단"),
         f"- LLM: {model}",
@@ -104,6 +131,630 @@ def _execution_lines(execution: RunExecutionProfile | None) -> list[str]:
         lines.append(f"- LLM 분당 호출 제한: {execution.llm_rpm_limit}")
     lines.append("")
     return lines
+
+
+def _ssrf_review_lines(review: SsrfReviewFact | None) -> list[str]:
+    if review is None:
+        return ["- SSRF analysis: not assessed"]
+    result_labels = {
+        "NOT_TESTED": "미검사",
+        "REVIEW_REQUIRED": "운영자 검토 필요",
+        "CALLBACK_OBSERVED": "Callback 발신 관측 · 정책 위반 미입증",
+        "CANARY_OBSERVED_POLICY_PENDING": "내부 Canary 접근 관측 · 정책 근거 필요",
+        "CONFIRMED_POLICY_VIOLATION": "목적지 정책 위반 독립 재현",
+        "CALLBACK_PROVIDER_BLOCKED": "Callback Provider 장애",
+        "OBSERVATION_PROVIDER_BLOCKED": "서버 요청 관측 Provider 장애",
+        "EXECUTION_APPROVAL_PENDING": "실행 승인 대기",
+        "POLICY_EVIDENCE_PENDING": "목적지 정책 근거 대기",
+        "VALIDATION_BUDGET_INSUFFICIENT": "Validation 예산 부족",
+        "ALLOWED_DESTINATION": "허용된 목적지의 정상 동작",
+        "CALLBACK_NOT_OBSERVED": "Callback HTTP 발신 미관측",
+        "CALLBACK_ANALYSIS_OBSERVED": "Callback Analysis 관측 · 독립 검증 대기",
+        "CALLBACK_NOT_REPRODUCED": "Callback 독립 재현 실패",
+        "CANARY_ANALYSIS_OBSERVED": "Canary Analysis 관측 · 독립 검증 대기",
+        "CANARY_NOT_REPRODUCED": "Canary 독립 재현 실패",
+        "OWNED_RECEIVER_OBSERVED_POLICY_PENDING": (
+            "운영자 소유 Receiver A/B 관측 · 정책 근거 필요"
+        ),
+        "OWNED_RECEIVER_ANALYSIS_OBSERVED": (
+            "운영자 소유 Receiver Analysis 관측 · 독립 검증 대기"
+        ),
+        "OWNED_RECEIVER_NOT_REPRODUCED": "운영자 소유 Receiver 독립 재현 실패",
+        "OWNED_RECEIVER_NOT_OBSERVED": "운영자 소유 Receiver 발신 미관측",
+        "OWNED_RECEIVER_PROVIDER_BLOCKED": "운영자 소유 Receiver 장애",
+    }
+    callback_labels = {
+        "NOT_CONFIGURED": "미설정",
+        "NOT_RUN": "미실행",
+        "NO_HTTP_CALLBACK": "HTTP callback 미관측",
+        "ANALYSIS_OBSERVED": "Analysis callback 관측",
+        "VALIDATION_REPRODUCED": "A/B callback 독립 재현",
+        "VALIDATION_NOT_REPRODUCED": "Validation callback 미재현",
+        "PROVIDER_BLOCKED": "Provider 장애",
+        "VALIDATION_BUDGET_INSUFFICIENT": "Validation 예산 부족",
+    }
+    canary_labels = {
+        "NOT_CONFIGURED": "미설정",
+        "NOT_RUN": "미실행",
+        "NO_CANARY_MARKER": "marker 미관측",
+        "ANALYSIS_OBSERVED": "Analysis marker 관측",
+        "VALIDATION_NOT_REPRODUCED": "Validation 재현 실패",
+        "ACCESS_OBSERVED_POLICY_PENDING": "독립 접근 관측 · 정책 대기",
+        "POLICY_MISMATCH": "정책 바인딩 불일치",
+        "ALLOWED_DESTINATION": "허용된 목적지",
+        "CONFIRMED_POLICY_VIOLATION": "정책 위반 독립 재현",
+        "PROVIDER_BLOCKED": "Provider 장애",
+        "EXECUTION_APPROVAL_PENDING": "실행 승인 대기",
+        "VALIDATION_BUDGET_INSUFFICIENT": "Validation 예산 부족",
+    }
+    owned_receiver_labels = {
+        "NOT_CONFIGURED": "미설정",
+        "NOT_RUN": "미실행",
+        "NO_REQUEST_OBSERVED": "HTTP 발신 미관측",
+        "ANALYSIS_OBSERVED": "Analysis 발신 관측",
+        "VALIDATION_NOT_REPRODUCED": "Validation 발신 미재현",
+        "ACCESS_OBSERVED_POLICY_PENDING": "A/B 발신 관측 · 정책 대기",
+        "POLICY_MISMATCH": "정책 바인딩 불일치",
+        "ALLOWED_DESTINATION": "허용된 목적지",
+        "CONFIRMED_POLICY_VIOLATION": "정책 위반 독립 재현",
+        "PROVIDER_BLOCKED": "Receiver 장애",
+        "VALIDATION_BUDGET_INSUFFICIENT": "Validation 예산 부족",
+    }
+    lines = [
+        f"- URL 처리 Surface: {review.url_surface_count}",
+        "- 수동 분석 완료: " + ("예" if review.manual_analysis_completed else "아니오"),
+        "- 실행 승인 등록: " + ("예" if review.execution_approval_registered else "아니오"),
+        "- 승인 적용 Surface: "
+        + (_code(review.approved_surface_id) if review.approved_surface_id else "없음"),
+        "- Recon 단서 목적지 사용 승인: "
+        + ("예" if review.destination_hint_use_approved else "아니오"),
+        "- 목적지 정책 등록: " + ("예" if review.destination_policy_registered else "아니오"),
+        "- 목적지 정책 출처: "
+        + (_code(review.destination_policy_source) if review.destination_policy_source else "없음"),
+        "- 서버 요청 관측 기록: " + ("있음" if review.observation_recorded else "없음"),
+        "- 실제 확인 수행: " + ("수행" if review.verification_performed else "미수행"),
+        f"- Callback 전략: {_code(review.callback_status)} · "
+        f"{callback_labels[review.callback_status]}",
+        f"- Canary 전략: {_code(review.canary_status)} · "
+        f"{canary_labels[review.canary_status]}",
+        f"- Owned receiver 전략: {_code(review.owned_receiver_status)} · "
+        f"{owned_receiver_labels[review.owned_receiver_status]}",
+        f"- 최종 상태: {_code(review.final_status)}",
+        f"- Reason code: {_code(review.reason_code)}",
+        f"- 상태 해석: {result_labels[review.final_status]}",
+    ]
+    if review.final_status == "REVIEW_REQUIRED" and review.manual_analysis_completed:
+        lines.append(
+            "SSRF 분석: 운영자 검토 등록 / 서버 요청 확인: 미수행 / "
+            "결과: 운영자 검토 필요"
+        )
+    elif review.final_status == "REVIEW_REQUIRED":
+        lines.append(
+            "Recon URL 좌표 분류 완료 / 운영자 검토: 대기 / "
+            "서버 요청 확인: 미수행 / 결과: 아직 검사에 사용되지 않음"
+        )
+    else:
+        lines.append(f"- 결과: {result_labels[review.final_status]}")
+    return lines
+
+
+def _ssrf_reason(value: object, *, fallback: str) -> str:
+    """Normalize closed SSRF reason enums without copying free-form errors."""
+
+    text = getattr(value, "value", value)
+    if not isinstance(text, str) or not text:
+        return fallback
+    if text == ValidationReasonCode.CONFIRMED_PROOF.value:
+        return "ssrf_confirmed_destination_policy_violation"
+    if text == ValidationReasonCode.GENERIC_NO_PROOF.value:
+        return "ssrf_policy_evidence_pending"
+    if not text.startswith("ssrf_"):
+        text = "ssrf_" + text
+    return text if text.replace("_", "").isalnum() else fallback
+
+
+def build_ssrf_review_fact(
+    *, profile: RunExecutionProfile, candidates: Sequence, findings: Sequence[Finding],
+    run_evidence: Sequence[Evidence],
+) -> SsrfReviewFact | None:
+    """Build a URL-free SSRF status summary from closed store fields only."""
+
+    ssrf_candidates = [item for item in candidates if item.vulnerability_type == SSRF_TYPE]
+    callback_candidates = [
+        item for item in ssrf_candidates if is_ssrf_callback_candidate(item)
+    ]
+    canary_candidates = [
+        item for item in ssrf_candidates if is_ssrf_canary_candidate(item)
+    ]
+    owned_receiver_candidates = [
+        item for item in ssrf_candidates if is_ssrf_owned_receiver_candidate(item)
+    ]
+    callback_candidate_ids = {item.candidate_id for item in callback_candidates}
+    canary_candidate_ids = {item.candidate_id for item in canary_candidates}
+    owned_receiver_candidate_ids = {
+        item.candidate_id for item in owned_receiver_candidates
+    }
+    review_evidence = [
+        item for item in run_evidence
+        if item.observation.get("type") == "ssrf_url_fetch_review"
+    ]
+    active_results = [
+        item for item in run_evidence
+        if item.observation.get("type") == "ssrf_probe_result"
+    ]
+    callback_results = [
+        item for item in active_results
+        if item.observation.get("candidate_id") in callback_candidate_ids
+        or item.observation.get("strategy_id") in SSRF_CALLBACK_STRATEGIES
+        or (
+            item.observation.get("candidate_id") not in canary_candidate_ids
+            and item.observation.get("candidate_id") not in owned_receiver_candidate_ids
+            and item.observation.get("strategy_id") not in SSRF_CANARY_STRATEGIES
+            and item.observation.get("strategy_id")
+            not in SSRF_OWNED_RECEIVER_STRATEGIES
+            and item.observation.get("status")
+            in {"http", "dns", "no_hit", "provider_error"}
+        )
+    ]
+    canary_results = [
+        item for item in active_results
+        if item.observation.get("candidate_id") in canary_candidate_ids
+        or item.observation.get("strategy_id") in SSRF_CANARY_STRATEGIES
+        or item.observation.get("status") in {"controlled_marker", "no_marker"}
+    ]
+    owned_receiver_results = [
+        item for item in active_results
+        if item.observation.get("candidate_id") in owned_receiver_candidate_ids
+        or item.observation.get("strategy_id") in SSRF_OWNED_RECEIVER_STRATEGIES
+    ]
+    callback_http = [
+        item for item in run_evidence
+        if item.observation.get("type") == "ssrf_callback_http"
+    ]
+    canary_observations = [
+        item for item in run_evidence
+        if item.observation.get("ssrf_canary_marker_present") is True
+    ]
+    server_observations = [
+        item for item in run_evidence
+        if item.observation.get("type") == "ssrf_server_request_observation"
+    ]
+    owned_receiver_observations = [
+        item for item in server_observations
+        if item.observation.get("observation_mode") == "owned_receiver"
+    ]
+    owned_receiver_observation_ids = {
+        item.evidence_id for item in owned_receiver_observations
+    }
+    canary_server_observations = [
+        item for item in server_observations
+        if item.evidence_id not in owned_receiver_observation_ids
+    ]
+    assessments = [
+        item for item in run_evidence
+        if item.observation.get("type") == "ssrf_assessment_result"
+    ]
+    owned_receiver_assessments = [
+        item for item in assessments
+        if any(
+            evidence_id in owned_receiver_observation_ids
+            for evidence_id in item.observation.get("observation_evidence_ids", ())
+        )
+    ]
+    owned_receiver_assessment_ids = {
+        item.evidence_id for item in owned_receiver_assessments
+    }
+    canary_assessments = [
+        item for item in assessments
+        if item.evidence_id not in owned_receiver_assessment_ids
+    ]
+    relevant = bool(
+        review_evidence or ssrf_candidates or active_results or callback_http
+        or canary_observations or server_observations or assessments
+    )
+    if not relevant and not (
+        profile.recorded and getattr(profile, "ssrf_analysis_mode", "") == "passive"
+    ):
+        return None
+
+    surface_ids = {
+        item.surface_id for item in review_evidence if item.surface_id is not None
+    } or {item.surface_id for item in ssrf_candidates}
+    # Recon classifies coordinates; only the central registration record shows
+    # that an operator actually completed the review in this Run.
+    registrations = [
+        item for item in run_evidence
+        if item.created_by == "execution_runtime:ssrf_review_registry"
+        and item.observation.get("type") == "ssrf_review_registration"
+    ]
+    manual_completed = bool(registrations)
+    approved_surface_ids = {
+        item.surface_id for item in registrations if item.surface_id is not None
+    }
+    approved_surface_id = (
+        next(iter(approved_surface_ids)) if len(approved_surface_ids) == 1 else ""
+    )
+    destination_hint_use_approved = any(
+        item.observation.get("hint_use_approved") is True
+        for item in registrations
+    )
+    observation_recorded = bool(
+        callback_http or canary_observations or server_observations
+    ) or any(
+        item.observation.get("observation_recorded") is True
+        for item in review_evidence
+    )
+    active_probe_performed = any(
+        item.observation.get("status") != "provider_error"
+        or bool(item.observation.get("probe_evidence_id"))
+        for item in active_results
+    )
+    verification_performed = bool(
+        active_probe_performed
+        or callback_http
+        or canary_observations
+        or server_observations
+    ) or any(
+        item.observation.get("verification_performed") is True
+        for item in review_evidence
+    )
+    approval_registered = bool(
+        getattr(profile, "ssrf_execution_approval_registered", False)
+        or approved_surface_id
+    )
+    policy_registered = bool(
+        getattr(profile, "ssrf_destination_policy_registered", False)
+    )
+    source = getattr(profile, "ssrf_destination_policy_source", None)
+    policy_source = getattr(source, "value", source) if source is not None else ""
+    if not isinstance(policy_source, str):
+        policy_source = ""
+
+    callback_reasons = {
+        _ssrf_reason(item.validation_reason_code, fallback="ssrf_manual_review_required")
+        for item in callback_candidates if item.validation_reason_code is not None
+    }
+    canary_reasons = {
+        _ssrf_reason(item.validation_reason_code, fallback="ssrf_manual_review_required")
+        for item in canary_candidates if item.validation_reason_code is not None
+    }
+    owned_receiver_reasons = {
+        _ssrf_reason(item.validation_reason_code, fallback="ssrf_manual_review_required")
+        for item in owned_receiver_candidates
+        if item.validation_reason_code is not None
+    }
+    reasons = callback_reasons | canary_reasons | owned_receiver_reasons
+    evidence_reasons = {
+        _ssrf_reason(
+            item.observation.get("reason_code"), fallback="ssrf_manual_review_required",
+        )
+        for item in review_evidence
+    }
+    reasons.update(evidence_reasons)
+    canary_assessment_reasons = {
+        _ssrf_reason(
+            item.observation.get("reason_code"), fallback="ssrf_manual_review_required",
+        )
+        for item in canary_assessments
+    }
+    owned_assessment_reasons = {
+        _ssrf_reason(
+            item.observation.get("reason_code"), fallback="ssrf_manual_review_required",
+        )
+        for item in owned_receiver_assessments
+    }
+    reasons.update(canary_assessment_reasons)
+    reasons.update(owned_assessment_reasons)
+    canary_reasons.update(canary_assessment_reasons)
+    owned_receiver_reasons.update(owned_assessment_reasons)
+    callback_provider_blocked = any(
+        item.observation.get("status") == "provider_error" for item in callback_results
+    ) or "ssrf_callback_provider_unavailable" in callback_reasons
+    callback_budget_blocked = any(
+        item.status is CandidateStatus.SKIPPED_BUDGET
+        or item.validation_reason_code is ValidationReasonCode.SSRF_PROOF_BUDGET_EXHAUSTED
+        for item in callback_candidates
+    )
+    canary_budget_blocked = any(
+        item.status is CandidateStatus.SKIPPED_BUDGET
+        or item.validation_reason_code is ValidationReasonCode.SSRF_PROOF_BUDGET_EXHAUSTED
+        for item in canary_candidates
+    ) or "ssrf_request_budget_unavailable" in canary_reasons
+    owned_receiver_budget_blocked = any(
+        item.status is CandidateStatus.SKIPPED_BUDGET
+        or item.validation_reason_code is ValidationReasonCode.SSRF_PROOF_BUDGET_EXHAUSTED
+        for item in owned_receiver_candidates
+    ) or "ssrf_request_budget_unavailable" in owned_receiver_reasons
+    observation_provider_blocked = "ssrf_provider_unavailable" in reasons
+    owned_receiver_provider_blocked = any(
+        item.observation.get("status") == "provider_error"
+        for item in owned_receiver_results
+    ) or "ssrf_owned_receiver_unavailable" in owned_receiver_reasons
+    explicit_approval_pending = "ssrf_execution_approval_missing" in reasons
+    owned_receiver_confirmed = any(
+        item.status is CandidateStatus.CONFIRMED
+        for item in owned_receiver_candidates
+    ) or any(
+        item.observation.get("verdict") == "confirmed"
+        for item in owned_receiver_assessments
+    )
+    canary_confirmed = any(
+        item.status is CandidateStatus.CONFIRMED for item in canary_candidates
+    ) or any(
+        item.observation.get("verdict") == "confirmed"
+        for item in canary_assessments
+    )
+
+    callback_configured = bool(
+        callback_candidates or callback_results or callback_http
+        or getattr(profile, "ssrf_oast_mode", "off") != "off"
+    )
+    analysis_callback_observed = any(
+        item.validation_id is None for item in callback_http
+    ) or any(
+        item.observation.get("status") == "http" for item in callback_results
+    )
+    validation_callback_observed = any(
+        item.validation_id is not None for item in callback_http
+    )
+    callback_reproduced = (
+        analysis_callback_observed and validation_callback_observed
+    ) or "ssrf_callback_only" in callback_reasons
+    callback_not_observed = any(
+        item.observation.get("status") in {"dns", "no_hit"}
+        for item in callback_results
+    ) or bool(callback_reasons & {
+        "ssrf_callback_not_observed", "ssrf_probe_signal_not_reproduced",
+    })
+    if callback_reproduced:
+        callback_status = "VALIDATION_REPRODUCED"
+    elif callback_provider_blocked:
+        callback_status = "PROVIDER_BLOCKED"
+    elif callback_budget_blocked:
+        callback_status = "VALIDATION_BUDGET_INSUFFICIENT"
+    elif analysis_callback_observed and "ssrf_callback_not_observed" in callback_reasons:
+        callback_status = "VALIDATION_NOT_REPRODUCED"
+    elif analysis_callback_observed:
+        callback_status = "ANALYSIS_OBSERVED"
+    elif callback_not_observed:
+        callback_status = "NO_HTTP_CALLBACK"
+    elif callback_configured:
+        callback_status = "NOT_RUN"
+    else:
+        callback_status = "NOT_CONFIGURED"
+
+    policy_mismatch_reasons = (
+        "ssrf_destination_policy_mismatch",
+        "ssrf_destination_policy_surface_mismatch",
+        "ssrf_destination_policy_origin_mismatch",
+        "ssrf_destination_policy_evidence_invalid",
+    )
+    policy_mismatch_reason = next(
+        (item for item in policy_mismatch_reasons if item in canary_reasons), None,
+    )
+    canary_analysis_observed = any(
+        item.observation.get("status") == "controlled_marker"
+        for item in canary_results
+    ) or any(
+        item.validation_id is None
+        for item in (*canary_observations, *canary_server_observations)
+    )
+    canary_validation_observed = any(
+        item.validation_id is not None for item in canary_observations
+    ) or any(
+        item.validation_id is not None for item in canary_server_observations
+    )
+    canary_configured = bool(
+        canary_candidates or canary_results or canary_observations
+        or canary_server_observations or canary_assessments
+    )
+    if (
+        canary_confirmed
+        and policy_registered
+        and canary_analysis_observed
+        and canary_validation_observed
+    ):
+        canary_status = "CONFIRMED_POLICY_VIOLATION"
+    elif "ssrf_destination_policy_allows_access" in canary_reasons:
+        canary_status = "ALLOWED_DESTINATION"
+    elif policy_mismatch_reason is not None:
+        canary_status = "POLICY_MISMATCH"
+    elif (
+        "ssrf_destination_policy_missing" in canary_reasons
+        or "ssrf_server_request_observed_without_destination_policy" in canary_reasons
+        or (canary_analysis_observed and canary_validation_observed and not policy_registered)
+    ):
+        canary_status = "ACCESS_OBSERVED_POLICY_PENDING"
+    elif (
+        "ssrf_canary_not_reproduced" in canary_reasons
+        or "ssrf_independent_observation_missing" in canary_reasons
+    ):
+        canary_status = "VALIDATION_NOT_REPRODUCED"
+    elif canary_analysis_observed:
+        canary_status = "ANALYSIS_OBSERVED"
+    elif any(item.observation.get("status") == "no_marker" for item in canary_results) or (
+        "ssrf_canary_analysis_not_established" in canary_reasons
+        or "ssrf_no_server_request_observed" in canary_reasons
+    ):
+        canary_status = "NO_CANARY_MARKER"
+    elif canary_budget_blocked:
+        canary_status = "VALIDATION_BUDGET_INSUFFICIENT"
+    elif observation_provider_blocked:
+        canary_status = "PROVIDER_BLOCKED"
+    elif explicit_approval_pending:
+        canary_status = "EXECUTION_APPROVAL_PENDING"
+    elif canary_configured:
+        canary_status = "NOT_RUN"
+    else:
+        canary_status = "NOT_CONFIGURED"
+
+    owned_policy_mismatch_reason = next(
+        (
+            item for item in policy_mismatch_reasons
+            if item in owned_receiver_reasons
+        ),
+        None,
+    )
+    owned_analysis_observed = any(
+        item.observation.get("status") == "owned_request_observed"
+        for item in owned_receiver_results
+    ) or any(
+        item.validation_id is None for item in owned_receiver_observations
+    )
+    owned_validation_observed = any(
+        item.validation_id is not None for item in owned_receiver_observations
+    )
+    owned_configured = bool(
+        owned_receiver_candidates or owned_receiver_results
+        or owned_receiver_observations or owned_receiver_assessments
+    )
+    if (
+        owned_receiver_confirmed
+        and policy_registered
+        and owned_analysis_observed
+        and owned_validation_observed
+    ):
+        owned_receiver_status = "CONFIRMED_POLICY_VIOLATION"
+    elif "ssrf_destination_policy_allows_access" in owned_receiver_reasons:
+        owned_receiver_status = "ALLOWED_DESTINATION"
+    elif owned_policy_mismatch_reason is not None:
+        owned_receiver_status = "POLICY_MISMATCH"
+    elif (
+        "ssrf_server_request_observed_without_destination_policy"
+        in owned_receiver_reasons
+        or "ssrf_owned_receiver_only" in owned_receiver_reasons
+        or (
+            owned_analysis_observed and owned_validation_observed
+            and not policy_registered
+        )
+    ):
+        owned_receiver_status = "ACCESS_OBSERVED_POLICY_PENDING"
+    elif (
+        "ssrf_owned_receiver_not_observed" in owned_receiver_reasons
+        and owned_analysis_observed
+    ):
+        owned_receiver_status = "VALIDATION_NOT_REPRODUCED"
+    elif owned_analysis_observed:
+        owned_receiver_status = "ANALYSIS_OBSERVED"
+    elif any(
+        item.observation.get("status") == "no_hit"
+        for item in owned_receiver_results
+    ) or "ssrf_owned_receiver_not_observed" in owned_receiver_reasons:
+        owned_receiver_status = "NO_REQUEST_OBSERVED"
+    elif owned_receiver_budget_blocked:
+        owned_receiver_status = "VALIDATION_BUDGET_INSUFFICIENT"
+    elif owned_receiver_provider_blocked:
+        owned_receiver_status = "PROVIDER_BLOCKED"
+    elif owned_configured:
+        owned_receiver_status = "NOT_RUN"
+    else:
+        owned_receiver_status = "NOT_CONFIGURED"
+
+    # Overall status is a convenience summary only. Preserve both strategy
+    # states above, and prefer a positive observation/policy result over an
+    # unrelated strategy outage or budget block.
+    if (
+        canary_status == "CONFIRMED_POLICY_VIOLATION"
+        or owned_receiver_status == "CONFIRMED_POLICY_VIOLATION"
+    ):
+        final_status = "CONFIRMED_POLICY_VIOLATION"
+        reason_code = "ssrf_confirmed_destination_policy_violation"
+    elif canary_status == "ACCESS_OBSERVED_POLICY_PENDING":
+        if "ssrf_server_request_observed_without_destination_policy" in canary_reasons:
+            final_status = "POLICY_EVIDENCE_PENDING"
+            reason_code = "ssrf_server_request_observed_without_destination_policy"
+        else:
+            final_status = "CANARY_OBSERVED_POLICY_PENDING"
+            reason_code = "ssrf_policy_evidence_pending"
+    elif canary_status == "POLICY_MISMATCH":
+        final_status = "POLICY_EVIDENCE_PENDING"
+        reason_code = policy_mismatch_reason or "ssrf_policy_evidence_pending"
+    elif owned_receiver_status == "ACCESS_OBSERVED_POLICY_PENDING":
+        final_status = "OWNED_RECEIVER_OBSERVED_POLICY_PENDING"
+        reason_code = "ssrf_owned_receiver_only"
+    elif owned_receiver_status == "POLICY_MISMATCH":
+        final_status = "POLICY_EVIDENCE_PENDING"
+        reason_code = (
+            owned_policy_mismatch_reason or "ssrf_policy_evidence_pending"
+        )
+    elif callback_status == "VALIDATION_REPRODUCED":
+        final_status = "CALLBACK_OBSERVED"
+        reason_code = "ssrf_callback_only"
+    elif canary_status == "ANALYSIS_OBSERVED":
+        final_status = "CANARY_ANALYSIS_OBSERVED"
+        reason_code = "ssrf_canary_analysis_observed"
+    elif callback_status == "ANALYSIS_OBSERVED":
+        final_status = "CALLBACK_ANALYSIS_OBSERVED"
+        reason_code = "ssrf_callback_analysis_observed"
+    elif owned_receiver_status == "ANALYSIS_OBSERVED":
+        final_status = "OWNED_RECEIVER_ANALYSIS_OBSERVED"
+        reason_code = "ssrf_owned_receiver_analysis_observed"
+    elif (
+        canary_status == "ALLOWED_DESTINATION"
+        or owned_receiver_status == "ALLOWED_DESTINATION"
+    ):
+        final_status = "ALLOWED_DESTINATION"
+        reason_code = "ssrf_destination_policy_allows_access"
+    elif canary_status in {"VALIDATION_NOT_REPRODUCED", "NO_CANARY_MARKER"}:
+        final_status = "CANARY_NOT_REPRODUCED"
+        reason_code = (
+            "ssrf_canary_not_reproduced"
+            if canary_status == "VALIDATION_NOT_REPRODUCED"
+            else "ssrf_canary_analysis_not_established"
+        )
+    elif callback_status == "VALIDATION_NOT_REPRODUCED":
+        final_status = "CALLBACK_NOT_REPRODUCED"
+        reason_code = "ssrf_callback_not_observed"
+    elif callback_status == "NO_HTTP_CALLBACK":
+        final_status = "CALLBACK_NOT_OBSERVED"
+        reason_code = "ssrf_callback_not_observed"
+    elif owned_receiver_status == "VALIDATION_NOT_REPRODUCED":
+        final_status = "OWNED_RECEIVER_NOT_REPRODUCED"
+        reason_code = "ssrf_owned_receiver_not_observed"
+    elif owned_receiver_status == "NO_REQUEST_OBSERVED":
+        final_status = "OWNED_RECEIVER_NOT_OBSERVED"
+        reason_code = "ssrf_owned_receiver_not_observed"
+    elif canary_status == "VALIDATION_BUDGET_INSUFFICIENT" or (
+        callback_status == "VALIDATION_BUDGET_INSUFFICIENT"
+        or owned_receiver_status == "VALIDATION_BUDGET_INSUFFICIENT"
+    ):
+        final_status = "VALIDATION_BUDGET_INSUFFICIENT"
+        reason_code = "ssrf_proof_budget_exhausted"
+    elif canary_status == "PROVIDER_BLOCKED":
+        final_status = "OBSERVATION_PROVIDER_BLOCKED"
+        reason_code = "ssrf_provider_unavailable"
+    elif callback_status == "PROVIDER_BLOCKED":
+        final_status = "CALLBACK_PROVIDER_BLOCKED"
+        reason_code = "ssrf_callback_provider_unavailable"
+    elif owned_receiver_status == "PROVIDER_BLOCKED":
+        final_status = "OWNED_RECEIVER_PROVIDER_BLOCKED"
+        reason_code = "ssrf_owned_receiver_unavailable"
+    elif canary_status == "EXECUTION_APPROVAL_PENDING":
+        final_status = "EXECUTION_APPROVAL_PENDING"
+        reason_code = "ssrf_execution_approval_missing"
+    elif review_evidence:
+        final_status = "REVIEW_REQUIRED"
+        reason_code = "ssrf_manual_review_required"
+    else:
+        final_status = "NOT_TESTED"
+        reason_code = "ssrf_not_tested"
+
+    return SsrfReviewFact(
+        url_surface_count=len(surface_ids),
+        manual_analysis_completed=manual_completed,
+        execution_approval_registered=approval_registered,
+        destination_policy_registered=policy_registered,
+        destination_policy_source=policy_source,
+        observation_recorded=observation_recorded,
+        verification_performed=verification_performed,
+        final_status=final_status,
+        reason_code=reason_code,
+        callback_status=callback_status,
+        canary_status=canary_status,
+        owned_receiver_status=owned_receiver_status,
+        destination_hint_use_approved=destination_hint_use_approved,
+        approved_surface_id=approved_surface_id,
+    )
 
 
 def render_report_v2(
@@ -135,6 +786,11 @@ def render_report_v2(
         # 같은 대상을 같은 조건으로 두 번 검사해도 절대 같아지지 않는다.
         f"- Facts SHA-256 (생성 ID 제외): `{comparable_report_facts_hash(facts)}`", "",
         *_execution_lines(execution),
+        "## SSRF review", "",
+        *_ssrf_review_lines(facts.ssrf_review), "",
+        "## SSRF 보조 사실", "",
+        f"- Callback 표면: {len(facts.ssrf_callback_surfaces)}",
+        f"- Recon 내부 목적지 단서: {facts.ssrf_destination_hint_count}", "",
         "## 검사 범위 및 요청 예산", "",
         f"- 발견 Surface: {number(facts.surface_count)}",
         f"- 발견 파라미터 수 (Surface별 중복 제거): {number(facts.parameter_count)}",
@@ -167,6 +823,22 @@ def render_report_v2(
     for status, explanation in explanations:
         if counts[status]:
             lines.append(f"- {explanation}: {counts[status]}개")
+    if facts.ssrf_callback_surfaces:
+        lines.extend([
+            "", "## SSRF callback 표면", "",
+            "동일 입력 좌표에서 Analysis와 독립 Validation의 HTTP callback이 재현됐습니다.",
+            "이는 재현 가능한 서버 요청 표면을 증명하지만, 목적지 규칙 위반을 증명하지 않으므로 확정 Finding 개수에 포함되지 않습니다.", "",
+        ])
+        for item in facts.ssrf_callback_surfaces:
+            lines.extend([
+                "### Callback 반응 재현", "",
+                f"- Fact: {_code(item.fact_id)}",
+                f"- 경로 (일반화): {_code(item.surface_path_hint)}",
+                f"- Analysis HTTP callback: {item.analysis_http_callbacks}",
+                f"- Validation HTTP callback: {item.validation_http_callbacks}",
+                "- 발신 주체 귀속: 독립적으로 확인되지 않음",
+                "- 다음 검증: 운영자 승인 목적지 규칙 또는 읽기 전용 엔드포인트 필요", "",
+            ])
     if unrouted_post_surface_count:
         lines.extend([
             "", "## 검사 불가 범위", "",
@@ -287,7 +959,42 @@ class MarkdownReportAgent:
             raise ValueError("collecting report facts requires candidate, surface and run stores")
         run = self._runs.get(task.run_id)
         surfaces = self._surfaces.list_by_run(task.run_id)
-        counts = Counter(candidate.status for candidate in self._candidates.list_by_run(task.run_id))
+        candidates = self._candidates.list_by_run(task.run_id)
+        counts = Counter(candidate.status for candidate in candidates)
+        run_evidence = self._evidence.list_by_run(task.run_id)
+        callback_surface_ids = {
+            candidate.surface_id
+            for candidate in candidates
+            if candidate.vulnerability_type == SSRF_TYPE
+            and candidate.status is CandidateStatus.SUSPECTED
+            and candidate.validation_reason_code is ValidationReasonCode.SSRF_CALLBACK_ONLY
+        }
+        callback_facts: list[SsrfCallbackSurfaceFact] = []
+        for surface_id in callback_surface_ids:
+            callbacks = [
+                item for item in run_evidence
+                if item.surface_id == surface_id
+                and item.created_by == "execution_runtime:ssrf_callback"
+                and item.observation.get("type") == "ssrf_callback_http"
+            ]
+            analysis_count = sum(item.validation_id is None for item in callbacks)
+            validation_count = sum(item.validation_id is not None for item in callbacks)
+            if not analysis_count or not validation_count:
+                continue
+            callback_facts.append(SsrfCallbackSurfaceFact(
+                fact_id=ssrf_callback_surface_fact_id(surface_id),
+                surface_path_hint=surface_path_hint(
+                    self._surfaces.get(task.run_id, surface_id).url
+                ),
+                analysis_http_callbacks=analysis_count,
+                validation_http_callbacks=validation_count,
+            ))
+        destination_hint_keys = {
+            str(item.observation.get("destination_fingerprint") or item.evidence_id)
+            for item in run_evidence
+            if item.created_by == "recon"
+            and item.observation.get("type") == SSRF_DESTINATION_HINT_TYPE
+        }
         used = None
         if self._budget is not None:
             try:
@@ -301,6 +1008,14 @@ class MarkdownReportAgent:
             run_id=task.run_id,
             format_version="v2",
             candidate_counts=tuple((status, counts[status]) for status in CandidateStatus),
+            ssrf_callback_surfaces=tuple(callback_facts),
+            ssrf_destination_hint_count=len(destination_hint_keys),
+            ssrf_review=build_ssrf_review_fact(
+                profile=run.execution_profile,
+                candidates=candidates,
+                findings=findings,
+                run_evidence=run_evidence,
+            ),
             findings=tuple(
                 FindingReportFact(
                     fact_id=finding_fact_id(finding.finding_id),

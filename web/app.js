@@ -76,6 +76,9 @@ let activity = [];
 let running = false;
 let timer = null;
 const expandedFindingGroups = new Set();
+let ssrfReviewSubmitting = false;
+let currentRunId = '';
+let currentSsrfReviewHints = [];
 
 /* ------------------------------------------------------------------ 포맷터 */
 
@@ -312,11 +315,174 @@ function renderMetrics(state) {
   $('m-parameters').textContent = `${snapshot.parameter_count} parameters`;
   $('m-budget-used').textContent = pad2(snapshot.budget_used);
   $('m-budget-total').textContent = `${snapshot.budget_total} budget`;
+  const callback = $('m-ssrf-callback');
+  const callbackCalls = (snapshot.ssrf_issue_calls || 0) + (snapshot.ssrf_poll_calls || 0);
+  const oastMode = state.ssrf_oast || 'off';
+  callback.hidden = oastMode === 'off' && !callbackCalls;
+  callback.textContent = callback.hidden ? ''
+    : `SSRF ${oastMode}: ${snapshot.ssrf_issue_calls || 0} issue · ${snapshot.ssrf_poll_calls || 0} poll · ${snapshot.ssrf_analysis_http_hits || 0}/${snapshot.ssrf_validation_http_hits || 0} A/B HTTP`;
   $('m-findings').textContent = pad2(state.findings_total);
   $('m-awaiting').textContent = String(countByStatus(state, ['routed', 'analyzed']));
   $('nav-findings-count').textContent = String(state.findings_total);
   $('run-id').textContent = state.run_id ? state.run_id.slice(0, 8) : '—';
   $('current-agent').textContent = agentLabel(state.current_agent) || '—';
+}
+
+function renderSsrfReview(state) {
+  const review = state.ssrf_review || {};
+  const completed = review.manual_analysis_completed === true;
+  const observed = review.observation_recorded === true;
+  const verified = review.verification_performed === true;
+  const approval = review.execution_approval_registered === true;
+  const policy = review.destination_policy_registered === true;
+  const policySource = policy && review.destination_policy_source
+    ? `registered (${review.destination_policy_source})` : 'not registered';
+  const statusLabels = {
+    NOT_TESTED: 'Not tested',
+    REVIEW_REQUIRED: '운영자 검토 필요',
+    CALLBACK_OBSERVED: 'Callback observed; policy violation not proven',
+    CANARY_OBSERVED_POLICY_PENDING: 'Canary observed; policy evidence pending',
+    CONFIRMED_POLICY_VIOLATION: 'Destination policy violation reproduced',
+    CALLBACK_PROVIDER_BLOCKED: 'Callback provider blocked',
+    OBSERVATION_PROVIDER_BLOCKED: 'Verification observation unavailable',
+    EXECUTION_APPROVAL_PENDING: 'Execution approval pending',
+    POLICY_EVIDENCE_PENDING: 'Destination policy evidence pending',
+    VALIDATION_BUDGET_INSUFFICIENT: 'Validation budget insufficient',
+    ALLOWED_DESTINATION: 'Allowed destination; normal behavior',
+    CALLBACK_NOT_OBSERVED: 'Callback HTTP not observed',
+    CALLBACK_ANALYSIS_OBSERVED: 'Callback observed in Analysis; validation pending',
+    CALLBACK_NOT_REPRODUCED: 'Callback not independently reproduced',
+    CANARY_ANALYSIS_OBSERVED: 'Canary observed in Analysis; validation pending',
+    CANARY_NOT_REPRODUCED: 'Canary not independently reproduced',
+    OWNED_RECEIVER_OBSERVED_POLICY_PENDING: 'Owned receiver A/B observed; policy pending',
+    OWNED_RECEIVER_ANALYSIS_OBSERVED: 'Owned receiver observed in Analysis; validation pending',
+    OWNED_RECEIVER_NOT_REPRODUCED: 'Owned receiver request not independently reproduced',
+    OWNED_RECEIVER_NOT_OBSERVED: 'Owned receiver request not observed',
+    OWNED_RECEIVER_PROVIDER_BLOCKED: 'Owned receiver unavailable',
+  };
+  const callbackLabels = {
+    NOT_CONFIGURED: 'not configured', NOT_RUN: 'not run',
+    NO_HTTP_CALLBACK: 'HTTP callback not observed',
+    ANALYSIS_OBSERVED: 'analysis callback observed',
+    VALIDATION_REPRODUCED: 'A/B callback reproduced',
+    VALIDATION_NOT_REPRODUCED: 'validation callback not reproduced',
+    PROVIDER_BLOCKED: 'provider blocked',
+    VALIDATION_BUDGET_INSUFFICIENT: 'validation budget insufficient',
+  };
+  const canaryLabels = {
+    NOT_CONFIGURED: 'not configured', NOT_RUN: 'not run',
+    NO_CANARY_MARKER: 'marker not observed', ANALYSIS_OBSERVED: 'analysis observed',
+    VALIDATION_NOT_REPRODUCED: 'validation not reproduced',
+    ACCESS_OBSERVED_POLICY_PENDING: 'access observed; policy pending',
+    POLICY_MISMATCH: 'policy binding mismatch',
+    ALLOWED_DESTINATION: 'allowed destination',
+    CONFIRMED_POLICY_VIOLATION: 'policy violation reproduced',
+    PROVIDER_BLOCKED: 'provider blocked', EXECUTION_APPROVAL_PENDING: 'approval pending',
+    VALIDATION_BUDGET_INSUFFICIENT: 'validation budget insufficient',
+  };
+  const ownedReceiverLabels = {
+    NOT_CONFIGURED: 'not configured', NOT_RUN: 'not run',
+    NO_REQUEST_OBSERVED: 'HTTP request not observed',
+    ANALYSIS_OBSERVED: 'analysis request observed',
+    VALIDATION_NOT_REPRODUCED: 'validation request not reproduced',
+    ACCESS_OBSERVED_POLICY_PENDING: 'A/B request observed; policy pending',
+    POLICY_MISMATCH: 'policy binding mismatch',
+    ALLOWED_DESTINATION: 'allowed destination',
+    CONFIRMED_POLICY_VIOLATION: 'policy violation reproduced',
+    PROVIDER_BLOCKED: 'receiver blocked',
+    VALIDATION_BUDGET_INSUFFICIENT: 'validation budget insufficient',
+  };
+  $('ssrf-review-surfaces').textContent = String(review.url_surface_count || 0);
+  $('ssrf-review-hints').textContent = `${review.destination_hint_count || 0} hints (${review.destination_hint_use_approved === true ? 'selected hint exact-bound and approved' : 'not used for probing'})`;
+  const approvedSurface = review.approved_surface_id || 'none';
+  $('ssrf-review-policy').textContent = `${approval ? 'approval registered' : 'approval not registered'} (surface: ${approvedSurface}) / ${policySource}`;
+  $('ssrf-review-verification').textContent = `${observed ? 'recorded' : 'not observed'} / ${verified ? 'performed' : 'not performed'}`;
+  const callbackStatus = review.callback_status || 'NOT_CONFIGURED';
+  const canaryStatus = review.canary_status || 'NOT_CONFIGURED';
+  const ownedReceiverStatus = review.owned_receiver_status || 'NOT_CONFIGURED';
+  $('ssrf-review-status').textContent = `${review.final_status || 'NOT_TESTED'} · callback: ${callbackLabels[callbackStatus] || callbackStatus} · canary: ${canaryLabels[canaryStatus] || canaryStatus} · owned receiver: ${ownedReceiverLabels[ownedReceiverStatus] || ownedReceiverStatus}`;
+  $('ssrf-review-reason').textContent = review.reason_code || 'ssrf_not_tested';
+  $('ssrf-review-summary').textContent = !observed && review.url_surface_count
+    ? `Recon URL 좌표 분류 완료 / 운영자 검토: ${completed ? '등록 완료' : '대기'} / 서버 요청 확인: 미수행`
+    : `SSRF analysis: ${completed ? 'operator review registered' : 'not assessed'} / result: ${statusLabels[review.final_status] || 'operator review required'}`;
+
+  if (!observed && review.url_surface_count) {
+    $('ssrf-review-summary').textContent = completed
+      ? 'SSRF 분석: 운영자 검토 등록 / 서버 요청 확인: 미수행 / 결과: 운영자 검토 필요'
+      : 'Recon URL 좌표 분류 완료 / 운영자 검토: 대기 / 서버 요청 확인: 미수행 / 결과: 아직 검사에 사용되지 않음';
+  }
+
+  const pending = state.ssrf_review_pending === true;
+  const form = $('ssrf-review-form');
+  form.hidden = !pending;
+  if (!pending) return;
+
+  const options = state.ssrf_review_options || {};
+  const ownedReceiverAvailable = options.owned_receiver_available === true;
+  $('ssrf-review-owned-receiver-row').hidden = !ownedReceiverAvailable;
+  if (!ownedReceiverAvailable) $('ssrf-review-owned-receiver').checked = false;
+  fillSsrfReviewSurfaces(Array.isArray(options.surfaces) ? options.surfaces : []);
+  currentSsrfReviewHints = Array.isArray(options.hints) ? options.hints : [];
+  fillSsrfReviewHints(currentSsrfReviewHints);
+  syncSsrfPolicyFields();
+  $('ssrf-review-register').disabled = ssrfReviewSubmitting || !$('ssrf-review-surface').value;
+  $('ssrf-review-skip').disabled = ssrfReviewSubmitting;
+}
+
+function safeReviewPath(value) {
+  const raw = String(value || '/');
+  let path;
+  try {
+    path = new URL(raw).pathname || '/';
+  } catch (_error) {
+    path = raw.split(/[?#]/, 1)[0] || '/';
+  }
+  return path
+    .replace(/\/(token|secret|api[-_]?key|credential)\/[^/]*/gi, '/$1/{redacted}')
+    .replace(/\/[^/]*%[0-9a-f]{2}[^/]*/gi, '/{redacted}')
+    .replace(/\/[0-9a-f]{8}-[0-9a-f-]{27,}/gi, '/{redacted}')
+    .replace(/\/[A-Za-z0-9_-]{40,}(?=\/|$)/g, '/{redacted}');
+}
+
+function safeReviewOrigin(value) {
+  try {
+    return new URL(String(value)).origin;
+  } catch (_error) {
+    return 'sanitized destination';
+  }
+}
+
+function fillSsrfReviewSurfaces(surfaces) {
+  const select = $('ssrf-review-surface');
+  const selected = select.value;
+  select.replaceChildren();
+  const prompt = new Option('Select an exact Surface and parameter', '');
+  prompt.disabled = true;
+  select.append(prompt);
+  for (const surface of surfaces) {
+    if (!surface?.surface_id || !surface?.parameter) continue;
+    const option = new Option();
+    option.value = JSON.stringify([String(surface.surface_id), String(surface.parameter)]);
+    option.textContent = `${safeReviewPath(surface.path)} · ${surface.parameter} · ${surface.source || 'observed'}`;
+    option.dataset.surfaceId = String(surface.surface_id);
+    option.dataset.parameter = String(surface.parameter);
+    select.append(option);
+  }
+  select.value = [...select.options].some((option) => option.value === selected) ? selected : '';
+}
+
+function fillSsrfReviewHints(hints) {
+  const select = $('ssrf-review-hint');
+  const selected = select.value;
+  select.replaceChildren(new Option('No destination hint', ''));
+  for (const hint of hints) {
+    if (!hint?.evidence_id) continue;
+    const option = new Option();
+    option.value = String(hint.evidence_id);
+    option.textContent = `${safeReviewOrigin(hint.destination_origin)}${safeReviewPath(hint.path_hint)} · ${hint.source || 'observed'} · from ${safeReviewPath(hint.source_path)}`;
+    select.append(option);
+  }
+  if ([...select.options].some((option) => option.value === selected)) select.value = selected;
 }
 
 function renderFindings(state) {
@@ -370,7 +536,9 @@ function renderFindings(state) {
               `<td><span class="finding-name">${escapeHtml(type)}</span>` +
               `<span class="finding-path">${escapeHtml(surfaceLabel(item))}</span></td>` +
               `<td><span class="severity ${severity}">${severity[0].toUpperCase()}${severity.slice(1)}</span></td>` +
-              `<td><span class="finding-status ${klass}">${escapeHtml(label)}</span></td>` +
+              `<td><span class="finding-status ${klass}">${escapeHtml(label)}</span>` +
+              (item.vulnerability_type === 'SSRF' && item.reason
+                ? `<span class="finding-path">${escapeHtml(item.reason)}</span>` : '') + '</td>' +
               '</tr>'
             );
           })
@@ -469,10 +637,120 @@ function escapeHtml(value) {
 
 /* ------------------------------------------------------------------ 폴링 */
 
+function syncSsrfPolicyFields() {
+  const policyRequired = $('ssrf-review-rule').value !== 'unknown';
+  const policyPrefixes = {
+    operator_attestation: 'operator:',
+  };
+  for (const id of ['ssrf-review-policy-source', 'ssrf-review-source-reference']) {
+    $(id).disabled = ssrfReviewSubmitting || !policyRequired;
+  }
+  const reference = $('ssrf-review-source-reference');
+  const prefix = policyPrefixes[$('ssrf-review-policy-source').value] || '';
+  reference.required = policyRequired;
+  reference.placeholder = `${prefix}policy-id`;
+  reference.setCustomValidity(
+    policyRequired && !reference.value.trim().startsWith(prefix)
+      ? `Policy reference must start with ${prefix}` : ''
+  );
+  syncSsrfVerificationFields();
+}
+
+function syncSsrfVerificationFields() {
+  const url = $('ssrf-review-url');
+  const ownedReceiver = $('ssrf-review-owned-receiver').checked;
+  const internal = !ownedReceiver && !!url.value.trim();
+  const reference = $('ssrf-review-endpoint-ref');
+  url.disabled = ssrfReviewSubmitting || ownedReceiver;
+  reference.disabled = ssrfReviewSubmitting || internal || ownedReceiver;
+  reference.required = !internal && !ownedReceiver;
+  const consent = $('ssrf-review-consent');
+  if (!internal && !ownedReceiver) consent.checked = false;
+  consent.disabled = ssrfReviewSubmitting || (!internal && !ownedReceiver);
+  consent.required = internal || ownedReceiver;
+  const hintConsent = $('ssrf-review-hint-consent');
+  const hintSelected = !!$('ssrf-review-hint').value;
+  if (!internal || !hintSelected || ownedReceiver) hintConsent.checked = false;
+  hintConsent.disabled = ssrfReviewSubmitting || !internal || !hintSelected || ownedReceiver;
+  url.setCustomValidity('');
+}
+
+function setSsrfReviewBusy(busy) {
+  ssrfReviewSubmitting = busy;
+  for (const control of $('ssrf-review-form').querySelectorAll('button, input, select')) {
+    control.disabled = busy;
+  }
+  if (!busy) {
+    syncSsrfPolicyFields();
+    $('ssrf-review-register').disabled = !$('ssrf-review-surface').value;
+  }
+}
+
+async function submitSsrfReview(action) {
+  const form = $('ssrf-review-form');
+  const surface = $('ssrf-review-surface').selectedOptions[0];
+  if (action === 'register' && !form.reportValidity()) return;
+
+  const rule = $('ssrf-review-rule').value;
+  const payload = action === 'skip' ? { action, run_id: currentRunId } : {
+    action, run_id: currentRunId,
+    surface_id: surface?.dataset.surfaceId || '',
+    parameter: surface?.dataset.parameter || '',
+    hint_evidence_id: $('ssrf-review-hint').value,
+    verification_endpoint_ref: ($('ssrf-review-url').value.trim() || $('ssrf-review-owned-receiver').checked)
+      ? '' : $('ssrf-review-endpoint-ref').value.trim(),
+    verification_url: $('ssrf-review-owned-receiver').checked
+      ? '' : $('ssrf-review-url').value.trim(),
+    use_owned_receiver: $('ssrf-review-owned-receiver').checked,
+    execution_consent: $('ssrf-review-consent').checked,
+    hint_use_approved: $('ssrf-review-hint-consent').checked,
+    approved_by: $('ssrf-review-approved-by').value.trim(),
+    destination_rule: rule,
+    policy_source: rule === 'unknown' ? '' : $('ssrf-review-policy-source').value,
+    source_reference: rule === 'unknown' ? '' : $('ssrf-review-source-reference').value.trim(),
+  };
+
+  const feedback = $('ssrf-review-feedback');
+  feedback.classList.remove('is-error');
+  feedback.textContent = action === 'skip' ? 'Skipping review…' : 'Registering review…';
+  setSsrfReviewBusy(true);
+  try {
+    const response = await fetch('/api/ssrf-review', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Hacklipse-CSRF': config.csrf_token || '',
+      },
+      body: JSON.stringify(payload),
+    });
+    let result = {};
+    try {
+      result = await response.json();
+    } catch (_error) {
+      // An empty success response is valid; failures still retain their HTTP status below.
+    }
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    $('ssrf-review-url').value = '';
+    $('ssrf-review-consent').checked = false;
+    $('ssrf-review-hint-consent').checked = false;
+    $('ssrf-review-owned-receiver').checked = false;
+    feedback.textContent = action === 'skip'
+      ? 'Review skipped.' : 'Execution approval and optional policy recorded.';
+    schedule(100);
+  } catch (error) {
+    feedback.classList.add('is-error');
+    feedback.textContent = `Review request failed: ${error.message}`;
+  } finally {
+    setSsrfReviewBusy(false);
+  }
+}
+
 function render(state) {
+  currentRunId = state.run_id || '';
   running = state.status === 'running';
   renderStatus(state);
   renderMetrics(state);
+  renderSsrfReview(state);
   renderPipeline(state);
   renderFindings(state);
   renderValidation(state);
@@ -575,7 +853,7 @@ async function start() {
     $('start-btn').disabled = false;
     /* 무엇을 채워야 하는지 바로 보여준다. 사유만 띄우고 칸을 숨겨두지 않는다. */
     const blank = [...document.querySelectorAll('[data-secret]')].find(
-      (input) => !input.value.trim()
+      (input) => !['ssrf_interactsh_callback_domain', 'interactsh_token'].includes(input.dataset.secret) && !input.value.trim()
     );
     if (blank) {
       openSetup();
@@ -606,6 +884,11 @@ const CREDENTIAL_FIELDS = {
   ],
   ssti: [['ssti_token', 'SSTI token Cookie', 'password']],
   db: [['juice_shop_db', 'juiceshop.sqlite 경로', 'text']],
+  private_oast: [
+    ['ssrf_interactsh_server', '사설 Interactsh HTTPS 서버', 'text'],
+    ['ssrf_interactsh_callback_domain', 'Callback 도메인 (선택)', 'text'],
+    ['interactsh_token', '보호 서버 token (선택)', 'password'],
+  ],
 };
 
 function buildControls() {
@@ -665,6 +948,7 @@ function buildControls() {
   $('mode-select').addEventListener('change', syncMode);
   $('vuln-select').addEventListener('change', syncMode);
   $('engine-select').addEventListener('change', syncEngine);
+  document.querySelector('[data-field="ssrf_oast"]')?.addEventListener('change', syncMode);
   syncMode();
   syncEngine();
 }
@@ -681,6 +965,9 @@ function syncMode() {
   if (juice && ['access_control', 'all'].includes(vuln)) needed.push('access');
   if (juice && vuln === 'ssti') needed.push('ssti');
   if (juice && ['path_traversal', 'all'].includes(vuln)) needed.push('db');
+  if (document.querySelector('[data-field="ssrf_oast"]')?.value === 'private_interactsh') {
+    needed.push('private_oast');
+  }
 
   $('credential-block').hidden = needed.length === 0;
   applyBrowserRule(juice, vuln);
@@ -724,7 +1011,7 @@ function openSetup() {
  * 무엇이 막고 있는지 알 수 있어야 한다. */
 function markSetupNeeded() {
   const pending = [...document.querySelectorAll('[data-secret]')].some(
-    (input) => !input.value.trim()
+    (input) => !['ssrf_interactsh_callback_domain', 'interactsh_token'].includes(input.dataset.secret) && !input.value.trim()
   );
   $('setup-toggle').classList.toggle('needs-input', pending);
 }
@@ -768,6 +1055,37 @@ async function boot() {
   tickClock();
   setInterval(tickClock, 30000);
   $('start-btn').addEventListener('click', start);
+  $('ssrf-review-form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    submitSsrfReview('register');
+  });
+  $('ssrf-review-skip').addEventListener('click', () => submitSsrfReview('skip'));
+  $('ssrf-review-rule').addEventListener('change', syncSsrfPolicyFields);
+  $('ssrf-review-policy-source').addEventListener('change', syncSsrfPolicyFields);
+  $('ssrf-review-source-reference').addEventListener('input', syncSsrfPolicyFields);
+  $('ssrf-review-url').addEventListener('input', () => {
+    $('ssrf-review-consent').checked = false;
+    $('ssrf-review-hint-consent').checked = false;
+    syncSsrfVerificationFields();
+  });
+  $('ssrf-review-owned-receiver').addEventListener('change', () => {
+    $('ssrf-review-url').value = '';
+    $('ssrf-review-endpoint-ref').value = '';
+    $('ssrf-review-consent').checked = false;
+    $('ssrf-review-hint-consent').checked = false;
+    syncSsrfVerificationFields();
+  });
+  $('ssrf-review-hint').addEventListener('change', () => {
+    $('ssrf-review-hint-consent').checked = false;
+    syncSsrfVerificationFields();
+  });
+  $('ssrf-review-surface').addEventListener('change', () => {
+    $('ssrf-review-consent').checked = false;
+    $('ssrf-review-hint-consent').checked = false;
+    fillSsrfReviewHints(currentSsrfReviewHints);
+    syncSsrfVerificationFields();
+    $('ssrf-review-register').disabled = ssrfReviewSubmitting || !$('ssrf-review-surface').value;
+  });
   const toggleSetup = () => setSetupExpanded($('setup-body').hidden);
   $('setup-toggle').addEventListener('click', toggleSetup);
   $('setup-panel-toggle').addEventListener('click', toggleSetup);

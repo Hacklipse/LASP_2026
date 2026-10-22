@@ -4,19 +4,29 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import sys
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from compare_routers import compare_records, latest_run, main, replay
 from routing_options import append_run_result, execution_profile_from_args
-from hacklipse.adapters.routing_audit import input_fingerprint, routing_input_fingerprint, surface_key
+import hacklipse.adapters.routing_audit as routing_audit
+from hacklipse.adapters.routing_audit import (
+    JsonlRoutingAuditLog,
+    input_fingerprint,
+    routing_input_fingerprint,
+    routing_input_manifest,
+    routing_surface_key,
+    surface_key,
+)
 from hacklipse.bootstrap import build_local_application, standard_router
 from hacklipse.domain import (
     Candidate,
@@ -42,6 +52,67 @@ def _args(directory, failure="none"):
 
 
 class RouterComparisonTests(unittest.TestCase):
+    def test_run_result_redacts_sensitive_surface_path(self):
+        run = Run(
+            run_id="private-result-path-run",
+            target_url="http://localhost/",
+            policy_profile="safe",
+            scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+            request_budget=10,
+        )
+        app = build_local_application({})
+        app.budget_manager.open_run(run.run_id, run.request_budget)
+        app.stores.surfaces.add(Surface(
+            surface_id="private-result-surface",
+            run_id=run.run_id,
+            url="http://localhost/private/token/SECRET?url=ignored",
+            method="GET",
+            parameters=("url",),
+        ))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "routing.jsonl"
+            append_run_result(argparse.Namespace(routing_log=path), app, run)
+
+            rendered = path.read_text(encoding="utf-8")
+            record = json.loads(rendered)
+
+        self.assertEqual(
+            record["surfaces"][0]["path"],
+            "/private/token/{redacted}",
+        )
+        self.assertNotIn("SECRET", rendered)
+
+    def test_routing_audit_manifest_redacts_sensitive_surface_path(self):
+        run = Run(
+            run_id="private-path-run",
+            target_url="http://localhost/",
+            policy_profile="safe",
+            scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+            request_budget=10,
+        )
+        surface = Surface(
+            surface_id="private-path-surface",
+            run_id=run.run_id,
+            url="http://localhost/private/token/shortsecret?url=ignored",
+            method="GET",
+            parameters=("url",),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "routing.jsonl"
+            standard_router(audit_log=JsonlRoutingAuditLog(path)).route(
+                run, (surface,), ()
+            )
+
+            rendered = path.read_text(encoding="utf-8")
+            record = json.loads(rendered)
+            self.assertEqual(
+                record["routing_input_manifest"]["surfaces"][0]["path"],
+                "/private/token/{redacted}",
+            )
+            self.assertNotIn("shortsecret", rendered)
+
     def test_cli_execution_profile_records_effective_conditions(self):
         args = argparse.Namespace(
             profile="llm",
@@ -223,6 +294,11 @@ class RouterComparisonTests(unittest.TestCase):
             self.assertFalse(compare_records(
                 baseline, hybrid, left, changed_approval
             )["analysis_comparison_available"])
+            changed_canary = dict(right, ssrf_canary_policy_ref="operator:canary-denied")
+            proof_mismatch = compare_records(baseline, hybrid, left, changed_canary)
+            self.assertFalse(proof_mismatch["analysis_comparison_available"])
+            self.assertIn("ssrf_proof_setup_mismatch",
+                          proof_mismatch["analysis_unavailable_reasons"])
             for change, reason in (
                 ({"phase": "failed"}, "run_incomplete"),
                 ({"code_version": ""}, "code_version_missing"),
@@ -275,6 +351,60 @@ class RouterComparisonTests(unittest.TestCase):
         self.assertEqual(routing_input_fingerprint(run, (surface,), (response,)),
                          routing_input_fingerprint(run, (surface,), (changed_body,)))
 
+    def test_raw_audit_fingerprints_are_keyed_but_structural_keys_remain_portable(self):
+        run = Run(
+            run_id="private-fingerprint-run",
+            target_url="http://localhost/",
+            policy_profile="safe",
+            scope=RunScope(allowed_hosts=frozenset({"localhost"})),
+            request_budget=10,
+        )
+        surface = Surface(
+            surface_id="private-surface",
+            run_id=run.run_id,
+            url="http://localhost/private/token/guessable?token=guessable",
+            method="GET",
+            parameters=("token",),
+            observed_query=(("token", "guessable"),),
+        )
+        evidence = Evidence(
+            evidence_id="private-evidence",
+            run_id=run.run_id,
+            surface_id=surface.surface_id,
+            created_by="recon",
+            evidence_type="observation",
+            observation={"type": "reflection", "body": "guessable"},
+        )
+        raw_surface = asdict(surface)
+        raw_surface.pop("run_id")
+        raw_surface.pop("surface_id")
+        plain_sha = hashlib.sha256(json.dumps(
+            raw_surface, sort_keys=True, ensure_ascii=True, default=str,
+        ).encode("utf-8")).hexdigest()
+
+        with patch.object(routing_audit, "_PRIVATE_FINGERPRINT_KEY", b"a" * 32):
+            first_surface_key = surface_key(surface)
+            first_input = input_fingerprint(run, (surface,), (evidence,))
+            first_observation = routing_input_manifest(
+                (surface,), (evidence,)
+            )["evidence"][0]["observation_fingerprint"]
+            structural_key = routing_surface_key(surface, (evidence,))
+            self.assertEqual(first_surface_key, surface_key(surface))
+            self.assertEqual(first_input, input_fingerprint(run, (surface,), (evidence,)))
+
+        with patch.object(routing_audit, "_PRIVATE_FINGERPRINT_KEY", b"b" * 32):
+            self.assertNotEqual(first_surface_key, surface_key(surface))
+            self.assertNotEqual(first_input, input_fingerprint(run, (surface,), (evidence,)))
+            self.assertNotEqual(
+                first_observation,
+                routing_input_manifest(
+                    (surface,), (evidence,)
+                )["evidence"][0]["observation_fingerprint"],
+            )
+            self.assertEqual(structural_key, routing_surface_key(surface, (evidence,)))
+
+        self.assertNotEqual(first_surface_key, plain_sha)
+
     def test_live_run_summary_retains_status_and_budget_without_raw_surface(self):
         with tempfile.TemporaryDirectory() as directory:
             args = _args(directory)
@@ -303,6 +433,7 @@ class RouterComparisonTests(unittest.TestCase):
                     llm_model="fixture-model",
                     llm_rpm_limit=7,
                     code_version="feat/test",
+                    ssrf_canary_policy_ref="operator:legacy-canary-rule",
                 ),
             )
             # 실제 실행에서는 Orchestrator.start가 예산을 초기화한다.
@@ -336,8 +467,11 @@ class RouterComparisonTests(unittest.TestCase):
             self.assertEqual(record["llm_model"], "fixture-model")
             self.assertEqual(record["llm_rpm_limit"], 7)
             self.assertEqual(record["code_version"], "feat/test")
+            self.assertTrue(record["ssrf_canary_policy_ref_present"])
+            self.assertNotIn("ssrf_canary_policy_ref", record)
             self.assertFalse(record["authenticated"])
             self.assertNotIn("private-value", json.dumps(record))
+            self.assertNotIn("legacy-canary-rule", json.dumps(record))
 
     def test_comparison_cli_appends_results(self):
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):

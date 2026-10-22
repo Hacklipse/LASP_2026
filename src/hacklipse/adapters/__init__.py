@@ -58,6 +58,13 @@ from .validation import ValidationAgent
 from .xss_analysis import HeuristicXssAnalyzer
 from .sqlite_budget import SQLiteBudgetManager
 from .sqlite_store import SQLiteProgressLog, SQLiteStoreBundle
+from .ssrf_observation import InMemoryServerRequestObservationProvider
+from .ssrf_assessment import assess_ssrf_observations, resolve_ssrf_assessment
+from .ssrf_review import (
+    InMemorySsrfReviewRegistry,
+    SsrfReviewAwareRouter,
+    SsrfReviewRegistration,
+)
 
 __all__ = [
     "AllowlistPolicyGate",
@@ -84,6 +91,12 @@ __all__ = [
     "CallbackProgressLog",
     "InMemoryExecutionAuditLog",
     "InMemoryProgressLog",
+    "InMemoryServerRequestObservationProvider",
+    "InMemorySsrfReviewRegistry",
+    "SsrfReviewAwareRouter",
+    "SsrfReviewRegistration",
+    "assess_ssrf_observations",
+    "resolve_ssrf_assessment",
     "LlmSqliAnalyzer",
     "SlidingWindowLlmClient",
     "LlmSstiAnalyzer",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from urllib.parse import urlsplit
+from dataclasses import replace
 
 from hacklipse.application.errors import AgentContractError
 from hacklipse.domain import (
@@ -12,12 +13,17 @@ from hacklipse.domain import (
     Candidate,
     Evidence,
     EvidenceRequest,
+    SsrfAssessmentReason,
+    SsrfDestinationRule,
+    SsrfObservationPhase,
+    SsrfVerificationStrategy,
     TaskEnvelope,
     ValidationProof,
     ValidationProofType,
     ValidationReasonCode,
     ValidationResult,
     ValidationVerdict,
+    ssrf_destination_origin,
 )
 from hacklipse.ports.errors import BudgetExceeded
 from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
@@ -123,6 +129,13 @@ from .file_upload_analysis import (
     UPLOAD_TYPE, UPLOAD_ANALYZER, UPLOAD_RESULT, UPLOAD_RISK_EXTENSIONS,
     check_upload_extensions,
 )
+from .ssrf_analysis import (
+    SSRF_RESULT_TYPE, SSRF_TYPE, build_ssrf_canary_requests,
+    build_ssrf_owned_receiver_requests, build_ssrf_requests,
+    canary_marker_signal, has_http_callback, has_owned_receiver_observation,
+    poll_ssrf_callbacks, ssrf_candidate_verification_strategy, ssrf_parameters,
+)
+from .ssrf_assessment import resolve_ssrf_assessment
 
 # Router가 Candidate를 만들 때 쓴 것과 같은 taxonomy. Candidate가 알려진 취약점
 # 유형을 벗어나면(Router가 만들 수 없는 값) 계약 위반으로 간주한다. Analysis
@@ -131,6 +144,7 @@ _EXPECTED_SIGNAL = {
     rule.vulnerability_type: rule.observation_type
     for rule in (*DEFAULT_RULES, *OPTIONAL_SOURCE_MAP_RULES)
 }
+_EXPECTED_SIGNAL[SSRF_TYPE] = "ssrf_callback_http"
 
 # HttpExecutionRuntime(및 그 대역)이 실제 재현 요청 결과에 붙이는 Observation 유형.
 # 최초 Recon이 남긴 신호 관측(예: "url_or_file_parameter")과는 구분되는, Validator
@@ -203,7 +217,7 @@ class ValidationAgent:
             candidate.vulnerability_type == "SSTI" and SSTI_TOOL in task.allowed_tools
         )
         specialized_login_validation = candidate.vulnerability_type == PUBLIC_LOGIN_TYPE
-        if candidate.vulnerability_type == "SQLi":
+        if candidate.vulnerability_type in {"SQLi", SSRF_TYPE}:
             surface = self._surfaces.get(task.run_id, candidate.surface_id)
             required_tool = (
                 "http_post" if surface.method.upper() == "POST" else _REPRODUCTION_TOOL
@@ -237,6 +251,8 @@ class ValidationAgent:
             return self._validate_file_upload(task, candidate, evidence)
         if candidate.vulnerability_type == "SQLi":
             return self._validate_sqli(task, candidate, evidence, reproduction)
+        if candidate.vulnerability_type == SSRF_TYPE:
+            return self._validate_ssrf(task, candidate, evidence)
         if candidate.vulnerability_type == EXPOSURE_TYPE:
             return self._validate_sensitive_exposure(task, candidate, evidence, reproduction)
         if specialized_login_validation:
@@ -363,6 +379,676 @@ class ValidationAgent:
             evidence=self._evidence.get_many(task.run_id, ids),
             reason="independent upload acceptance could not be verified",
             reason_code=ValidationReasonCode.COMPARABLE_RESPONSES_MISSING,
+        )
+
+    def _validate_ssrf(
+        self, task: TaskEnvelope, candidate: Candidate, evidence: Sequence[Evidence],
+    ) -> AgentResult:
+        if self._collector is None:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="SSRF validation collector is unavailable",
+                reason_code=ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR,
+            )
+        surface = self._surfaces.get(task.run_id, candidate.surface_id)
+        surface_evidence = tuple(item for item in self._evidence.list_by_run(task.run_id)
+                                 if item.surface_id == surface.surface_id)
+        available_parameters = ssrf_parameters(surface, surface_evidence)
+        canary = self._collector.ssrf_canary_proof_for_run(task.run_id)
+        try:
+            strategy = ssrf_candidate_verification_strategy(candidate)
+        except AgentContractError:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="unsupported or mixed SSRF verification strategy",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        registration = self._collector.ssrf_review_for_surface(
+            task.run_id, candidate.surface_id, strategy,
+        )
+        callback_candidate = strategy is SsrfVerificationStrategy.CALLBACK
+        canary_candidate = strategy is SsrfVerificationStrategy.INTERNAL_CANARY
+        owned_receiver_candidate = strategy is SsrfVerificationStrategy.OWNED_RECEIVER
+        passive_candidate = strategy is SsrfVerificationStrategy.PASSIVE
+        if (canary_candidate or owned_receiver_candidate) and registration is None:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="SSRF verification requires a Surface-bound execution approval",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        if owned_receiver_candidate:
+            if not self._collector.ssrf_owned_receiver_enabled:
+                return self._validation_result(
+                    task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                    reason="operator-owned SSRF receiver is unavailable",
+                    reason_code=ValidationReasonCode.SSRF_OWNED_RECEIVER_UNAVAILABLE,
+                )
+            assert registration is not None
+            return self._validate_registered_ssrf_owned_receiver(
+                task,
+                candidate,
+                evidence,
+                surface,
+                surface_evidence,
+                available_parameters,
+                registration,
+            )
+        if canary_candidate and registration is not None and canary is not None:
+            return self._validate_registered_ssrf_canary(
+                task, candidate, evidence, surface, surface_evidence,
+                available_parameters, registration, canary,
+            )
+        if (
+            passive_candidate
+            and registration is not None
+            and self._collector.ssrf_observation_enabled
+        ):
+            return self._validate_registered_ssrf_review(
+                task, candidate, available_parameters, registration,
+            )
+        if passive_candidate:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="passive SSRF review provider or registration is unavailable",
+                reason_code=ValidationReasonCode.SSRF_MANUAL_REVIEW_REQUIRED,
+            )
+        if canary_candidate:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="approved internal canary endpoint is unavailable",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        if registration is not None:
+            available_parameters = tuple(
+                item for item in available_parameters
+                if item == registration.parameter
+            )
+        if not self._collector.ssrf_enabled:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="SSRF callback service is unavailable",
+                reason_code=ValidationReasonCode.SSRF_CALLBACK_PROVIDER_UNAVAILABLE,
+            )
+        if not available_parameters:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="observed or declared URL input is unavailable",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        analysis_evidence = tuple(item for item in evidence if item.validation_id is None)
+        results = tuple(
+            item for item in analysis_evidence
+            if item.created_by == "ssrf_analyzer"
+            and item.observation.get("type") == SSRF_RESULT_TYPE
+            and item.observation.get("candidate_id") == candidate.candidate_id
+        )
+        if any(item.observation.get("status") == "provider_error" for item in results):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="SSRF callback provider failed during analysis",
+                reason_code=ValidationReasonCode.SSRF_CALLBACK_PROVIDER_UNAVAILABLE,
+            )
+        first_probe = None
+        parameter = None
+        first_hits = tuple(item for item in analysis_evidence
+                           if item.created_by == "execution_runtime:ssrf_callback")
+        for outcome in results:
+            selected = outcome.observation.get("parameter")
+            if selected not in available_parameters or outcome.observation.get("status") != "http":
+                continue
+            try:
+                analysis_ticket = self._collector.issue_ssrf_ticket(
+                    task.run_id, candidate.candidate_id, selected,
+                )
+            except (OSError, TimeoutError):
+                return self._validation_result(
+                    task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                    reason="SSRF callback provider could not reload the analysis ticket",
+                    reason_code=ValidationReasonCode.SSRF_CALLBACK_PROVIDER_UNAVAILABLE,
+                )
+            _, analysis_probe = build_ssrf_requests(
+                surface, selected, analysis_ticket.url, surface_evidence,
+            )
+            candidate_probe = matching_evidence(analysis_evidence, surface.url, analysis_probe)
+            if candidate_probe is not None and has_http_callback(first_hits, candidate_probe.evidence_id):
+                first_probe, parameter = candidate_probe, selected
+                break
+        if first_probe is None or parameter is None:
+            dns_seen = any(item.observation.get("status") == "dns" for item in results)
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.SUSPECTED,
+                evidence=(),
+                reason=("analysis observed DNS only" if dns_seen
+                        else "no HTTP callback arrived within the bounded wait"),
+                reason_code=ValidationReasonCode.SSRF_CALLBACK_NOT_OBSERVED,
+            )
+        assert task.validation_id is not None
+        try:
+            ticket = self._collector.issue_ssrf_ticket(
+                task.run_id, candidate.candidate_id, parameter,
+                validation_id=task.validation_id,
+            )
+        except (OSError, TimeoutError):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="SSRF callback provider could not issue a validation ticket",
+                reason_code=ValidationReasonCode.SSRF_CALLBACK_PROVIDER_UNAVAILABLE,
+            )
+        requests = build_ssrf_requests(surface, parameter, ticket.url, surface_evidence)
+        session_evidence = tuple(item for item in evidence
+                                 if item.validation_id == task.validation_id)
+        collected = tuple(matching_evidence(session_evidence, surface.url, request)
+                          for request in requests)
+        missing = tuple(request for request, item in zip(requests, collected) if item is None)
+        if missing:
+            if task.request_budget < len(missing):
+                return self._validation_result(
+                    task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                    reason="independent SSRF control/probe budget is unavailable",
+                    reason_code=ValidationReasonCode.SSRF_PROOF_BUDGET_EXHAUSTED,
+                )
+            return AgentResult(
+                task_id=task.task_id, status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+        probe = collected[1]
+        assert probe is not None
+        try:
+            callback_ids = poll_ssrf_callbacks(
+                self._collector, self._evidence, task, surface, requests[1], probe.evidence_id,
+            )
+        except (OSError, TimeoutError):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=collected,
+                reason="SSRF callback provider failed during validation",
+                reason_code=ValidationReasonCode.SSRF_CALLBACK_PROVIDER_UNAVAILABLE,
+            )
+        callback_evidence = self._evidence.get_many(task.run_id, callback_ids)
+        reproduced = tuple(item for item in collected if item is not None) + callback_evidence
+        if has_http_callback(callback_evidence, probe.evidence_id):
+            result = self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduced,
+                reason="independent HTTP callback reproduced; server attribution and "
+                       "destination rule violation remain unproven",
+                reason_code=ValidationReasonCode.SSRF_CALLBACK_ONLY,
+            )
+        else:
+            result = self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduced,
+                reason="analysis HTTP callback was not independently reproduced",
+                reason_code=ValidationReasonCode.SSRF_CALLBACK_NOT_OBSERVED,
+            )
+        return replace(result, new_evidence_ids=callback_ids)
+
+    def _validate_registered_ssrf_owned_receiver(
+        self,
+        task: TaskEnvelope,
+        candidate: Candidate,
+        evidence: Sequence[Evidence],
+        surface,
+        surface_evidence: tuple[Evidence, ...],
+        available_parameters: Sequence[str],
+        registration,
+    ) -> AgentResult:
+        """Reproduce a trusted receiver hit with a fresh Validation ticket."""
+
+        parameter = registration.parameter
+        if (
+            parameter not in available_parameters
+            or candidate.exploration_parameters != (parameter,)
+        ):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=(),
+                reason="owned receiver coordinate does not match this Candidate",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        analysis_evidence = tuple(
+            item for item in evidence if item.validation_id is None
+        )
+        results = tuple(
+            item
+            for item in analysis_evidence
+            if item.created_by == "ssrf_analyzer"
+            and item.observation.get("type") == SSRF_RESULT_TYPE
+            and item.observation.get("candidate_id") == candidate.candidate_id
+            and item.observation.get("parameter") == parameter
+        )
+        if any(item.observation.get("status") == "provider_error" for item in results):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=(),
+                reason="operator-owned SSRF receiver failed during Analysis",
+                reason_code=ValidationReasonCode.SSRF_OWNED_RECEIVER_UNAVAILABLE,
+            )
+        try:
+            analysis_ticket = self._collector.issue_ssrf_owned_receiver_ticket(
+                task.run_id,
+                candidate.candidate_id,
+                candidate.surface_id,
+                parameter,
+            )
+        except (AgentContractError, OSError, TimeoutError):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=(),
+                reason="operator-owned SSRF receiver could not restore ticket A",
+                reason_code=ValidationReasonCode.SSRF_OWNED_RECEIVER_UNAVAILABLE,
+            )
+        analysis_requests = build_ssrf_owned_receiver_requests(
+            surface, parameter, analysis_ticket.url, surface_evidence,
+        )
+        analysis_probe = matching_evidence(
+            analysis_evidence, surface.url, analysis_requests[1],
+        )
+        analysis_observations = tuple(
+            item
+            for item in analysis_evidence
+            if item.created_by == "execution_runtime:ssrf_observation_provider"
+        )
+        result_seen = any(
+            item.observation.get("status") == "owned_request_observed"
+            and item.observation.get("probe_evidence_id")
+            == (analysis_probe.evidence_id if analysis_probe is not None else None)
+            for item in results
+        )
+        if (
+            analysis_probe is None
+            or not result_seen
+            or not has_owned_receiver_observation(
+                analysis_observations, analysis_probe.evidence_id,
+            )
+        ):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.SUSPECTED,
+                evidence=analysis_observations,
+                reason="operator-owned receiver did not establish request A",
+                reason_code=ValidationReasonCode.SSRF_OWNED_RECEIVER_NOT_OBSERVED,
+            )
+        assert task.validation_id is not None
+        try:
+            validation_ticket = self._collector.issue_ssrf_owned_receiver_ticket(
+                task.run_id,
+                candidate.candidate_id,
+                candidate.surface_id,
+                parameter,
+                validation_id=task.validation_id,
+            )
+        except (AgentContractError, OSError, TimeoutError):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=analysis_observations,
+                reason="operator-owned SSRF receiver could not issue fresh ticket B",
+                reason_code=ValidationReasonCode.SSRF_OWNED_RECEIVER_UNAVAILABLE,
+            )
+        requests = build_ssrf_owned_receiver_requests(
+            surface, parameter, validation_ticket.url, surface_evidence,
+        )
+        session_evidence = tuple(
+            item for item in evidence if item.validation_id == task.validation_id
+        )
+        collected = tuple(
+            matching_evidence(
+                session_evidence, request.request_target_url or surface.url, request,
+            )
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                return self._validation_result(
+                    task,
+                    verdict=ValidationVerdict.BLOCKED,
+                    evidence=(),
+                    reason="independent owned-receiver request budget is unavailable",
+                    reason_code=ValidationReasonCode.SSRF_PROOF_BUDGET_EXHAUSTED,
+                )
+            return AgentResult(
+                task_id=task.task_id,
+                status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+        probe = collected[1]
+        assert probe is not None
+        try:
+            observation_ids = self._collector.collect_ssrf_owned_receiver_observations(
+                task.run_id,
+                candidate.candidate_id,
+                surface.url,
+                requests[1],
+                probe.evidence_id,
+                task_id=task.task_id,
+                validation_id=task.validation_id,
+                poll_timeout_seconds=(
+                    self._collector.ssrf_owned_receiver_poll_wait_seconds
+                ),
+            )
+        except (AgentContractError, OSError, TimeoutError):
+            return self._validation_result(
+                task,
+                verdict=ValidationVerdict.BLOCKED,
+                evidence=tuple(item for item in collected if item is not None),
+                reason="operator-owned SSRF receiver failed during Validation",
+                reason_code=ValidationReasonCode.SSRF_OWNED_RECEIVER_UNAVAILABLE,
+            )
+        validation_observations = self._evidence.get_many(
+            task.run_id, observation_ids,
+        )
+        if not has_owned_receiver_observation(
+            validation_observations, probe.evidence_id,
+        ):
+            result = self._validation_result(
+                task,
+                verdict=ValidationVerdict.SUSPECTED,
+                evidence=tuple(item for item in collected if item is not None),
+                reason="request A was observed but fresh request B was not reproduced",
+                reason_code=ValidationReasonCode.SSRF_OWNED_RECEIVER_NOT_OBSERVED,
+            )
+            return replace(result, new_evidence_ids=observation_ids)
+        return self._validate_registered_ssrf_review(
+            task,
+            candidate,
+            available_parameters,
+            registration,
+            owned_receiver=True,
+        )
+
+    def _validate_registered_ssrf_canary(
+        self, task: TaskEnvelope, candidate: Candidate, evidence: Sequence[Evidence],
+        surface, surface_evidence: tuple[Evidence, ...],
+        available_parameters: Sequence[str], registration, canary,
+    ) -> AgentResult:
+        """Reproduce the approved, exact endpoint independently of Analysis."""
+
+        parameter = registration.parameter
+        if (
+            canary.surface_id != candidate.surface_id
+            or registration.execution_approval.verification_endpoint_ref
+            != self._collector.ssrf_verification_endpoint_ref(task.run_id, canary.url)
+            or parameter not in available_parameters
+            or candidate.exploration_parameters != (parameter,)
+        ):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="approved SSRF coordinate or policy does not match",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        requests = build_ssrf_canary_requests(
+            surface, parameter, canary.url, surface_evidence,
+        )
+        analysis_evidence = tuple(
+            item for item in evidence if item.validation_id is None
+        )
+        analysis_control, analysis_probe = tuple(
+            matching_evidence(analysis_evidence, surface.url, request)
+            for request in requests
+        )
+        result_seen = any(
+            item.created_by == "ssrf_analyzer"
+            and item.observation.get("type") == SSRF_RESULT_TYPE
+            and item.observation.get("candidate_id") == candidate.candidate_id
+            and item.observation.get("parameter") == parameter
+            and item.observation.get("probe_evidence_id") == (
+                analysis_probe.evidence_id if analysis_probe is not None else None
+            )
+            and item.observation.get("status") == "controlled_marker"
+            for item in analysis_evidence
+        )
+        if (
+            analysis_control is None or analysis_probe is None or not result_seen
+            or not canary_marker_signal(analysis_control, analysis_probe)
+        ):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=(),
+                reason="approved endpoint marker was not established during Analysis",
+                reason_code=ValidationReasonCode.SSRF_CANARY_ANALYSIS_NOT_ESTABLISHED,
+            )
+        assert task.validation_id is not None
+        session_evidence = tuple(
+            item for item in evidence if item.validation_id == task.validation_id
+        )
+        collected = tuple(
+            matching_evidence(session_evidence, surface.url, request)
+            for request in requests
+        )
+        missing = tuple(
+            request for request, item in zip(requests, collected) if item is None
+        )
+        if missing:
+            if task.request_budget < len(missing):
+                return self._validation_result(
+                    task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                    reason="independent SSRF verification request budget is unavailable",
+                    reason_code=ValidationReasonCode.SSRF_PROOF_BUDGET_EXHAUSTED,
+                )
+            return AgentResult(
+                task_id=task.task_id, status=AgentResultStatus.NEEDS_EVIDENCE,
+                evidence_requests=missing,
+            )
+        control, probe = collected
+        assert control is not None and probe is not None
+        reproduced = (control, probe)
+        if not canary_marker_signal(control, probe):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduced,
+                reason="approved endpoint marker was not independently reproduced",
+                reason_code=ValidationReasonCode.SSRF_CANARY_NOT_REPRODUCED,
+            )
+        policy = registration.destination_policy
+        if policy is None:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduced,
+                reason="internal canary was independently reproduced, but no destination "
+                       "policy was registered",
+                reason_code=ValidationReasonCode.SSRF_DESTINATION_POLICY_MISSING,
+            )
+        if (
+            canary.destination_policy is not None
+            and canary.destination_policy != policy
+        ):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduced,
+                reason="internal canary policy does not match the Run-bound policy",
+                reason_code=ValidationReasonCode.SSRF_DESTINATION_POLICY_MISMATCH,
+            )
+        if candidate.surface_id not in policy.surface_ids:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduced,
+                reason="destination policy is not bound to this Surface",
+                reason_code=ValidationReasonCode.SSRF_DESTINATION_POLICY_SURFACE_MISMATCH,
+            )
+        if policy.destination_rule is not SsrfDestinationRule.FORBIDDEN:
+            return self._validation_result(
+                task, verdict=ValidationVerdict.REJECTED, evidence=reproduced,
+                reason="destination policy explicitly allows this access",
+                reason_code=ValidationReasonCode.SSRF_DESTINATION_POLICY_ALLOWS_ACCESS,
+            )
+        if not policy.confirms_for(candidate.surface_id, canary.url):
+            if policy.destination_origin != ssrf_destination_origin(canary.url):
+                return self._validation_result(
+                    task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduced,
+                    reason="internal canary was reproduced, but policy origin does not "
+                           "match the approved endpoint",
+                    reason_code=(
+                        ValidationReasonCode.SSRF_DESTINATION_POLICY_ORIGIN_MISMATCH
+                    ),
+                )
+            return self._validation_result(
+                task, verdict=ValidationVerdict.SUSPECTED, evidence=reproduced,
+                reason="internal canary was reproduced, but policy assertion or evidence "
+                       "status is insufficient",
+                reason_code=(
+                    ValidationReasonCode.SSRF_DESTINATION_POLICY_EVIDENCE_INVALID
+                ),
+            )
+        proof = ValidationProof(
+            proof_type=ValidationProofType.SSRF_UNAUTHORIZED_FETCH,
+            evidence_ids=(control.evidence_id, probe.evidence_id),
+            summary=(
+                "approved endpoint marker independently reproduced; policy "
+                f"source={policy.source_type.value}, reference={policy.source_reference}, "
+                f"surface={candidate.surface_id}, assertion={policy.assertion.value}, "
+                f"status={policy.evidence_status.value}"
+            ),
+        )
+        return self._validation_result(
+            task, verdict=ValidationVerdict.CONFIRMED, evidence=reproduced,
+            reason="approved endpoint response was independently reproduced",
+            reason_code=(
+                ValidationReasonCode.SSRF_CONFIRMED_DESTINATION_POLICY_VIOLATION
+            ),
+            proof=proof,
+        )
+
+    def _validate_registered_ssrf_review(
+        self, task: TaskEnvelope, candidate: Candidate,
+        available_parameters: Sequence[str], registration,
+        *, owned_receiver: bool = False,
+    ) -> AgentResult:
+        """Map sanitized provider observations into the normal Validation contract."""
+
+        parameter = registration.parameter
+        if (
+            parameter not in available_parameters
+            or candidate.exploration_parameters != (parameter,)
+        ):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="registered SSRF coordinate is not available to this Candidate",
+                reason_code=ValidationReasonCode.ANALYSIS_SIGNAL_MISSING,
+            )
+        assert task.validation_id is not None
+        review_strategy = (
+            SsrfVerificationStrategy.OWNED_RECEIVER
+            if owned_receiver else SsrfVerificationStrategy.PASSIVE
+        )
+        try:
+            provider_status, observations, mapping = (
+                self._collector.collect_server_request_observations(
+                    run_id=task.run_id,
+                    surface_id=candidate.surface_id,
+                    parameter=parameter,
+                    task_id=task.task_id,
+                    validation_id=task.validation_id,
+                    strategy=review_strategy,
+                )
+            )
+        except (AgentContractError, OSError, TimeoutError):
+            return self._validation_result(
+                task, verdict=ValidationVerdict.BLOCKED, evidence=(),
+                reason="registered SSRF observation failed provenance validation",
+                reason_code=ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR,
+            )
+        analysis_sessions = {
+            item.verification_session_id for item in observations
+            if item.phase is SsrfObservationPhase.ANALYSIS
+        }
+        # A provider record is the only trusted proof that a verification
+        # session actually ran. With zero records there is no safe distinction
+        # between "not attempted" and "attempted with no request", so the
+        # deterministic resolver keeps this case BLOCKED rather than negative.
+        analysis_session = (
+            next(iter(analysis_sessions)) if len(analysis_sessions) == 1 else None
+        )
+        assessment = resolve_ssrf_assessment(
+            observations,
+            provider_status=provider_status,
+            run_id=task.run_id,
+            surface_id=candidate.surface_id,
+            parameter=parameter,
+            execution_approval=registration.execution_approval,
+            destination_policy=registration.destination_policy,
+            request_budget_available=task.request_budget > 0,
+            analysis_verification_session_id=analysis_session,
+            validation_verification_session_id=task.validation_id,
+        )
+        assessment_id = self._collector.record_ssrf_assessment(
+            run_id=task.run_id,
+            surface_id=candidate.surface_id,
+            parameter=parameter,
+            task_id=task.task_id,
+            validation_id=task.validation_id,
+            assessment=assessment,
+            observation_evidence_ids=mapping,
+            strategy=review_strategy,
+        )
+        current_observation_ids = tuple(
+            mapping[item.observation_id]
+            for item in observations
+            if item.phase is SsrfObservationPhase.VALIDATION
+            and item.verification_session_id == task.validation_id
+            and item.observation_id in assessment.observation_ids
+        )
+        validation_evidence_ids = tuple(dict.fromkeys(
+            (*current_observation_ids, assessment_id)
+        ))
+        validation_evidence = self._evidence.get_many(
+            task.run_id, validation_evidence_ids,
+        )
+        proof = None
+        if assessment.verdict is ValidationVerdict.CONFIRMED:
+            proof = ValidationProof(
+                proof_type=ValidationProofType.SSRF_UNAUTHORIZED_FETCH,
+                evidence_ids=validation_evidence_ids,
+                summary=(
+                    "independent operator-owned request observation and an exact-Surface "
+                    "destination policy were reproduced in the validation session"
+                ),
+            )
+        reason = f"structured SSRF assessment: {assessment.reason_code.value}"
+        if assessment.verdict is ValidationVerdict.CONFIRMED:
+            result = self._validation_result(
+                task, verdict=assessment.verdict, evidence=validation_evidence,
+                reason=reason, reason_code=ValidationReasonCode.CONFIRMED_PROOF,
+                proof=proof,
+            )
+        elif assessment.verdict is ValidationVerdict.BLOCKED:
+            result = self._validation_result(
+                task, verdict=assessment.verdict, evidence=validation_evidence,
+                reason=reason,
+                reason_code=ValidationReasonCode.REPRODUCTION_EXECUTION_ERROR,
+            )
+        elif (
+            assessment.verdict is ValidationVerdict.SUSPECTED
+            and assessment.reason_code is SsrfAssessmentReason.MANUAL_REVIEW_REQUIRED
+        ):
+            result = self._validation_result(
+                task, verdict=assessment.verdict, evidence=validation_evidence,
+                reason=reason,
+                reason_code=ValidationReasonCode.SSRF_MANUAL_REVIEW_REQUIRED,
+            )
+        elif (
+            assessment.verdict is ValidationVerdict.SUSPECTED
+            and owned_receiver
+        ):
+            result = self._validation_result(
+                task, verdict=assessment.verdict, evidence=validation_evidence,
+                reason=reason,
+                reason_code=ValidationReasonCode.SSRF_OWNED_RECEIVER_ONLY,
+            )
+        elif assessment.verdict is ValidationVerdict.SUSPECTED:
+            result = self._validation_result(
+                task, verdict=assessment.verdict, evidence=validation_evidence,
+                reason=reason,
+                reason_code=ValidationReasonCode.SSRF_MANUAL_REVIEW_REQUIRED,
+            )
+        else:
+            result = self._validation_result(
+                task, verdict=assessment.verdict, evidence=validation_evidence,
+                reason=reason,
+                reason_code=ValidationReasonCode.PROBE_SIGNAL_NOT_REPRODUCED,
+            )
+        return replace(
+            result,
+            new_evidence_ids=tuple(dict.fromkeys((*mapping.values(), assessment_id))),
         )
 
     def _validate_public_login(

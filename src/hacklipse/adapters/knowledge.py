@@ -37,6 +37,7 @@ from hacklipse.ports.errors import DuplicateRecord
 # 바꿨을 때 조용히 매칭이 끊긴다 — 실제로 그렇게 끊겨 있었다.
 from .access_control_analysis import OBSERVATION_TYPE as ACCESS_CONTROL_OBSERVATION
 from .arbitrary_file_read import ARBITRARY_FILE_READ_OBSERVATION
+from .file_upload_analysis import UPLOAD_RESULT
 from .open_redirect_analysis import REDIRECT_OBSERVATION
 from .path_traversal_analysis import PATH_TRAVERSAL_OBSERVATION
 from .ssti_analysis import SSTI_OBSERVATION
@@ -90,6 +91,7 @@ _SIGNAL_OBSERVATIONS_BY_VULNERABILITY: Mapping[str, tuple[str, ...]] = MappingPr
     "SSTI": (SSTI_OBSERVATION,),
     "Path Traversal": (PATH_TRAVERSAL_OBSERVATION,),
     "Arbitrary File Read": (ARBITRARY_FILE_READ_OBSERVATION,),
+    "File Upload": (UPLOAD_RESULT,),
     "Open Redirect": (REDIRECT_OBSERVATION,),
     "Access Control": (ACCESS_CONTROL_OBSERVATION,),
     "CORS": (),

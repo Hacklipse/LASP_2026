@@ -36,6 +36,7 @@ _ORCHESTRATION_LABELS = {
     "skipped:continue": "LLM 판단 건너뜀",
     "skipped:no_options": "추가 탐색 후보 없음",
     "skipped:insufficient_budget": "추가 탐색 예산 부족",
+    "skipped:ssrf_followup_insufficient_budget": "SSRF 후속 검증 예산 부족",
     "deterministic_fallback:continue": "LLM 판단 실패 · 기존 흐름 유지",
     "advisor:recon": "추가 탐색 선택",
 }
@@ -54,6 +55,7 @@ _PHASE_LABELS = {
     "route": "분류",
     "analyze": "분석",
     "validate": "검증",
+    "ssrf_review": "SSRF 후속 검토",
     "report": "보고",
     "done": "완료",
     "failed": "실패",

@@ -41,6 +41,8 @@ _CWE = {
     # 사용자가 바꿀 수 있는 객체 식별자로 남의 객체를 읽는 IDOR.
     ValidationProofType.UNAUTHORIZED_OBJECT_ACCESS: "CWE-639",
     ValidationProofType.SSTI_EXECUTION: "CWE-1336",
+    ValidationProofType.FILE_UPLOAD_RETRIEVAL: "CWE-434",
+    ValidationProofType.SSRF_UNAUTHORIZED_FETCH: "CWE-918",
 }
 # 새 proof type 이 매핑 없이 추가되면 CWE 필드가 조용히 빠진 채로 내보내진다. 스코어러는
 # 그 finding 을 분류하지 못하는데 수출 쪽은 성공한 것처럼 보이므로, 여기서 먼저 막는다.

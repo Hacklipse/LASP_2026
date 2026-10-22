@@ -19,12 +19,14 @@ resolver.clear() 로 참조를 버린다. 화면 상태(DashboardState)에는 �
 from __future__ import annotations
 
 import argparse
+import os
 import threading
 import traceback
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
+from uuid import uuid4
 
 from hacklipse.adapters import (
     HttpExecutionRuntime,
@@ -36,9 +38,13 @@ from hacklipse.adapters import (
 )
 from hacklipse.adapters.knowledge import SQLiteKnowledgeBase
 from hacklipse.adapters.llm_budget_allocation_advisor import LlmBudgetAllocationAdvisor
+from hacklipse.adapters.local_ssrf_callback import LocalSsrfCallbackService
+from hacklipse.adapters.interactsh_callback import InteractshCliCallbackService
 from hacklipse.adapters.llm_orchestration_advisor import LlmOrchestrationAdvisor
 from hacklipse.adapters.memory import CallbackProgressLog
 from hacklipse.adapters.path_traversal_analysis import PATH_TRAVERSAL_POST_APPROVAL_REF
+from hacklipse.adapters.reporting import build_ssrf_review_fact
+from hacklipse.adapters.security import redacted_internal_url_path
 from hacklipse.adapters.ssti_analysis import SSTI_APPROVAL_REF
 from hacklipse.application import OrchestratorConfig, build_progress_snapshot
 from hacklipse.application.errors import WorkflowExecutionError
@@ -51,13 +57,28 @@ from hacklipse.bootstrap import (
     register_standard_agents,
     standard_recon_planner,
 )
-from hacklipse.domain import RunRequest, RunScope
+from hacklipse.domain import (
+    RunRequest,
+    RunScope,
+    SsrfCanaryProofTarget,
+    SsrfDestinationPolicy,
+    SsrfDestinationRule,
+    SsrfExecutionApproval,
+    SsrfPolicyAssertion,
+    SsrfPolicyEvidenceStatus,
+    SsrfPolicySource,
+    SsrfVerificationStrategy,
+    ssrf_destination_origin,
+)
+from hacklipse.domain.models import utc_now
 from hacklipse.ports import LlmRequest, LlmResponse, ResolvedHttpCredential
 from hacklipse.ports.errors import LlmCredentialsMissing, RecordNotFound
 
 # CLI 와 공유하는 실행 옵션 계약. Namespace 하나로 같은 함수를 먹인다.
 from routing_options import (
     NoLlmUsage,
+    assemble_with_ssrf_cleanup,
+    close_ssrf_services,
     append_run_result,
     build_run_router,
     execution_profile_from_args,
@@ -124,6 +145,17 @@ class RunOptions:
     report: str = "heuristic"
     browser: bool = False
     browser_recon: bool = False
+    ssrf_review_gate: bool = False
+    ssrf_analysis_mode: str = "passive"
+    ssrf_execution_approval_registered: bool = False
+    ssrf_destination_policy_registered: bool = False
+    ssrf_destination_policy_source: str = ""
+    ssrf_local_callback: bool = False
+    ssrf_owned_local_receiver: bool = False
+    ssrf_oast: str = "off"
+    ssrf_public_oast_consent: bool = False
+    ssrf_interactsh_server: str = ""
+    ssrf_interactsh_callback_domain: str = ""
     llm_provider: str = "gemini"
     llm_model: str = ""
     llm_rpm_limit: int | None = None
@@ -145,6 +177,13 @@ class RunOptions:
             recon_entry=self.recon_entry,
             surface_collection=self.surface_collection,
             browser_recon=self.browser_recon,
+            ssrf_analysis_mode=self.ssrf_analysis_mode,
+            ssrf_execution_approval_registered=self.ssrf_execution_approval_registered,
+            ssrf_destination_policy_registered=self.ssrf_destination_policy_registered,
+            ssrf_destination_policy_source=self.ssrf_destination_policy_source,
+            ssrf_local_callback=self.ssrf_local_callback,
+            ssrf_oast=self.ssrf_oast,
+            ssrf_public_oast_consent=self.ssrf_public_oast_consent,
             router=self.router,
             router_review=self.router_review,
             compare_routers=self.compare_routers,
@@ -216,6 +255,25 @@ class RunOptions:
 
 
 @dataclass(frozen=True, slots=True)
+class SsrfReviewSubmission:
+    """Opaque, exact-coordinate input accepted by the post-Recon review gate."""
+
+    run_id: str
+    surface_id: str
+    parameter: str
+    verification_endpoint_ref: str
+    approved_by: str
+    hint_evidence_id: str = ""
+    destination_rule: SsrfDestinationRule | None = None
+    policy_source: SsrfPolicySource | None = None
+    source_reference: str = ""
+    verification_url: str = field(repr=False, default="")
+    execution_consent: bool = False
+    hint_use_approved: bool = False
+    use_owned_receiver: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class AccessAccounts:
     """Access Control 로그인에만 쓰는 사용자 입력. 로그와 상태에 남기지 않는다."""
 
@@ -262,6 +320,7 @@ class RunSecrets:
 
     access: AccessAccounts | None = None
     ssti_token: str = field(repr=False, default="")
+    interactsh_token: str = field(repr=False, default="")
 
 
 # ------------------------------------------------------------------ 계측
@@ -301,6 +360,30 @@ def _empty_snapshot(budget_total: int) -> dict:
         "llm_calls": 0,
         "llm_input_tokens": 0,
         "llm_output_tokens": 0,
+        "ssrf_issue_calls": 0,
+        "ssrf_poll_calls": 0,
+        "ssrf_analysis_http_hits": 0,
+        "ssrf_validation_http_hits": 0,
+    }
+
+
+def _empty_ssrf_review() -> dict:
+    return {
+        "analysis_mode": "passive",
+        "url_surface_count": 0,
+        "manual_analysis_completed": False,
+        "execution_approval_registered": False,
+        "destination_policy_registered": False,
+        "destination_policy_source": "",
+        "destination_hint_count": 0,
+        "destination_hint_use_approved": False,
+        "observation_recorded": False,
+        "verification_performed": False,
+        "final_status": "NOT_TESTED",
+        "reason_code": "ssrf_not_tested",
+        "callback_status": "NOT_CONFIGURED",
+        "canary_status": "NOT_CONFIGURED",
+        "owned_receiver_status": "NOT_CONFIGURED",
     }
 
 
@@ -311,6 +394,7 @@ def _idle_view(target: str, budget: int) -> dict:
         "engine": None,
         "mode": MODE_GENERIC,
         "vuln": "",
+        "ssrf_oast": "off",
         "run_id": None,
         "phase": "init",
         "error": None,
@@ -318,6 +402,11 @@ def _idle_view(target: str, budget: int) -> dict:
         "current_agent": None,
         "findings_total": 0,
         "snapshot": _empty_snapshot(budget),
+        "ssrf_review": _empty_ssrf_review(),
+        "ssrf_review_pending": False,
+        "ssrf_review_options": {
+            "surfaces": [], "hints": [], "owned_receiver_available": False,
+        },
         "candidates": [],
         "report": None,
     }
@@ -350,6 +439,9 @@ class DashboardState:
                 "engine": engine_label,
                 "mode": options.mode,
                 "vuln": options.vuln if options.is_juice_shop else "",
+                "ssrf_oast": (
+                    "local_test" if options.ssrf_local_callback else options.ssrf_oast
+                ),
             }
 
     def record_event(self, event, *, current_agent: str | None) -> None:
@@ -411,6 +503,15 @@ class DashboardState:
         with self._lock:
             view = dict(self._view)
             view["snapshot"] = dict(self._view["snapshot"])
+            view["ssrf_review"] = dict(self._view["ssrf_review"])
+            review_options = self._view["ssrf_review_options"]
+            view["ssrf_review_options"] = {
+                "surfaces": [dict(item) for item in review_options["surfaces"]],
+                "hints": [dict(item) for item in review_options["hints"]],
+                "owned_receiver_available": bool(
+                    review_options.get("owned_receiver_available", False)
+                ),
+            }
             view["candidates"] = list(self._view["candidates"])
             # note 는 음수 순번이라 since 비교에서 항상 통과한다. 화면은 중복을
             # 시각+본문으로 거르지 않고 순번으로 거르므로 별도 목록으로 넘긴다.
@@ -442,6 +543,276 @@ class RunSupervisor:
         self._current_agent: str | None = None
         self._usage: LlmUsageMeter | None = None
         self._app = None
+        self._ssrf_review_condition = threading.Condition()
+        self._ssrf_review_pending_run_id: str | None = None
+        self._ssrf_review_resolved_run_ids: set[str] = set()
+
+    def _ssrf_review_options(self, run_id: str) -> dict:
+        """Build value-free choices from trusted Recon Evidence for one Run."""
+
+        app = self._app
+        if app is None:
+            return {
+                "surfaces": [], "hints": [],
+                "owned_receiver_available": False,
+            }
+        surfaces = {
+            item.surface_id: item for item in app.stores.surfaces.list_by_run(run_id)
+        }
+        coordinates: list[dict] = []
+        hints: list[dict] = []
+        seen_coordinates: set[tuple[str, str]] = set()
+        for evidence in app.stores.evidence.list_by_run(run_id):
+            observation = evidence.observation
+            if evidence.created_by != "recon":
+                continue
+            if observation.get("type") == "ssrf_url_fetch_review":
+                surface = surfaces.get(evidence.surface_id or "")
+                if surface is None or surface.method.upper() != "GET":
+                    continue
+                sources = observation.get("parameter_sources")
+                parameter_names = observation.get("parameter_names")
+                if not isinstance(sources, list) or not isinstance(parameter_names, list):
+                    continue
+                for item in sources:
+                    if not isinstance(item, dict):
+                        continue
+                    name = item.get("name")
+                    source = item.get("source")
+                    if not isinstance(name, str) or not isinstance(source, str):
+                        continue
+                    if name not in parameter_names or name not in surface.parameters:
+                        continue
+                    key = (surface.surface_id, name)
+                    if key in seen_coordinates:
+                        continue
+                    seen_coordinates.add(key)
+                    coordinates.append({
+                        "surface_id": surface.surface_id,
+                        "parameter": name,
+                        "path": redacted_internal_url_path(
+                            urlsplit(surface.url).path or "/"
+                        ),
+                        "source": source,
+                    })
+            elif observation.get("type") == "ssrf_destination_hint":
+                origin = observation.get("destination_origin")
+                path_hint = observation.get("path_hint")
+                source = observation.get("source")
+                if not all(isinstance(value, str) for value in (origin, path_hint, source)):
+                    continue
+                parsed = urlsplit(origin)
+                if (
+                    parsed.scheme not in {"http", "https"}
+                    or not parsed.netloc
+                    or parsed.username is not None
+                    or parsed.password is not None
+                    or parsed.query
+                    or parsed.fragment
+                    or "?" in path_hint
+                    or "#" in path_hint
+                ):
+                    continue
+                hints.append({
+                    "evidence_id": evidence.evidence_id,
+                    "surface_id": evidence.surface_id,
+                    "source_path": redacted_internal_url_path(
+                        urlsplit(surfaces[evidence.surface_id].url).path or "/"
+                    ) if evidence.surface_id in surfaces else "",
+                    "destination_origin": origin,
+                    "path_hint": redacted_internal_url_path(path_hint),
+                    "source": source,
+                })
+        return {
+            "surfaces": sorted(
+                coordinates,
+                key=lambda item: (item["path"], item["parameter"], item["surface_id"]),
+            ),
+            "hints": sorted(hints, key=lambda item: item["evidence_id"]),
+            "owned_receiver_available": app.collector.ssrf_owned_receiver_enabled,
+        }
+
+    def _wait_for_ssrf_review(self, run) -> None:
+        """Pause this Run after Recon until one exact review is registered or skipped."""
+
+        options = self._ssrf_review_options(run.run_id)
+        if not options["surfaces"]:
+            return
+        with self._ssrf_review_condition:
+            if run.run_id in self._ssrf_review_resolved_run_ids:
+                return
+            self._ssrf_review_pending_run_id = run.run_id
+            self.state.update_view(
+                ssrf_review_pending=True,
+                ssrf_review_options=options,
+            )
+            self.state.note("SSRF URL 처리 좌표 검토 대기 중")
+        app = self._app
+        assert app is not None
+        app.ssrf_reviews.wait_for_review(run.run_id)
+        with self._ssrf_review_condition:
+            self._ssrf_review_resolved_run_ids.add(run.run_id)
+            self._ssrf_review_pending_run_id = None
+        self.state.update_view(ssrf_review_pending=False)
+
+    def register_ssrf_review(self, submission: SsrfReviewSubmission) -> None:
+        """Register one exact, value-free review and release the current Run once."""
+
+        app = self._app
+        if app is None:
+            raise RuntimeError("검토할 Run이 없다.")
+        with self._ssrf_review_condition:
+            if submission.run_id != self._ssrf_review_pending_run_id:
+                raise RuntimeError("현재 대기 중인 Run과 일치하지 않는다.")
+            options = self._ssrf_review_options(submission.run_id)
+            allowed = {
+                (item["surface_id"], item["parameter"])
+                for item in options["surfaces"]
+            }
+            coordinate = (submission.surface_id, submission.parameter)
+            if coordinate not in allowed:
+                raise ValueError("현재 Run에서 관측된 정확한 Surface와 파라미터가 아니다.")
+            allowed_hints = {item["evidence_id"] for item in options["hints"]}
+            if (
+                submission.hint_evidence_id
+                and submission.hint_evidence_id not in allowed_hints
+            ):
+                raise ValueError("선택한 목적지 단서는 현재 Run의 정제된 Recon 단서가 아니다.")
+            all_hint_ids = {
+                item["evidence_id"] for item in options["hints"]
+            }
+            if submission.verification_endpoint_ref in all_hint_ids:
+                raise ValueError("확인 서비스 참조에 Recon 단서 ID를 사용할 수 없다.")
+            if submission.source_reference in all_hint_ids:
+                raise ValueError("정책 참조에 Recon 단서 ID를 사용할 수 없다.")
+
+            if submission.use_owned_receiver:
+                if not app.collector.ssrf_owned_receiver_enabled:
+                    raise ValueError("운영자 소유 Receiver가 이 Run에 설정되지 않았다.")
+                if submission.verification_url or submission.verification_endpoint_ref:
+                    raise ValueError(
+                        "Receiver와 별도 확인 주소·서비스 참조를 함께 사용할 수 없다."
+                    )
+                if submission.hint_use_approved:
+                    raise ValueError(
+                        "생성된 Receiver 주소는 Recon 목적지 단서로 승인할 수 없다."
+                    )
+                if not submission.execution_consent:
+                    raise ValueError("Receiver 실행에는 별도 실행 동의가 필요하다.")
+                approved_destination_url = app.ssrf_owned_receiver_origin
+                if not approved_destination_url:
+                    raise ValueError("운영자 소유 Receiver가 사용 불가하다.")
+            else:
+                approved_destination_url = submission.verification_url or None
+
+            now = utc_now()
+            policy = None
+            if submission.destination_rule is not None:
+                if not approved_destination_url:
+                    raise ValueError(
+                        "A structured destination policy requires an exact approved destination."
+                    )
+                if submission.policy_source is None or not submission.source_reference:
+                    raise ValueError("목적지 규칙에는 신뢰 가능한 출처와 참조가 필요하다.")
+                if submission.policy_source is not SsrfPolicySource.OPERATOR_ATTESTATION:
+                    raise ValueError(
+                        "수동 Dashboard 검토는 운영자 증언 정책만 등록할 수 있다."
+                    )
+                policy = SsrfDestinationPolicy(
+                    policy_id=f"policy-{uuid4()}",
+                    surface_id=submission.surface_id,
+                    destination_rule=submission.destination_rule,
+                    source_type=submission.policy_source,
+                    source_reference=submission.source_reference,
+                    approved_by=submission.approved_by,
+                    created_at=now,
+                    destination_origin=ssrf_destination_origin(
+                        approved_destination_url
+                    ),
+                    assertion=(
+                        SsrfPolicyAssertion.TARGET_MUST_NOT_REACH_DESTINATION
+                        if submission.destination_rule is SsrfDestinationRule.FORBIDDEN
+                        else SsrfPolicyAssertion.TARGET_MAY_REACH_DESTINATION
+                    ),
+                    evidence_status=(
+                        SsrfPolicyEvidenceStatus.ATTESTED
+                        if approved_destination_url else None
+                    ),
+                )
+            elif submission.policy_source is not None or submission.source_reference:
+                raise ValueError("목적지 규칙 없이 정책 출처를 등록할 수 없다.")
+
+            canary = None
+            verification_ref = submission.verification_endpoint_ref
+            if submission.use_owned_receiver:
+                verification_ref = app.ssrf_owned_receiver_endpoint_ref(
+                    submission.run_id,
+                )
+            elif submission.verification_url:
+                if not submission.execution_consent:
+                    raise ValueError("내부 확인에는 별도 실행 동의가 필요하다.")
+                marker = os.environ.get("HACKLIPSE_SSRF_CANARY_MARKER", "")
+                if not marker:
+                    raise ValueError("서버에 SSRF 확인 응답 표식이 설정되지 않았다.")
+                canary = SsrfCanaryProofTarget(
+                    url=submission.verification_url,
+                    marker=marker,
+                    surface_id=submission.surface_id,
+                    destination_policy=policy,
+                    operator_approved=True,
+                )
+                verification_ref = app.ssrf_verification_endpoint_ref(
+                    submission.run_id, canary.url,
+                )
+            elif submission.execution_consent:
+                raise ValueError("내부 확인 주소 없이 실행 동의를 등록할 수 없다.")
+            approval = SsrfExecutionApproval(
+                approval_id=f"approval-{uuid4()}",
+                surface_id=submission.surface_id,
+                verification_endpoint_ref=verification_ref,
+                approved_by=submission.approved_by,
+                approved_at=now,
+            )
+
+            app.collector.register_ssrf_review(
+                run_id=submission.run_id,
+                parameter=submission.parameter,
+                hint_evidence_id=submission.hint_evidence_id or None,
+                approval=approval,
+                destination_policy=policy,
+                hint_use_approved=submission.hint_use_approved,
+                approved_destination_url=approved_destination_url,
+                verification_strategy=(
+                    SsrfVerificationStrategy.OWNED_RECEIVER
+                    if submission.use_owned_receiver
+                    else SsrfVerificationStrategy.INTERNAL_CANARY
+                    if submission.verification_url
+                    else SsrfVerificationStrategy.CALLBACK
+                    if app.collector.ssrf_enabled
+                    else SsrfVerificationStrategy.PASSIVE
+                ),
+            )
+            if canary is not None:
+                app.register_ssrf_canary_proof(submission.run_id, canary)
+            self._ssrf_review_resolved_run_ids.add(submission.run_id)
+            self._ssrf_review_pending_run_id = None
+        self.state.update_view(ssrf_review_pending=False)
+        self.state.note("SSRF 실행 승인과 선택적 목적지 정책 등록 완료")
+
+    def skip_ssrf_review(self, run_id: str) -> None:
+        """Release the current gate without creating approval or policy facts."""
+
+        with self._ssrf_review_condition:
+            if run_id != self._ssrf_review_pending_run_id:
+                raise RuntimeError("현재 대기 중인 Run과 일치하지 않는다.")
+            app = self._app
+            if app is None:
+                raise RuntimeError("검토할 Run이 없다.")
+            app.ssrf_reviews.skip(run_id)
+            self._ssrf_review_resolved_run_ids.add(run_id)
+            self._ssrf_review_pending_run_id = None
+        self.state.update_view(ssrf_review_pending=False)
+        self.state.note("SSRF 좌표 검토를 건너뜀")
 
     # --- 검증 (HTTP 스레드에서 호출) ---
 
@@ -461,6 +832,30 @@ class RunSupervisor:
             return f"알 수 없는 실행 모드다: {options.mode}"
         if options.is_juice_shop and options.vuln not in VULN_CHOICES:
             return f"알 수 없는 취약점 유형이다: {options.vuln}"
+        if options.ssrf_analysis_mode != "passive":
+            return "SSRF analysis mode must be passive."
+        if options.ssrf_local_callback and (
+            host not in {"localhost", "127.0.0.1"}
+            or (options.is_juice_shop and options.vuln not in {"auto", "all"})
+        ):
+            return "로컬 SSRF callback은 loopback 대상의 자동·전체 검사에서만 쓸 수 있다."
+        if options.ssrf_local_callback and options.ssrf_oast != "off":
+            return "로컬 callback과 Interactsh는 동시에 선택할 수 없다."
+        if options.ssrf_owned_local_receiver and (
+            host not in {"localhost", "127.0.0.1"}
+            or (options.is_juice_shop and options.vuln not in {"auto", "all"})
+        ):
+            return "운영자 소유 Receiver는 격리된 loopback 대상의 자동·전체 검사에서만 쓸 수 있다."
+        if options.ssrf_owned_local_receiver and not options.ssrf_review_gate:
+            return "운영자 소유 Receiver는 Recon 후 Surface 단위 승인 절차가 필요하다."
+        if options.ssrf_oast not in {"off", "public_interactsh", "private_interactsh"}:
+            return "알 수 없는 SSRF OAST 모드다."
+        if options.ssrf_oast != "off" and options.is_juice_shop and options.vuln not in {"auto", "all"}:
+            return "Interactsh SSRF는 자동·전체 검사에서만 쓸 수 있다."
+        if options.ssrf_oast == "public_interactsh" and not options.ssrf_public_oast_consent:
+            return "공개 Interactsh 사용에는 제3자 메타데이터 전송 동의가 필요하다."
+        if options.ssrf_oast == "private_interactsh" and not options.ssrf_interactsh_server:
+            return "사설 Interactsh 서버 주소가 필요하다."
         if options.validation_review and options.profile != "llm":
             # CLI 와 같은 규칙이다.
             return "Validation review는 Analysis 프로필이 llm일 때만 쓸 수 있다."
@@ -563,27 +958,11 @@ class RunSupervisor:
         plan = _preparation_plan(options, secrets)
         namespace.approve_state_changing = bool(plan.approvals)
 
-        try:
-            router = build_run_router(
-                namespace,
-                vulnerability_types=self._vulnerability_types(options),
-                llm_client=llm_client,
-                selected_model=options.resolved_model(),
-            )
-        except OSError as error:
-            self.state.finish(
-                status="failed", error=f"Router 기록 파일을 열 수 없다: {error}"
-            )
-            return
-
         resolver = InMemoryCredentialResolver(plan.credentials)
         http_runtime = HttpExecutionRuntime(credential_resolver=resolver)
-        # SPA 의 DOM sink 는 브라우저로만 관측된다. 필요할 때만 감싸 다른 유형의
-        # 실행 비용을 늘리지 않는다 — CLI 와 같은 판단이다.
         runtime = (
             PlaywrightBrowserRuntime(http_runtime=http_runtime)
-            if options.needs_browser
-            else http_runtime
+            if options.needs_browser else http_runtime
         )
         audit = InMemoryExecutionAuditLog()
         knowledge_base = None
@@ -592,8 +971,58 @@ class RunSupervisor:
             knowledge_path.parent.mkdir(parents=True, exist_ok=True)
             knowledge_base = SQLiteKnowledgeBase(knowledge_path)
 
-        app = build_local_application(
+        ssrf_callback = None
+        ssrf_owned_receiver = None
+        try:
+            if options.ssrf_local_callback:
+                ssrf_callback = LocalSsrfCallbackService()
+            elif options.ssrf_oast != "off":
+                ssrf_callback = InteractshCliCallbackService(
+                    server=("oast.pro" if options.ssrf_oast == "public_interactsh"
+                            else options.ssrf_interactsh_server),
+                    public_oast=options.ssrf_oast == "public_interactsh",
+                    public_oast_consent=options.ssrf_public_oast_consent,
+                    callback_domain=options.ssrf_interactsh_callback_domain or None,
+                    token=(secrets.interactsh_token
+                           if options.ssrf_oast == "private_interactsh" else ""),
+                )
+        except (OSError, TimeoutError, ValueError) as error:
+            close_ssrf_services(ssrf_callback)
+            ssrf_callback = None
+            self.state.note(
+                "SSRF callback Provider 장애: callback 전략만 비활성화하고 "
+                f"실행을 계속함 ({error})"
+            )
+        try:
+            if options.ssrf_owned_local_receiver:
+                # Callback Provider와 별도인, 명시적 local-research 수신기다.
+                ssrf_owned_receiver = LocalSsrfCallbackService()
+        except (OSError, TimeoutError, ValueError) as error:
+            close_ssrf_services(ssrf_owned_receiver)
+            ssrf_owned_receiver = None
+            self.state.note(
+                "운영자 소유 Receiver 장애: Receiver 전략만 "
+                f"비활성화하고 실행을 계속함 ({error})"
+            )
+        try:
+            router = build_run_router(
+                namespace,
+                vulnerability_types=self._vulnerability_types(options),
+                llm_client=llm_client,
+                selected_model=options.resolved_model(),
+                ssrf_callback_service=ssrf_callback,
+            )
+        except (OSError, TimeoutError, ValueError) as error:
+            close_ssrf_services(ssrf_callback, ssrf_owned_receiver)
+            self.state.finish(
+                status="failed", error=f"Router를 시작할 수 없다: {error}"
+            )
+            return
+
+        app = assemble_with_ssrf_cleanup(
+            build_local_application, ssrf_callback,
             {},
+            ssrf_cleanup_services=(ssrf_owned_receiver,),
             runtime=runtime,
             knowledge_base=knowledge_base,
             orchestration_advisor=(
@@ -614,6 +1043,9 @@ class RunSupervisor:
             # 것이 아니라 0회다.
             report_llm_usage=llm_client if llm_client is not None else NoLlmUsage(),
             router=router,
+            ssrf_callback_service=ssrf_callback,
+            ssrf_owned_receiver_service=ssrf_owned_receiver,
+            ssrf_local_test_mode=isinstance(ssrf_callback, LocalSsrfCallbackService),
             credential_resolver=resolver,
             approval_gate=StaticApprovalGate(plan.approvals),
             audit_log=audit,
@@ -621,7 +1053,9 @@ class RunSupervisor:
             config=OrchestratorConfig(
                 browser_xss_validation=options.needs_browser,
                 budget_allocation_enabled=options.budget_allocation != "off",
-                max_evidence_rounds=2 if options.router == "agentic" else 1,
+                post_recon_gate=(
+                    self._wait_for_ssrf_review if options.ssrf_review_gate else None
+                ),
             ),
         )
         self._app = app
@@ -767,6 +1201,7 @@ class RunSupervisor:
                 except Exception as error:  # noqa: BLE001
                     cleanup_error = error
             _release(http_runtime, resolver, preparation_run_ids, run)
+            close_ssrf_services(ssrf_callback, ssrf_owned_receiver)
             self.state.note("세션 credential 메모리 참조 폐기 완료")
 
         try:
@@ -837,21 +1272,59 @@ class RunSupervisor:
             llm_output_tokens=usage.output_tokens if usage else 0,
         )
         surfaces = {item.surface_id: item for item in app.stores.surfaces.list_by_run(run_id)}
-        findings = {item.candidate_id: item for item in app.stores.findings.list_by_run(run_id)}
+        candidate_records = app.stores.candidates.list_by_run(run_id)
+        finding_records = app.stores.findings.list_by_run(run_id)
+        findings = {item.candidate_id: item for item in finding_records}
+        run_evidence = app.stores.evidence.list_by_run(run_id)
+        ssrf_http_hits = [item for item in run_evidence
+                          if item.observation.get("type") == "ssrf_callback_http"]
+        ssrf_review_fact = build_ssrf_review_fact(
+            profile=run.execution_profile,
+            candidates=candidate_records,
+            findings=finding_records,
+            run_evidence=run_evidence,
+        )
+        ssrf_review = (
+            _empty_ssrf_review()
+            if ssrf_review_fact is None
+            else {
+                "analysis_mode": run.execution_profile.ssrf_analysis_mode,
+                **asdict(ssrf_review_fact),
+            }
+        )
+        ssrf_review["destination_hint_count"] = len({
+            str(item.observation.get("destination_fingerprint") or item.evidence_id)
+            for item in run_evidence
+            if item.created_by == "recon"
+            and item.observation.get("type") == "ssrf_destination_hint"
+        })
 
         candidates = []
-        for item in app.stores.candidates.list_by_run(run_id):
+        for item in candidate_records:
             surface = surfaces.get(item.surface_id)
             finding = findings.get(item.candidate_id)
+            reason_code = (
+                item.validation_reason_code.value
+                if item.validation_reason_code is not None else None
+            )
             candidates.append(
                 {
                     "vulnerability_type": item.vulnerability_type,
                     # query 값은 빼고 경로와 파라미터 이름만 넘긴다.
-                    "path": urlsplit(surface.url).path if surface else "",
+                    "path": redacted_internal_url_path(
+                        urlsplit(surface.url).path or "/"
+                    ) if surface else "",
                     "parameters": list(item.exploration_parameters)
                     or (list(surface.parameters) if surface else []),
                     "status": item.status.value,
-                    "reason": item.last_error,
+                    "reason": (
+                        "서버 요청 관측; 허용 목적지 규칙 미확인"
+                        if item.vulnerability_type == "SSRF"
+                        and item.validation_reason_code is not None
+                        and item.validation_reason_code.value == "generic_no_proof"
+                        else item.last_error if item.vulnerability_type != "SSRF" else None
+                    ),
+                    "reason_code": reason_code,
                     "severity": finding.severity if finding else None,
                 }
             )
@@ -862,6 +1335,7 @@ class RunSupervisor:
             phase=run.phase.value,
             findings_total=len(findings),
             candidates=candidates,
+            ssrf_review=ssrf_review,
             report=reports[-1].content if reports else None,
             snapshot={
                 "surface_count": snapshot.surface_count,
@@ -873,6 +1347,14 @@ class RunSupervisor:
                 "llm_calls": snapshot.llm_calls,
                 "llm_input_tokens": snapshot.llm_input_tokens,
                 "llm_output_tokens": snapshot.llm_output_tokens,
+                "ssrf_issue_calls": app.collector.ssrf_callback_usage[0],
+                "ssrf_poll_calls": app.collector.ssrf_callback_usage[1],
+                "ssrf_analysis_http_hits": sum(
+                    item.validation_id is None for item in ssrf_http_hits
+                ),
+                "ssrf_validation_http_hits": sum(
+                    item.validation_id is not None for item in ssrf_http_hits
+                ),
             },
         )
 

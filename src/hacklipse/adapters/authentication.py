@@ -47,7 +47,7 @@ class FormLoginWorker:
         if login.csrf_field is not None:
             preflight_id, preflight = self._collector.collect_with_result(
                 task.run_id,
-                login.login_url,
+                login.preflight_url or login.login_url,
                 EvidenceRequest(
                     evidence_type="authentication_preflight",
                     surface_id="authentication",

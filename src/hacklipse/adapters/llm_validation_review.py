@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 from collections.abc import Mapping
 from urllib.parse import urlsplit
@@ -23,6 +22,7 @@ from hacklipse.ports.errors import (
 from hacklipse.ports.llm import LlmClient, LlmMessage, LlmRequest
 
 from .llm_parameter_names import alias_parameter_names
+from .security import redacted_internal_url_path
 from .validation_review_contract import (
     ValidationOutcomeClass,
     ValidationReview,
@@ -32,7 +32,6 @@ from .validation_review_contract import (
 
 _LOG = logging.getLogger(__name__)
 _FALLBACK_REASON = "이번 Validation session의 제한된 facts만으로 결과를 분류할 수 없음"
-_SAFE_SEGMENT = re.compile(r"^[A-Za-z][A-Za-z_-]{0,63}(?:\.[A-Za-z]{1,10})?$")
 _SAFE_OBSERVATION = frozenset(
     {"http_response", "http_error", "http_redirect", "browser_execution", "browser_error"}
 )
@@ -112,11 +111,7 @@ class LlmValidationReviewer:
     def _prompt(context: ValidationReviewContext) -> str:
         # Explicit selection: storage-only identifiers and raw Validation reason are never sent.
         path = urlsplit(context.surface_path_hint).path.split("?", 1)[0]
-        segments = [
-            segment if not segment or _SAFE_SEGMENT.fullmatch(segment) else "{value}"
-            for segment in path.split("/")[:16]
-        ]
-        safe_path = "/".join(segments)[:256] or "/"
+        safe_path = redacted_internal_url_path(path)[:256]
         aliases = alias_parameter_names(context.parameter_aliases).prompt_names[:20]
         facts = [
             {"type": kind, "status": status}

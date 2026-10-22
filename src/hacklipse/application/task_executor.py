@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import json
+
 import signal
 import threading
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import replace
 
 from hacklipse.domain import (
     AgentResult,
     AgentResultStatus,
+    HttpRequestKind,
     TaskEnvelope,
     TaskRecord,
     TaskStatus,
@@ -19,6 +23,10 @@ from hacklipse.ports import BudgetManager, RetryPolicy, TaskDispatcher, TaskStor
 from hacklipse.ports.errors import TaskTimeout
 
 from .errors import AgentContractError, safe_error_reason
+
+
+_PROTECTED_SSRF_ENDPOINT = "https://protected-ssrf-endpoint.invalid/"
+_PROTECTED_SSRF_VALUE = "protected"
 
 
 class TaskExecutor:
@@ -44,14 +52,16 @@ class TaskExecutor:
         """Task를 기록하고 성공하거나 재시도 한도에 도달할 때까지 실행한다."""
 
         # PENDING 레코드를 먼저 남겨 실행 전부터 Task를 추적할 수 있게 한다.
-        record = TaskRecord(envelope=envelope)
+        # SSRF 확인 주소는 Worker에만 원본으로 전달하고 저장·진행 알림에는 남기지 않는다.
+        observable_envelope = _protected_observable_envelope(envelope)
+        record = TaskRecord(envelope=observable_envelope)
         self._tasks.add(record)
         attempt = 0
 
         while True:
             attempt += 1
             started = time.monotonic()
-            self._notify("started", envelope, attempt, 0.0)
+            self._notify("started", observable_envelope, attempt, 0.0)
             try:
                 # Agent를 호출하기 전에 남은 Run 예산을 확인한다.
                 self._budget.ensure_available(envelope)
@@ -63,7 +73,7 @@ class TaskExecutor:
                 record = record.with_status(TaskStatus.SUCCEEDED, attempts=attempt)
                 self._tasks.save(record)
                 self._notify(
-                    "succeeded", envelope, attempt, time.monotonic() - started
+                    "succeeded", observable_envelope, attempt, time.monotonic() - started
                 )
                 return result
             except Exception as error:
@@ -74,7 +84,9 @@ class TaskExecutor:
                     error=safe_error_reason(error),
                 )
                 self._tasks.save(record)
-                self._notify("failed", envelope, attempt, time.monotonic() - started)
+                self._notify(
+                    "failed", observable_envelope, attempt, time.monotonic() - started
+                )
                 if not self._retry.should_retry(attempt, error):
                     raise
 
@@ -103,6 +115,73 @@ class TaskExecutor:
             raise AgentContractError("agent result task_id does not match its envelope")
         if result.status is AgentResultStatus.FAILED:
             raise AgentContractError(result.message or "agent reported failure")
+
+
+def _protected_observable_envelope(envelope: TaskEnvelope) -> TaskEnvelope:
+    """TaskStore·UI에서는 SSRF 실행 주소와 동반 값을 보호한다."""
+
+    evidence_request = envelope.evidence_request
+    request = evidence_request.http_request if evidence_request is not None else None
+    if request is None or request.request_kind not in {
+        HttpRequestKind.SSRF_PROBE,
+        HttpRequestKind.SSRF_CANARY_PROBE,
+        HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE,
+        HttpRequestKind.SSRF_WORKFLOW_OWNED_PROBE,
+        HttpRequestKind.SSRF_CSV_UPLOAD_PROBE,
+    }:
+        return envelope
+
+    def protected(value: str) -> str:
+        return (
+            _PROTECTED_SSRF_ENDPOINT
+            if value.casefold().startswith(("http://", "https://"))
+            else _PROTECTED_SSRF_VALUE
+        )
+
+    protected_body = _PROTECTED_SSRF_VALUE if request.body is not None else None
+    if request.request_kind is HttpRequestKind.SSRF_CSV_UPLOAD_PROBE:
+        assert request.body is not None
+        prefix, separator, remainder = request.body.partition("\r\n\r\n")
+        row, newline, trailer = remainder.partition("\n")
+        category, delimiter, _ = row.partition(";")
+        if not (separator and newline and delimiter):
+            raise AgentContractError("CSV probe body is malformed")
+        protected_body = (
+            prefix + separator + category + delimiter
+            + "http://%31%32%37%2e%30%2e%30%2e%31:9/redacted"
+            + newline + trailer
+        )
+    elif request.method.upper() == "POST" and request.body is not None:
+        # Keep only field names in observable tasks. The execution worker uses
+        # its original envelope, which remains bound to the issued URL ticket.
+        def protect_json(value):
+            if isinstance(value, dict):
+                return {name: protect_json(item) for name, item in value.items()}
+            if isinstance(value, str):
+                return protected(value)
+            return _PROTECTED_SSRF_VALUE
+        protected_body = json.dumps(protect_json(json.loads(request.body)))
+
+    protected_request = replace(
+        request,
+        query_parameters=(
+            request.query_parameters
+            if request.request_kind is HttpRequestKind.SSRF_CSV_UPLOAD_PROBE
+            else tuple((name, protected(value)) for name, value in request.query_parameters)
+        ),
+        form_parameters=tuple(
+            (name, protected(value)) for name, value in request.form_parameters
+        ),
+        headers=(
+            request.headers if request.method.upper() == "POST"
+            else tuple((name, _PROTECTED_SSRF_VALUE) for name, _ in request.headers)
+        ),
+        body=protected_body,
+    )
+    return replace(
+        envelope,
+        evidence_request=replace(evidence_request, http_request=protected_request),
+    )
 
 
 @contextmanager
