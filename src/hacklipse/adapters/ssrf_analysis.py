@@ -19,12 +19,15 @@ from hacklipse.ports import CandidateStore, EvidenceStore, SurfaceStore
 from hacklipse.ports.errors import BudgetExceeded, RecordNotFound
 
 from .probing import matching_evidence, resolve_analysis_task
+from .graphql_discovery import _NAME as GRAPHQL_NAME, _named_type, _schema
 
 SSRF_TYPE = "SSRF"
 SSRF_ANALYZER = "ssrf_analyzer"
 SSRF_CALLBACK_CAPABILITY = "ssrf.callback_observed_url_query"
 SSRF_CALLBACK_DECLARED_CAPABILITY = "ssrf.callback_declared_url_query"
 SSRF_CALLBACK_JSON_CAPABILITY = "ssrf.callback_declared_url_json"
+SSRF_CALLBACK_OPENAPI_JSON_CAPABILITY = "ssrf.callback_openapi_single_url_json"
+SSRF_CALLBACK_GRAPHQL_CAPABILITY = "ssrf.callback_graphql_url_query"
 SSRF_CALLBACK_EDITOR_CAPABILITY = "ssrf.callback_editor_catcher_query"
 SSRF_CANARY_CAPABILITY = "ssrf.internal_canary_observed_url_query"
 SSRF_CANARY_DECLARED_CAPABILITY = "ssrf.internal_canary_declared_url_query"
@@ -34,15 +37,21 @@ SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY = (
     "ssrf.internal_request_log_declared_url_query"
 )
 SSRF_OWNED_RECEIVER_JSON_CAPABILITY = "ssrf.internal_request_log_declared_url_json"
+SSRF_OWNED_RECEIVER_OPENAPI_JSON_CAPABILITY = (
+    "ssrf.internal_request_log_openapi_single_url_json"
+)
+SSRF_OWNED_RECEIVER_GRAPHQL_CAPABILITY = "ssrf.internal_request_log_graphql_url_query"
 SSRF_OWNED_RECEIVER_EDITOR_CAPABILITY = "ssrf.internal_request_log_editor_catcher_query"
 SSRF_EDITOR_CATCHER_STRUCTURE = "editor_catcher_request_structure"
+SSRF_OPENAPI_SINGLE_JSON_STRUCTURE = "ssrf_openapi_single_json_request_structure"
+SSRF_GRAPHQL_QUERY_STRUCTURE = "ssrf_graphql_url_query_structure"
 # Backwards-compatible public names. Existing callers mean the callback
 # strategy when they ask for the original SSRF capability.
 SSRF_CAPABILITY = SSRF_CALLBACK_CAPABILITY
 SSRF_DECLARED_CAPABILITY = SSRF_CALLBACK_DECLARED_CAPABILITY
 SSRF_CALLBACK_STRATEGIES = frozenset({
     "observed_url_callback_probe", "declared_url_callback_probe",
-    "declared_json_callback_probe",
+    "declared_json_callback_probe", "declared_graphql_callback_probe",
 })
 SSRF_CANARY_STRATEGIES = frozenset({
     "observed_url_internal_canary_probe",
@@ -52,6 +61,7 @@ SSRF_OWNED_RECEIVER_STRATEGIES = frozenset({
     "observed_url_internal_request_log_probe",
     "declared_url_internal_request_log_probe",
     "declared_json_internal_request_log_probe",
+    "declared_graphql_internal_request_log_probe",
 })
 SSRF_PARAMETER_HINTS = frozenset({
     "url", "uri", "link", "image", "image_url", "feed", "feed_url",
@@ -89,6 +99,57 @@ def observed_url_parameter_names(surface: Surface) -> frozenset[str]:
         except ValueError:
             continue
     return frozenset(names)
+
+
+def ssrf_graphql_query_inputs(
+    observation: dict,
+) -> tuple[tuple[str, str, bool], ...]:
+    """Choose only schema-declared read queries with one URL string argument."""
+
+    schema = _schema(observation)
+    if schema is None:
+        return ()
+    query_type = schema.get("queryType")
+    root = query_type.get("name") if isinstance(query_type, dict) else None
+    if not isinstance(root, str) or not GRAPHQL_NAME.fullmatch(root):
+        return ()
+    for entry in schema["types"]:
+        if not isinstance(entry, dict) or entry.get("kind") != "OBJECT" or entry.get("name") != root:
+            continue
+        fields = entry.get("fields")
+        if not isinstance(fields, list) or len(fields) > 1000:
+            return ()
+        plans: list[tuple[str, str, bool]] = []
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            name, args = field.get("name"), field.get("args")
+            result_type = _named_type(field.get("type"))
+            if (
+                not isinstance(name, str) or not GRAPHQL_NAME.fullmatch(name)
+                or name.startswith("__") or not isinstance(args, list)
+                or len(args) != 1 or result_type is None
+            ):
+                continue
+            argument = args[0]
+            if not isinstance(argument, dict):
+                continue
+            argument_name = argument.get("name")
+            if (
+                not isinstance(argument_name, str)
+                or not GRAPHQL_NAME.fullmatch(argument_name)
+                or argument_name.casefold() not in SSRF_JSON_PARAMETER_HINTS
+                or _named_type(argument.get("type")) != ("SCALAR", "String")
+            ):
+                continue
+            plans.append((
+                name, argument_name,
+                result_type[0] not in {"SCALAR", "ENUM"},
+            ))
+            if len(plans) >= 4:
+                break
+        return tuple(plans)
+    return ()
 
 
 def _ssrf_http_spec(
@@ -160,8 +221,28 @@ def ssrf_parameter_sources(
     if method not in {"GET", "POST"} or urlsplit(surface.url).fragment:
         return ()
     if method == "POST":
+        graphql = tuple(
+            str(item.observation["argument"])
+            for item in evidence
+            if item.run_id == surface.run_id
+            and item.surface_id == surface.surface_id
+            and item.created_by == "recon"
+            and item.evidence_type == "observation"
+            and item.observation.get("type") == SSRF_GRAPHQL_QUERY_STRUCTURE
+            and item.observation.get("method") == "POST"
+            and isinstance(item.observation.get("argument"), str)
+            and item.observation["argument"].casefold() in SSRF_JSON_PARAMETER_HINTS
+            and item.observation["argument"] in surface.parameters
+        )
+        if graphql:
+            return tuple((name, "graphql_introspection")
+                         for name in dict.fromkeys(graphql))
         declared = {
-            name
+            name: (
+                "declared_openapi_single_json_body"
+                if item.observation.get("type") == SSRF_OPENAPI_SINGLE_JSON_STRUCTURE
+                else "declared_json_body"
+            )
             for item in evidence
             if item.run_id == surface.run_id
             and item.surface_id == surface.surface_id
@@ -169,16 +250,16 @@ def ssrf_parameter_sources(
             and item.evidence_type == "observation"
             and item.observation.get("method") == "POST"
             and item.observation.get("content_type") == "application/json"
-            and item.observation.get("type") == "javascript_json_request_structure"
+            and item.observation.get("type") in {
+                "javascript_json_request_structure",
+                SSRF_OPENAPI_SINGLE_JSON_STRUCTURE,
+            }
             and isinstance(item.observation.get("body_parameter_names"), (list, tuple))
             for name in item.observation["body_parameter_names"]
             if isinstance(name, str) and name.casefold() in SSRF_JSON_PARAMETER_HINTS
         }
-        return tuple(
-            (name, "declared_json_body")
-            for name in surface.parameters
-            if name in declared
-        )
+        return tuple((name, declared[name]) for name in surface.parameters
+                     if name in declared)
     observed_names = {name for name, _ in surface.observed_query}
     observed_names.update(name for name, _ in parse_qsl(
         urlsplit(surface.url).query, keep_blank_values=True,
@@ -217,6 +298,50 @@ def ssrf_parameter_sources(
     return tuple(sorted(coordinates, key=lambda item: item[1] != "observed_query"))
 
 
+def _ssrf_graphql_plan(
+    surface: Surface, parameter: str, evidence: tuple[Evidence, ...],
+) -> tuple[str, bool] | None:
+    plans = tuple(
+        item.observation for item in evidence
+        if item.run_id == surface.run_id
+        and item.surface_id == surface.surface_id
+        and item.created_by == "recon"
+        and item.evidence_type == "observation"
+        and item.observation.get("type") == SSRF_GRAPHQL_QUERY_STRUCTURE
+        and item.observation.get("argument") == parameter
+    )
+    if len(plans) != 1:
+        return None
+    field = plans[0].get("field")
+    selected = plans[0].get("select_typename")
+    if (
+        not isinstance(field, str) or not GRAPHQL_NAME.fullmatch(field)
+        or not GRAPHQL_NAME.fullmatch(parameter) or type(selected) is not bool
+    ):
+        return None
+    return field, selected
+
+
+def _ssrf_graphql_request(
+    surface: Surface, parameter: str, field: str, selected: bool,
+    value: str, kind: HttpRequestKind,
+) -> EvidenceRequest:
+    selection = "{__typename}" if selected else ""
+    document = f"query($probe:String!){{{field}({parameter}:$probe){selection}}}"
+    return EvidenceRequest(
+        evidence_type="http_response", surface_id=surface.surface_id,
+        reason=f"SSRF GraphQL {kind.value} for {parameter}",
+        suggested_tool="http_post",
+        http_request=HttpRequestSpec(
+            method="POST", headers=(("Content-Type", "application/json"),),
+            body=json.dumps({
+                "query": document, "variables": {"probe": value},
+            }, separators=(",", ":")),
+            request_kind=kind,
+        ),
+    )
+
+
 def ssrf_parameters(
     surface: Surface, evidence: tuple[Evidence, ...] = (),
 ) -> tuple[str, ...]:
@@ -241,6 +366,27 @@ def build_ssrf_requests(
         or parsed.query or parsed.fragment
     ):
         raise ValueError("SSRF callback must be an HTTPS or loopback-test URL without credentials")
+    graphql_shape_present = any(
+        item.run_id == surface.run_id
+        and item.surface_id == surface.surface_id
+        and item.observation.get("type") == SSRF_GRAPHQL_QUERY_STRUCTURE
+        for item in evidence
+    )
+    graphql_plan = _ssrf_graphql_plan(surface, parameter, evidence)
+    if graphql_shape_present:
+        if graphql_plan is None:
+            raise ValueError("SSRF GraphQL probe requires one exact schema plan")
+        field, selected = graphql_plan
+        return (
+            _ssrf_graphql_request(
+                surface, parameter, field, selected,
+                _CONTROL_VALUE, HttpRequestKind.SSRF_CONTROL,
+            ),
+            _ssrf_graphql_request(
+                surface, parameter, field, selected,
+                callback_url, HttpRequestKind.SSRF_PROBE,
+            ),
+        )
     observed = dict(surface.observed_query)
     observed.update(parse_qsl(urlsplit(surface.url).query, keep_blank_values=True))
     observed_url_names = observed_url_parameter_names(surface)
@@ -336,6 +482,27 @@ def build_ssrf_owned_receiver_requests(
     if parameter not in ssrf_parameters(surface, evidence):
         raise ValueError(
             "SSRF owned receiver requires an observed or declared URL input"
+        )
+    graphql_shape_present = any(
+        item.run_id == surface.run_id
+        and item.surface_id == surface.surface_id
+        and item.observation.get("type") == SSRF_GRAPHQL_QUERY_STRUCTURE
+        for item in evidence
+    )
+    graphql_plan = _ssrf_graphql_plan(surface, parameter, evidence)
+    if graphql_shape_present:
+        if graphql_plan is None:
+            raise ValueError("SSRF GraphQL receiver requires one exact schema plan")
+        field, selected = graphql_plan
+        return (
+            _ssrf_graphql_request(
+                surface, parameter, field, selected,
+                _CONTROL_VALUE, HttpRequestKind.SSRF_CONTROL,
+            ),
+            _ssrf_graphql_request(
+                surface, parameter, field, selected,
+                receiver_url, HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE,
+            ),
         )
     observed = dict(surface.observed_query)
     observed.update(parse_qsl(urlsplit(surface.url).query, keep_blank_values=True))

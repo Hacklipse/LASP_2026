@@ -72,6 +72,72 @@ def _executor(task_store, agent: _RecordingAgent, *, progress=None) -> TaskExecu
 
 
 class TaskExecutorSsrfSecretTests(unittest.TestCase):
+    def test_graphql_owned_receiver_ticket_is_redacted_in_task_store(self) -> None:
+        receiver_url = "http://host.docker.internal:18080/owned-receiver-ticket"
+        document = "query($probe:String!){linkPreview(url:$probe){__typename}}"
+        task = TaskEnvelope(
+            task_id="task-graphql-owned", run_id="run-ssrf-secret",
+            agent_type="worker", surface_id="surface-fetch",
+            evidence_request=EvidenceRequest(
+                evidence_type="http_response", surface_id="surface-fetch",
+                reason="owned receiver GraphQL SSRF verification",
+                suggested_tool="http_post",
+                http_request=HttpRequestSpec(
+                    method="POST", headers=(("Content-Type", "application/json"),),
+                    body=json.dumps({"query": document,
+                                     "variables": {"probe": receiver_url}}),
+                    request_kind=HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE,
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.sqlite3"
+            with SQLiteStoreBundle(path) as stores:
+                agent = _RecordingAgent()
+                _executor(stores.tasks, agent).execute(task)
+                persisted = stores.tasks.get(task.task_id).envelope
+                protected = persisted.evidence_request.http_request.body
+                self.assertEqual(json.loads(protected)["query"], document)
+                self.assertEqual(
+                    json.loads(protected)["variables"],
+                    {"probe": "https://protected-ssrf-endpoint.invalid/"},
+                )
+                self.assertNotIn(receiver_url, repr(persisted))
+                self.assertIn(receiver_url, agent.tasks[0].evidence_request.http_request.body)
+
+    def test_graphql_probe_variable_is_redacted_without_losing_query_shape(self) -> None:
+        secret_endpoint = "https://callback.example/session/graphql-secret"
+        document = "query($probe:String!){linkPreview(url:$probe){__typename}}"
+        task = TaskEnvelope(
+            task_id="task-graphql", run_id="run-ssrf-secret", agent_type="worker",
+            surface_id="surface-fetch",
+            evidence_request=EvidenceRequest(
+                evidence_type="http_response", surface_id="surface-fetch",
+                reason="bounded GraphQL SSRF verification",
+                suggested_tool="http_post",
+                http_request=HttpRequestSpec(
+                    method="POST", headers=(("Content-Type", "application/json"),),
+                    body=json.dumps({"query": document,
+                                     "variables": {"probe": secret_endpoint}}),
+                    request_kind=HttpRequestKind.SSRF_PROBE,
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.sqlite3"
+            with SQLiteStoreBundle(path) as stores:
+                agent = _RecordingAgent()
+                _executor(stores.tasks, agent).execute(task)
+                persisted = stores.tasks.get(task.task_id).envelope
+                protected = persisted.evidence_request.http_request.body
+                self.assertEqual(json.loads(protected)["query"], document)
+                self.assertEqual(
+                    json.loads(protected)["variables"],
+                    {"probe": "https://protected-ssrf-endpoint.invalid/"},
+                )
+                self.assertNotIn(secret_endpoint, repr(persisted))
+                self.assertIn(secret_endpoint, agent.tasks[0].evidence_request.http_request.body)
+
     def test_json_post_probe_body_is_redacted_in_task_store(self) -> None:
         secret_endpoint = "https://callback.example/session/json-secret"
         task = TaskEnvelope(

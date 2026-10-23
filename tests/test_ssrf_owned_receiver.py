@@ -6,10 +6,13 @@ import unittest
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
-from hacklipse.adapters import InMemoryBudgetManager
+from hacklipse.adapters import InMemoryBudgetManager, StaticApprovalGate
 from hacklipse.adapters.ssrf_analysis import (
     SSRF_OWNED_RECEIVER_CAPABILITY,
     SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY,
+    SSRF_OWNED_RECEIVER_OPENAPI_JSON_CAPABILITY,
+    SSRF_OWNED_RECEIVER_GRAPHQL_CAPABILITY, SSRF_GRAPHQL_QUERY_STRUCTURE,
+    SSRF_OPENAPI_SINGLE_JSON_STRUCTURE,
 )
 from hacklipse.application.task_factory import TaskFactory
 from hacklipse.bootstrap import build_local_application, register_standard_agents
@@ -33,6 +36,7 @@ from hacklipse.domain import (
 )
 from hacklipse.ports import SsrfCallbackHit, SsrfCallbackTicket
 from hacklipse.ports.llm import LlmResponse
+from hacklipse.domain.models import ssrf_request_parameters
 
 
 class _UnexpectedLlm:
@@ -88,7 +92,10 @@ class _TargetRuntime:
     def execute(self, request):
         if request.request_kind is HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE:
             self.receiver.observe(next(
-                value for _, value in request.query_parameters
+                value for _, value in ssrf_request_parameters(
+                    request.method, request.query_parameters,
+                    request.headers, request.body,
+                )
                 if value.startswith(self.receiver.origin)
             ))
         return ExecutionResult(
@@ -102,6 +109,8 @@ class SsrfOwnedReceiverTests(unittest.TestCase):
     def _run(
         self, *, with_policy: bool, llm_profile: bool = False,
         declared_coordinate: bool = False,
+        graphql_coordinate: bool = False,
+        openapi_json_coordinate: bool = False,
     ):
         receiver = _OwnedReceiver()
         llm = _UnexpectedLlm() if llm_profile else None
@@ -109,6 +118,11 @@ class SsrfOwnedReceiverTests(unittest.TestCase):
         app = build_local_application(
             {}, budget_manager=budget, runtime=_TargetRuntime(receiver),
             ssrf_owned_receiver_service=receiver,
+            approval_gate=StaticApprovalGate(("approved-post",)),
+            default_approval_ref=(
+                "approved-post"
+                if graphql_coordinate or openapi_json_coordinate else None
+            ),
         )
         register_standard_agents(app, llm_client=llm)
         run = Run(
@@ -120,11 +134,15 @@ class SsrfOwnedReceiverTests(unittest.TestCase):
         surface = Surface(
             surface_id="surface-owned", run_id=run.run_id,
             url=(
+                "https://target.example/graphql"
+                if graphql_coordinate else
+                "https://target.example/api/preview"
+                if openapi_json_coordinate else
                 "https://target.example/fetch"
                 if declared_coordinate
                 else "https://target.example/fetch?url=old"
             ),
-            method="GET",
+            method="POST" if graphql_coordinate or openapi_json_coordinate else "GET",
             parameters=("url",),
         )
         review = Evidence(
@@ -146,6 +164,32 @@ class SsrfOwnedReceiverTests(unittest.TestCase):
                     "type": "openapi_request_structure",
                     "method": "GET",
                     "query_parameter_names": ["url"],
+                },
+            )
+            app.stores.evidence.append(declaration)
+            route_evidence.append(declaration)
+        if graphql_coordinate:
+            declaration = Evidence(
+                evidence_id="evi-graphql", run_id=run.run_id,
+                surface_id=surface.surface_id, created_by="recon",
+                evidence_type="observation",
+                observation={
+                    "type": SSRF_GRAPHQL_QUERY_STRUCTURE,
+                    "method": "POST", "field": "preview", "argument": "url",
+                    "select_typename": True,
+                },
+            )
+            app.stores.evidence.append(declaration)
+            route_evidence.append(declaration)
+        if openapi_json_coordinate:
+            declaration = Evidence(
+                evidence_id="evi-openapi-json", run_id=run.run_id,
+                surface_id=surface.surface_id, created_by="recon",
+                evidence_type="observation",
+                observation={
+                    "type": SSRF_OPENAPI_SINGLE_JSON_STRUCTURE,
+                    "method": "POST", "content_type": "application/json",
+                    "body_parameter_names": ["url"],
                 },
             )
             app.stores.evidence.append(declaration)
@@ -175,6 +219,10 @@ class SsrfOwnedReceiverTests(unittest.TestCase):
             verification_strategy=SsrfVerificationStrategy.OWNED_RECEIVER,
         )
         expected_capability = (
+            SSRF_OWNED_RECEIVER_GRAPHQL_CAPABILITY
+            if graphql_coordinate else
+            SSRF_OWNED_RECEIVER_OPENAPI_JSON_CAPABILITY
+            if openapi_json_coordinate else
             SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY
             if declared_coordinate else SSRF_OWNED_RECEIVER_CAPABILITY
         )
@@ -188,6 +236,7 @@ class SsrfOwnedReceiverTests(unittest.TestCase):
         factory = TaskFactory()
         analysis = app.dispatcher.dispatch(factory.analysis(
             run, candidate, target_url=surface.url, request_budget=4,
+            surface_method=surface.method,
         ))
         self.assertEqual(analysis.status, AgentResultStatus.NEEDS_EVIDENCE)
         ids = tuple(app.collector.collect(
@@ -198,6 +247,7 @@ class SsrfOwnedReceiverTests(unittest.TestCase):
         app.stores.candidates.save(candidate)
         analysis = app.dispatcher.dispatch(factory.analysis(
             run, candidate, target_url=surface.url, request_budget=2,
+            surface_method=surface.method,
         ))
         candidate = candidate.add_evidence(analysis.new_evidence_ids)
         app.stores.candidates.save(candidate)
@@ -205,6 +255,7 @@ class SsrfOwnedReceiverTests(unittest.TestCase):
         validation = app.dispatcher.dispatch(factory.validation(
             run, candidate, validation_id=validation_id,
             agent_type="validation", request_budget=2,
+            surface_method=surface.method,
         ))
         self.assertEqual(validation.status, AgentResultStatus.NEEDS_EVIDENCE)
         ids = tuple(app.collector.collect(
@@ -216,6 +267,7 @@ class SsrfOwnedReceiverTests(unittest.TestCase):
         result = app.dispatcher.dispatch(factory.validation(
             run, candidate, validation_id=validation_id,
             agent_type="validation", request_budget=1,
+            surface_method=surface.method,
         ))
         return app, receiver, result, llm
 
@@ -235,6 +287,33 @@ class SsrfOwnedReceiverTests(unittest.TestCase):
         _, _, result, _ = self._run(with_policy=True)
         self.assertEqual(result.validation.verdict, ValidationVerdict.CONFIRMED)
         self.assertIsNotNone(result.validation.proof)
+
+    def test_graphql_receiver_without_policy_remains_suspected(self):
+        _, receiver, result, _ = self._run(
+            with_policy=False, graphql_coordinate=True,
+        )
+        self.assertEqual(result.validation.verdict, ValidationVerdict.SUSPECTED)
+        self.assertEqual(
+            result.validation.reason_code,
+            ValidationReasonCode.SSRF_OWNED_RECEIVER_ONLY,
+        )
+        self.assertEqual(len(receiver.tickets), 2)
+
+    def test_graphql_receiver_with_exact_policy_confirms(self):
+        _, receiver, result, _ = self._run(
+            with_policy=True, graphql_coordinate=True,
+        )
+        self.assertEqual(result.validation.verdict, ValidationVerdict.CONFIRMED)
+        self.assertIsNotNone(result.validation.proof)
+        self.assertEqual(len(receiver.tickets), 2)
+
+    def test_openapi_json_receiver_with_exact_policy_confirms(self):
+        _, receiver, result, _ = self._run(
+            with_policy=True, openapi_json_coordinate=True,
+        )
+        self.assertEqual(result.validation.verdict, ValidationVerdict.CONFIRMED)
+        self.assertIsNotNone(result.validation.proof)
+        self.assertEqual(len(receiver.tickets), 2)
 
     def test_llm_profile_uses_typed_owned_receiver_contract_without_model_choice(self):
         _, receiver, result, llm = self._run(

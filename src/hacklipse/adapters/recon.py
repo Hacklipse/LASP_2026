@@ -99,10 +99,13 @@ from .file_upload_analysis import UPLOAD_FORM, upload_form_plans
 from .security import redacted_internal_url_path
 from .ssrf_analysis import (
     SSRF_EDITOR_CATCHER_STRUCTURE,
+    SSRF_OPENAPI_SINGLE_JSON_STRUCTURE,
+    SSRF_GRAPHQL_QUERY_STRUCTURE,
     SSRF_DESTINATION_HINT_TYPE,
     SSRF_JSON_PARAMETER_HINTS,
     SSRF_URL_FETCH_REVIEW_TYPE,
     ssrf_parameter_sources,
+    ssrf_graphql_query_inputs,
 )
 
 # HttpExecutionRuntime이 GET 실행에 사용하는 도구 이름과 맞춘다(tests/test_http_runtime.py).
@@ -846,6 +849,45 @@ def _openapi_literal_surfaces(
     return found
 
 
+def _openapi_single_json_url_field(document: dict, operation: dict) -> str | None:
+    """Accept only a complete, one-field JSON POST shape from a local schema."""
+
+    request_body = operation.get("requestBody")
+    content = request_body.get("content") if isinstance(request_body, dict) else None
+    entry = content.get("application/json") if isinstance(content, dict) else None
+    schema = entry.get("schema") if isinstance(entry, dict) else None
+    if not isinstance(schema, dict):
+        return None
+    reference = schema.get("$ref")
+    if reference is not None:
+        prefix = "#/components/schemas/"
+        if not isinstance(reference, str) or not reference.startswith(prefix):
+            return None
+        schema_name = reference[len(prefix):]
+        if not _API_FIELD.fullmatch(schema_name):
+            return None
+        components = document.get("components")
+        schemas = components.get("schemas") if isinstance(components, dict) else None
+        schema = schemas.get(schema_name) if isinstance(schemas, dict) else None
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        return None
+    properties = schema.get("properties")
+    if not isinstance(properties, dict) or len(properties) != 1:
+        return None
+    name, field = next(iter(properties.items()))
+    if (
+        not isinstance(name, str) or not _API_FIELD.fullmatch(name)
+        or name.casefold() not in SSRF_JSON_PARAMETER_HINTS
+        or schema.get("required") != [name]
+        or not isinstance(field, dict) or field.get("type") != "string"
+        or field.get("format") not in {None, "uri", "url"}
+        or field.get("readOnly") is True
+        or any(key in field for key in ("$ref", "enum", "const", "pattern"))
+    ):
+        return None
+    return name
+
+
 def _openapi_html_document_urls(evidence: Evidence, origin) -> tuple[str, ...]:
     """Sample only literal, input-free GET documents declared to return HTML."""
 
@@ -1449,9 +1491,22 @@ class ReconAgent:
             collection_templates: Sequence[tuple[str, str, str]] = (),
         ) -> None:
             nonlocal schema_get_samples_queued
+            schema_evidence = self._evidence.get(task.run_id, source_evidence_id)
+            document = _openapi_document(schema_evidence)
             for url, method, query_names, body_names, content_type in shapes:
+                operation = (
+                    document.get("paths", {}).get(urlsplit(url).path, {}).get("post")
+                    if document is not None and method == "POST" else None
+                )
+                single_json_field = (
+                    _openapi_single_json_url_field(document, operation)
+                    if isinstance(operation, dict) else None
+                )
                 surface_id = remember(
-                    url, method, tuple(dict.fromkeys((*query_names, *body_names))),
+                    url, method, tuple(dict.fromkeys((
+                        *query_names, *body_names,
+                        *((single_json_field,) if single_json_field else ()),
+                    ))),
                     discovery_types=("openapi_schema",),
                 )
                 # A declaration supplies field names and media type, never a
@@ -1472,6 +1527,21 @@ class ReconAgent:
                     },
                 ))
                 evidence_ids.append(shape_id)
+                if single_json_field is not None:
+                    ssrf_shape_id = f"evi-{self._id_factory()}"
+                    self._evidence.append(Evidence(
+                        evidence_id=ssrf_shape_id, run_id=task.run_id,
+                        surface_id=surface_id, created_by="recon",
+                        evidence_type="observation", source_task_id=task.task_id,
+                        observation={
+                            "type": SSRF_OPENAPI_SINGLE_JSON_STRUCTURE,
+                            "schema_evidence_id": source_evidence_id,
+                            "method": "POST",
+                            "body_parameter_names": [single_json_field],
+                            "content_type": "application/json",
+                        },
+                    ))
+                    evidence_ids.append(ssrf_shape_id)
             for collection_url, template, identifier in collection_templates:
                 related = schema_collections.setdefault(collection_url, [])
                 if (template, identifier) not in related:
@@ -2190,6 +2260,31 @@ class ReconAgent:
                 )
                 self._evidence.append(schema_observation)
                 evidence_ids.append(schema_observation.evidence_id)
+                # Only a declared read query with one URL string argument is
+                # a replayable SSRF probe shape. Mutations remain excluded.
+                ssrf_queries = ssrf_graphql_query_inputs(
+                    graphql_evidence.observation
+                )
+                if ssrf_queries:
+                    field, argument, select_typename = ssrf_queries[0]
+                    ssrf_surface_id = remember(
+                        graphql_endpoint, "POST", (argument,),
+                        discovery_types=("graphql_introspection",),
+                    )
+                    ssrf_shape_id = f"evi-{self._id_factory()}"
+                    self._evidence.append(Evidence(
+                        evidence_id=ssrf_shape_id, run_id=task.run_id,
+                        surface_id=ssrf_surface_id, created_by="recon",
+                        evidence_type="observation", source_task_id=task.task_id,
+                        observation={
+                            "type": SSRF_GRAPHQL_QUERY_STRUCTURE,
+                            "schema_evidence_id": graphql_evidence_id,
+                            "method": "POST", "field": field,
+                            "argument": argument,
+                            "select_typename": select_typename,
+                        },
+                    ))
+                    evidence_ids.append(ssrf_shape_id)
                 error_probe = Evidence(
                     evidence_id=f"evi-{self._id_factory()}", run_id=task.run_id,
                     surface_id=graphql_surface_id, created_by="recon",

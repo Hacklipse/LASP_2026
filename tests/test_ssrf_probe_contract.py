@@ -9,7 +9,10 @@ from urllib.parse import parse_qsl, urlsplit
 
 from hacklipse.adapters.policy import AllowlistPolicyGate
 from hacklipse.adapters.ssrf_analysis import (
-    build_ssrf_requests, ssrf_parameter_sources, ssrf_parameters,
+    SSRF_GRAPHQL_QUERY_STRUCTURE, SSRF_OPENAPI_SINGLE_JSON_STRUCTURE,
+    build_ssrf_owned_receiver_requests, build_ssrf_requests,
+    ssrf_graphql_query_inputs,
+    ssrf_parameter_sources, ssrf_parameters,
 )
 from hacklipse.adapters.routing import SsrfSurfaceRoutingRule
 from hacklipse.domain import (
@@ -18,6 +21,7 @@ from hacklipse.domain import (
     SsrfExecutionApproval,
     SsrfPolicyAssertion, SsrfPolicyEvidenceStatus, SsrfPolicySource, Surface,
 )
+from hacklipse.domain.models import ssrf_request_parameters
 from hacklipse.domain.errors import DomainInvariantError
 from hacklipse.ports.errors import PolicyViolation
 
@@ -206,6 +210,125 @@ class SsrfProbeContractTests(unittest.TestCase):
             },
         )
         self.assertEqual(ssrf_parameter_sources(surface, (schema_only,)), ())
+        bounded_schema = Evidence(
+            evidence_id="evi-bounded-schema", run_id="run-1",
+            surface_id=surface.surface_id, created_by="recon",
+            evidence_type="observation",
+            observation={
+                "type": SSRF_OPENAPI_SINGLE_JSON_STRUCTURE,
+                "method": "POST", "content_type": "application/json",
+                "body_parameter_names": ["url"],
+            },
+        )
+        self.assertEqual(
+            ssrf_parameter_sources(surface, (bounded_schema,)),
+            (("url", "declared_openapi_single_json_body"),),
+        )
+
+    def test_graphql_url_query_uses_schema_shape_and_one_bound_variable(self) -> None:
+        scalar = {"kind": "SCALAR", "name": "String"}
+        object_type = {"kind": "OBJECT", "name": "Preview"}
+        schema = {"data": {"__schema": {
+            "queryType": {"name": "Query"},
+            "mutationType": {"name": "Mutation"},
+            "types": [
+                {"kind": "OBJECT", "name": "Query", "fields": [
+                    {"name": "linkPreview", "args": [
+                        {"name": "url", "type": scalar},
+                    ], "type": object_type},
+                    {"name": "needsOther", "args": [
+                        {"name": "url", "type": scalar},
+                        {"name": "id", "type": scalar},
+                    ], "type": object_type},
+                ]},
+                {"kind": "OBJECT", "name": "Mutation", "fields": [
+                    {"name": "sendWebhook", "args": [
+                        {"name": "url", "type": scalar},
+                    ], "type": object_type},
+                ]},
+            ],
+        }}}
+        plans = ssrf_graphql_query_inputs({
+            "status": 200, "content_type": "application/json",
+            "body": json.dumps(schema),
+        })
+        self.assertEqual(plans, (("linkPreview", "url", True),))
+        surface = Surface(
+            surface_id="graphql", run_id="run-1",
+            url="https://target.example/graphql", method="POST",
+            parameters=("url",),
+        )
+        shape = Evidence(
+            evidence_id="evi-graphql", run_id="run-1", surface_id="graphql",
+            created_by="recon", evidence_type="observation",
+            observation={"type": SSRF_GRAPHQL_QUERY_STRUCTURE,
+                         "method": "POST", "field": plans[0][0],
+                         "argument": plans[0][1], "select_typename": plans[0][2]},
+        )
+        control, probe = build_ssrf_requests(
+            surface, "url", "https://callback.example/fresh", (shape,),
+        )
+        for request, expected in (
+            (control, "hacklipse-control"),
+            (probe, "https://callback.example/fresh"),
+        ):
+            spec = request.http_request
+            self.assertEqual(spec.method, "POST")
+            self.assertEqual(spec.query_parameters, ())
+            self.assertEqual(json.loads(spec.body)["variables"], {"probe": expected})
+            self.assertEqual(
+                ssrf_request_parameters(spec.method, spec.query_parameters,
+                                        spec.headers, spec.body),
+                (("url", expected),),
+            )
+        class PermitPost:
+            def is_approved(self, run, request):
+                return True
+
+        probe_spec = probe.http_request
+        execution = ExecutionRequest(
+            execution_id="graphql-exec", run_id=self.run.run_id,
+            task_id="graphql-task", tool="http_post", target_url=surface.url,
+            surface_id=surface.surface_id, purpose="GraphQL SSRF proof",
+            method="POST", headers=probe_spec.headers, body=probe_spec.body,
+            request_kind=HttpRequestKind.SSRF_PROBE, scope=self.run.scope,
+        )
+        AllowlistPolicyGate(
+            approval_gate=PermitPost(),
+            ssrf_callback_origin="https://callback.example",
+        ).validate_execution(self.run, execution)
+        with self.assertRaises(PolicyViolation):
+            AllowlistPolicyGate(
+                approval_gate=PermitPost(),
+                ssrf_callback_origin="https://other.example",
+            ).validate_execution(self.run, execution)
+        with self.assertRaises(DomainInvariantError):
+            HttpRequestSpec(
+                method="POST", headers=(("Content-Type", "application/json"),),
+                body=json.dumps({"query": "mutation($probe:String!){sendWebhook(url:$probe){__typename}}",
+                                 "variables": {"probe": "https://callback.example/fresh"}}),
+                request_kind=HttpRequestKind.SSRF_PROBE,
+            )
+        receiver_control, receiver_probe = build_ssrf_owned_receiver_requests(
+            surface, "url", "http://host.docker.internal:18080/fresh", (shape,),
+        )
+        self.assertEqual(
+            receiver_probe.http_request.request_kind,
+            HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE,
+        )
+        self.assertEqual(
+            ssrf_request_parameters(
+                receiver_probe.http_request.method,
+                receiver_probe.http_request.query_parameters,
+                receiver_probe.http_request.headers,
+                receiver_probe.http_request.body,
+            ),
+            (("url", "http://host.docker.internal:18080/fresh"),),
+        )
+        self.assertEqual(
+            json.loads(receiver_control.http_request.body)["variables"],
+            {"probe": "hacklipse-control"},
+        )
 
     def test_canary_requires_operator_rule_and_exact_runtime_url(self) -> None:
         with self.assertRaises(DomainInvariantError):

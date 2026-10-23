@@ -38,11 +38,18 @@ from .ssrf_analysis import (
     SSRF_ANALYZER,
     SSRF_CALLBACK_CAPABILITY, SSRF_CALLBACK_DECLARED_CAPABILITY,
     SSRF_CALLBACK_JSON_CAPABILITY, SSRF_CALLBACK_EDITOR_CAPABILITY,
+    SSRF_CALLBACK_OPENAPI_JSON_CAPABILITY,
+    SSRF_CALLBACK_GRAPHQL_CAPABILITY,
     SSRF_CANARY_CAPABILITY, SSRF_CANARY_DECLARED_CAPABILITY,
     SSRF_CANARY_EDITOR_CAPABILITY,
     SSRF_OWNED_RECEIVER_CAPABILITY, SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY,
-    SSRF_OWNED_RECEIVER_JSON_CAPABILITY, SSRF_OWNED_RECEIVER_EDITOR_CAPABILITY,
+    SSRF_OWNED_RECEIVER_JSON_CAPABILITY,
+    SSRF_OWNED_RECEIVER_OPENAPI_JSON_CAPABILITY,
+    SSRF_OWNED_RECEIVER_EDITOR_CAPABILITY,
+    SSRF_OWNED_RECEIVER_GRAPHQL_CAPABILITY,
     SSRF_EDITOR_CATCHER_STRUCTURE,
+    SSRF_OPENAPI_SINGLE_JSON_STRUCTURE,
+    SSRF_GRAPHQL_QUERY_STRUCTURE,
     SSRF_JSON_PARAMETER_HINTS, SSRF_PARAMETER_HINTS, SSRF_TYPE,
     observed_url_parameter_names,
 )
@@ -379,6 +386,20 @@ OPTIONAL_SSRF_OBSERVATION_RULES = (
         capability_id=SSRF_CALLBACK_JSON_CAPABILITY,
         analysis_strategy_id="declared_json_callback_probe",
     ),
+    RoutingRule(
+        SSRF_OPENAPI_SINGLE_JSON_STRUCTURE, SSRF_TYPE, SSRF_ANALYZER,
+        0.28, methods=("POST",),
+        observation_parameter_field="body_parameter_names",
+        parameter_hints=tuple(sorted(SSRF_JSON_PARAMETER_HINTS)),
+        capability_id=SSRF_CALLBACK_OPENAPI_JSON_CAPABILITY,
+        analysis_strategy_id="declared_json_callback_probe",
+    ),
+    RoutingRule(
+        SSRF_GRAPHQL_QUERY_STRUCTURE, SSRF_TYPE, SSRF_ANALYZER,
+        0.28, methods=("POST",),
+        capability_id=SSRF_CALLBACK_GRAPHQL_CAPABILITY,
+        analysis_strategy_id="declared_graphql_callback_probe",
+    ),
 )
 
 OPTIONAL_SSRF_CANARY_SURFACE_RULES = (
@@ -445,6 +466,20 @@ OPTIONAL_SSRF_OWNED_RECEIVER_OBSERVATION_RULES = (
         capability_id=SSRF_OWNED_RECEIVER_JSON_CAPABILITY,
         analysis_strategy_id="declared_json_internal_request_log_probe",
     ),
+    RoutingRule(
+        SSRF_OPENAPI_SINGLE_JSON_STRUCTURE, SSRF_TYPE, SSRF_ANALYZER,
+        0.30, methods=("POST",),
+        observation_parameter_field="body_parameter_names",
+        parameter_hints=tuple(sorted(SSRF_JSON_PARAMETER_HINTS)),
+        capability_id=SSRF_OWNED_RECEIVER_OPENAPI_JSON_CAPABILITY,
+        analysis_strategy_id="declared_json_internal_request_log_probe",
+    ),
+    RoutingRule(
+        SSRF_GRAPHQL_QUERY_STRUCTURE, SSRF_TYPE, SSRF_ANALYZER,
+        0.30, methods=("POST",),
+        capability_id=SSRF_OWNED_RECEIVER_GRAPHQL_CAPABILITY,
+        analysis_strategy_id="declared_graphql_internal_request_log_probe",
+    ),
 )
 
 # A registered passive review still needs an exact coordinate Candidate, but it
@@ -492,6 +527,7 @@ def _decision_key(
         SSRF_OWNED_RECEIVER_CAPABILITY,
         SSRF_OWNED_RECEIVER_DECLARED_CAPABILITY,
         SSRF_OWNED_RECEIVER_JSON_CAPABILITY,
+        SSRF_OWNED_RECEIVER_OPENAPI_JSON_CAPABILITY,
         SSRF_OWNED_RECEIVER_EDITOR_CAPABILITY,
     }:
         return surface_id, "ssrf.internal_request_log"

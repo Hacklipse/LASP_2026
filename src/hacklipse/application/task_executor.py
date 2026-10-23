@@ -154,13 +154,32 @@ def _protected_observable_envelope(envelope: TaskEnvelope) -> TaskEnvelope:
     elif request.method.upper() == "POST" and request.body is not None:
         # Keep only field names in observable tasks. The execution worker uses
         # its original envelope, which remains bound to the issued URL ticket.
+        parsed_body = json.loads(request.body)
         def protect_json(value):
             if isinstance(value, dict):
                 return {name: protect_json(item) for name, item in value.items()}
             if isinstance(value, str):
                 return protected(value)
             return _PROTECTED_SSRF_VALUE
-        protected_body = json.dumps(protect_json(json.loads(request.body)))
+        if (
+            request.request_kind in {
+                HttpRequestKind.SSRF_PROBE,
+                HttpRequestKind.SSRF_OWNED_RECEIVER_PROBE,
+            }
+            and isinstance(parsed_body, dict)
+            and set(parsed_body) == {"query", "variables"}
+            and isinstance(parsed_body.get("query"), str)
+            and isinstance(parsed_body.get("variables"), dict)
+            and set(parsed_body["variables"]) == {"probe"}
+        ):
+            # Preserve the already validated GraphQL shape, but replace its
+            # sole variable before any task or audit record is persisted.
+            protected_body = json.dumps({
+                "query": parsed_body["query"],
+                "variables": {"probe": _PROTECTED_SSRF_ENDPOINT},
+            })
+        else:
+            protected_body = json.dumps(protect_json(parsed_body))
 
     protected_request = replace(
         request,

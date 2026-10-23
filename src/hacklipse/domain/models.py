@@ -488,6 +488,12 @@ class RunScope:
 _SSRF_REFERENCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/#-]{0,199}\Z")
 _SSRF_SURFACE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z")
 _SSRF_PARAMETER = re.compile(r"[A-Za-z_][A-Za-z0-9_.:-]{0,63}(?:\[\])?\Z")
+_SSRF_GRAPHQL_QUERY = re.compile(
+    r"query\(\$probe:String!\)\{"
+    r"(?P<field>[A-Za-z_][A-Za-z0-9_]{0,79})\("
+    r"(?P<argument>[A-Za-z_][A-Za-z0-9_]{0,79}):\$probe\)"
+    r"(?:\{__typename\})?\}\Z"
+)
 
 
 def ssrf_request_parameters(
@@ -523,6 +529,20 @@ def ssrf_request_parameters(
         return ()
     if not isinstance(parsed, dict):
         return ()
+    if not allow_companions and set(parsed) == {"query", "variables"}:
+        document, variables = parsed["query"], parsed["variables"]
+        match = (
+            _SSRF_GRAPHQL_QUERY.fullmatch(document)
+            if isinstance(document, str) else None
+        )
+        if (
+            match is None or match.group("field").startswith("__")
+            or not isinstance(variables, dict)
+            or set(variables) != {"probe"}
+            or not isinstance(variables["probe"], str)
+        ):
+            return ()
+        return ((match.group("argument"), variables["probe"]),)
     if allow_companions:
         flattened: list[tuple[str, str]] = []
         def visit(value: object, prefix: str, depth: int) -> bool:

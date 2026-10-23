@@ -15,7 +15,10 @@ from hacklipse.adapters import (
 from hacklipse.adapters.analyzer_capabilities import (
     OPTIONAL_SSRF_CAPABILITIES, capability_missing_requirements,
 )
-from hacklipse.adapters.ssrf_analysis import SSRF_ANALYZER
+from hacklipse.adapters.ssrf_analysis import (
+    SSRF_ANALYZER, SSRF_GRAPHQL_QUERY_STRUCTURE,
+    SSRF_OPENAPI_SINGLE_JSON_STRUCTURE,
+)
 from hacklipse.application import OrchestratorConfig
 from hacklipse.application.task_factory import TaskFactory
 from hacklipse.bootstrap import (
@@ -316,6 +319,64 @@ class SsrfStage3Tests(unittest.TestCase):
             ("SSRF",), ssrf_owned_receiver_enabled=True,
         ).route(self.run, (surface,), (claimed,))
         self.assertEqual(decisions, ())
+
+    def test_graphql_owned_receiver_requires_explicit_mode_and_schema_shape(self) -> None:
+        surface = Surface(
+            surface_id="graphql-owned", run_id=self.run.run_id,
+            url="https://target.example/graphql", method="POST",
+            parameters=("url",),
+        )
+        shape = Evidence(
+            evidence_id="graphql-owned-shape", run_id=self.run.run_id,
+            surface_id=surface.surface_id, created_by="recon",
+            evidence_type="observation",
+            observation={
+                "type": SSRF_GRAPHQL_QUERY_STRUCTURE, "method": "POST",
+                "field": "preview", "argument": "url",
+                "select_typename": True,
+            },
+        )
+        self.assertEqual(
+            standard_router(("SSRF",)).route(self.run, (surface,), (shape,)),
+            (),
+        )
+        decisions = standard_router(
+            ("SSRF",), ssrf_owned_receiver_enabled=True,
+        ).route(self.run, (surface,), (shape,))
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(
+            decisions[0].candidate.analysis_strategy_id,
+            "declared_graphql_internal_request_log_probe",
+        )
+
+    def test_openapi_json_owned_receiver_requires_explicit_mode(self) -> None:
+        surface = Surface(
+            surface_id="schema-json-owned", run_id=self.run.run_id,
+            url="https://target.example/api/preview", method="POST",
+            parameters=("url",),
+        )
+        shape = Evidence(
+            evidence_id="schema-json-owned-shape", run_id=self.run.run_id,
+            surface_id=surface.surface_id, created_by="recon",
+            evidence_type="observation",
+            observation={
+                "type": SSRF_OPENAPI_SINGLE_JSON_STRUCTURE,
+                "method": "POST", "content_type": "application/json",
+                "body_parameter_names": ["url"],
+            },
+        )
+        self.assertEqual(
+            standard_router(("SSRF",)).route(self.run, (surface,), (shape,)),
+            (),
+        )
+        decisions = standard_router(
+            ("SSRF",), ssrf_owned_receiver_enabled=True,
+        ).route(self.run, (surface,), (shape,))
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(
+            decisions[0].candidate.analysis_strategy_id,
+            "declared_json_internal_request_log_probe",
+        )
 
     def test_declared_get_query_routes_and_reproduces_without_claiming_proof(self) -> None:
         surface = Surface(

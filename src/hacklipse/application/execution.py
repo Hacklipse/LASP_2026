@@ -82,6 +82,8 @@ _SSRF_CAPABILITY_STRATEGIES = {
     "ssrf.callback_observed_url_query": SsrfVerificationStrategy.CALLBACK,
     "ssrf.callback_declared_url_query": SsrfVerificationStrategy.CALLBACK,
     "ssrf.callback_declared_url_json": SsrfVerificationStrategy.CALLBACK,
+    "ssrf.callback_openapi_single_url_json": SsrfVerificationStrategy.CALLBACK,
+    "ssrf.callback_graphql_url_query": SsrfVerificationStrategy.CALLBACK,
     "ssrf.callback_editor_catcher_query": SsrfVerificationStrategy.CALLBACK,
     "ssrf.internal_canary_observed_url_query": (
         SsrfVerificationStrategy.INTERNAL_CANARY
@@ -101,6 +103,12 @@ _SSRF_CAPABILITY_STRATEGIES = {
     "ssrf.internal_request_log_declared_url_json": (
         SsrfVerificationStrategy.OWNED_RECEIVER
     ),
+    "ssrf.internal_request_log_openapi_single_url_json": (
+        SsrfVerificationStrategy.OWNED_RECEIVER
+    ),
+    "ssrf.internal_request_log_graphql_url_query": (
+        SsrfVerificationStrategy.OWNED_RECEIVER
+    ),
     "ssrf.internal_request_log_editor_catcher_query": (
         SsrfVerificationStrategy.OWNED_RECEIVER
     ),
@@ -118,6 +126,7 @@ _SSRF_ANALYSIS_STRATEGIES = {
     "observed_url_callback_probe": SsrfVerificationStrategy.CALLBACK,
     "declared_url_callback_probe": SsrfVerificationStrategy.CALLBACK,
     "declared_json_callback_probe": SsrfVerificationStrategy.CALLBACK,
+    "declared_graphql_callback_probe": SsrfVerificationStrategy.CALLBACK,
     "observed_url_internal_canary_probe": (
         SsrfVerificationStrategy.INTERNAL_CANARY
     ),
@@ -131,6 +140,9 @@ _SSRF_ANALYSIS_STRATEGIES = {
         SsrfVerificationStrategy.OWNED_RECEIVER
     ),
     "declared_json_internal_request_log_probe": (
+        SsrfVerificationStrategy.OWNED_RECEIVER
+    ),
+    "declared_graphql_internal_request_log_probe": (
         SsrfVerificationStrategy.OWNED_RECEIVER
     ),
     "declared_json_workflow_internal_request_log_probe": (

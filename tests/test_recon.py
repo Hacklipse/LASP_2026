@@ -15,7 +15,8 @@ from hacklipse.adapters.browser_recon import BrowserReconResult
 from hacklipse.adapters.memory import InMemoryEvidenceStore, InMemorySurfaceStore
 from hacklipse.adapters.recon import (
     ReconAgent, _data_navigation_links, _json_links_from_response, _parse_page,
-    _openapi_html_document_urls, _script_ssrf_json_shapes,
+    _openapi_html_document_urls, _openapi_single_json_url_field,
+    _script_ssrf_json_shapes,
     sanitize_url_reference, ssrf_destination_hints,
 )
 from hacklipse.adapters.routing import RuleBasedVulnerabilityRouter
@@ -47,6 +48,27 @@ _SAMPLE_HTML = """
 
 
 class SsrfJsonShapeTests(unittest.TestCase):
+    def test_openapi_json_shape_requires_one_required_url_string(self) -> None:
+        document = {"components": {"schemas": {"Fetch": {
+            "type": "object", "properties": {"url": {"type": "string"}},
+            "required": ["url"],
+        }}}}
+        operation = {"requestBody": {"content": {"application/json": {
+            "schema": {"$ref": "#/components/schemas/Fetch"},
+        }}}}
+        self.assertEqual(_openapi_single_json_url_field(document, operation), "url")
+        document["components"]["schemas"]["Fetch"]["properties"]["mode"] = {
+            "type": "string",
+        }
+        self.assertIsNone(_openapi_single_json_url_field(document, operation))
+        document["components"]["schemas"]["Fetch"]["properties"].pop("mode")
+        document["components"]["schemas"]["Fetch"]["required"] = []
+        self.assertIsNone(_openapi_single_json_url_field(document, operation))
+        operation["requestBody"]["content"]["application/json"]["schema"] = {
+            "$ref": "https://remote.example/schema.json",
+        }
+        self.assertIsNone(_openapi_single_json_url_field(document, operation))
+
     def test_data_navigation_accepts_only_local_nonmutating_get(self) -> None:
         body = (
             '<button data-url="/articles/new">New</button>'
