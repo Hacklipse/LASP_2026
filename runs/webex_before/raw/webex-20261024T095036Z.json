@@ -1,0 +1,39 @@
+{
+  "measured_at": "20261024T095036Z",
+  "webex_root": "/home/gonewroad/hf/WebExploitBench",
+  "budget": 80,
+  "targets": [
+    {
+      "target": "white-jotter",
+      "url": "http://127.0.0.1:43601",
+      "status": "ok",
+      "detail": "",
+      "surfaces": 36,
+      "candidates": {
+        "XSS": 1
+      },
+      "confirmed": {},
+      "requests_used": 7,
+      "seconds": 0.8,
+      "detected_ids": [],
+      "pre_verdicts": {
+        "white-jotter-001": "fail",
+        "white-jotter-002": "unscored",
+        "white-jotter-003": "fail",
+        "white-jotter-004": "fail",
+        "white-jotter-005": "fail",
+        "white-jotter-006": "fail",
+        "white-jotter-007": "unscored"
+      },
+      "verdicts": {
+        "white-jotter-001": "fail",
+        "white-jotter-002": "unscored",
+        "white-jotter-003": "fail",
+        "white-jotter-004": "fail",
+        "white-jotter-005": "fail",
+        "white-jotter-006": "fail",
+        "white-jotter-007": "unscored"
+      }
+    }
+  ]
+}

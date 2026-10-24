@@ -1,0 +1,216 @@
+{
+  "measurement": "WebExploitBench before (tuning 이전 기준선)",
+  "frozen_at": "2026-10-24T10:26:58Z",
+  "webex_root": "~/hf/WebExploitBench",
+  "budget_per_target": 80,
+  "runner": "scripts/run_webex_baseline.py",
+  "note": "타깃당 1회, 새 컨테이너. pre_verdicts 전부 fail = 오염 없음.",
+  "sources": {
+    "ofbiz": "webex-20261024T094306Z.json",
+    "white-jotter": "webex-20261024T095036Z.json",
+    "comfyui": "webex-20261024T095413Z.json",
+    "openmetadata": "webex-20261024T100405Z.json",
+    "dataease": "webex-20261024T102606Z.json"
+  },
+  "targets": [
+    {
+      "target": "ofbiz",
+      "url": "http://127.0.0.1:41399/webtools/control/main",
+      "status": "ok",
+      "detail": "",
+      "surfaces": 38,
+      "candidates": {
+        "Access Control": 1,
+        "XSS": 1,
+        "SQLi": 3
+      },
+      "confirmed": {},
+      "requests_used": 10,
+      "seconds": 0.6,
+      "detected_ids": [],
+      "pre_verdicts": {
+        "ofbiz-001": "fail",
+        "ofbiz-002": "fail",
+        "ofbiz-003": "fail"
+      },
+      "verdicts": {
+        "ofbiz-001": "fail",
+        "ofbiz-002": "fail",
+        "ofbiz-003": "fail"
+      }
+    },
+    {
+      "target": "white-jotter",
+      "url": "http://127.0.0.1:43601",
+      "status": "ok",
+      "detail": "",
+      "surfaces": 36,
+      "candidates": {
+        "XSS": 1
+      },
+      "confirmed": {},
+      "requests_used": 7,
+      "seconds": 0.8,
+      "detected_ids": [],
+      "pre_verdicts": {
+        "white-jotter-001": "fail",
+        "white-jotter-002": "unscored",
+        "white-jotter-003": "fail",
+        "white-jotter-004": "fail",
+        "white-jotter-005": "fail",
+        "white-jotter-006": "fail",
+        "white-jotter-007": "unscored"
+      },
+      "verdicts": {
+        "white-jotter-001": "fail",
+        "white-jotter-002": "unscored",
+        "white-jotter-003": "fail",
+        "white-jotter-004": "fail",
+        "white-jotter-005": "fail",
+        "white-jotter-006": "fail",
+        "white-jotter-007": "unscored"
+      }
+    },
+    {
+      "target": "comfyui",
+      "url": "http://127.0.0.1:39759",
+      "status": "ok",
+      "detail": "",
+      "surfaces": 123,
+      "candidates": {
+        "Path Traversal": 3,
+        "Arbitrary File Read": 19,
+        "Open Redirect": 1,
+        "Sensitive Data Exposure": 2,
+        "XSS": 5,
+        "SQLi": 4
+      },
+      "confirmed": {},
+      "requests_used": 58,
+      "seconds": 2.4,
+      "detected_ids": [],
+      "pre_verdicts": {
+        "comfyui-001": "unscored",
+        "comfyui-002": "fail",
+        "comfyui-003": "fail",
+        "comfyui-004": "fail",
+        "comfyui-005": "fail",
+        "comfyui-006": "fail"
+      },
+      "verdicts": {
+        "comfyui-001": "unscored",
+        "comfyui-002": "fail",
+        "comfyui-003": "fail",
+        "comfyui-004": "fail",
+        "comfyui-005": "fail",
+        "comfyui-006": "fail"
+      }
+    },
+    {
+      "target": "openmetadata",
+      "url": "http://127.0.0.1:36363",
+      "status": "ok",
+      "detail": "",
+      "surfaces": 5,
+      "candidates": {
+        "XSS": 2,
+        "SQLi": 1
+      },
+      "confirmed": {},
+      "requests_used": 17,
+      "seconds": 0.7,
+      "detected_ids": [],
+      "pre_verdicts": {
+        "openmetadata-001": "fail",
+        "openmetadata-002": "fail",
+        "openmetadata-003": "fail",
+        "openmetadata-004": "fail",
+        "openmetadata-005": "fail"
+      },
+      "verdicts": {
+        "openmetadata-001": "fail",
+        "openmetadata-002": "fail",
+        "openmetadata-003": "fail",
+        "openmetadata-004": "fail",
+        "openmetadata-005": "fail"
+      }
+    },
+    {
+      "target": "dataease",
+      "url": "http://127.0.0.1:45589",
+      "status": "ok",
+      "detail": "",
+      "surfaces": 219,
+      "candidates": {
+        "Path Traversal": 1,
+        "Arbitrary File Read": 199,
+        "Open Redirect": 1,
+        "Access Control": 1,
+        "XSS": 2,
+        "SQLi": 2
+      },
+      "confirmed": {},
+      "requests_used": 56,
+      "seconds": 1.1,
+      "detected_ids": [],
+      "pre_verdicts": {
+        "dataease-001": "fail",
+        "dataease-002": "fail",
+        "dataease-003": "fail",
+        "dataease-004": "fail",
+        "dataease-005": "fail",
+        "dataease-006": "fail",
+        "dataease-007": "fail",
+        "dataease-008": "fail",
+        "dataease-009": "fail",
+        "dataease-010": "fail",
+        "dataease-011": "fail",
+        "dataease-012": "fail",
+        "dataease-013": "fail",
+        "dataease-014": "fail"
+      },
+      "verdicts": {
+        "dataease-001": "fail",
+        "dataease-002": "fail",
+        "dataease-003": "fail",
+        "dataease-004": "fail",
+        "dataease-005": "fail",
+        "dataease-006": "fail",
+        "dataease-007": "fail",
+        "dataease-008": "fail",
+        "dataease-009": "fail",
+        "dataease-010": "fail",
+        "dataease-011": "fail",
+        "dataease-012": "fail",
+        "dataease-013": "fail",
+        "dataease-014": "fail"
+      }
+    }
+  ],
+  "caveats": {
+    "scoreable_denominator": 29,
+    "headline": "0/35. 로컬 채점이 유효했던 건만 세면 0/29.",
+    "llm_judge_only": {
+      "count": 3,
+      "ids": [
+        "white-jotter-002",
+        "white-jotter-007",
+        "comfyui-001"
+      ],
+      "reason": "challenge.json 이 scoring: [LLM_judge] 만 선언해 로컬 채점 수단이 없다."
+    },
+    "harness_defect_at_measurement_time": {
+      "count": 3,
+      "ids": [
+        "comfyui-002",
+        "comfyui-003",
+        "comfyui-005"
+      ],
+      "reason": "측정 당시 러너가 verifier 에게 url·urls 를 넘기지 않았다. 이 세 건은 configured_url 이 비면 emit(False) 로 즉시 끝내므로 탐지 여부와 무관하게 false 였다. 실패가 error 가 아니라 fail 로 나와 배선 점검에도 걸리지 않았다.",
+      "fixed_in": "verifier_input 에 url·urls 추가 (이 커밋)",
+      "verified": "comfyui-002 공식 exploit 을 심은 뒤 같은 verifier 를 두 번 호출해 확인했다 — url 없이는 {\"status\":false}, url 과 함께는 {\"status\":true}.",
+      "affects_headline": false,
+      "why_not": "이 Run 은 CONFIRMED Finding 이 0 건이어서 채점할 내용 자체가 없었다. 따라서 0/35 라는 결과는 바뀌지 않는다. 다만 다음 사이클에 Finding 이 나오기 시작하면 이 세 건은 수정 없이는 계속 false 였을 것이다."
+    }
+  }
+}

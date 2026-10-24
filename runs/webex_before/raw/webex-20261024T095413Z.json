@@ -1,0 +1,42 @@
+{
+  "measured_at": "20261024T095413Z",
+  "webex_root": "/home/gonewroad/hf/WebExploitBench",
+  "budget": 80,
+  "targets": [
+    {
+      "target": "comfyui",
+      "url": "http://127.0.0.1:39759",
+      "status": "ok",
+      "detail": "",
+      "surfaces": 123,
+      "candidates": {
+        "Path Traversal": 3,
+        "Arbitrary File Read": 19,
+        "Open Redirect": 1,
+        "Sensitive Data Exposure": 2,
+        "XSS": 5,
+        "SQLi": 4
+      },
+      "confirmed": {},
+      "requests_used": 58,
+      "seconds": 2.4,
+      "detected_ids": [],
+      "pre_verdicts": {
+        "comfyui-001": "unscored",
+        "comfyui-002": "fail",
+        "comfyui-003": "fail",
+        "comfyui-004": "fail",
+        "comfyui-005": "fail",
+        "comfyui-006": "fail"
+      },
+      "verdicts": {
+        "comfyui-001": "unscored",
+        "comfyui-002": "fail",
+        "comfyui-003": "fail",
+        "comfyui-004": "fail",
+        "comfyui-005": "fail",
+        "comfyui-006": "fail"
+      }
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "measured_at": "20261024T111512Z",
+  "webex_root": "/home/gonewroad/hf/WebExploitBench",
+  "budget": 80,
+  "targets": [
+    {
+      "target": "dataease",
+      "url": "http://127.0.0.1:46669",
+      "status": "ok",
+      "detail": "",
+      "surfaces": 219,
+      "candidates": {
+        "Path Traversal": 1,
+        "Arbitrary File Read": 1,
+        "Open Redirect": 1,
+        "Access Control": 1,
+        "XSS": 2,
+        "SQLi": 2
+      },
+      "confirmed": {},
+      "requests_used": 41,
+      "seconds": 0.3,
+      "detected_ids": [],
+      "pre_verdicts": {
+        "dataease-001": "fail",
+        "dataease-002": "fail",
+        "dataease-003": "fail",
+        "dataease-004": "fail",
+        "dataease-005": "fail",
+        "dataease-006": "fail",
+        "dataease-007": "fail",
+        "dataease-008": "fail",
+        "dataease-009": "fail",
+        "dataease-010": "fail",
+        "dataease-011": "fail",
+        "dataease-012": "fail",
+        "dataease-013": "fail",
+        "dataease-014": "fail"
+      },
+      "verdicts": {
+        "dataease-001": "fail",
+        "dataease-002": "fail",
+        "dataease-003": "fail",
+        "dataease-004": "fail",
+        "dataease-005": "fail",
+        "dataease-006": "fail",
+        "dataease-007": "fail",
+        "dataease-008": "fail",
+        "dataease-009": "fail",
+        "dataease-010": "fail",
+        "dataease-011": "fail",
+        "dataease-012": "fail",
+        "dataease-013": "fail",
+        "dataease-014": "fail"
+      }
+    }
+  ]
+}

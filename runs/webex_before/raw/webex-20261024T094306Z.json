@@ -1,0 +1,33 @@
+{
+  "measured_at": "20261024T094306Z",
+  "webex_root": "/home/gonewroad/hf/WebExploitBench",
+  "budget": 80,
+  "targets": [
+    {
+      "target": "ofbiz",
+      "url": "http://127.0.0.1:41399/webtools/control/main",
+      "status": "ok",
+      "detail": "",
+      "surfaces": 38,
+      "candidates": {
+        "Access Control": 1,
+        "XSS": 1,
+        "SQLi": 3
+      },
+      "confirmed": {},
+      "requests_used": 10,
+      "seconds": 0.6,
+      "detected_ids": [],
+      "pre_verdicts": {
+        "ofbiz-001": "fail",
+        "ofbiz-002": "fail",
+        "ofbiz-003": "fail"
+      },
+      "verdicts": {
+        "ofbiz-001": "fail",
+        "ofbiz-002": "fail",
+        "ofbiz-003": "fail"
+      }
+    }
+  ]
+}
