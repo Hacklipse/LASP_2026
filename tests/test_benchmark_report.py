@@ -154,6 +154,29 @@ class VerifierInputTest(unittest.TestCase):
         data = json.loads(verifier_input({"output": "", "_reports": []}))
         self.assertNotIn("urls", data)
 
+    def test_container_names_reach_the_verifier(self) -> None:
+        """compose 이름 규칙이 서비스 키와 달라 매핑을 실어야 한다.
+
+        verifier 다수가 ``docker exec``로 원본 파일을 읽어 비교한다. 매핑이 없으면
+        서비스 키를 컨테이너 이름으로 쓰다가 "컨테이너 없음"으로 실패한다 — 탐지
+        실패와 구분되지 않는 가짜 미탐이 된다.
+        """
+
+        data = json.loads(
+            verifier_input(
+                {"output": "", "_reports": []},
+                dockers={"openmetadata-server": "web_openmetadata-openmetadata-server-1"},
+            )
+        )
+        self.assertEqual(
+            data["dockers"]["openmetadata-server"],
+            "web_openmetadata-openmetadata-server-1",
+        )
+
+    def test_container_names_are_optional(self) -> None:
+        data = json.loads(verifier_input({"output": "", "_reports": []}))
+        self.assertNotIn("dockers", data)
+
 
 if __name__ == "__main__":
     unittest.main()

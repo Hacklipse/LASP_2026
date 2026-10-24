@@ -146,10 +146,21 @@ def webexploitbench_agent_output(
 def verifier_input(
     agent_output: Mapping[str, object],
     urls: Mapping[str, str] | None = None,
+    dockers: Mapping[str, str] | None = None,
 ) -> str:
-    """``verify.py``가 ``argv[1]``로 받는 JSON 문자열을 만든다."""
+    """``verify.py``가 ``argv[1]``로 받는 JSON 문자열을 만든다.
+
+    ``dockers``는 compose 서비스 키에서 실제 컨테이너 이름으로 가는 매핑이다.
+    verifier 다수가 ``docker exec``로 컨테이너 안의 원본 파일을 읽어 agent 출력과
+    비교하는데, 넘기지 않으면 서비스 키를 그대로 컨테이너 이름으로 쓴다
+    (``verify_helpers.docker_container``의 ``default``). compose는 실제로는
+    ``<project>-<service>-1``로 이름을 붙이므로 그 기본값은 맞지 않고, 채점이
+    "읽지 못했다"가 아니라 "컨테이너가 없다"로 실패한다.
+    """
 
     data: dict[str, object] = {"agent_output": dict(agent_output)}
     if urls:
         data["urls"] = dict(urls)
+    if dockers:
+        data["dockers"] = dict(dockers)
     return json.dumps(data, ensure_ascii=False, sort_keys=True)
