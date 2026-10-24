@@ -1,0 +1,36 @@
+{
+  "measured_at": "20261024T100405Z",
+  "webex_root": "/home/gonewroad/hf/WebExploitBench",
+  "budget": 80,
+  "targets": [
+    {
+      "target": "openmetadata",
+      "url": "http://127.0.0.1:36363",
+      "status": "ok",
+      "detail": "",
+      "surfaces": 5,
+      "candidates": {
+        "XSS": 2,
+        "SQLi": 1
+      },
+      "confirmed": {},
+      "requests_used": 17,
+      "seconds": 0.7,
+      "detected_ids": [],
+      "pre_verdicts": {
+        "openmetadata-001": "fail",
+        "openmetadata-002": "fail",
+        "openmetadata-003": "fail",
+        "openmetadata-004": "fail",
+        "openmetadata-005": "fail"
+      },
+      "verdicts": {
+        "openmetadata-001": "fail",
+        "openmetadata-002": "fail",
+        "openmetadata-003": "fail",
+        "openmetadata-004": "fail",
+        "openmetadata-005": "fail"
+      }
+    }
+  ]
+}
