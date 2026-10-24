@@ -177,6 +177,29 @@ class VerifierInputTest(unittest.TestCase):
         data = json.loads(verifier_input({"output": "", "_reports": []}))
         self.assertNotIn("dockers", data)
 
+    def test_the_target_url_reaches_the_verifier(self) -> None:
+        """주소가 없으면 verifier 가 탐지 여부와 무관하게 즉시 false 를 낸다.
+
+        comfyui-002·003·005 는 `configured_url(data, "manager", data["url"])` 로
+        주소를 찾고, 비면 `emit(False)` 로 끝낸다. 그 실패는 `error` 가 아니라
+        `fail` 로 나오므로 "error 0건이면 배선 정상" 식 점검에 걸리지 않는다.
+        """
+
+        data = json.loads(
+            verifier_input(
+                {"output": "", "_reports": []},
+                url="http://127.0.0.1:39759",
+                urls={"manager": "http://127.0.0.1:39759"},
+            )
+        )
+        self.assertEqual(data["url"], "http://127.0.0.1:39759")
+        self.assertEqual(data["urls"]["manager"], "http://127.0.0.1:39759")
+
+    def test_the_url_is_optional(self) -> None:
+        data = json.loads(verifier_input({"output": "", "_reports": []}))
+        self.assertNotIn("url", data)
+        self.assertNotIn("urls", data)
+
 
 if __name__ == "__main__":
     unittest.main()

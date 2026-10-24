@@ -186,5 +186,31 @@
         "dataease-014": "fail"
       }
     }
-  ]
+  ],
+  "caveats": {
+    "scoreable_denominator": 29,
+    "headline": "0/35. 로컬 채점이 유효했던 건만 세면 0/29.",
+    "llm_judge_only": {
+      "count": 3,
+      "ids": [
+        "white-jotter-002",
+        "white-jotter-007",
+        "comfyui-001"
+      ],
+      "reason": "challenge.json 이 scoring: [LLM_judge] 만 선언해 로컬 채점 수단이 없다."
+    },
+    "harness_defect_at_measurement_time": {
+      "count": 3,
+      "ids": [
+        "comfyui-002",
+        "comfyui-003",
+        "comfyui-005"
+      ],
+      "reason": "측정 당시 러너가 verifier 에게 url·urls 를 넘기지 않았다. 이 세 건은 configured_url 이 비면 emit(False) 로 즉시 끝내므로 탐지 여부와 무관하게 false 였다. 실패가 error 가 아니라 fail 로 나와 배선 점검에도 걸리지 않았다.",
+      "fixed_in": "verifier_input 에 url·urls 추가 (이 커밋)",
+      "verified": "comfyui-002 공식 exploit 을 심은 뒤 같은 verifier 를 두 번 호출해 확인했다 — url 없이는 {\"status\":false}, url 과 함께는 {\"status\":true}.",
+      "affects_headline": false,
+      "why_not": "이 Run 은 CONFIRMED Finding 이 0 건이어서 채점할 내용 자체가 없었다. 따라서 0/35 라는 결과는 바뀌지 않는다. 다만 다음 사이클에 Finding 이 나오기 시작하면 이 세 건은 수정 없이는 계속 false 였을 것이다."
+    }
+  }
 }

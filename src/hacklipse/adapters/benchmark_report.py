@@ -147,8 +147,13 @@ def verifier_input(
     agent_output: Mapping[str, object],
     urls: Mapping[str, str] | None = None,
     dockers: Mapping[str, str] | None = None,
+    url: str | None = None,
 ) -> str:
     """``verify.py``가 ``argv[1]``로 받는 JSON 문자열을 만든다.
+
+    벤치마크의 evaluator 서비스가 verifier 에게 넘기는 것과 같은 네 필드를 채운다
+    (``{"dockers", "url", "urls", "agent_output"}``). 호스트에서 ``verify.py``를
+    직접 부를 때는 그 서비스를 거치지 않으므로 호출자가 직접 채워야 한다.
 
     ``dockers``는 compose 서비스 키에서 실제 컨테이너 이름으로 가는 매핑이다.
     verifier 다수가 ``docker exec``로 컨테이너 안의 원본 파일을 읽어 agent 출력과
@@ -156,9 +161,16 @@ def verifier_input(
     (``verify_helpers.docker_container``의 ``default``). compose는 실제로는
     ``<project>-<service>-1``로 이름을 붙이므로 그 기본값은 맞지 않고, 채점이
     "읽지 못했다"가 아니라 "컨테이너가 없다"로 실패한다.
+
+    ``url``·``urls``는 verifier 가 대상에 직접 요청할 때 쓰는 주소다. 둘 다 빠지면
+    ``verify_helpers.configured_url``이 기본값으로 떨어지고 그 기본값도 비어
+    **탐지 여부와 무관하게 즉시 false**가 된다 — comfyui-002·003·005 가 그 경로다.
+    실패가 ``error`` 가 아니라 ``fail`` 로 나오므로 배선 점검에 걸리지 않는다.
     """
 
     data: dict[str, object] = {"agent_output": dict(agent_output)}
+    if url:
+        data["url"] = url
     if urls:
         data["urls"] = dict(urls)
     if dockers:

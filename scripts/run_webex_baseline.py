@@ -29,6 +29,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -76,18 +77,17 @@ def _targetctl(root: Path, *args: str, check: bool = True) -> subprocess.Complet
     )
 
 
-def _resolve_url(root: Path, target: Target) -> str | None:
-    """컨테이너 내부 주소를 호스트에서 접근 가능한 URL로 바꾼다.
+def _host_substitutions(root: Path, target: Target) -> dict[str, str] | None:
+    """컨테이너 내부 주소 -> 호스트 주소 치환 표. ports 파일이 없으면 ``None``.
 
-    `application_targets`에는 설명 문장이 붙어 있는 타깃이 있어(dataease) 치환 후
-    첫 URL 토큰만 떼어 쓴다. bind host는 `0.0.0.0`으로 적히는데 그건 수신 주소라
-    클라이언트가 붙을 주소가 아니다 — loopback으로 바꾼다.
+    bind host 는 `0.0.0.0` 으로 적히는데 그건 수신 주소라 클라이언트가 붙을 주소가
+    아니다 — loopback 으로 바꾼다.
     """
 
     ports_file = root / ".targetctl" / "ports" / f"{_project_name(target.name)}.ports"
     if not ports_file.exists():
         return None
-    rendered = target.application_targets
+    mapping: dict[str, str] = {}
     for line in ports_file.read_text(encoding="utf-8").splitlines():
         parts = line.split("\t")
         if len(parts) != 4:
@@ -96,11 +96,67 @@ def _resolve_url(root: Path, target: Target) -> str | None:
         if host in {"0.0.0.0", "::", ""}:
             host = "127.0.0.1"
         for scheme in ("http", "https"):
-            rendered = rendered.replace(
-                f"{scheme}://{service}:{internal}", f"{scheme}://{host}:{published}"
-            )
-    match = _URL.search(rendered)
+            mapping[f"{scheme}://{service}:{internal}"] = f"{scheme}://{host}:{published}"
+    return mapping
+
+
+def _to_host(text: str, substitutions: Mapping[str, str]) -> str:
+    for internal, external in substitutions.items():
+        text = text.replace(internal, external)
+    return text
+
+
+def _resolve_url(root: Path, target: Target) -> str | None:
+    """대상 앱의 호스트 접근 URL.
+
+    `application_targets` 에는 설명 문장이 붙어 있는 타깃이 있어(dataease) 치환 후
+    첫 URL 토큰만 떼어 쓴다.
+    """
+
+    substitutions = _host_substitutions(root, target)
+    if substitutions is None:
+        return None
+    match = _URL.search(_to_host(target.application_targets, substitutions))
     return match.group(0).rstrip("/") if match else None
+
+
+def _evaluator_urls(root: Path, target: Target) -> dict[str, str]:
+    """compose 의 ``EVALUATOR_URLS_JSON`` 을 호스트 주소로 바꿔 돌려준다.
+
+    다중 타깃 챌린지의 verifier 가 `configured_url(data, "manager", …)` 처럼 **이름**
+    으로 주소를 찾는다. comfyui 는 `core`·`manager` 둘을 선언하고 002·003·005 가
+    그것을 읽는다. 평소 이 값은 evaluator 서비스가 기동 설정에서 채우는데, 호스트에서
+    `verify.py` 를 직접 부르면 아무도 채우지 않는다.
+
+    compose 를 YAML 로 읽지 않고 이 한 키만 뽑는다. pyyaml 이 없는 환경에서도 돌아야
+    하고, 다른 키를 해석할 이유가 없다.
+    """
+
+    compose = root / target.name / "docker-compose.cage.yml"
+    if not compose.exists():
+        return {}
+    match = re.search(
+        r"EVALUATOR_URLS_JSON:\s*'([^']*)'", compose.read_text(encoding="utf-8")
+    )
+    if match is None:
+        return {}
+    try:
+        declared = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(declared, dict):
+        return {}
+    substitutions = _host_substitutions(root, target) or {}
+    resolved: dict[str, str] = {}
+    for key, value in declared.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        external = _to_host(value, substitutions)
+        # 공개되지 않은 서비스는 호스트에서 닿지 않는다. 내부 주소를 그대로 넘기면
+        # verifier 가 연결 실패를 탐지 실패로 보고하므로 아예 싣지 않는다.
+        if external != value:
+            resolved[key] = external.rstrip("/")
+    return resolved
 
 
 def _container_names(root: Path, target: Target) -> dict[str, str]:
@@ -185,7 +241,8 @@ def _run_lasp(url: str, budget: int) -> tuple[object, object]:
 
 
 def _score(
-    root: Path, target: Target, agent_output: dict, dockers: dict[str, str]
+    root: Path, target: Target, agent_output: dict, dockers: dict[str, str],
+    *, url: str | None = None, urls: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """verifier가 있는 건만 실제로 채점한다.
 
@@ -196,7 +253,7 @@ def _score(
     """
 
     verdicts: dict[str, str] = {}
-    payload = verifier_input(agent_output, urls={}, dockers=dockers)
+    payload = verifier_input(agent_output, urls=urls, dockers=dockers, url=url)
     for vuln in target.vulnerabilities:
         if "verifier" not in vuln.scoring:
             verdicts[vuln.vuln_id] = "unscored"
@@ -273,7 +330,11 @@ def _measure(root: Path, target: Target, args) -> TargetResult:
     dockers = _container_names(root, target)
     # LASP 를 돌리기 전에 한 번 채점한다. 여기서 이미 pass 가 나오는 건은 컨테이너에
     # 남은 흔적 때문이지 이번 실행의 성과가 아니다.
-    result.pre_verdicts = _score(root, target, {"output": "", "_reports": []}, dockers)
+    evaluator_urls = _evaluator_urls(root, target)
+    result.pre_verdicts = _score(
+        root, target, {"output": "", "_reports": []}, dockers,
+        url=url, urls=evaluator_urls,
+    )
     contaminated = sorted(k for k, v in result.pre_verdicts.items() if v == "pass")
     if contaminated:
         print(
@@ -308,7 +369,9 @@ def _measure(root: Path, target: Target, args) -> TargetResult:
         {s.surface_id: s for s in surfaces},
         {e.evidence_id: e for e in evidence},
     )
-    post = _score(root, target, agent_output, dockers)
+    post = _score(
+        root, target, agent_output, dockers, url=url, urls=evaluator_urls,
+    )
     # 측정 전에 이미 통과하던 건은 이번 실행의 성과로 셀 수 없다. 차이만 인정한다.
     result.verdicts = {
         vuln_id: (
