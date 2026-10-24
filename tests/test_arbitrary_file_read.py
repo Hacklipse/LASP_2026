@@ -513,7 +513,12 @@ class PathSegmentCoordinateTests(unittest.TestCase):
 
         cases = {
             "http://t/download/report.pdf": 2,
-            "http://t/assets/js/app.js": 3,
+            "http://t/files/2024/q3.csv": 3,
+            "http://t/download/avatar.png": 2,
+            # 앱 자신의 번들. 디렉터리 단서(assets)와 겹치지만 좌표가 아니다.
+            "http://t/assets/js/app.js": None,
+            "http://t/assets/chunk/vendor.css": None,
+            "http://t/assets/app.js.map": None,
             "http://t/about/team.html": None,
             "http://t/report.pdf": None,
         }
@@ -523,6 +528,33 @@ class PathSegmentCoordinateTests(unittest.TestCase):
                     surface_id="s", run_id="r", url=url, method="GET",
                 )
                 self.assertEqual(file_serving_segment_index(surface), expected)
+
+    def test_a_surface_found_only_as_a_script_is_not_a_read_coordinate(self) -> None:
+        """SPA 번들이 좌표를 점령하지 못하게 한다.
+
+        WebExploitBench dataease 에서 표면 219 개 중 198 개가 `<script src>` 로
+        발견된 `/assets/chunk/*.js` 였고, 그것들이 후보 206 개 중 199 개를 차지해
+        같은 앱의 SQLi 7 건에는 후보가 2 개만 배정됐다. 앱이 공개하도록 만든 파일은
+        읽혀도 증명이 되지 않으면서 예산만 가져간다.
+        """
+
+        from hacklipse.adapters.arbitrary_file_read import file_serving_segment_index
+        from hacklipse.domain import Surface
+
+        bundle = Surface(
+            surface_id="s", run_id="r", method="GET",
+            url="http://t/assets/chunk/mitt-0.0.0.js",
+            discovery_types=("html_script_reference",),
+        )
+        self.assertIsNone(file_serving_segment_index(bundle))
+
+        # 같은 경로라도 스크립트 참조가 아닌 경로로 발견됐고 번들 확장자가 아니면 좌표다.
+        served = Surface(
+            surface_id="s", run_id="r", method="GET",
+            url="http://t/assets/chunk/report.pdf",
+            discovery_types=("html_link",),
+        )
+        self.assertEqual(file_serving_segment_index(served), 3)
 
 
 class _PublicProofFileRuntime:

@@ -153,20 +153,49 @@ _FILE_SERVING_DIRECTORY_CUES = frozenset({
     "include", "template", "templates",
 })
 
+# recon 이 "앱이 스스로 불러오는 스크립트"로 발견한 표면. SPA 빌드 산출물은 보통
+# `/assets/...` 아래에 있어 디렉터리 단서와 겹치는데, 그것은 앱이 공개하도록 만든
+# 파일이므로 "읽을 수 있는가"를 물을 대상이 아니다.
+#
+# recon 의 리터럴을 그대로 적는다. recon 이 이 모듈을 import 하므로 역방향 import 로
+# 공유할 수 없다.
+_CLIENT_SCRIPT_DISCOVERY = frozenset({
+    "html_script_reference", "script_literal",
+    "inline_script_literal", "browser_script_literal",
+})
+
+# 프런트엔드 번들의 확장자. 문서(pdf·csv…)와 이미지는 사용자 파일일 수 있으므로
+# 빼지 않는다 — `/download/avatar.png` 는 실제 좌표일 수 있다.
+_BUNDLE_EXTENSIONS = frozenset({
+    "js", "mjs", "cjs", "css", "map", "woff", "woff2", "ttf", "eot", "otf",
+})
+
 
 def file_serving_segment_index(surface: Surface) -> int | None:
     """바꿔 볼 마지막 경로 세그먼트의 위치. 해당 없으면 ``None``.
 
     index 는 ``urlsplit(url).path.split("/")`` 기준이므로 ``/download/report.pdf``의
     ``report.pdf``는 2다. 실행기는 그 자리만 교체한다.
+
+    앱 자신의 프런트엔드 번들은 제외한다. 디렉터리 단서만으로 고르면 SPA 에서
+    ``/assets/chunk/*.js`` 가 전부 좌표로 잡힌다 — WebExploitBench dataease 에서
+    표면 219 개 중 **198 개**가 그렇게 잡혀 후보 206 개 중 199 개를 차지했고, 같은 앱의
+    SQLi 7 건에는 후보가 2 개밖에 배정되지 않았다. 번들은 앱이 공개하도록 만든 파일이라
+    읽혀도 증명이 되지 않으면서 후보 슬롯과 예산만 가져간다.
     """
 
     if surface.method.upper() != "GET" or surface.parameters:
         return None
     if urlsplit(surface.url).fragment or surface.path_assignment is not None:
         return None
+    discovery = {kind.casefold() for kind in surface.discovery_types or ()}
+    if discovery and discovery <= _CLIENT_SCRIPT_DISCOVERY:
+        return None
     segments = urlsplit(surface.url).path.split("/")
     if len(segments) < 3 or not segments[-1]:
+        return None
+    suffix = segments[-1].rsplit(".", 1)
+    if len(suffix) == 2 and suffix[1].casefold() in _BUNDLE_EXTENSIONS:
         return None
     directories = {part.casefold() for part in segments[1:-1] if part}
     if not directories & _FILE_SERVING_DIRECTORY_CUES:
