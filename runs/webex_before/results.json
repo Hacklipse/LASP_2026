@@ -1,0 +1,190 @@
+{
+  "measurement": "WebExploitBench before (tuning 이전 기준선)",
+  "frozen_at": "2026-10-24T10:26:58Z",
+  "webex_root": "~/hf/WebExploitBench",
+  "budget_per_target": 80,
+  "runner": "scripts/run_webex_baseline.py",
+  "note": "타깃당 1회, 새 컨테이너. pre_verdicts 전부 fail = 오염 없음.",
+  "sources": {
+    "ofbiz": "webex-20261024T094306Z.json",
+    "white-jotter": "webex-20261024T095036Z.json",
+    "comfyui": "webex-20261024T095413Z.json",
+    "openmetadata": "webex-20261024T100405Z.json",
+    "dataease": "webex-20261024T102606Z.json"
+  },
+  "targets": [
+    {
+      "target": "ofbiz",
+      "url": "http://127.0.0.1:41399/webtools/control/main",
+      "status": "ok",
+      "detail": "",
+      "surfaces": 38,
+      "candidates": {
+        "Access Control": 1,
+        "XSS": 1,
+        "SQLi": 3
+      },
+      "confirmed": {},
+      "requests_used": 10,
+      "seconds": 0.6,
+      "detected_ids": [],
+      "pre_verdicts": {
+        "ofbiz-001": "fail",
+        "ofbiz-002": "fail",
+        "ofbiz-003": "fail"
+      },
+      "verdicts": {
+        "ofbiz-001": "fail",
+        "ofbiz-002": "fail",
+        "ofbiz-003": "fail"
+      }
+    },
+    {
+      "target": "white-jotter",
+      "url": "http://127.0.0.1:43601",
+      "status": "ok",
+      "detail": "",
+      "surfaces": 36,
+      "candidates": {
+        "XSS": 1
+      },
+      "confirmed": {},
+      "requests_used": 7,
+      "seconds": 0.8,
+      "detected_ids": [],
+      "pre_verdicts": {
+        "white-jotter-001": "fail",
+        "white-jotter-002": "unscored",
+        "white-jotter-003": "fail",
+        "white-jotter-004": "fail",
+        "white-jotter-005": "fail",
+        "white-jotter-006": "fail",
+        "white-jotter-007": "unscored"
+      },
+      "verdicts": {
+        "white-jotter-001": "fail",
+        "white-jotter-002": "unscored",
+        "white-jotter-003": "fail",
+        "white-jotter-004": "fail",
+        "white-jotter-005": "fail",
+        "white-jotter-006": "fail",
+        "white-jotter-007": "unscored"
+      }
+    },
+    {
+      "target": "comfyui",
+      "url": "http://127.0.0.1:39759",
+      "status": "ok",
+      "detail": "",
+      "surfaces": 123,
+      "candidates": {
+        "Path Traversal": 3,
+        "Arbitrary File Read": 19,
+        "Open Redirect": 1,
+        "Sensitive Data Exposure": 2,
+        "XSS": 5,
+        "SQLi": 4
+      },
+      "confirmed": {},
+      "requests_used": 58,
+      "seconds": 2.4,
+      "detected_ids": [],
+      "pre_verdicts": {
+        "comfyui-001": "unscored",
+        "comfyui-002": "fail",
+        "comfyui-003": "fail",
+        "comfyui-004": "fail",
+        "comfyui-005": "fail",
+        "comfyui-006": "fail"
+      },
+      "verdicts": {
+        "comfyui-001": "unscored",
+        "comfyui-002": "fail",
+        "comfyui-003": "fail",
+        "comfyui-004": "fail",
+        "comfyui-005": "fail",
+        "comfyui-006": "fail"
+      }
+    },
+    {
+      "target": "openmetadata",
+      "url": "http://127.0.0.1:36363",
+      "status": "ok",
+      "detail": "",
+      "surfaces": 5,
+      "candidates": {
+        "XSS": 2,
+        "SQLi": 1
+      },
+      "confirmed": {},
+      "requests_used": 17,
+      "seconds": 0.7,
+      "detected_ids": [],
+      "pre_verdicts": {
+        "openmetadata-001": "fail",
+        "openmetadata-002": "fail",
+        "openmetadata-003": "fail",
+        "openmetadata-004": "fail",
+        "openmetadata-005": "fail"
+      },
+      "verdicts": {
+        "openmetadata-001": "fail",
+        "openmetadata-002": "fail",
+        "openmetadata-003": "fail",
+        "openmetadata-004": "fail",
+        "openmetadata-005": "fail"
+      }
+    },
+    {
+      "target": "dataease",
+      "url": "http://127.0.0.1:45589",
+      "status": "ok",
+      "detail": "",
+      "surfaces": 219,
+      "candidates": {
+        "Path Traversal": 1,
+        "Arbitrary File Read": 199,
+        "Open Redirect": 1,
+        "Access Control": 1,
+        "XSS": 2,
+        "SQLi": 2
+      },
+      "confirmed": {},
+      "requests_used": 56,
+      "seconds": 1.1,
+      "detected_ids": [],
+      "pre_verdicts": {
+        "dataease-001": "fail",
+        "dataease-002": "fail",
+        "dataease-003": "fail",
+        "dataease-004": "fail",
+        "dataease-005": "fail",
+        "dataease-006": "fail",
+        "dataease-007": "fail",
+        "dataease-008": "fail",
+        "dataease-009": "fail",
+        "dataease-010": "fail",
+        "dataease-011": "fail",
+        "dataease-012": "fail",
+        "dataease-013": "fail",
+        "dataease-014": "fail"
+      },
+      "verdicts": {
+        "dataease-001": "fail",
+        "dataease-002": "fail",
+        "dataease-003": "fail",
+        "dataease-004": "fail",
+        "dataease-005": "fail",
+        "dataease-006": "fail",
+        "dataease-007": "fail",
+        "dataease-008": "fail",
+        "dataease-009": "fail",
+        "dataease-010": "fail",
+        "dataease-011": "fail",
+        "dataease-012": "fail",
+        "dataease-013": "fail",
+        "dataease-014": "fail"
+      }
+    }
+  ]
+}

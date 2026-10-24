@@ -350,6 +350,28 @@ def _print_summary(results: list[TargetResult], targets: tuple[Target, ...]) -> 
     if unscored:
         print("\n미통과 내역: " + ", ".join(f"{k} {n}" for k, n in unscored.most_common()))
 
+    # 미탐의 원인을 두 갈래로 갈라 적는다. 둘을 합치면 다음 작업이 "탐지를 고치는 일"인지
+    # "보고·채점을 고치는 일"인지 결정할 수 없다.
+    print("\n미탐 원인 구분")
+    for result in results:
+        if result.status != "ok":
+            print(f"  {result.target:<14} 측정 못 함 ({result.status}) {result.detail[:60]}")
+            continue
+        confirmed = sum(result.confirmed.values())
+        passed = sum(1 for v in result.verdicts.values() if v == "pass")
+        if confirmed == 0:
+            print(
+                f"  {result.target:<14} 탐지 0건 — CONFIRMED Finding 자체가 없다"
+                f" (표면 {result.surfaces}, Candidate {sum(result.candidates.values())})"
+            )
+        elif passed == 0:
+            print(
+                f"  {result.target:<14} 탐지 {confirmed}건인데 채점 0 — 하네스/보고 쪽 문제일 수 있다"
+                f" {result.confirmed}"
+            )
+        else:
+            print(f"  {result.target:<14} 탐지 {confirmed}건, 채점 {passed}건 통과")
+
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -371,6 +393,15 @@ def main(argv: list[str]) -> int:
     for target in targets:
         try:
             results.append(_measure(root, target, args))
+        except Exception as error:  # noqa: BLE001 - 한 타깃이 죽어도 나머지는 재야 한다
+            print(f"[{target.name}] 중단: {type(error).__name__}: {error}", flush=True)
+            results.append(
+                TargetResult(
+                    target=target.name,
+                    status="crashed",
+                    detail=f"{type(error).__name__}: {error}"[-400:],
+                )
+            )
         finally:
             if not args.keep_up and not args.no_up:
                 _targetctl(root, "down", target.name, check=False)
